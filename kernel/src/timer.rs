@@ -24,6 +24,14 @@ pub fn init() {
     // For virt machine, we use the generic timer which doesn't need initialization
 }
 
+pub fn millis() -> u64 {
+    let freq = get_timer_frequency();
+    if freq == 0 {
+        return 0;
+    }
+    get_ticks() * 1000 / freq
+}
+
 pub fn get_ticks() -> u64 {
     // Read generic timer counter (available on all ARMv8 systems)
     // This returns a 64-bit monotonic counter

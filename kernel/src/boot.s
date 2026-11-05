@@ -3,22 +3,28 @@
 .global _start
 
 _start:
-    // Read CPU ID, stop cores 1-3
+    // Only the boot core continues. QEMU virt starts one CPU at EL1.
     mrs     x1, mpidr_el1
     and     x1, x1, #3
     cbz     x1, 2f
-    
-    // CPU ID > 0, hang
+
 1:
     wfe
     b       1b
 
 2:
-    // Set stack pointer
-    ldr     x1, =0x80000
+    // Rust's aarch64 target uses NEON for copies. QEMU boots with FP/SIMD
+    // trapped, so enable it before any Rust code runs.
+    mrs     x0, cpacr_el1
+    orr     x0, x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+
+    // Stack grows down from the kernel load address into the RAM below it.
+    ldr     x1, =0x40080000
     mov     sp, x1
 
-    // Clear BSS
+    // Clear BSS (linked into RAM, so these stores are real memory).
     ldr     x1, =__bss_start
     ldr     x2, =__bss_end
 
@@ -29,10 +35,8 @@ _start:
     b       3b
 
 4:
-    // Jump to Rust
     bl      kernel_main
-    
-    // Halt if kernel_main returns
+
 5:
     wfe
     b       5b

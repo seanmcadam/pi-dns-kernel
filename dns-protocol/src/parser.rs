@@ -42,9 +42,20 @@ impl DnsPacket {
 
         let mut additional = Vec::new();
         for _ in 0..header.arcount {
-            let (rr, new_offset) = parse_resource_record(data, offset)?;
-            additional.push(rr);
-            offset = new_offset;
+            // dig (and most resolvers) append an EDNS OPT pseudo-RR. Its type
+            // and class are not a normal record, so skip anything we don't
+            // understand instead of failing the whole query.
+            let start = offset;
+            match parse_resource_record(data, offset) {
+                Ok((rr, new_offset)) => {
+                    additional.push(rr);
+                    offset = new_offset;
+                }
+                Err(ParseError::UnsupportedType) => {
+                    offset = skip_resource_record(data, start)?;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(DnsPacket {
@@ -158,6 +169,19 @@ fn parse_question(data: &[u8], offset: usize) -> Result<(Question, usize), Parse
         },
         offset,
     ))
+}
+
+fn skip_resource_record(data: &[u8], offset: usize) -> Result<usize, ParseError> {
+    let (_, mut offset) = parse_name(data, offset)?;
+    if offset + 10 > data.len() {
+        return Err(ParseError::TooShort);
+    }
+    let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
+    offset += 10;
+    if offset + rdlength > data.len() {
+        return Err(ParseError::TooShort);
+    }
+    Ok(offset + rdlength)
 }
 
 fn parse_resource_record(

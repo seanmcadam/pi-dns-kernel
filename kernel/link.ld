@@ -2,8 +2,10 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Kernel starts at 0x80000 for Raspberry Pi 4 */
-    . = 0x80000;
+    /* QEMU's virt machine loads a raw kernel at RAM base + 0x80000.
+       RAM starts at 0x40000000, so the image must be linked at 0x40080000.
+       (A Raspberry Pi 4 image would instead be linked at 0x80000.) */
+    . = 0x40080000;
 
     .text :
     {
@@ -21,7 +23,7 @@ SECTIONS
         *(.data*)
     }
 
-    .bss (NOLOAD) :
+    .bss ALIGN(16) (NOLOAD) :
     {
         __bss_start = .;
         *(.bss*)
@@ -29,13 +31,9 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* Stack grows downward from 0x80000 */
-    . = ALIGN(16);
-    __stack_end = .;
-    
-    /* Heap starts after BSS */
+    /* Heap sits in RAM, after the image. Stack grows down from 0x40080000. */
     . = ALIGN(4096);
     __heap_start = .;
-    . += 0x100000; /* 1MB heap */
+    . += 0x200000; /* 2MB heap */
     __heap_end = .;
 }

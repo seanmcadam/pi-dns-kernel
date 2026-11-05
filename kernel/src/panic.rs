@@ -1,14 +1,22 @@
-use crate::uart_pl011::Pl011Uart;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
+struct UartWriter;
+
+impl Write for UartWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for byte in s.bytes() {
+            unsafe {
+                core::ptr::write_volatile(0x0900_0000 as *mut u32, byte as u32);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut uart = Pl011Uart::new();
-    uart.init();
-    writeln!(uart, "\r\n!!! KERNEL PANIC !!!\r").ok();
-    writeln!(uart, "{}\r", info).ok();
-    
+    let _ = writeln!(UartWriter, "\r\n!!! KERNEL PANIC !!!\r\n{}\r\n", info);
     loop {
         cortex_a::asm::wfe();
     }

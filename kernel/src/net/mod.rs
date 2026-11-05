@@ -80,9 +80,13 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
 pub fn poll() {
     let mut net = NETWORK.lock();
     if let Some(state) = net.as_mut() {
-        let timestamp = Instant::from_millis(crate::timer::get_ticks() as i64 / 1000);
+        let timestamp = Instant::from_millis(crate::timer::millis() as i64);
         state.stack.poll(timestamp, &mut state.device);
     }
+}
+
+pub fn packet_counts() -> (u32, u32) {
+    virtio::packet_counts()
 }
 
 pub fn with_stack<F, R>(f: F) -> Option<R>

@@ -15,33 +15,45 @@ pub fn start(config: &HttpConfig) {
 }
 
 pub fn init_sockets(stack: &mut crate::net::NetworkStack) -> Result<(), &'static str> {
-    // Create TCP socket for HTTP
-    let rx_buffer = TcpSocketBuffer::new(vec![0u8; 4096]);
-    let tx_buffer = TcpSocketBuffer::new(vec![0u8; 4096]);
-    let socket = TcpSocket::new(rx_buffer, tx_buffer);
-    
-    let http_handle = stack.sockets_mut().add(socket);
-    
-    // Listen on port 80
     let config = HTTP_CONFIG.lock();
     let port = config.as_ref().map(|c| c.port).unwrap_or(80);
-    
-    let socket = stack.sockets_mut().get_mut::<TcpSocket>(http_handle);
-    socket.listen(port).map_err(|_| "Failed to listen on HTTP port")?;
-    
+    drop(config);
+
+    // Several listeners so a connection stuck in TIME-WAIT does not block the next request.
+    for _ in 0..4 {
+        let rx_buffer = TcpSocketBuffer::new(vec![0u8; 8192]);
+        let tx_buffer = TcpSocketBuffer::new(vec![0u8; 8192]);
+        let socket = TcpSocket::new(rx_buffer, tx_buffer);
+        let http_handle = stack.sockets_mut().add(socket);
+        let socket = stack.sockets_mut().get_mut::<TcpSocket>(http_handle);
+        socket
+            .listen(port)
+            .map_err(|_| "Failed to listen on HTTP port")?;
+    }
+
     log::info!("HTTP socket listening on port {}", port);
     Ok(())
 }
 
 pub fn poll(stack: &mut crate::net::NetworkStack, _device: &mut crate::net::EthernetDevice) {
-    // Process HTTP requests
+    let port = HTTP_CONFIG
+        .lock()
+        .as_ref()
+        .map(|c| c.port)
+        .unwrap_or(80);
+
     let sockets = stack.sockets_mut();
-    
+
     for item in sockets.iter_mut() {
         let socket = item.1;
         if let Socket::Tcp(tcp_socket) = socket {
-            // Check if this is the HTTP socket (listening on port 80 or config port)
-            if tcp_socket.is_active() && tcp_socket.may_recv() {
+            // Recycle sockets that have finished (CLOSED or TIME-WAIT).
+            if !tcp_socket.is_open() {
+                tcp_socket.listen(port).ok();
+            } else if tcp_socket.state() == tcp::State::FinWait2 {
+                tcp_socket.abort();
+                tcp_socket.listen(port).ok();
+            } else if tcp_socket.is_active() && tcp_socket.may_recv() {
                 process_http_socket(tcp_socket);
             }
         }
@@ -61,6 +73,7 @@ fn process_http_socket(socket: &mut TcpSocket) {
             
             // Parse HTTP request
             match HttpRequest::parse(&buffer[..size]) {
+                Err(http_server::ParseError::Incomplete) => return,
                 Ok(request) => {
                     log::info!("{} {}", 
                         match request.method {
@@ -82,6 +95,7 @@ fn process_http_socket(socket: &mut TcpSocket) {
                             log::debug!("Sent HTTP response: {} bytes", response_bytes.len());
                         }
                     }
+                    socket.close();
                 }
                 Err(e) => {
                     log::warn!("Failed to parse HTTP request: {:?}", e);
@@ -91,6 +105,7 @@ fn process_http_socket(socket: &mut TcpSocket) {
                     if socket.can_send() {
                         socket.send_slice(&response.to_bytes()).ok();
                     }
+                    socket.close();
                 }
             }
         }
