@@ -1,5 +1,6 @@
 mod device;
 mod stack;
+mod virtio;
 
 use alloc::boxed::Box;
 use smoltcp::time::Instant;
@@ -8,7 +9,12 @@ use spin::Mutex;
 pub use device::{DeviceType, EthernetDevice};
 pub use stack::NetworkStack;
 
-static NETWORK: Mutex<Option<Box<NetworkStack>>> = Mutex::new(None);
+struct NetworkState {
+    stack: NetworkStack,
+    device: EthernetDevice,
+}
+
+static NETWORK: Mutex<Option<Box<NetworkState>>> = Mutex::new(None);
 
 #[derive(Debug, Clone)]
 pub enum NetworkMode {
@@ -33,10 +39,18 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
     let device_type = device::detect_device_type();
     log::info!("Network device: {:?}", device_type);
 
-    let device = device::create_device(device_type).ok_or(NetworkError::DeviceNotFound)?;
-
-    let mut stack = NetworkStack::new(device);
-
+    let mut device = match device_type {
+        DeviceType::Virtio => {
+            EthernetDevice::new_virtio().ok_or(NetworkError::DeviceNotFound)?
+        }
+        DeviceType::Genet => {
+            log::error!("GENET driver not yet implemented");
+            return Err(NetworkError::DeviceNotFound);
+        }
+    };
+    
+    let mut stack = NetworkStack::new(&mut device);
+    
     match config.mode {
         NetworkMode::Static {
             ip,
@@ -57,24 +71,24 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
             stack.configure_dhcp();
         }
     }
-
-    *NETWORK.lock() = Some(Box::new(stack));
+    
+    *NETWORK.lock() = Some(Box::new(NetworkState { stack, device }));
 
     Ok(())
 }
 
 pub fn poll() {
     let mut net = NETWORK.lock();
-    if let Some(stack) = net.as_mut() {
+    if let Some(state) = net.as_mut() {
         let timestamp = Instant::from_millis(crate::timer::get_ticks() as i64 / 1000);
-        stack.poll(timestamp);
+        state.stack.poll(timestamp, &mut state.device);
     }
 }
 
 pub fn with_stack<F, R>(f: F) -> Option<R>
 where
-    F: FnOnce(&mut NetworkStack) -> R,
+    F: FnOnce(&mut NetworkStack, &mut EthernetDevice) -> R,
 {
     let mut net = NETWORK.lock();
-    net.as_mut().map(|stack| f(stack.as_mut()))
+    net.as_mut().map(|state| f(&mut state.stack, &mut state.device))
 }

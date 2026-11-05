@@ -7,23 +7,21 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 pub struct NetworkStack {
     iface: Interface,
     sockets: SocketSet<'static>,
-    device: EthernetDevice,
 }
 
 impl NetworkStack {
-    pub fn new(device: EthernetDevice) -> Self {
+    pub fn new(device: &mut EthernetDevice) -> Self {
         let mac = device.mac_address();
         let ethernet_addr = EthernetAddress::from_bytes(&mac);
-
+        
         let config = Config::new(ethernet_addr.into());
-        let iface = Interface::new(config, &mut device.clone(), Instant::ZERO);
-
+        let iface = Interface::new(config, device, Instant::ZERO);
+        
         let sockets = SocketSet::new(Vec::new());
-
+        
         Self {
             iface,
             sockets,
-            device,
         }
     }
 
@@ -49,9 +47,8 @@ impl NetworkStack {
         self.configure_static([192, 168, 1, 100], [255, 255, 255, 0], [192, 168, 1, 1]);
     }
 
-    pub fn poll(&mut self, timestamp: Instant) {
-        self.iface
-            .poll(timestamp, &mut self.device, &mut self.sockets);
+    pub fn poll(&mut self, timestamp: Instant, device: &mut EthernetDevice) {
+        self.iface.poll(timestamp, device, &mut self.sockets);
     }
 
     pub fn iface_mut(&mut self) -> &mut Interface {
