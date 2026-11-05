@@ -2,6 +2,31 @@
 
 A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the Raspberry Pi 4 (BCM2711, AArch64) that implements a complete DNS server appliance.
 
+**Current Status**: ⚠️ Core software complete (5,247 lines), VirtIO driver packet I/O debugging in progress
+
+## Quick Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Build System | ✅ Working | 315 KB kernel, 0 errors, clean compile |
+| Boot (QEMU) | ✅ Working | Loads and runs to main event loop |
+| PL011 UART | ✅ Working | Serial output functional |
+| Memory/Timer | ✅ Working | Bump allocator, ARM generic timer |
+| Network Init | ✅ Working | Stack configured, sockets bound |
+| VirtIO Driver | ⚠️ 80% | Detection OK, **packet I/O broken** |
+| DNS Server | ✅ Complete | 259 lines, logic ready to test |
+| HTTP Server | ✅ Complete | 247 lines, logic ready to test |
+| Integration Tests | ❌ 0/7 Pass | **Blocked by VirtIO packet reception** |
+| DHCP Client | ❌ Not Started | Deferred per plan |
+| Storage (FAT32) | ❌ Not Started | Deferred per plan |
+| Pi 4 Drivers | ❌ Not Started | Deferred (GENET, EMMC2) |
+
+**Critical Blocker**: VirtIO network driver RX buffer/descriptor management needs debugging. Ports are listening (verified with `netstat`), but packets aren't reaching application layer.
+
+**See**: [TEST_RESULTS.md](TEST_RESULTS.md) for detailed root cause analysis and [ACTUAL_TEST_OUTPUT.md](ACTUAL_TEST_OUTPUT.md) for complete test output transcripts.
+
+---
+
 ## Features
 
 ### Implemented
