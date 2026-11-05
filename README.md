@@ -98,6 +98,41 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - For QEMU testing: `qemu-system-aarch64`
 - For physical Pi 4: Raspberry Pi firmware files
 
+### Local Setup (Linux Mint 22.3 / Ubuntu 24.04)
+
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Add AArch64 bare-metal target
+rustup target add aarch64-unknown-none
+
+# Install QEMU (version 8.2+)
+sudo apt update
+sudo apt install -y qemu-system-arm qemu-system-aarch64
+
+# Install DNS and HTTP test tools
+sudo apt install -y dnsutils curl netcat-openbsd
+
+# Clone and build
+git clone <repository-url>
+cd pi4-dns-server
+./scripts/build.sh
+
+# Run in QEMU with network
+./scripts/run-qemu.sh
+
+# In another terminal, test DNS and HTTP
+dig @127.0.0.1 -p 5353 test.local
+curl -u admin:admin http://127.0.0.1:8080/status
+
+# Or run full integration tests
+./scripts/test-integration.sh
+```
+
+**Note**: QEMU 8.2 is included in Ubuntu 24.04 and Linux Mint 22.3 repositories. For older versions, you may need to build QEMU from source or use a PPA.
+
 ### Build Commands
 
 ```bash
