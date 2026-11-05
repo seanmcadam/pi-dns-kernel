@@ -17,19 +17,19 @@ mod net;
 mod panic;
 mod timer;
 mod uart;
+mod uart_pl011;
 
 use core::fmt::Write;
 use memory::ALLOCATOR;
-use uart::Uart;
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
-    // Initialize UART for early logging
-    let mut uart = Uart::new();
+    // Initialize UART for early logging (use PL011 for QEMU virt machine)
+    let mut uart = uart_pl011::Pl011Uart::new();
     uart.init();
-
+    
     writeln!(uart, "\r\n=== Pi4 DNS Server Kernel ===\r").ok();
-    writeln!(uart, "Booting...\r").ok();
+    writeln!(uart, "Booting on QEMU virt machine...\r").ok();
 
     // Initialize memory allocator
     unsafe {

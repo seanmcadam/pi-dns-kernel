@@ -1,4 +1,4 @@
-use crate::uart::Uart;
+use crate::uart_pl011::Pl011Uart;
 use core::fmt::Write;
 use log::{Level, LevelFilter, Metadata, Record};
 use spin::Mutex;
@@ -8,7 +8,7 @@ static LOGGER: Logger = Logger {
 };
 
 struct Logger {
-    uart: Mutex<Option<Uart>>,
+    uart: Mutex<Option<Pl011Uart>>,
 }
 
 impl log::Log for Logger {
@@ -20,9 +20,11 @@ impl log::Log for Logger {
         if self.enabled(record.metadata()) {
             let mut uart = self.uart.lock();
             if uart.is_none() {
-                *uart = Some(Uart::new());
+                let mut new_uart = Pl011Uart::new();
+                new_uart.init();
+                *uart = Some(new_uart);
             }
-
+            
             if let Some(uart) = uart.as_mut() {
                 let level = match record.level() {
                     Level::Error => "ERROR",
@@ -31,7 +33,7 @@ impl log::Log for Logger {
                     Level::Debug => "DEBUG",
                     Level::Trace => "TRACE",
                 };
-
+                
                 writeln!(uart, "[{}] {}\r", level, record.args()).ok();
             }
         }
