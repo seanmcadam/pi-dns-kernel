@@ -1,0 +1,69 @@
+use super::EthernetDevice;
+use alloc::vec::{self, Vec};
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+
+pub struct NetworkStack {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    device: EthernetDevice,
+}
+
+impl NetworkStack {
+    pub fn new(device: EthernetDevice) -> Self {
+        let mac = device.mac_address();
+        let ethernet_addr = EthernetAddress::from_bytes(&mac);
+
+        let config = Config::new(ethernet_addr.into());
+        let iface = Interface::new(config, &mut device.clone(), Instant::ZERO);
+
+        let sockets = SocketSet::new(Vec::new());
+
+        Self {
+            iface,
+            sockets,
+            device,
+        }
+    }
+
+    pub fn configure_static(&mut self, ip: [u8; 4], netmask: [u8; 4], gateway: [u8; 4]) {
+        let ip_addr = Ipv4Address::from_bytes(&ip);
+        let netmask_addr = Ipv4Address::from_bytes(&netmask);
+        let prefix_len = netmask_to_prefix_len(netmask);
+
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.clear();
+            addrs.push(IpCidr::new(ip_addr.into(), prefix_len)).ok();
+        });
+
+        self.iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::from_bytes(&gateway))
+            .ok();
+    }
+
+    pub fn configure_dhcp(&mut self) {
+        // TODO: Implement DHCP client
+        log::warn!("DHCP not yet implemented, using fallback static IP");
+        self.configure_static([192, 168, 1, 100], [255, 255, 255, 0], [192, 168, 1, 1]);
+    }
+
+    pub fn poll(&mut self, timestamp: Instant) {
+        self.iface
+            .poll(timestamp, &mut self.device, &mut self.sockets);
+    }
+
+    pub fn iface_mut(&mut self) -> &mut Interface {
+        &mut self.iface
+    }
+
+    pub fn sockets_mut(&mut self) -> &mut SocketSet<'static> {
+        &mut self.sockets
+    }
+}
+
+fn netmask_to_prefix_len(netmask: [u8; 4]) -> u8 {
+    let mask = u32::from_be_bytes(netmask);
+    mask.leading_ones() as u8
+}

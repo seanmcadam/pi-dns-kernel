@@ -1,0 +1,16 @@
+# Build artifacts
+target/
+boot/kernel8.img
+boot/kernel8.asm
+qemu/*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

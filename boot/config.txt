@@ -1,0 +1,6 @@
+# Raspberry Pi 4 Boot Configuration
+arm_64bit=1
+kernel=kernel8.img
+disable_commandline_tags=1
+enable_uart=1
+uart_2ndstage=1

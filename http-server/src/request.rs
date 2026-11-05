@@ -1,0 +1,89 @@
+#[cfg(not(feature = "std"))]
+use alloc::{
+    str,
+    string::{String, ToString},
+    vec::Vec,
+};
+
+#[derive(Debug, PartialEq)]
+pub enum HttpMethod {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+}
+
+#[derive(Debug)]
+pub struct HttpRequest {
+    pub method: HttpMethod,
+    pub path: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum ParseError {
+    Invalid,
+    Incomplete,
+}
+
+impl HttpRequest {
+    pub fn parse(data: &[u8]) -> Result<Self, ParseError> {
+        let text = core::str::from_utf8(data).map_err(|_| ParseError::Invalid)?;
+
+        // Find header/body split
+        let (header_part, body_part) = if let Some(pos) = text.find("\r\n\r\n") {
+            (&text[..pos], &text[pos + 4..])
+        } else {
+            return Err(ParseError::Incomplete);
+        };
+
+        let mut lines = header_part.lines();
+        let request_line = lines.next().ok_or(ParseError::Invalid)?;
+
+        // Parse request line
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        if parts.len() != 3 {
+            return Err(ParseError::Invalid);
+        }
+
+        let method = match parts[0] {
+            "GET" => HttpMethod::GET,
+            "POST" => HttpMethod::POST,
+            "PUT" => HttpMethod::PUT,
+            "DELETE" => HttpMethod::DELETE,
+            _ => return Err(ParseError::Invalid),
+        };
+
+        let path = parts[1].to_string();
+        let version = parts[2].to_string();
+
+        // Parse headers
+        let mut headers = Vec::new();
+        for line in lines {
+            if let Some(pos) = line.find(':') {
+                let key = line[..pos].trim().to_string();
+                let value = line[pos + 1..].trim().to_string();
+                headers.push((key, value));
+            }
+        }
+
+        let body = body_part.as_bytes().to_vec();
+
+        Ok(HttpRequest {
+            method,
+            path,
+            version,
+            headers,
+            body,
+        })
+    }
+
+    pub fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}

@@ -1,0 +1,8 @@
+[build]
+# Default to native for library crates
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tlink.ld",
+    "-C", "target-cpu=cortex-a72",
+]

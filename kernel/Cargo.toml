@@ -1,0 +1,28 @@
+[package]
+name = "pi4-dns-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+cortex-a = { workspace = true }
+tock-registers = { workspace = true }
+aarch64-cpu = { workspace = true }
+smoltcp = { workspace = true }
+heapless = { workspace = true }
+spin = { workspace = true }
+log = { workspace = true }
+embedded-sdmmc = { version = "0.8", default-features = false }
+embedded-hal = { workspace = true }
+
+dns-protocol = { path = "../dns-protocol", default-features = false }
+http-server = { path = "../http-server", default-features = false }
+config = { path = "../config", default-features = false }
+dns-cache = { path = "../dns-cache", default-features = false }
+
+[build-dependencies]
+cc = "1.0"
+
+[[bin]]
+name = "kernel8"
+path = "src/main.rs"

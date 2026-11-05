@@ -1,0 +1,34 @@
+[workspace]
+members = [
+    "kernel",
+    "dns-protocol",
+    "http-server",
+    "config",
+    "dns-cache",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["DNS Server Project"]
+
+[workspace.dependencies]
+# Shared dependencies
+embedded-hal = "1.0"
+smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "proto-ipv6", "proto-dhcpv4", "socket-dns", "socket-tcp", "socket-udp", "socket-raw", "medium-ethernet", "alloc"] }
+heapless = "0.8"
+spin = "0.9"
+log = "0.4"
+cortex-a = { version = "8.1", default-features = false }
+tock-registers = "0.9"
+aarch64-cpu = "9.4"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
