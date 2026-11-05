@@ -1,5 +1,5 @@
 use smoltcp::phy::{Device, DeviceCapabilities};
-use super::virtio::VirtioNetDevice;
+use super::virtio_new::VirtioNetDriver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
@@ -14,13 +14,13 @@ pub fn detect_device_type() -> DeviceType {
 }
 
 pub enum EthernetDevice {
-    Virtio(VirtioNetDevice),
+    Virtio(VirtioNetDriver),
     // Genet will go here when implemented
 }
 
 impl EthernetDevice {
-    pub fn new_virtio() -> Option<Self> {
-        VirtioNetDevice::new().map(EthernetDevice::Virtio)
+    pub fn new_virtio(base_addr: usize) -> Result<Self, &'static str> {
+        VirtioNetDriver::new(base_addr).map(EthernetDevice::Virtio)
     }
     
     pub fn mac_address(&self) -> [u8; 6] {
@@ -60,7 +60,7 @@ impl Device for EthernetDevice {
 }
 
 pub enum EthernetRxToken<'a> {
-    Virtio(<VirtioNetDevice as Device>::RxToken<'a>),
+    Virtio(<VirtioNetDriver as Device>::RxToken<'a>),
 }
 
 impl<'a> smoltcp::phy::RxToken for EthernetRxToken<'a> {
@@ -75,7 +75,7 @@ impl<'a> smoltcp::phy::RxToken for EthernetRxToken<'a> {
 }
 
 pub enum EthernetTxToken<'a> {
-    Virtio(<VirtioNetDevice as Device>::TxToken<'a>),
+    Virtio(<VirtioNetDriver as Device>::TxToken<'a>),
 }
 
 impl<'a> smoltcp::phy::TxToken for EthernetTxToken<'a> {

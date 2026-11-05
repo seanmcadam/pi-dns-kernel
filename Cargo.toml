@@ -17,6 +17,7 @@ authors = ["DNS Server Project"]
 # Shared dependencies
 embedded-hal = "1.0"
 smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "proto-ipv6", "proto-dhcpv4", "socket-dns", "socket-tcp", "socket-udp", "socket-raw", "medium-ethernet", "alloc"] }
+virtio-drivers = { version = "0.7", default-features = false, features = ["alloc"] }
 heapless = "0.8"
 spin = "0.9"
 log = "0.4"

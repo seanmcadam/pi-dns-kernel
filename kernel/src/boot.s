@@ -14,10 +14,16 @@ _start:
     b       1b
 
 2:
+    // Enable FP/SIMD (CPACR_EL1)
+    mrs     x1, cpacr_el1
+    orr     x1, x1, #(3 << 20)   // FPEN bits to 0b11
+    msr     cpacr_el1, x1
+    isb
+    
     // Set stack pointer
     ldr     x1, =0x80000
     mov     sp, x1
-
+    
     // Clear BSS
     ldr     x1, =__bss_start
     ldr     x2, =__bss_end

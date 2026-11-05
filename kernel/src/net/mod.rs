@@ -1,6 +1,7 @@
 mod device;
 mod stack;
 mod virtio;
+mod virtio_new;
 
 use alloc::boxed::Box;
 use smoltcp::time::Instant;
@@ -35,13 +36,22 @@ pub enum NetworkError {
 
 pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), NetworkError> {
     log::info!("Detecting network device...");
+    
+    // TEMPORARY: Skip network init to test if kernel outputs anything
+    log::warn!("Network init skipped for testing");
+    return Ok(());
 
     let device_type = device::detect_device_type();
     log::info!("Network device: {:?}", device_type);
 
+    const VIRTIO_MMIO_BASE: usize = 0x0a000000;  // QEMU virt machine
+
     let mut device = match device_type {
         DeviceType::Virtio => {
-            EthernetDevice::new_virtio().ok_or(NetworkError::DeviceNotFound)?
+            EthernetDevice::new_virtio(VIRTIO_MMIO_BASE).map_err(|e| {
+                log::error!("VirtIO init failed: {}", e);
+                NetworkError::InitFailed
+            })?
         }
         DeviceType::Genet => {
             log::error!("GENET driver not yet implemented");

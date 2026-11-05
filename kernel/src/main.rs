@@ -18,25 +18,46 @@ mod panic;
 mod timer;
 mod uart;
 mod uart_pl011;
+mod virtio_hal;
 
 use core::fmt::Write;
 use memory::ALLOCATOR;
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
-    // Initialize UART for early logging (use PL011 for QEMU virt machine)
-    let mut uart = uart_pl011::Pl011Uart::new();
-    uart.init();
+    // Raw UART write for testing
+    unsafe {
+        let uart_dr = 0x0900_0000 as *mut u32;
+        core::ptr::write_volatile(uart_dr, b'S' as u32);
+        core::ptr::write_volatile(uart_dr, b'T' as u32);
+        core::ptr::write_volatile(uart_dr, b'A' as u32);
+        core::ptr::write_volatile(uart_dr, b'R' as u32);
+        core::ptr::write_volatile(uart_dr, b'T' as u32);
+        core::ptr::write_volatile(uart_dr, b'\r' as u32);
+        core::ptr::write_volatile(uart_dr, b'\n' as u32);
+    }
     
-    writeln!(uart, "\r\n=== Pi4 DNS Server Kernel ===\r").ok();
-    writeln!(uart, "Booting on QEMU virt machine...\r").ok();
+    // Initialize UART for early logging (use PL011 for QEMU virt machine)
+    // Skip init - QEMU already has it configured
+    // let mut uart = uart_pl011::Pl011Uart::new();
+    // uart.init();
+    
+    // writeln!(uart, "\r\n=== Pi4 DNS Server Kernel ===\r").ok();
+    // writeln!(uart, "Booting on QEMU virt machine...\r").ok();
+    // writeln!(uart, "[DEBUG] kernel_main started\r").ok();
 
-    writeln!(uart, "[1] Starting memory allocator...\r").ok();
+    unsafe {
+        let uart_dr = 0x0900_0000 as *mut u32;
+        core::ptr::write_volatile(uart_dr, b'1' as u32);
+    }
     // Initialize memory allocator
     unsafe {
         ALLOCATOR.init();
     }
-    writeln!(uart, "[OK] Memory allocator initialized\r").ok();
+    unsafe {
+        let uart_dr = 0x0900_0000 as *mut u32;
+        core::ptr::write_volatile(uart_dr, b'2' as u32);
+    }
     
     writeln!(uart, "[2] Initializing logger...\r").ok();
     // Initialize logger
@@ -62,6 +83,7 @@ pub extern "C" fn kernel_main() -> ! {
     writeln!(uart, "[6] Initializing network...\r").ok();
     // Initialize network
     log::info!("Initializing network...");
+    writeln!(uart, "[DEBUG] Calling net::init\r").ok();
     match net::init(&config.network) {
         Ok(()) => {
             writeln!(uart, "[OK] Network initialized\r").ok();
@@ -70,6 +92,7 @@ pub extern "C" fn kernel_main() -> ! {
         Err(e) => {
             writeln!(uart, "[ERROR] Network init failed: {:?}\r", e).ok();
             log::error!("Network init failed: {:?}", e);
+            writeln!(uart, "[ERROR] Entering error loop\r").ok();
             log::error!("Entering error loop...");
             loop {
                 cortex_a::asm::wfe();

@@ -9,6 +9,7 @@ cortex-a = { workspace = true }
 tock-registers = { workspace = true }
 aarch64-cpu = { workspace = true }
 smoltcp = { workspace = true }
+virtio-drivers = { workspace = true }
 heapless = { workspace = true }
 spin = { workspace = true }
 log = { workspace = true }
