@@ -73,18 +73,29 @@ pub extern "C" fn kernel_main() -> ! {
     // Initialize DNS server
     log::info!("Starting DNS server...");
     dns::init(&config.dns);
-    log::info!("DNS server listening on port 53");
-
+    
     // Initialize HTTP management interface
     log::info!("Starting HTTP server...");
     http::init(&config.http);
+    
+    // Create sockets after network is initialized
+    net::with_stack(|stack, _device| {
+        dns::init_sockets(stack).expect("Failed to create DNS socket");
+        http::init_sockets(stack).expect("Failed to create HTTP socket");
+    });
+    
+    log::info!("DNS server listening on port 53");
     log::info!("HTTP server listening on port {}", config.http.port);
-
+    
     log::info!("=== Kernel initialized successfully ===");
     log::info!("DNS Server ready");
-
+    
     // Main event loop
     loop {
+        net::with_stack(|stack, device| {
+            dns::poll(stack, device);
+            http::poll(stack, device);
+        });
         net::poll();
     }
 }

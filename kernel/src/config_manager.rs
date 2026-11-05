@@ -60,16 +60,40 @@ pub fn load_config() -> Config {
 }
 
 fn default_config() -> Config {
+    let mut records = Vec::new();
+    
+    // Add some default test records
+    records.push(DnsRecord {
+        name: String::from("test.local"),
+        record_type: RecordType::A,
+        value: String::from("192.168.1.100"),
+        ttl: 300,
+    });
+    
+    records.push(DnsRecord {
+        name: String::from("pi4.local"),
+        record_type: RecordType::A,
+        value: String::from("10.0.2.15"),  // QEMU user networking default
+        ttl: 300,
+    });
+    
+    records.push(DnsRecord {
+        name: String::from("www.local"),
+        record_type: RecordType::CNAME,
+        value: String::from("pi4.local"),
+        ttl: 300,
+    });
+    
     Config {
         network: NetworkConfig {
             mode: NetworkMode::Static {
-                ip: [192, 168, 1, 100],
+                ip: [10, 0, 2, 15],        // QEMU user networking default
                 netmask: [255, 255, 255, 0],
-                gateway: [192, 168, 1, 1],
+                gateway: [10, 0, 2, 2],
             },
         },
         dns: DnsConfig {
-            records: Vec::new(),
+            records,
             upstreams: vec![
                 [8, 8, 8, 8], // Google DNS
                 [1, 1, 1, 1], // Cloudflare DNS
