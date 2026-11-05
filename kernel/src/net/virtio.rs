@@ -295,14 +295,35 @@ impl VirtioNetDevice {
     }
     
     fn refill_rx(&mut self) {
-        // Provide RX buffers to device
-        for _ in 0..16 {
+        // Provide RX buffers to device by adding them to the virtqueue
+        for i in 0..16 {
             let mut buffer = Vec::with_capacity(BUFFER_SIZE);
             buffer.resize(BUFFER_SIZE, 0);
+            let buffer_addr = buffer.as_ptr() as u64;
             
-            // TODO: Actually add to RX queue
+            // Add buffer to descriptor table
+            let desc_idx = i;
+            self.rx_queue.desc[desc_idx].addr = buffer_addr;
+            self.rx_queue.desc[desc_idx].len = BUFFER_SIZE as u32;
+            self.rx_queue.desc[desc_idx].flags = 0x02; // VIRTQ_DESC_F_WRITE (device writes)
+            self.rx_queue.desc[desc_idx].next = 0;
+            
+            // Add to available ring
+            let avail_idx = unsafe { read_volatile(&self.rx_queue.avail.idx) };
+            let ring_idx = (avail_idx % QUEUE_SIZE as u16) as usize;
+            self.rx_queue.avail.ring[ring_idx] = desc_idx as u16;
+            
+            // Update available index (with memory barrier)
+            unsafe {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                write_volatile(&mut self.rx_queue.avail.idx as *mut u16, avail_idx.wrapping_add(1));
+            }
+            
             self.rx_buffers.push(buffer);
         }
+        
+        // Notify device that buffers are available
+        write_reg(self.base_addr, VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET, 0); // Queue 0 (RX)
     }
     
     pub fn mac_address(&self) -> [u8; 6] {
