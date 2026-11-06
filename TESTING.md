@@ -85,10 +85,10 @@ The integration test script verifies basic boot functionality:
 **Phase 1: Network Stack** (requires virtio-net setup)
 ```bash
 # Start kernel with network
-qemu-system-aarch64 -M virt -kernel kernel8.img -device virtio-net-device,netdev=net0 -netdev user,id=net0,hostfwd=udp::5353-:53
+qemu-system-aarch64 -M virt -kernel kernel8.img -device virtio-net-device,netdev=net0 -netdev user,id=net0,hostfwd=udp::15353-:53
 
-# Test DNS queries
-dig @127.0.0.1 -p 5353 example.com
+# Test DNS queries (host port 15353; guest DNS stays on 53)
+dig @127.0.0.1 -p 15353 example.com
 
 # Test HTTP interface
 curl http://127.0.0.1:8080/status -u admin:admin

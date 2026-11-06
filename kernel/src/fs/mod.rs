@@ -25,11 +25,25 @@ const CONFIG_NAME: &str = "CONFIG.TXT";
 const LOG_NAME: &str = "LOG.TXT";
 const LOG_OLD: &str = "LOG.OLD";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum FsError {
     NotInitialized,
-    ReadError,
-    WriteError,
+    Io { op: &'static str, detail: String },
+}
+
+impl core::fmt::Display for FsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FsError::NotInitialized => write!(f, "filesystem not mounted"),
+            FsError::Io { op, detail } => write!(f, "{op}: {detail}"),
+        }
+    }
+}
+
+fn fs_err(op: &'static str, err: impl core::fmt::Debug) -> FsError {
+    let detail = alloc::format!("{err:?}");
+    log::warn!("FAT {op} failed: {detail}");
+    FsError::Io { op, detail }
 }
 
 struct Clock;
@@ -77,7 +91,7 @@ pub fn init() -> Result<(), FsError> {
             Ok(())
         }
         Err(err) => {
-            log::warn!("FAT32 mount failed: {:?}", err);
+            log::warn!("FAT32 mount failed: {err:?}");
             Err(FsError::NotInitialized)
         }
     }
@@ -85,11 +99,11 @@ pub fn init() -> Result<(), FsError> {
 
 pub fn read_config() -> Result<String, FsError> {
     let bytes = read_file(CONFIG_NAME)?;
-    String::from_utf8(bytes).map_err(|_| FsError::ReadError)
+    String::from_utf8(bytes).map_err(|err| fs_err("config encoding", err))
 }
 
-pub fn write_config(data: &str) -> Result<(), FsError> {
-    write_file(CONFIG_NAME, data.as_bytes())
+pub fn write_config(data: &str) -> Result<(), String> {
+    write_file(CONFIG_NAME, data.as_bytes()).map_err(|err| alloc::format!("save failed: {err}"))
 }
 
 pub fn append_log(message: &str) {
@@ -102,15 +116,15 @@ pub fn append_log(message: &str) {
         line.push(' ');
     }
     line.push('\n');
-    let _ = with_file(LOG_NAME, Mode::ReadWriteCreateOrAppend, true, |mgr, file| {
+    let _ = with_file(LOG_NAME, Mode::ReadWriteCreateOrAppend, |mgr, file| {
         mgr.write(file, line.as_bytes())
-            .map_err(|_| FsError::WriteError)
+            .map_err(|err| fs_err("append log", err))
     });
 }
 
 fn rotate_log() -> Result<(), FsError> {
-    let len = match with_file(LOG_NAME, Mode::ReadOnly, false, |mgr, file| {
-        mgr.file_length(file).map_err(|_| FsError::ReadError)
+    let len = match with_file(LOG_NAME, Mode::ReadOnly, |mgr, file| {
+        mgr.file_length(file).map_err(|err| fs_err("log length", err))
     }) {
         Ok(len) => len,
         Err(_) => return Ok(()),
@@ -126,11 +140,11 @@ fn rotate_log() -> Result<(), FsError> {
 }
 
 fn read_file(name: &str) -> Result<Vec<u8>, FsError> {
-    with_file(name, Mode::ReadOnly, false, |mgr, file| {
+    with_file(name, Mode::ReadOnly, |mgr, file| {
         let mut out = Vec::new();
         let mut buf = [0u8; 512];
         loop {
-            let n = mgr.read(file, &mut buf).map_err(|_| FsError::ReadError)?;
+            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
             if n == 0 || out.len() >= 8192 {
                 break;
             }
@@ -142,51 +156,52 @@ fn read_file(name: &str) -> Result<Vec<u8>, FsError> {
 
 fn write_file(name: &str, data: &[u8]) -> Result<(), FsError> {
     let data = data.to_vec();
-    with_file(
-        name,
-        Mode::ReadWriteCreateOrTruncate,
-        true,
-        move |mgr, file| {
-            mgr.write(file, &data).map_err(|_| FsError::WriteError)?;
-            Ok(())
-        },
-    )
+    with_file(name, Mode::ReadWriteCreateOrTruncate, move |mgr, file| {
+        mgr.write(file, &data).map_err(|err| fs_err("write", err))?;
+        Ok(())
+    })
 }
 
 fn with_file<R>(
     name: &str,
     mode: Mode,
-    writing: bool,
     f: impl FnOnce(&mut Mgr, RawFile) -> Result<R, FsError>,
 ) -> Result<R, FsError> {
-    let fail = if writing {
-        FsError::WriteError
-    } else {
-        FsError::ReadError
-    };
     let mut guard = FS.lock();
     let mgr = guard.as_mut().ok_or(FsError::NotInitialized)?;
-    let volume = mgr
-        .open_raw_volume(VolumeIdx(0))
-        .map_err(|_| fail)?;
+    let volume = match mgr.open_raw_volume(VolumeIdx(0)) {
+        Ok(volume) => volume,
+        Err(err) => return Err(fs_err("open volume", err)),
+    };
     let dir = match mgr.open_root_dir(volume) {
         Ok(dir) => dir,
-        Err(_) => {
+        Err(err) => {
             mgr.close_volume(volume).ok();
-            return Err(fail);
+            return Err(fs_err("open root", err));
         }
     };
     let file = match mgr.open_file_in_dir(dir, name, mode) {
         Ok(file) => file,
-        Err(_) => {
+        Err(err) => {
             mgr.close_dir(dir).ok();
             mgr.close_volume(volume).ok();
-            return Err(fail);
+            // A missing CONFIG.TXT on a fresh volume is normal.
+            if matches!(err, embedded_sdmmc::Error::NotFound) {
+                return Err(FsError::Io {
+                    op: "open file",
+                    detail: String::from("NotFound"),
+                });
+            }
+            return Err(fs_err("open file", err));
         }
     };
     let result = f(mgr, file);
-    mgr.close_file(file).ok();
+    let close_err = mgr.close_file(file).err();
     mgr.close_dir(dir).ok();
     mgr.close_volume(volume).ok();
-    result
+    match (result, close_err) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Some(err)) => Err(fs_err("close file", err)),
+        (Ok(value), None) => Ok(value),
+    }
 }

@@ -3,6 +3,12 @@ set -e
 
 echo "=== Running Integration Tests ==="
 
+# 5353 is mDNS and is often already taken. Guest ports stay 53 and 80.
+DNS_HOST_PORT="${DNS_HOST_PORT:-15353}"
+HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
+HOSTFWD="hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80"
+echo "Using host ports DNS ${DNS_HOST_PORT} and HTTP ${HTTP_HOST_PORT}"
+
 # Build kernel first
 ./scripts/build.sh
 
@@ -16,7 +22,7 @@ timeout 120 qemu-system-aarch64 \
     -serial mon:tcp:127.0.0.1:4444,server,nowait \
     -nographic \
     -display none \
-    -netdev user,id=net0,hostfwd=udp::5353-:53,hostfwd=tcp::8080-:80 \
+    -netdev user,id=net0,${HOSTFWD} \
     -device virtio-net-device,netdev=net0 \
     &
 
@@ -60,7 +66,7 @@ sleep 3
 echo ""
 echo "Test 2: DNS query for test.local"
 if command -v dig &> /dev/null; then
-    if timeout 5 dig @127.0.0.1 -p 5353 test.local +short > qemu/dns-test-local.txt 2>&1; then
+    if timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short > qemu/dns-test-local.txt 2>&1; then
         RESULT=$(cat qemu/dns-test-local.txt)
         if echo "$RESULT" | grep -q "192.168.1.100"; then
             echo "✓ DNS query successful: test.local -> 192.168.1.100"
@@ -82,7 +88,7 @@ fi
 echo ""
 echo "Test 3: DNS query for pi4.local"
 if command -v dig &> /dev/null; then
-    if timeout 5 dig @127.0.0.1 -p 5353 pi4.local +short > qemu/dns-pi4-local.txt 2>&1; then
+    if timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} pi4.local +short > qemu/dns-pi4-local.txt 2>&1; then
         RESULT=$(cat qemu/dns-pi4-local.txt)
         if echo "$RESULT" | grep -q "10.0.2.15"; then
             echo "✓ DNS query successful: pi4.local -> 10.0.2.15"
@@ -101,7 +107,7 @@ fi
 echo ""
 echo "Test 4: DNS CNAME query for www.local"
 if command -v dig &> /dev/null; then
-    if timeout 5 dig @127.0.0.1 -p 5353 www.local CNAME +short > qemu/dns-cname.txt 2>&1; then
+    if timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} www.local CNAME +short > qemu/dns-cname.txt 2>&1; then
         RESULT=$(cat qemu/dns-cname.txt)
         if echo "$RESULT" | grep -q "pi4.local"; then
             echo "✓ DNS CNAME query successful: www.local -> pi4.local"
@@ -120,7 +126,7 @@ fi
 echo ""
 echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
-    if timeout 5 curl -s -u admin:admin http://127.0.0.1:8080/status > qemu/http-status.txt 2>&1; then
+    if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
         if echo "$RESULT" | grep -q '"status":"running"'; then
             echo "✓ HTTP request successful, server is running"
@@ -142,7 +148,7 @@ fi
 echo ""
 echo "Test 6: HTTP GET / (HTML dashboard)"
 if command -v curl &> /dev/null; then
-    if timeout 5 curl -s -u admin:admin http://127.0.0.1:8080/ > qemu/http-root.txt 2>&1; then
+    if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/ > qemu/http-root.txt 2>&1; then
         if grep -q "Raspberry Pi 4 DNS Server" qemu/http-root.txt; then
             echo "✓ HTTP dashboard accessible"
             TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -160,7 +166,7 @@ fi
 echo ""
 echo "Test 7: HTTP authentication check"
 if command -v curl &> /dev/null; then
-    HTTP_CODE=$(timeout 5 curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ 2>&1 || echo "000")
+    HTTP_CODE=$(timeout 5 curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${HTTP_HOST_PORT}/ 2>&1 || echo "000")
     if [ "$HTTP_CODE" = "401" ]; then
         echo "✓ HTTP authentication required (401 Unauthorized)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -174,12 +180,12 @@ fi
 echo ""
 echo "Test 8: Upstream forward and cache for example.com"
 if command -v dig &> /dev/null; then
-    if timeout 12 dig @127.0.0.1 -p 5353 example.com A +time=8 +tries=1 > qemu/dns-example.txt 2>&1; then
+    if timeout 12 dig @127.0.0.1 -p ${DNS_HOST_PORT} example.com A +time=8 +tries=1 > qemu/dns-example.txt 2>&1; then
         if grep -E 'IN[[:space:]]+A[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' qemu/dns-example.txt >/dev/null; then
             echo "✓ example.com forwarded:"
             grep -E 'IN[[:space:]]+A[[:space:]]+' qemu/dns-example.txt
-            timeout 5 dig @127.0.0.1 -p 5353 example.com A +short +time=3 +tries=1 > qemu/dns-example-cached.txt 2>&1 || true
-            if timeout 5 curl -s -u admin:admin http://127.0.0.1:8080/status | grep -Eq '"cache_entries":[1-9]'; then
+            timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} example.com A +short +time=3 +tries=1 > qemu/dns-example-cached.txt 2>&1 || true
+            if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status | grep -Eq '"cache_entries":[1-9]'; then
                 echo "✓ Second query can be served from the cache"
                 cat qemu/dns-example-cached.txt
                 TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -270,7 +276,7 @@ timeout 40 qemu-system-aarch64 \
     -kernel boot/kernel8.img \
     -serial file:qemu/persist-a.txt \
     -display none -monitor none -nographic \
-    -netdev user,id=net0,hostfwd=udp::5353-:53,hostfwd=tcp::8080-:80 \
+    -netdev user,id=net0,${HOSTFWD} \
     -device virtio-net-device,netdev=net0 \
     -drive file=qemu/disk.img,if=none,format=raw,id=hd0,cache=writethrough \
     -device virtio-blk-device,drive=hd0 \
@@ -279,11 +285,11 @@ PERSIST_PID=$!
 sleep 5
 curl -s -u admin:admin --max-time 5 -X POST \
     --data 'name=added.local&type=A&value=9.9.9.9&ttl=120' \
-    http://127.0.0.1:8080/records > qemu/record-add.txt || true
+    http://127.0.0.1:${HTTP_HOST_PORT}/records > qemu/record-add.txt || true
 for i in 1 2 3 4 5 6 7 8; do
     curl -s -u admin:admin --max-time 5 -X POST \
         --data "name=tmp${i}.local&type=A&value=1.2.3.${i}&ttl=60" \
-        http://127.0.0.1:8080/records >/dev/null || true
+        http://127.0.0.1:${HTTP_HOST_PORT}/records >/dev/null || true
 done
 sleep 1
 kill $PERSIST_PID 2>/dev/null || true
@@ -304,15 +310,15 @@ else
         -kernel boot/kernel8.img \
         -serial file:qemu/persist-b.txt \
         -display none -monitor none -nographic \
-        -netdev user,id=net0,hostfwd=udp::5353-:53,hostfwd=tcp::8080-:80 \
+        -netdev user,id=net0,${HOSTFWD} \
         -device virtio-net-device,netdev=net0 \
         -drive file=qemu/disk.img,if=none,format=raw,id=hd0,cache=writethrough \
         -device virtio-blk-device,drive=hd0 \
         >/tmp/qemu-persist-b.txt 2>&1 &
     PERSIST_PID=$!
     sleep 5
-    REBOOT_RESULT=$(timeout 5 dig @127.0.0.1 -p 5353 added.local +short +time=3 +tries=1 || true)
-    STILL_THERE=$(timeout 5 dig @127.0.0.1 -p 5353 test.local +short +time=3 +tries=1 || true)
+    REBOOT_RESULT=$(timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} added.local +short +time=3 +tries=1 || true)
+    STILL_THERE=$(timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short +time=3 +tries=1 || true)
     echo "added.local after reboot: $REBOOT_RESULT"
     if echo "$REBOOT_RESULT" | grep -q "9.9.9.9" && echo "$STILL_THERE" | grep -q "192.168.1.100" \
         && grep -q "Loaded config from filesystem" qemu/persist-b.txt; then

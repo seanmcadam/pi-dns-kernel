@@ -20,6 +20,8 @@ mod uart_pl011;
 
 use memory::ALLOCATOR;
 
+core::arch::global_asm!(include_str!("boot.s"));
+
 fn uart_write(s: &str) {
     console::write_str(s);
 }

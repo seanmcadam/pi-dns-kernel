@@ -105,17 +105,17 @@ pub fn upstreams() -> Vec<[u8; 4]> {
         .unwrap_or_default()
 }
 
-pub fn add_record(name: &str, record_type: &str, value: &str, ttl: u32) -> Result<(), &'static str> {
+pub fn add_record(name: &str, record_type: &str, value: &str, ttl: u32) -> Result<(), String> {
     let name = name.trim();
     let value = value.trim();
     if !valid_label(name) || !valid_label(value) {
-        return Err("invalid record");
+        return Err(String::from("invalid record"));
     }
-    let record_type = RecordType::parse(record_type).ok_or("invalid type")?;
-    let ttl = ttl.clamp(1, 86_400);
+    let record_type = RecordType::parse(record_type).ok_or_else(|| String::from("invalid type"))?;
+        let ttl = ttl.clamp(1, 86_400);
     {
         let mut config = CURRENT.lock();
-        let config = config.as_mut().ok_or("no config")?;
+        let config = config.as_mut().ok_or_else(|| String::from("no config"))?;
         config.dns.records.retain(|record| !names_eq(&record.name, name));
         config.dns.records.push(DnsRecord {
             name: name.to_string(),
@@ -129,14 +129,14 @@ pub fn add_record(name: &str, record_type: &str, value: &str, ttl: u32) -> Resul
     Ok(())
 }
 
-pub fn remove_record(name: &str) -> Result<bool, &'static str> {
+pub fn remove_record(name: &str) -> Result<bool, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("invalid record");
+        return Err(String::from("invalid record"));
     }
     let removed = {
         let mut config = CURRENT.lock();
-        let config = config.as_mut().ok_or("no config")?;
+        let config = config.as_mut().ok_or_else(|| String::from("no config"))?;
         let before = config.dns.records.len();
         config
             .dns
@@ -151,10 +151,10 @@ pub fn remove_record(name: &str) -> Result<bool, &'static str> {
     Ok(removed)
 }
 
-fn save_current() -> Result<(), &'static str> {
-    let config = CURRENT.lock().clone().ok_or("no config")?;
+fn save_current() -> Result<(), String> {
+    let config = CURRENT.lock().clone().ok_or_else(|| String::from("no config"))?;
     let text = serialize_config(&config);
-    crate::fs::write_config(&text).map_err(|_| "save failed")
+    crate::fs::write_config(&text)
 }
 
 fn default_config() -> Config {

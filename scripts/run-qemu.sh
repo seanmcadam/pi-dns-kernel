@@ -13,8 +13,13 @@ echo "Using 'virt' machine with virtio-net for network testing"
 echo "Press Ctrl-A X to exit QEMU"
 echo ""
 
-# Use virt machine with virtio-net and user networking
-# Port forwarding: host:5353 -> guest:53 (DNS), host:8080 -> guest:80 (HTTP)
+# Use virt machine with virtio-net and user networking.
+# 5353 is mDNS and is often already taken (avahi, Spotify, Brave).
+# Guest DNS stays on 53 and HTTP stays on 80.
+DNS_HOST_PORT="${DNS_HOST_PORT:-15353}"
+HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
+echo "Host DNS port ${DNS_HOST_PORT} -> guest 53, host HTTP port ${HTTP_HOST_PORT} -> guest 80"
+
 qemu-system-aarch64 \
     -M virt \
     -cpu cortex-a72 \
@@ -23,5 +28,5 @@ qemu-system-aarch64 \
     -serial stdio \
     -nographic \
     -display none \
-    -netdev user,id=net0,hostfwd=udp::5353-:53,hostfwd=tcp::8080-:80 \
+    -netdev user,id=net0,hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80 \
     -device virtio-net-device,netdev=net0

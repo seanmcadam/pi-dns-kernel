@@ -1,6 +1,6 @@
-.section ".text.boot"
-
+.section .text.boot, "ax"
 .global _start
+.type _start, %function
 
 _start:
     // Only the boot core continues. QEMU virt starts one CPU at EL1.

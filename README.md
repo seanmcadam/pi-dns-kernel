@@ -110,6 +110,8 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - For QEMU testing: `qemu-system-aarch64`
 - For physical Pi 4: Raspberry Pi firmware files
 
+Boot assembly is compiled with Rust's built-in assembler (`core::arch::global_asm!`). A C cross compiler such as `aarch64-linux-gnu-gcc` is not required. `scripts/build.sh` still uses `aarch64-linux-gnu-objcopy` to write the raw `kernel8.img`.
+
 ### Local Setup (Linux Mint 22.3 / Ubuntu 24.04)
 
 ```bash
@@ -132,11 +134,13 @@ git clone <repository-url>
 cd pi4-dns-server
 ./scripts/build.sh
 
-# Run in QEMU with network
+# Run in QEMU with network.
+# Host DNS defaults to 15353 because 5353 is mDNS (often held by avahi,
+# Spotify, or Brave). Override either port with DNS_HOST_PORT / HTTP_HOST_PORT.
 ./scripts/run-qemu.sh
 
 # In another terminal, test DNS and HTTP
-dig @127.0.0.1 -p 5353 test.local
+dig @127.0.0.1 -p 15353 test.local
 curl -u admin:admin http://127.0.0.1:8080/status
 
 # Or run full integration tests
