@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod config_manager;
+mod console;
 mod dns;
 mod fs;
 mod http;
@@ -20,12 +21,7 @@ mod uart_pl011;
 use memory::ALLOCATOR;
 
 fn uart_write(s: &str) {
-    unsafe {
-        let uart_dr = 0x0900_0000 as *mut u32;
-        for byte in s.bytes() {
-            core::ptr::write_volatile(uart_dr, byte as u32);
-        }
-    }
+    console::write_str(s);
 }
 
 fn uart_dec(mut n: u64) {
@@ -45,6 +41,9 @@ fn uart_dec(mut n: u64) {
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    #[cfg(feature = "pi4")]
+    uart_pl011::init_pi4();
+
     uart_write("\r\n=== Pi4 DNS Server Kernel ===\r\n");
 
     uart_write("[1] Starting memory allocator...\r\n");
@@ -66,6 +65,10 @@ pub extern "C" fn kernel_main() -> ! {
     uart_write("[OK] Interrupts initialized\r\n");
 
     uart_write("[5] Loading config...\r\n");
+    match fs::init() {
+        Ok(()) => uart_write("[OK] Filesystem mounted\r\n"),
+        Err(_) => uart_write("[OK] No filesystem, using defaults\r\n"),
+    }
     let config = config_manager::load_config();
     uart_write("[OK] Config loaded\r\n");
 

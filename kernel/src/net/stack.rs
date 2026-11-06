@@ -2,7 +2,7 @@ use super::EthernetDevice;
 use alloc::vec::{self, Vec};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
 pub struct NetworkStack {
     iface: Interface,
@@ -39,12 +39,6 @@ impl NetworkStack {
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::from_bytes(&gateway))
             .ok();
-    }
-
-    pub fn configure_dhcp(&mut self) {
-        // TODO: Implement DHCP client
-        log::warn!("DHCP not yet implemented, using fallback static IP");
-        self.configure_static([192, 168, 1, 100], [255, 255, 255, 0], [192, 168, 1, 1]);
     }
 
     pub fn poll(&mut self, timestamp: Instant, device: &mut EthernetDevice) {

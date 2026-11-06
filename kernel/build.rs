@@ -9,13 +9,20 @@ fn main() {
     // Compile boot assembly
     cc::Build::new().file("src/boot.s").compile("boot");
 
-    // Copy linker script to OUT_DIR so linker can find it
-    let linker_script_src = manifest_dir.join("link.ld");
+    // The Pi 4 feature is linked at 0x80000. The QEMU image stays at 0x40080000.
+    let script_name = if env::var("CARGO_FEATURE_PI4").is_ok() {
+        "link-pi4.ld"
+    } else {
+        "link.ld"
+    };
+    let linker_script_src = manifest_dir.join(script_name);
     let linker_script_dst = out_dir.join("link.ld");
-    fs::copy(&linker_script_src, &linker_script_dst).expect("Failed to copy link.ld");
+    fs::copy(&linker_script_src, &linker_script_dst)
+        .unwrap_or_else(|err| panic!("Failed to copy {script_name}: {err}"));
 
-    // Tell cargo where to find the linker script
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rerun-if-changed=src/boot.s");
     println!("cargo:rerun-if-changed=link.ld");
+    println!("cargo:rerun-if-changed=link-pi4.ld");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PI4");
 }

@@ -5,7 +5,7 @@ echo "=== Building Pi4 DNS Server Kernel ==="
 
 # Build the kernel
 echo "Building kernel..."
-cargo build --release --target aarch64-unknown-none -p pi4-dns-kernel
+cargo build --release --target aarch64-unknown-none -p pi4-dns-kernel "$@"
 
 # QEMU's -kernel on the virt machine loads a raw image at 0x40080000.
 echo "Creating kernel8.img..."

@@ -4,8 +4,9 @@ SECTIONS
 {
     /* QEMU's virt machine loads a raw kernel at RAM base + 0x80000.
        RAM starts at 0x40000000, so the image must be linked at 0x40080000.
-       (A Raspberry Pi 4 image would instead be linked at 0x80000.) */
+       The Pi 4 image uses link-pi4.ld and is linked at 0x80000. */
     . = 0x40080000;
+    __stack_top = .;
 
     .text :
     {

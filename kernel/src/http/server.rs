@@ -61,56 +61,59 @@ pub fn poll(stack: &mut crate::net::NetworkStack, _device: &mut crate::net::Ethe
 }
 
 fn process_http_socket(socket: &mut TcpSocket) {
-    if !socket.can_recv() {
+    let queued = socket.recv_queue();
+    if queued == 0 {
         return;
     }
-    
-    // Read request
-    let mut buffer = vec![0u8; 2048];
-    match socket.recv_slice(&mut buffer) {
-        Ok(size) if size > 0 => {
-            log::debug!("Received HTTP request: {} bytes", size);
-            
-            // Parse HTTP request
-            match HttpRequest::parse(&buffer[..size]) {
-                Err(http_server::ParseError::Incomplete) => return,
-                Ok(request) => {
-                    log::info!("{} {}", 
-                        match request.method {
-                            http_server::HttpMethod::GET => "GET",
-                            http_server::HttpMethod::POST => "POST",
-                            http_server::HttpMethod::PUT => "PUT",
-                            http_server::HttpMethod::DELETE => "DELETE",
-                        },
-                        request.path
-                    );
-                    
-                    // Handle request
-                    let response = handle_request(&request);
-                    
-                    // Send response
-                    if socket.can_send() {
-                        let response_bytes = response.to_bytes();
-                        if socket.send_slice(&response_bytes).is_ok() {
-                            log::debug!("Sent HTTP response: {} bytes", response_bytes.len());
-                        }
-                    }
-                    socket.close();
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse HTTP request: {:?}", e);
-                    
-                    // Send bad request response
-                    let response = HttpResponse::new(400, "Bad Request");
-                    if socket.can_send() {
-                        socket.send_slice(&response.to_bytes()).ok();
-                    }
-                    socket.close();
+    let peek_len = queued.min(2048);
+    let buffered = match socket.peek(peek_len) {
+        Ok(data) if !data.is_empty() => data.to_vec(),
+        _ => return,
+    };
+
+    match HttpRequest::parse(&buffered) {
+        Err(http_server::ParseError::Incomplete) => {}
+        Ok(request) => {
+            if let Some(length) = content_length(&request) {
+                if request.body.len() < length && buffered.len() < 2048 {
+                    return;
                 }
             }
+            let mut discard = vec![0u8; buffered.len()];
+            socket.recv_slice(&mut discard).ok();
+            log::info!(
+                "{} {}",
+                match request.method {
+                    http_server::HttpMethod::GET => "GET",
+                    http_server::HttpMethod::POST => "POST",
+                    http_server::HttpMethod::PUT => "PUT",
+                    http_server::HttpMethod::DELETE => "DELETE",
+                },
+                request.path
+            );
+            let response = handle_request(&request);
+            if socket.can_send() {
+                socket.send_slice(&response.to_bytes()).ok();
+            }
+            socket.close();
         }
-        _ => {}
+        Err(err) => {
+            log::warn!("Failed to parse HTTP request: {:?}", err);
+            let mut discard = vec![0u8; buffered.len()];
+            socket.recv_slice(&mut discard).ok();
+            let response = HttpResponse::new(400, "Bad Request");
+            if socket.can_send() {
+                socket.send_slice(&response.to_bytes()).ok();
+            }
+            socket.close();
+        }
     }
+}
+
+fn content_length(request: &HttpRequest) -> Option<usize> {
+    request
+        .get_header("Content-Length")
+        .and_then(|value| value.parse().ok())
 }
 
 fn handle_request(request: &HttpRequest) -> HttpResponse {
@@ -125,6 +128,7 @@ fn handle_request(request: &HttpRequest) -> HttpResponse {
         "/status" => handle_status(),
         "/config" => handle_config(request),
         "/records" => handle_records(request),
+        "/records/delete" => handle_record_delete(request),
         _ => HttpResponse::not_found(),
     }
 }
@@ -146,15 +150,32 @@ fn check_auth(request: &HttpRequest) -> bool {
 }
 
 fn handle_index() -> HttpResponse {
-    let html = r#"<!DOCTYPE html>
+    let mut rows = String::new();
+    for record in crate::config_manager::records() {
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>\
+<form method=\"POST\" action=\"/records/delete\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\">Remove</button></form>\
+</td></tr>",
+            record.name,
+            record.record_type.as_str(),
+            record.value,
+            record.ttl,
+            record.name
+        ));
+    }
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Pi4 DNS Server</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        h1 { color: #333; }
-        .status { background: #e8f5e9; padding: 10px; border-radius: 5px; }
-        a { color: #1976d2; text-decoration: none; }
+        body {{ font-family: Arial, sans-serif; margin: 40px; }}
+        h1 {{ color: #333; }}
+        .status {{ background: #e8f5e9; padding: 10px; border-radius: 5px; }}
+        a {{ color: #1976d2; text-decoration: none; }}
+        table {{ border-collapse: collapse; }}
+        td, th {{ border: 1px solid #ccc; padding: 6px 10px; }}
     </style>
 </head>
 <body>
@@ -163,16 +184,29 @@ fn handle_index() -> HttpResponse {
         <p><strong>Status:</strong> Running</p>
         <p><strong>Kernel:</strong> Bare-metal Rust (no_std)</p>
     </div>
+    <h2>DNS records</h2>
+    <table>
+        <tr><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th></th></tr>
+        {rows}
+    </table>
+    <h2>Add a record</h2>
+    <form method="POST" action="/records">
+        <input name="name" placeholder="name" required>
+        <select name="type"><option>A</option><option>AAAA</option><option>CNAME</option><option>PTR</option></select>
+        <input name="value" placeholder="value" required>
+        <input name="ttl" value="300">
+        <button type="submit">Add record</button>
+    </form>
     <h2>Management</h2>
     <ul>
         <li><a href="/status">System Status (JSON)</a></li>
         <li><a href="/config">Configuration</a></li>
-        <li><a href="/records">DNS Records</a></li>
+        <li><a href="/records">DNS Records (JSON)</a></li>
     </ul>
 </body>
-</html>"#;
-    
-    let mut response = HttpResponse::ok(html);
+</html>"#
+    );
+    let mut response = HttpResponse::ok(&html);
     response.add_header("Content-Type", "text/html; charset=utf-8");
     response
 }
@@ -183,8 +217,9 @@ fn handle_status() -> HttpResponse {
     let uptime = crate::timer::get_ticks() / 1_000_000; // seconds
     
     let json = format!(
-        r#"{{"status":"running","uptime":{},"dns_port":53,"http_port":80}}"#,
-        uptime
+        r#"{{"status":"running","uptime":{},"dns_port":53,"http_port":80,"cache_entries":{}}}"#,
+        uptime,
+        crate::dns::cache_entries()
     );
     
     let mut response = HttpResponse::ok(&json);
@@ -216,10 +251,90 @@ fn handle_config(request: &HttpRequest) -> HttpResponse {
     }
 }
 
-fn handle_records(_request: &HttpRequest) -> HttpResponse {
-    // TODO: Return actual DNS records
-    let json = r#"{"records":[],"message":"Record management not yet implemented"}"#;
-    let mut response = HttpResponse::ok(json);
+fn handle_records(request: &HttpRequest) -> HttpResponse {
+    match request.method {
+        http_server::HttpMethod::GET => records_json(),
+        http_server::HttpMethod::POST => add_record_from_body(request),
+        http_server::HttpMethod::DELETE => delete_record_from_body(request),
+        _ => HttpResponse::new(405, "Method Not Allowed"),
+    }
+}
+
+fn handle_record_delete(request: &HttpRequest) -> HttpResponse {
+    if request.method != http_server::HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    delete_record_from_body(request)
+}
+
+fn records_json() -> HttpResponse {
+    let mut json = String::from("{\"records\":[");
+    for (index, record) in crate::config_manager::records().iter().enumerate() {
+        if index != 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\",\"ttl\":{}}}",
+            record.name,
+            record.record_type.as_str(),
+            record.value,
+            record.ttl
+        ));
+    }
+    json.push_str("]}");
+    let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
     response
+}
+
+fn add_record_from_body(request: &HttpRequest) -> HttpResponse {
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    let name = form_value(body, "name").unwrap_or("");
+    let record_type = form_value(body, "type").unwrap_or("A");
+    let value = form_value(body, "value").unwrap_or("");
+    let ttl = form_value(body, "ttl")
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(300);
+    match crate::config_manager::add_record(name, record_type, value, ttl) {
+        Ok(()) => html_ok(&format!("Record added: {name}")),
+        Err(err) => {
+            let mut response = HttpResponse::new(400, "Bad Request");
+            response.set_body(err.as_bytes());
+            response
+        }
+    }
+}
+
+fn delete_record_from_body(request: &HttpRequest) -> HttpResponse {
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    let name = form_value(body, "name").unwrap_or("");
+    match crate::config_manager::remove_record(name) {
+        Ok(true) => html_ok(&format!("Record removed: {name}")),
+        Ok(false) => HttpResponse::not_found(),
+        Err(err) => {
+            let mut response = HttpResponse::new(400, "Bad Request");
+            response.set_body(err.as_bytes());
+            response
+        }
+    }
+}
+
+fn html_ok(text: &str) -> HttpResponse {
+    let body = format!(
+        "<!DOCTYPE html><html><body><p>{text}</p><p><a href=\"/\">Back</a></p></body></html>"
+    );
+    let mut response = HttpResponse::ok(&body);
+    response.add_header("Content-Type", "text/html; charset=utf-8");
+    response
+}
+
+fn form_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    for pair in body.split('&') {
+        if let Some((name, value)) = pair.split_once('=') {
+            if name.trim() == key {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
 }

@@ -5,11 +5,7 @@ struct UartWriter;
 
 impl Write for UartWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for byte in s.bytes() {
-            unsafe {
-                core::ptr::write_volatile(0x0900_0000 as *mut u32, byte as u32);
-            }
-        }
+        crate::console::write_str(s);
         Ok(())
     }
 }

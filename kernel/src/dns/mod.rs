@@ -13,3 +13,7 @@ pub fn init_sockets(stack: &mut crate::net::NetworkStack) -> Result<(), &'static
 pub fn poll(stack: &mut crate::net::NetworkStack, device: &mut crate::net::EthernetDevice) {
     server::poll(stack, device);
 }
+
+pub fn cache_entries() -> usize {
+    server::cache_entries()
+}

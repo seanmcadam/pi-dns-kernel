@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Boot with the DHCP client (static address remains the fallback).
+dhcp-default = []
+# Raspberry Pi 4 image: link at 0x80000, PL011, EMMC2, and GENET.
+pi4 = []
+
 [dependencies]
 cortex-a = { workspace = true }
 tock-registers = { workspace = true }

@@ -1,17 +1,11 @@
 use core::fmt::{self, Write};
 use log::{Level, LevelFilter, Metadata, Record};
 
-const UART_DR: *mut u32 = 0x0900_0000 as *mut u32;
-
 struct UartWriter;
 
 impl Write for UartWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            unsafe {
-                core::ptr::write_volatile(UART_DR, byte as u32);
-            }
-        }
+        crate::console::write_str(s);
         Ok(())
     }
 }

@@ -21,7 +21,8 @@ _start:
     isb
 
     // Stack grows down from the kernel load address into the RAM below it.
-    ldr     x1, =0x40080000
+    // QEMU: 0x40080000. Pi 4: 0x80000. The linker script defines the symbol.
+    ldr     x1, =__stack_top
     mov     sp, x1
 
     // Clear BSS (linked into RAM, so these stores are real memory).

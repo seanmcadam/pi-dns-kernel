@@ -3,6 +3,9 @@ target/
 boot/kernel8.img
 boot/kernel8.asm
 qemu/*.txt
+qemu/*.img
+qemu/*.pcap
+boot/pi4/*.img
 
 # IDE
 .vscode/

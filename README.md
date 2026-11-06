@@ -2,28 +2,19 @@
 
 A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the Raspberry Pi 4 (BCM2711, AArch64) that implements a complete DNS server appliance.
 
-**Current Status**: ⚠️ Core software complete (5,247 lines), VirtIO driver packet I/O debugging in progress
+**Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. A separate Pi 4 image links at `0x80000`. That image has not been tested on hardware.
 
 ## Quick Status
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Build System | ✅ Working | 315 KB kernel, 0 errors, clean compile |
-| Boot (QEMU) | ✅ Working | Loads and runs to main event loop |
-| PL011 UART | ✅ Working | Serial output functional |
-| Memory/Timer | ✅ Working | Bump allocator, ARM generic timer |
-| Network Init | ✅ Working | Stack configured, sockets bound |
-| VirtIO Driver | ⚠️ 80% | Detection OK, **packet I/O broken** |
-| DNS Server | ✅ Complete | 259 lines, logic ready to test |
-| HTTP Server | ✅ Complete | 247 lines, logic ready to test |
-| Integration Tests | ❌ 0/7 Pass | **Blocked by VirtIO packet reception** |
-| DHCP Client | ❌ Not Started | Deferred per plan |
-| Storage (FAT32) | ❌ Not Started | Deferred per plan |
-| Pi 4 Drivers | ❌ Not Started | Deferred (GENET, EMMC2) |
-
-**Critical Blocker**: VirtIO network driver RX buffer/descriptor management needs debugging. Ports are listening (verified with `netstat`), but packets aren't reaching application layer.
-
-**See**: [TEST_RESULTS.md](TEST_RESULTS.md) for detailed root cause analysis and [ACTUAL_TEST_OUTPUT.md](ACTUAL_TEST_OUTPUT.md) for complete test output transcripts.
+| Boot (QEMU virt) | Working | Raw image linked at `0x40080000` |
+| VirtIO-net | Working | Legacy virtio-mmio, ARP/ICMP, UDP, TCP |
+| DNS | Working | Local records, upstream forward, cache |
+| HTTP | Working | Dashboard can add and remove records |
+| DHCP | Working | User-net lease, static fallback on timeout |
+| FAT32 config | Working | virtio-blk, records survive reboot, rotating logs |
+| Pi 4 image | Compiles, untested on hardware | `0x80000`, PL011, EMMC2, GENET |
 
 ---
 
@@ -47,21 +38,17 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - ✅ Configuration management
 - ✅ Unit tests for all protocol layers
 
-### In Progress
-- 🚧 Network stack integration (smoltcp)
-- 🚧 GENET Ethernet driver for Pi 4 hardware
-- 🚧 QEMU network device support for testing
-- 🚧 DNS server socket handling
-- 🚧 HTTP web interface
-- 🚧 SD card driver (EMMC2)
-- 🚧 FAT32 filesystem support
-- 🚧 DHCP client
+### QEMU image
+- VirtIO-net packet I/O on the `virt` machine
+- Local DNS records and forwarding of other names to the configured upstreams, with TTL caching
+- DHCP client with a configurable static fallback
+- virtio-blk FAT32 volume for `CONFIG.TXT`, plus `LOG.TXT` rotated to `LOG.OLD`
+- Web dashboard to add and remove records
 
-### Planned
-- 📋 Complete DNS forwarding to upstream resolvers
-- 📋 Persistent configuration on SD card
-- 📋 Log rotation on filesystem
-- 📋 Full integration tests with real DNS queries
+### Pi 4 image (untested on hardware)
+- Separate link at `0x80000`
+- PL011 UART on GPIO 14/15
+- EMMC2 SD driver and GENET Ethernet driver, compiled into `boot/pi4/kernel8.img`
 
 ## Architecture
 
@@ -198,16 +185,12 @@ All tests run with `std` feature for host-side validation.
 ./scripts/test-integration.sh
 ```
 
-Current integration tests verify:
-- Kernel boots in QEMU
-- Serial output is produced
-- Main event loop starts
+`./scripts/test-integration.sh` checks the original boot, local DNS, and HTTP cases, then:
 
-**Planned integration tests:**
-- DNS query/response via dig
-- HTTP GET/POST via curl
-- Configuration persistence
-- DNS cache behavior
+- `dig` for `example.com` through QEMU user networking, and a second query served from the cache
+- a DHCP lease from QEMU user-net, and the static fallback when no DHCP server answers
+- adding a record in the web UI, rebooting the same FAT disk, and resolving that name
+- the Pi 4 image links at `0x80000` and `boot/pi4/config.txt` names `kernel8.img`
 
 ## Deployment
 
@@ -221,52 +204,51 @@ Note: QEMU's raspi3b/raspi4b models have limited peripheral support. Network tes
 
 ### Real Raspberry Pi 4
 
-1. **Download Pi 4 firmware:**
+**This image has not been tested on hardware.** `scripts/build-pi4.sh` is a separate target from the QEMU image. Do not copy `boot/kernel8.img` to the card: that file is linked at `0x40080000` for QEMU. The Pi 4 file is `boot/pi4/kernel8.img`, linked at `0x80000`.
+
+1. Build the SD card files:
+
    ```bash
-   wget https://github.com/raspberrypi/firmware/raw/master/boot/start4.elf
-   wget https://github.com/raspberrypi/firmware/raw/master/boot/fixup4.dat
+   ./scripts/build-pi4.sh
    ```
 
-2. **Prepare SD card:**
-   - Format as FAT32
-   - Copy `start4.elf`, `fixup4.dat`
-   - Copy `boot/config.txt`
-   - Copy `boot/kernel8.img`
+   That writes:
 
-3. **Connect serial console:**
-   - USB-to-TTL adapter at 115200 baud
-   - GND → Pin 6
-   - TX → Pin 10 (RXD)
-   - RX → Pin 8 (TXD)
+   - `boot/pi4/kernel8.img` — raw kernel, entry at `0x80000`
+   - `boot/pi4/config.txt` — `arm_64bit=1`, `enable_uart=1`, `kernel=kernel8.img`
 
-4. **Connect Ethernet** to your network
+   The image uses the Pi 4 PL011 UART at `0xFE201000` (GPIO 14/15, 115200 8N1), the EMMC2 SD controller at `0xFE340000`, and the GENET Ethernet controller at `0xFD580000`.
 
-5. **Power on** and watch serial output
+2. Flash a microSD card. The Pi boot ROM reads a FAT32 filesystem. On a card with one FAT32 partition, that partition is the boot partition:
 
-6. **Access:**
-   - DNS: Query port 53 on the configured IP
-   - Web UI: Browse to `http://<ip>/` (default: admin/admin)
+   ```bash
+   # Example only. Replace sdX with the card, and unmount it first.
+   sudo mkfs.vfat -F 32 /dev/sdX1
+   sudo mount /dev/sdX1 /mnt
+   sudo cp boot/pi4/kernel8.img boot/pi4/config.txt /mnt/
+   # start4.elf and fixup4.dat from the Raspberry Pi firmware are also required.
+   sudo umount /mnt
+   ```
+
+3. Serial console, 115200 baud: GND to pin 6, adapter TX to pin 10, adapter RX to pin 8.
+
+4. Insert the card, connect Ethernet, and power on. Until this image is run on a board, treat boot, DHCP, and SD writes as unverified. The QEMU image remains the tested one.
 
 ## Configuration
 
-Default configuration (when filesystem is not available):
+The default QEMU image uses a static address so the integration tests can reach it immediately:
 
 ```
-Network:
-  IP: 192.168.1.100
-  Netmask: 255.255.255.0
-  Gateway: 192.168.1.1
-
-DNS:
-  Upstream: 8.8.8.8, 1.1.1.1
-  Cache: 1000 entries
-
-HTTP:
-  Port: 80
-  Auth: admin/admin
+mode=static
+ip=10.0.2.15
+netmask=255.255.255.0
+gateway=10.0.2.2
+upstream=8.8.8.8
+upstream=1.1.1.1
+upstream=10.0.2.3
 ```
 
-Configuration will be read from `/config.txt` on the SD card once filesystem support is complete.
+`10.0.2.3` is QEMU's user-net DNS proxy. Build with `--features dhcp-default` to request a lease first and fall back to `10.0.2.15/24` after three seconds. The same fields are stored in `CONFIG.TXT` on the FAT volume (`record=name TYPE value ttl`). The dashboard at `/` adds and removes records; `DELETE /records` with `name=` removes one. `LOG.TXT` is copied to `LOG.OLD` once it passes 512 bytes.
 
 ## Project Structure
 
