@@ -38,8 +38,10 @@
 // them, and erets. Hardware saves ELR_EL1 and SPSR_EL1 and masks IRQ for the
 // duration of the handler. eret puts both back, so a handler that returned
 // with IRQs unmasked stays unmasked. irq_handler acknowledges the GIC.
-// Every other slot still reports the fault and halts. exception_handler
-// does not return, so the restore after those calls is not reached.
+// Lower-EL AArch64 synchronous exceptions and IRQs save into the current
+// task and can return to EL0 or to the kernel. Every other slot still
+// reports the fault and halts. exception_handler does not return, so the
+// restore after those calls is not reached.
 //
 // boot.s drops EL2 to EL1 before it installs this table. A real Pi 4
 // firmware handover is at EL2. That path is untested on hardware.
@@ -227,9 +229,9 @@ exc_el1_fiq:
 exc_el1_serr:
     enter 7
 exc_el0_sync:
-    enter 8
+    b       el0_sync_entry
 exc_el0_irq:
-    enter 9
+    b       el0_irq_entry
 exc_el0_fiq:
     enter 10
 exc_el0_serr:

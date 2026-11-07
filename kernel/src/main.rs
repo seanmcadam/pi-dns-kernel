@@ -17,6 +17,7 @@ mod mailbox;
 mod memory;
 mod net;
 mod panic;
+mod task;
 mod timer;
 mod uart;
 mod uart_pl011;
@@ -94,6 +95,10 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     interrupts::init();
     uart_write("[OK] Interrupts initialized\r\n");
 
+    uart_write("[4b] Running EL0 tests...\r\n");
+    task::run_boot_tests();
+    uart_write("[OK] EL0 tests finished\r\n");
+
     uart_write("[5] Loading config...\r\n");
     match fs::init() {
         Ok(()) => uart_write("[OK] Filesystem mounted\r\n"),
@@ -166,6 +171,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
             uart_write("DNS Server ready\r\n");
             uart_write("MMU and caches enabled\r\n");
             report_el(entry_el);
+            task::print_summary();
         }
     }
 }

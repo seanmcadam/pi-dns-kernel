@@ -1,12 +1,20 @@
-//! Identity-mapped EL1 MMU.
+//! Identity-mapped EL1 MMU, plus a small EL0 window.
 //!
-//! TTBR0 maps physical addresses to the same virtual addresses with a 4 KiB
-//! granule. The upper half of the 48-bit address space is owned by TTBR1,
-//! which points at an empty table, so those addresses fault. A later split
-//! can move the kernel into that half without changing the page-table shape.
-//! EL0 does not run yet. Kernel `.text` is privileged-executable and
-//! unprivileged-execute-never, which is the permission a later user mapping
-//! wants.
+//! TTBR0 maps kernel physical addresses to the same virtual addresses with a
+//! 4 KiB granule. Those pages are EL1-only: EL0 reads and executes fault.
+//! Kernel `.text` is privileged-executable and unprivileged-execute-never.
+//! TTBR1 still points at an empty table.
+//!
+//! The kernel is not in the high half. It is linked at the physical load
+//! address, and `boot.s` consumes those absolute addresses before the MMU is
+//! on. Virtio also programs devices with physical addresses, so the DMA
+//! pages have to stay identity-mapped. A later change can link the kernel at
+//! a TTBR1 address and keep a second identity map for DMA. Until then, EL0
+//! lives at `USER_CODE_VA` (`0x1_0000_0000`), which is past the identity map
+//! on QEMU (RAM ends at 2 GiB) and past the 4 GiB table budget used for the
+//! Pi 4. User pages are non-global and tagged with ASID 1 in TTBR0. Kernel
+//! pages stay global. Installing or dropping the user window invalidates the
+//! EL1 TLB.
 //!
 //! Virtio descriptor rings and packet buffers live in the `.dma` section.
 //! Those pages are Normal non-cacheable, so the device and the CPU see the
@@ -39,8 +47,17 @@ const AF: u64 = 1 << 10;
 const AP_RO: u64 = 1 << 7;
 const SH_INNER: u64 = 3 << 8;
 const SH_OUTER: u64 = 2 << 8;
+const NG: u64 = 1 << 11;
+const AP_EL0_RW: u64 = 1 << 6;
+const AP_EL0_RO: u64 = (1 << 6) | (1 << 7);
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
+
+/// EL0 code and stack. Not an identity map: the physical pages are kernel RAM.
+pub const USER_CODE_VA: u64 = 0x1_0000_0000;
+pub const USER_CODE_BYTES: u64 = 16 * 1024;
+pub const USER_STACK_VA: u64 = 0x1_0002_0000;
+pub const USER_STACK_BYTES: u64 = 16 * 1024;
 const ATTR_NORMAL: u64 = 0 << 2;
 const ATTR_DEVICE: u64 = 1 << 2;
 const ATTR_DMA: u64 = 2 << 2;
@@ -55,6 +72,9 @@ struct Tables {
     l1: Table,
     l2: [Table; 4],
     l3: [Table; 8],
+    // Level-1 index 4, the 4 GiB point. Outside the identity map.
+    l2_user: Table,
+    l3_user: Table,
     ttbr1: Table,
 }
 
@@ -77,6 +97,8 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
     ],
+    l2_user: Table { entries: [0; 512] },
+    l3_user: Table { entries: [0; 512] },
     ttbr1: Table { entries: [0; 512] },
 };
 
@@ -111,6 +133,121 @@ pub fn init() {
 
         let ttbr1 = addr_of!(TABLES.ttbr1) as u64;
         enable(l0, ttbr1);
+        if pan_supported() {
+            // SPAN clear: an exception into EL1 sets PAN, so a user fault
+            // cannot leave EL1 able to read the user window by accident.
+            let mut sctlr: u64;
+            core::arch::asm!(
+                "mrs {sctlr}, sctlr_el1",
+                "bic {sctlr}, {sctlr}, #0x800000",
+                "msr sctlr_el1, {sctlr}",
+                "isb",
+                ".inst 0xd500419f",
+                sctlr = out(reg) sctlr,
+                options(nostack),
+            );
+            let _ = sctlr;
+            PAN = true;
+        }
+    }
+}
+
+static mut PAN: bool = false;
+
+pub fn pan_enabled() -> bool {
+    unsafe { PAN }
+}
+
+pub fn set_pan(on: bool) {
+    if !pan_enabled() {
+        return;
+    }
+    unsafe {
+        if on {
+            core::arch::asm!(".inst 0xd500419f", options(nomem, nostack));
+        } else {
+            core::arch::asm!(".inst 0xd500409f", options(nomem, nostack));
+        }
+    }
+}
+
+fn pan_supported() -> bool {
+    let mmfr: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {mmfr}, id_aa64mmfr1_el1",
+            mmfr = out(reg) mmfr,
+            options(nomem, nostack)
+        );
+    }
+    (mmfr >> 4) & 0xf != 0
+}
+
+/// Map the EL0 code and stack windows at the physical pages the kernel owns.
+pub fn map_user_window(code_pa: u64, stack_pa: u64) {
+    unsafe {
+        let l1 = addr_of_mut!(TABLES.l1);
+        let l2 = addr_of_mut!(TABLES.l2_user);
+        let l3 = addr_of_mut!(TABLES.l3_user);
+        (*l1).entries[4] = (l2 as u64) | VALID | TABLE_OR_PAGE;
+        (*l2).entries[0] = (l3 as u64) | VALID | TABLE_OR_PAGE;
+        let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
+        let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+        map_user_span(l3, USER_CODE_VA, code_pa, USER_CODE_BYTES, code);
+        map_user_span(l3, USER_STACK_VA, stack_pa, USER_STACK_BYTES, data);
+    }
+    flush_tlb();
+}
+
+fn map_user_span(l3: *mut Table, va: u64, pa: u64, bytes: u64, flags: u64) {
+    let mut off = 0;
+    while off < bytes {
+        let index = (((va + off) >> 12) & 511) as usize;
+        unsafe {
+            (*l3).entries[index] =
+                (pa + off) | flags | VALID | TABLE_OR_PAGE;
+        }
+        off += PAGE;
+    }
+}
+
+pub fn user_slice_ok(ptr: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+    let code = ptr >= USER_CODE_VA && end <= USER_CODE_VA + USER_CODE_BYTES;
+    let stack = ptr >= USER_STACK_VA && end <= USER_STACK_VA + USER_STACK_BYTES;
+    code || stack
+}
+
+/// ASID lives in TTBR0[63:56] (TCR_EL1.AS is 0, so the ASID is 8 bits).
+/// Kernel translations are global. User translations are non-global, so
+/// ASID 0 does not match them.
+pub fn set_user_asid(active: bool) {
+    let base = unsafe { addr_of!(TABLES.l0) as u64 };
+    let ttbr = if active { base | (1 << 56) } else { base };
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {ttbr}",
+            "isb",
+            ttbr = in(reg) ttbr,
+            options(nostack),
+        );
+    }
+}
+
+pub fn flush_tlb() {
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "tlbi vmalle1",
+            "dsb sy",
+            "isb",
+            options(nostack),
+        );
     }
 }
 

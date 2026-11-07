@@ -6,6 +6,7 @@ members = [
     "config",
     "dns-cache",
 ]
+exclude = ["user-test"]
 resolver = "2"
 
 [workspace.package]

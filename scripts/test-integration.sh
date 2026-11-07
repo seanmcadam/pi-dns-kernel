@@ -446,7 +446,44 @@ echo ""
 echo "Test 13: Write to kernel text is a permission fault"
 fault_case text /debug/fault/text "debug fault: write kernel text" "Permission fault"
 
-# Test 11: Pi 4 image links at 0x80000 and the SD files exist
+echo ""
+echo "Test 16: EL0 round trip, IRQ, and fault isolation"
+rm -f qemu/el0-serial.txt
+timeout 30 qemu-system-aarch64 \
+    -M virt,gic-version=2 \
+    -cpu cortex-a72 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/el0-serial.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    >/tmp/qemu-el0.txt 2>&1 &
+EL0_PID=$!
+sleep 8
+EL0_DNS=$(timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short +time=3 +tries=1 || true)
+kill $EL0_PID 2>/dev/null || true
+wait $EL0_PID 2>/dev/null || true
+EL0_LINE=$(grep "EL0 test:" qemu/el0-serial.txt | tail -1 || true)
+echo "$EL0_LINE"
+if echo "$EL0_LINE" | grep -q "log ok, yield ok, irq ok, exit 0, bad-syscall -1, bad-pointer rejected, kernel-read killed, priv killed, exec-data killed" \
+    && grep -q "user: hello from el0" qemu/el0-serial.txt \
+    && grep -q "user: ticks advanced" qemu/el0-serial.txt \
+    && grep -q "EL0 yield: back in kernel" qemu/el0-serial.txt \
+    && grep -q "EL0 log: rejected pointer" qemu/el0-serial.txt \
+    && grep -q "EL0 syscall: unknown" qemu/el0-serial.txt \
+    && grep -q "user: bad syscall survived" qemu/el0-serial.txt \
+    && grep -q "user: bad pointer survived" qemu/el0-serial.txt \
+    && grep -q "DNS Server ready" qemu/el0-serial.txt \
+    && echo "$EL0_DNS" | grep -q "192.168.1.100"; then
+    echo "✓ EL0 round trip, IRQ resume, bad syscall, bad pointer, and user faults"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ EL0 tests did not all pass"
+    echo "dig: $EL0_DNS"
+    cat qemu/el0-serial.txt
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 echo ""
 echo "Test 14: Boot from EL2 (QEMU virtualization=on)"
 rm -f qemu/el2-serial.txt
