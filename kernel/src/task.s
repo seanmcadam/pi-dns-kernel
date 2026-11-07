@@ -120,7 +120,12 @@ el0_resume:
     adrp    x0, CURRENT_CTX
     add     x0, x0, :lo12:CURRENT_CTX
     ldr     x0, [x0]
+    cbz     x0, el0_resume_dead
     b       restore_user
+
+el0_resume_dead:
+    mov     x0, #3
+    b       return_to_kernel
 
 el0_no_ctx:
     bl      el0_no_task
@@ -140,6 +145,7 @@ enter_user:
     str     x12, [x9, #96]
     mrs     x12, daif
     str     x12, [x9, #104]
+    msr     daifset, #0xf
     adrp    x9, CURRENT_CTX
     add     x9, x9, :lo12:CURRENT_CTX
     str     x10, [x9]

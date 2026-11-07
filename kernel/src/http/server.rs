@@ -1,6 +1,7 @@
 use crate::config_manager::HttpConfig;
 use alloc::{vec, vec::Vec, string::{String, ToString}, format};
-use smoltcp::socket::{tcp, Socket};
+use smoltcp::iface::SocketHandle;
+use smoltcp::socket::tcp;
 use http_server::{HttpRequest, HttpResponse, parse_basic_auth};
 use spin::Mutex;
 
@@ -8,6 +9,7 @@ type TcpSocket = smoltcp::socket::tcp::Socket<'static>;
 type TcpSocketBuffer = smoltcp::socket::tcp::SocketBuffer<'static>;
 
 static HTTP_CONFIG: Mutex<Option<HttpConfig>> = Mutex::new(None);
+static mut HTTP_HANDLES: [Option<SocketHandle>; 4] = [None; 4];
 
 pub fn start(config: &HttpConfig) {
     log::info!("HTTP server initialized on port {}", config.port);
@@ -20,7 +22,8 @@ pub fn init_sockets(stack: &mut crate::net::NetworkStack) -> Result<(), &'static
     drop(config);
 
     // Several listeners so a connection stuck in TIME-WAIT does not block the next request.
-    for _ in 0..4 {
+    // Only these handles are HTTP. EL0 DNS sockets live in the same set.
+    for index in 0..4 {
         let rx_buffer = TcpSocketBuffer::new(vec![0u8; 8192]);
         let tx_buffer = TcpSocketBuffer::new(vec![0u8; 8192]);
         let socket = TcpSocket::new(rx_buffer, tx_buffer);
@@ -29,6 +32,7 @@ pub fn init_sockets(stack: &mut crate::net::NetworkStack) -> Result<(), &'static
         socket
             .listen(port)
             .map_err(|_| "Failed to listen on HTTP port")?;
+        unsafe { HTTP_HANDLES[index] = Some(http_handle) };
     }
 
     log::info!("HTTP socket listening on port {}", port);
@@ -42,20 +46,19 @@ pub fn poll(stack: &mut crate::net::NetworkStack, _device: &mut crate::net::Ethe
         .map(|c| c.port)
         .unwrap_or(80);
 
+    let handles = unsafe { HTTP_HANDLES };
     let sockets = stack.sockets_mut();
 
-    for item in sockets.iter_mut() {
-        let socket = item.1;
-        if let Socket::Tcp(tcp_socket) = socket {
-            // Recycle sockets that have finished (CLOSED or TIME-WAIT).
-            if !tcp_socket.is_open() {
-                tcp_socket.listen(port).ok();
-            } else if tcp_socket.state() == tcp::State::FinWait2 {
-                tcp_socket.abort();
-                tcp_socket.listen(port).ok();
-            } else if tcp_socket.is_active() && tcp_socket.may_recv() {
-                process_http_socket(tcp_socket);
-            }
+    for handle in handles.into_iter().flatten() {
+        let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+        // Recycle sockets that have finished (CLOSED or TIME-WAIT).
+        if !tcp_socket.is_open() {
+            tcp_socket.listen(port).ok();
+        } else if tcp_socket.state() == tcp::State::FinWait2 {
+            tcp_socket.abort();
+            tcp_socket.listen(port).ok();
+        } else if tcp_socket.is_active() && tcp_socket.may_recv() {
+            process_http_socket(tcp_socket);
         }
     }
 }

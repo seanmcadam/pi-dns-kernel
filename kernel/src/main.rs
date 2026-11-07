@@ -18,6 +18,7 @@ mod memory;
 mod net;
 mod panic;
 mod task;
+mod user_fd;
 mod timer;
 mod uart;
 mod uart_pl011;
@@ -128,15 +129,15 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
 
     uart_write("[9] Creating sockets...\r\n");
     net::with_stack(|stack, _device| {
-        match dns::init_sockets(stack) {
-            Ok(()) => uart_write("[OK] DNS socket created\r\n"),
-            Err(_) => uart_write("[ERROR] DNS socket failed\r\n"),
-        }
         match http::init_sockets(stack) {
             Ok(()) => uart_write("[OK] HTTP socket created\r\n"),
             Err(_) => uart_write("[ERROR] HTTP socket failed\r\n"),
         }
     });
+    match task::start_dns() {
+        Ok(()) => uart_write("[OK] DNS user program running\r\n"),
+        Err(()) => uart_write("[ERROR] DNS user program failed\r\n"),
+    }
 
     uart_write("\r\n=== Kernel Initialized Successfully ===\r\n");
     uart_write("DNS server listening on port 53\r\n");
@@ -147,8 +148,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     let mut next_status = timer::millis() + 2000;
     loop {
         net::poll();
+        task::poll_dns();
         net::with_stack(|stack, device| {
-            dns::poll(stack, device);
             http::poll(stack, device);
         });
         net::poll();

@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=link-pi4.ld");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PI4");
     build_user(&out_dir, &manifest_dir);
+    build_dns(&out_dir, &manifest_dir);
 }
 
 fn build_user(out_dir: &Path, manifest_dir: &Path) {
@@ -97,4 +98,178 @@ fn build_user(out_dir: &Path, manifest_dir: &Path) {
     if !status.success() {
         panic!("user-test objcopy failed");
     }
+}
+
+fn build_dns(out_dir: &Path, manifest_dir: &Path) {
+    let dir = manifest_dir.join("../dns-el0");
+    for rel in ["src/main.rs", "src/server.rs", "src/start.s", "link.ld"] {
+        println!("cargo:rerun-if-changed={}", dir.join(rel).display());
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../dns-protocol/src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../dns-cache/src").display()
+    );
+
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let proto = out_dir.join("libdns_protocol.rlib");
+    let cache = out_dir.join("libdns_cache.rlib");
+    compile_rlib(
+        &rustc,
+        &manifest_dir.join("../dns-protocol/src/lib.rs"),
+        "dns_protocol",
+        &proto,
+    );
+    compile_rlib(
+        &rustc,
+        &manifest_dir.join("../dns-cache/src/lib.rs"),
+        "dns_cache",
+        &cache,
+    );
+
+    let elf = out_dir.join("dns.elf");
+    let link = dir.join("link.ld");
+    let link_arg = format!("link-arg=-T{}", link.display());
+    let status = Command::new(&rustc)
+        .args([
+            "--target",
+            "aarch64-unknown-none",
+            "--edition",
+            "2021",
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=z",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "linker=aarch64-linux-gnu-ld",
+            "-C",
+            &link_arg,
+            "--extern",
+        ])
+        .arg(format!("dns_protocol={}", proto.display()))
+        .arg("--extern")
+        .arg(format!("dns_cache={}", cache.display()))
+        .arg("-o")
+        .arg(&elf)
+        .arg(dir.join("src/main.rs"))
+        .status()
+        .unwrap_or_else(|err| panic!("failed to link dns-el0: {err}"));
+    if !status.success() {
+        panic!("dns-el0 link failed");
+    }
+
+    let nm = Command::new("aarch64-linux-gnu-nm")
+        .arg(&elf)
+        .output()
+        .unwrap_or_else(|err| panic!("nm dns-el0: {err}"));
+    let listing = String::from_utf8_lossy(&nm.stdout);
+    let start = listing
+        .lines()
+        .find(|line| line.ends_with(" _start"))
+        .unwrap_or_else(|| panic!("dns-el0 has no _start:\n{listing}"));
+    let addr = start.split_whitespace().next().unwrap_or("");
+    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
+        panic!("dns-el0 _start is {addr}, expected 0x100000000");
+    }
+
+    let bin = out_dir.join("dns.bin");
+    let status = Command::new("aarch64-linux-gnu-objcopy")
+        .args(["-O", "binary"])
+        .arg(&elf)
+        .arg(&bin)
+        .status()
+        .unwrap_or_else(|err| panic!("objcopy dns-el0: {err}"));
+    if !status.success() {
+        panic!("dns-el0 objcopy failed");
+    }
+
+    let sections = elf_sections(&elf);
+    let code_limit = 0x1_0008_0000u64;
+    let data_base = 0x1_0009_0000u64;
+    let data_limit = 0x1_000A_0000u64;
+    let mut data_off = 0usize;
+    let mut data_len = 0usize;
+    let mut data_place = 0usize;
+    for (name, addr, size) in &sections {
+        if *size == 0 || *addr == 0 || name.starts_with(".comment") || name.starts_with(".ARM") || name.starts_with(".debug") {
+            continue;
+        }
+        let end = addr + size;
+        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
+        let in_data = *addr >= data_base && end <= data_limit;
+        if !in_code && !in_data {
+            panic!("dns-el0 section {name} at {addr:#x} size {size:#x} is outside the user window");
+        }
+        if name == ".data" {
+            data_off = (*addr - 0x1_0000_0000) as usize;
+            data_len = *size as usize;
+            data_place = (*addr - data_base) as usize;
+        }
+    }
+    fs::write(
+        out_dir.join("dns_meta.rs"),
+        format!(
+            "const DNS_DATA_OFF: usize = {data_off};\nconst DNS_DATA_LEN: usize = {data_len};\nconst DNS_DATA_PLACE: usize = {data_place};\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn compile_rlib(rustc: &str, src: &Path, name: &str, out: &Path) {
+    let status = Command::new(rustc)
+        .args([
+            "--target",
+            "aarch64-unknown-none",
+            "--edition",
+            "2021",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            name,
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=z",
+        ])
+        .arg("-o")
+        .arg(out)
+        .arg(src)
+        .status()
+        .unwrap_or_else(|err| panic!("rustc {name}: {err}"));
+    if !status.success() {
+        panic!("{name} rlib failed");
+    }
+}
+
+fn elf_sections(elf: &Path) -> Vec<(String, u64, u64)> {
+    let output = Command::new("aarch64-linux-gnu-readelf")
+        .args(["-S", "-W"])
+        .arg(elf)
+        .output()
+        .unwrap_or_else(|err| panic!("readelf dns-el0: {err}"));
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut sections = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('[') || line.starts_with("[Nr]") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let _nr = parts.next();
+        let name = parts.next().unwrap_or("").to_string();
+        let kind = parts.next().unwrap_or("");
+        if kind != "PROGBITS" && kind != "NOBITS" {
+            continue;
+        }
+        let addr = u64::from_str_radix(parts.next().unwrap_or("0"), 16).unwrap_or(0);
+        let _off = parts.next();
+        let size = u64::from_str_radix(parts.next().unwrap_or("0"), 16).unwrap_or(0);
+        sections.push((name, addr, size));
+    }
+    sections
 }

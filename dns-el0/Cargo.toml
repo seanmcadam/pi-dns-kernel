@@ -1,0 +1,8 @@
+[package]
+name = "dns-el0"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dns-protocol = { path = "../dns-protocol", default-features = false }
+dns-cache = { path = "../dns-cache", default-features = false }

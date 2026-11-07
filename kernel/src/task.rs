@@ -9,8 +9,11 @@
 //!   1 yield
 //!   2 uptime_ticks
 //!   3 exit(code)
+//!   4-17 sockets, time, and config. See user_fd.
 //! Anything else returns -1. A log pointer outside the user window returns -2.
-//! Neither path faults.
+//! Neither path faults. The boot program proves the round trip. After the
+//! network is up, `start_dns` loads the DNS program into the same window and
+//! the poll loop resumes it on every yield. Yield is cooperative.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +21,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 core::arch::global_asm!(include_str!("task.s"));
 
 const USER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.bin"));
+const DNS_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns.bin"));
+include!(concat!(env!("OUT_DIR"), "/dns_meta.rs"));
 
 const RESUME: u64 = 0;
 const YIELD: u64 = 1;
@@ -50,14 +55,24 @@ struct KernelResume {
 }
 
 #[repr(C, align(4096))]
-struct UserPages {
-    code: [u8; 16384],
-    stack: [u8; 16384],
+struct UserMem {
+    code: [u8; 512 * 1024],
+    data: [u8; 64 * 1024],
+    heap: [u8; 1536 * 1024],
+    stack: [u8; 64 * 1024],
 }
 
+const KSTACK_BYTES: usize = 64 * 1024;
+
+// Context, then a gap, then the stack. Without the gap the 32 KiB stack
+// ended on the first byte of the context, so an EL1 IRQ frame or a kernel
+// spill sat on the registers ERET restores. A fault there aborts at EL1
+// and halts the kernel.
+#[repr(C, align(16))]
 struct Task {
     ctx: TaskContext,
-    kstack: [u8; 16384],
+    _gap: [u8; 4096],
+    kstack: [u8; KSTACK_BYTES],
 }
 
 #[no_mangle]
@@ -83,7 +98,8 @@ static mut TASK: Task = Task {
         fpcr: 0,
         q: [0; 64],
     },
-    kstack: [0; 16384],
+    _gap: [0; 4096],
+    kstack: [0; KSTACK_BYTES],
 };
 
 static mut SCENARIO: u64 = 0;
@@ -98,6 +114,7 @@ static mut KERN_KILLED: bool = false;
 static mut PRIV_KILLED: bool = false;
 static mut EXEC_KILLED: bool = false;
 static EL0_IRQS: AtomicU64 = AtomicU64::new(0);
+static mut DNS_LIVE: bool = false;
 
 extern "C" {
     fn enter_user(ctx: *mut TaskContext, kernel_sp: u64) -> u64;
@@ -109,9 +126,7 @@ pub fn run_boot_tests() {
         put("EL0 test: user program does not fit\r\n");
         return;
     }
-    let code_pa = unsafe { addr_of!(USER_PAGES.code) as u64 };
-    let stack_pa = unsafe { addr_of!(USER_PAGES.stack) as u64 };
-    crate::mmu::map_user_window(code_pa, stack_pa);
+    map_window();
     publish_code();
     if crate::mmu::pan_enabled() {
         put("EL0 PAN on\r\n");
@@ -137,7 +152,7 @@ pub fn run_boot_tests() {
 
 fn publish_code() {
     unsafe {
-        let dst = addr_of_mut!(USER_PAGES.code) as *mut u8;
+        let dst = addr_of_mut!(USER_MEM.code) as *mut u8;
         core::ptr::copy_nonoverlapping(USER_BIN.as_ptr(), dst, USER_BIN.len());
         let user = crate::mmu::USER_CODE_VA;
         let mut off = 0usize;
@@ -169,7 +184,7 @@ fn run_scenario(scenario: u64, arg1: u64) {
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::mmu::USER_STACK_BYTES;
         CURRENT_CTX = ctx;
-        let ksp = addr_of!(TASK.kstack) as u64 + 16384;
+        let ksp = addr_of!(TASK.kstack) as u64 + KSTACK_BYTES as u64;
         TASK_KSP = ksp;
         crate::mmu::set_user_asid(true);
         loop {
@@ -280,6 +295,11 @@ fn syscall() -> u64 {
             }
             EXIT
         }
+        4..=17 => {
+            let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
+            ctx.x[0] = crate::user_fd::call(num, args);
+            RESUME
+        }
         _ => {
             unsafe { BAD_SYSCALL = true };
             put("EL0 syscall: unknown ");
@@ -383,7 +403,116 @@ fn hex(mut n: u64) {
     put(unsafe { core::str::from_utf8_unchecked(&buf) });
 }
 
-static mut USER_PAGES: UserPages = UserPages {
-    code: [0; 16384],
-    stack: [0; 16384],
+static mut USER_MEM: UserMem = UserMem {
+    code: [0; 512 * 1024],
+    data: [0; 64 * 1024],
+    heap: [0; 1536 * 1024],
+    stack: [0; 64 * 1024],
 };
+
+fn map_window() {
+    unsafe {
+        let code_pa = addr_of!(USER_MEM.code) as u64;
+        let data_pa = addr_of!(USER_MEM.data) as u64;
+        let heap_pa = addr_of!(USER_MEM.heap) as u64;
+        let stack_pa = addr_of!(USER_MEM.stack) as u64;
+        crate::mmu::map_user_window(code_pa, data_pa, heap_pa, stack_pa);
+    }
+}
+
+pub fn start_dns() -> Result<(), ()> {
+    if DNS_BIN.len() > crate::mmu::USER_CODE_BYTES as usize {
+        put("EL0 dns: program does not fit\r\n");
+        return Err(());
+    }
+    map_window();
+    load_dns_image();
+    unsafe {
+        SCENARIO = 0xff;
+        let ctx = addr_of_mut!(TASK.ctx);
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = crate::mmu::USER_CODE_VA;
+        (*ctx).spsr = 0;
+        (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::mmu::USER_STACK_BYTES;
+        CURRENT_CTX = ctx;
+        let ksp = addr_of!(TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        TASK_KSP = ksp;
+        crate::mmu::set_user_asid(true);
+        DNS_LIVE = true;
+        if enter_user(ctx, ksp) == YIELD {
+            Ok(())
+        } else {
+            DNS_LIVE = false;
+            CURRENT_CTX = core::ptr::null_mut();
+            Err(())
+        }
+    }
+}
+
+pub fn poll_dns() {
+    if !unsafe { DNS_LIVE } {
+        return;
+    }
+    unsafe {
+        let ctx = addr_of_mut!(TASK.ctx);
+        let ksp = TASK_KSP;
+        if enter_user(ctx, ksp) != YIELD {
+            DNS_LIVE = false;
+            CURRENT_CTX = core::ptr::null_mut();
+            put("EL0 dns stopped\r\n");
+        }
+    }
+}
+
+fn load_dns_image() {
+    unsafe {
+        let code = addr_of_mut!(USER_MEM.code) as *mut u8;
+        let data = addr_of_mut!(USER_MEM.data) as *mut u8;
+        core::ptr::write_bytes(code, 0, crate::mmu::USER_CODE_BYTES as usize);
+        core::ptr::write_bytes(data, 0, crate::mmu::USER_DATA_BYTES as usize);
+        core::ptr::write_bytes(
+            addr_of_mut!(USER_MEM.heap) as *mut u8,
+            0,
+            crate::mmu::USER_HEAP_BYTES as usize,
+        );
+        core::ptr::write_bytes(
+            addr_of_mut!(USER_MEM.stack) as *mut u8,
+            0,
+            crate::mmu::USER_STACK_BYTES as usize,
+        );
+        let code_len = DNS_BIN.len().min(crate::mmu::USER_CODE_BYTES as usize);
+        core::ptr::copy_nonoverlapping(DNS_BIN.as_ptr(), code, code_len);
+        if DNS_DATA_LEN > 0
+            && DNS_DATA_OFF + DNS_DATA_LEN <= DNS_BIN.len()
+            && DNS_DATA_PLACE + DNS_DATA_LEN <= crate::mmu::USER_DATA_BYTES as usize
+        {
+            core::ptr::copy_nonoverlapping(
+                DNS_BIN.as_ptr().add(DNS_DATA_OFF),
+                data.add(DNS_DATA_PLACE),
+                DNS_DATA_LEN,
+            );
+        }
+        maintain_code(code, code_len);
+    }
+}
+
+fn maintain_code(kernel_ptr: *mut u8, len: usize) {
+    unsafe {
+        let user = crate::mmu::USER_CODE_VA as usize;
+        let mut off = 0;
+        while off < len {
+            let kva = kernel_ptr as usize + off;
+            let uva = user + off;
+            core::arch::asm!(
+                "dc cvau, {kva}",
+                "ic ivau, {kva}",
+                "ic ivau, {uva}",
+                kva = in(reg) kva,
+                uva = in(reg) uva,
+                options(nostack),
+            );
+            off += 64;
+        }
+        core::arch::asm!("dsb sy", "isb", options(nostack));
+    }
+}

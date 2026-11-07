@@ -22,10 +22,8 @@ log = { workspace = true }
 embedded-sdmmc = { path = "../vendor/embedded-sdmmc", default-features = false }
 embedded-hal = { workspace = true }
 
-dns-protocol = { path = "../dns-protocol", default-features = false }
 http-server = { path = "../http-server", default-features = false }
 config = { path = "../config", default-features = false }
-dns-cache = { path = "../dns-cache", default-features = false }
 
 [[bin]]
 name = "kernel8"

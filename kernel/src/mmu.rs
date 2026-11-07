@@ -53,11 +53,17 @@ const AP_EL0_RO: u64 = (1 << 6) | (1 << 7);
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 
-/// EL0 code and stack. Not an identity map: the physical pages are kernel RAM.
+/// EL0 window. Not an identity map: the physical pages are kernel RAM.
+/// Code ends at `USER_CODE_VA + USER_CODE_BYTES`. The next page is unmapped
+/// so a pointer just past the code is a fault, not a heap address.
 pub const USER_CODE_VA: u64 = 0x1_0000_0000;
-pub const USER_CODE_BYTES: u64 = 16 * 1024;
-pub const USER_STACK_VA: u64 = 0x1_0002_0000;
-pub const USER_STACK_BYTES: u64 = 16 * 1024;
+pub const USER_CODE_BYTES: u64 = 512 * 1024;
+pub const USER_DATA_VA: u64 = 0x1_0009_0000;
+pub const USER_DATA_BYTES: u64 = 64 * 1024;
+pub const USER_HEAP_VA: u64 = 0x1_000A_0000;
+pub const USER_HEAP_BYTES: u64 = 1536 * 1024;
+pub const USER_STACK_VA: u64 = 0x1_0022_0000;
+pub const USER_STACK_BYTES: u64 = 64 * 1024;
 const ATTR_NORMAL: u64 = 0 << 2;
 const ATTR_DEVICE: u64 = 1 << 2;
 const ATTR_DMA: u64 = 2 << 2;
@@ -74,7 +80,8 @@ struct Tables {
     l3: [Table; 8],
     // Level-1 index 4, the 4 GiB point. Outside the identity map.
     l2_user: Table,
-    l3_user: Table,
+    // Two level-3 tables: 4 MiB from USER_CODE_VA. The window uses about 2.2 MiB.
+    l3_user: [Table; 2],
     ttbr1: Table,
 }
 
@@ -98,7 +105,7 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
     ],
     l2_user: Table { entries: [0; 512] },
-    l3_user: Table { entries: [0; 512] },
+    l3_user: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
     ttbr1: Table { entries: [0; 512] },
 };
 
@@ -183,44 +190,74 @@ fn pan_supported() -> bool {
     (mmfr >> 4) & 0xf != 0
 }
 
-/// Map the EL0 code and stack windows at the physical pages the kernel owns.
-pub fn map_user_window(code_pa: u64, stack_pa: u64) {
+/// Map the EL0 code, data, heap, and stack at the physical pages the kernel owns.
+pub fn map_user_window(code_pa: u64, data_pa: u64, heap_pa: u64, stack_pa: u64) {
     unsafe {
         let l1 = addr_of_mut!(TABLES.l1);
         let l2 = addr_of_mut!(TABLES.l2_user);
-        let l3 = addr_of_mut!(TABLES.l3_user);
         (*l1).entries[4] = (l2 as u64) | VALID | TABLE_OR_PAGE;
-        (*l2).entries[0] = (l3 as u64) | VALID | TABLE_OR_PAGE;
+        for index in 0..2 {
+            let l3 = addr_of_mut!(TABLES.l3_user[index]);
+            (*l3).entries = [0; 512];
+            (*l2).entries[index] = (l3 as u64) | VALID | TABLE_OR_PAGE;
+        }
         let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
         let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
-        map_user_span(l3, USER_CODE_VA, code_pa, USER_CODE_BYTES, code);
-        map_user_span(l3, USER_STACK_VA, stack_pa, USER_STACK_BYTES, data);
+        map_user_span(USER_CODE_VA, code_pa, USER_CODE_BYTES, code);
+        map_user_span(USER_DATA_VA, data_pa, USER_DATA_BYTES, data);
+        map_user_span(USER_HEAP_VA, heap_pa, USER_HEAP_BYTES, data);
+        map_user_span(USER_STACK_VA, stack_pa, USER_STACK_BYTES, data);
     }
     flush_tlb();
 }
 
-fn map_user_span(l3: *mut Table, va: u64, pa: u64, bytes: u64, flags: u64) {
+fn map_user_span(va: u64, pa: u64, bytes: u64, flags: u64) {
     let mut off = 0;
     while off < bytes {
-        let index = (((va + off) >> 12) & 511) as usize;
+        let page = va + off;
+        let l2_index = ((page >> 21) & 511) as usize;
+        let l3_index = ((page >> 12) & 511) as usize;
+        if l2_index >= 2 {
+            return;
+        }
         unsafe {
-            (*l3).entries[index] =
-                (pa + off) | flags | VALID | TABLE_OR_PAGE;
+            let l3 = addr_of_mut!(TABLES.l3_user[l2_index]);
+            (*l3).entries[l3_index] = (pa + off) | flags | VALID | TABLE_OR_PAGE;
         }
         off += PAGE;
     }
 }
 
+fn in_window(ptr: u64, end: u64, start: u64, bytes: u64) -> bool {
+    ptr >= start && end <= start + bytes
+}
+
 pub fn user_slice_ok(ptr: u64, len: u64) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let Some(end) = ptr.checked_add(len) else {
+    let Some(end) = checked_end(ptr, len) else {
         return false;
     };
-    let code = ptr >= USER_CODE_VA && end <= USER_CODE_VA + USER_CODE_BYTES;
-    let stack = ptr >= USER_STACK_VA && end <= USER_STACK_VA + USER_STACK_BYTES;
-    code || stack
+    in_window(ptr, end, USER_CODE_VA, USER_CODE_BYTES)
+        || in_window(ptr, end, USER_DATA_VA, USER_DATA_BYTES)
+        || in_window(ptr, end, USER_HEAP_VA, USER_HEAP_BYTES)
+        || in_window(ptr, end, USER_STACK_VA, USER_STACK_BYTES)
+}
+
+/// Pages EL0 may store to. Code is read-only, so a recv buffer there is rejected
+/// instead of taking an EL1 permission fault.
+pub fn user_write_ok(ptr: u64, len: u64) -> bool {
+    let Some(end) = checked_end(ptr, len) else {
+        return false;
+    };
+    in_window(ptr, end, USER_DATA_VA, USER_DATA_BYTES)
+        || in_window(ptr, end, USER_HEAP_VA, USER_HEAP_BYTES)
+        || in_window(ptr, end, USER_STACK_VA, USER_STACK_BYTES)
+}
+
+fn checked_end(ptr: u64, len: u64) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    ptr.checked_add(len)
 }
 
 /// ASID lives in TTBR0[63:56] (TCR_EL1.AS is 0, so the ASID is 8 bits).

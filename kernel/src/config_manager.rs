@@ -19,6 +19,7 @@ pub struct NetworkConfig {
 pub struct DnsConfig {
     pub records: Vec<DnsRecord>,
     pub upstreams: Vec<[u8; 4]>,
+    pub blocklist: Vec<String>,
     pub cache_size: usize,
 }
 
@@ -105,6 +106,104 @@ pub fn upstreams() -> Vec<[u8; 4]> {
         .unwrap_or_default()
 }
 
+pub fn blocklist() -> Vec<String> {
+    CURRENT
+        .lock()
+        .as_ref()
+        .map(|config| config.dns.blocklist.clone())
+        .unwrap_or_default()
+}
+
+pub fn cache_size() -> usize {
+    CURRENT
+        .lock()
+        .as_ref()
+        .map(|config| config.dns.cache_size)
+        .unwrap_or(1000)
+}
+
+/// Write `name TYPE value ttl` lines. `None` if `out` is too small.
+/// These writers do not allocate: the kernel heap never frees, and the DNS
+/// program asks for this text on every query.
+pub fn write_records(out: &mut [u8]) -> Option<usize> {
+    let current = CURRENT.lock();
+    let Some(config) = current.as_ref() else {
+        return Some(0);
+    };
+    let mut used = 0;
+    for record in &config.dns.records {
+        used = push_slice(out, used, record.name.as_bytes())?;
+        used = push_slice(out, used, b" ")?;
+        used = push_slice(out, used, record.record_type.as_str().as_bytes())?;
+        used = push_slice(out, used, b" ")?;
+        used = push_slice(out, used, record.value.as_bytes())?;
+        used = push_slice(out, used, b" ")?;
+        used = push_u32(out, used, record.ttl)?;
+        used = push_slice(out, used, b"\n")?;
+    }
+    Some(used)
+}
+
+pub fn write_upstreams(out: &mut [u8]) -> Option<usize> {
+    let current = CURRENT.lock();
+    let Some(config) = current.as_ref() else {
+        return Some(0);
+    };
+    let mut used = 0;
+    for ip in &config.dns.upstreams {
+        used = append_ip(out, used, *ip)?;
+        used = push_slice(out, used, b"\n")?;
+    }
+    Some(used)
+}
+
+pub fn write_blocklist(out: &mut [u8]) -> Option<usize> {
+    let current = CURRENT.lock();
+    let Some(config) = current.as_ref() else {
+        return Some(0);
+    };
+    let mut used = 0;
+    for name in &config.dns.blocklist {
+        used = push_slice(out, used, name.as_bytes())?;
+        used = push_slice(out, used, b"\n")?;
+    }
+    Some(used)
+}
+
+fn push_slice(out: &mut [u8], used: usize, bytes: &[u8]) -> Option<usize> {
+    let end = used.checked_add(bytes.len())?;
+    if end > out.len() {
+        return None;
+    }
+    out[used..end].copy_from_slice(bytes);
+    Some(end)
+}
+
+fn push_u32(out: &mut [u8], mut used: usize, mut value: u32) -> Option<usize> {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    if value == 0 {
+        return push_slice(out, used, b"0");
+    }
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    used = push_slice(out, used, &buf[i..])?;
+    Some(used)
+}
+
+fn append_ip(out: &mut [u8], mut used: usize, ip: [u8; 4]) -> Option<usize> {
+    for (index, byte) in ip.iter().enumerate() {
+        if index > 0 {
+            used = push_slice(out, used, b".")?;
+        }
+        used = push_u32(out, used, *byte as u32)?;
+    }
+    Some(used)
+}
+
 pub fn add_record(name: &str, record_type: &str, value: &str, ttl: u32) -> Result<(), String> {
     let name = name.trim();
     let value = value.trim();
@@ -185,6 +284,7 @@ fn default_config() -> Config {
         dns: DnsConfig {
             records,
             upstreams: alloc::vec![[8, 8, 8, 8], [1, 1, 1, 1], [10, 0, 2, 3]],
+            blocklist: Vec::new(),
             cache_size: 1000,
         },
         http: HttpConfig {
@@ -219,6 +319,7 @@ fn parse_config(text: &str) -> Option<Config> {
     let mut config = default_config();
     config.dns.records.clear();
     config.dns.upstreams.clear();
+    config.dns.blocklist.clear();
     let mut saw_record = false;
     let mut saw_upstream = false;
     let mut mode_dhcp = false;
@@ -246,6 +347,11 @@ fn parse_config(text: &str) -> Option<Config> {
                 saw_upstream = true;
             }
             "cache" => config.dns.cache_size = value.parse().unwrap_or(1000),
+            "block" => {
+                if valid_label(value) {
+                    config.dns.blocklist.push(value.to_string());
+                }
+            }
             "user" => config.http.username = value.to_string(),
             "pass" => config.http.password = value.to_string(),
             "port" => config.http.port = value.parse().unwrap_or(80),
@@ -315,6 +421,9 @@ fn serialize_config(config: &Config) -> String {
         push_ip(&mut out, "upstream", *upstream);
     }
     out.push_str(&alloc::format!("cache={}\n", config.dns.cache_size));
+    for name in &config.dns.blocklist {
+        out.push_str(&alloc::format!("block={name}\n"));
+    }
     out.push_str(&alloc::format!("user={}\n", config.http.username));
     out.push_str(&alloc::format!("pass={}\n", config.http.password));
     out.push_str(&alloc::format!("port={}\n", config.http.port));
