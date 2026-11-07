@@ -1,7 +1,17 @@
 //! VirtIO block device for QEMU `virtio-blk-device`.
 //!
 //! One request is in flight at a time. Each request is a three-descriptor
-//! chain: a 16-byte header, a 512-byte sector, and a status byte.
+//! chain: a 16-byte header, a 512-byte sector, and a status byte. All three
+//! buffers, and the descriptor/avail/used rings, live in the non-cacheable
+//! `.dma` section. Sector bytes from the stack are copied into that buffer
+//! before the descriptor is published.
+//!
+//! QEMU 8.2 defaults virtio-mmio `ioeventfd` on, so a queue notify returns
+//! before the request finishes and another thread completes it. The wait is
+//! therefore a fraction of a second of `cntpct`, not a short spin. A timeout
+//! resets the device before the next request: leaving the old one in flight
+//! and reusing its descriptors makes every later status read look like
+//! `blk io error`.
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -157,14 +167,41 @@ impl VirtioBlk {
         let base = find_blk_device()?;
         let version = read_reg(base, REG_VERSION);
         log::info!("VirtIO blk version {}", version);
+        let mut dev = Self {
+            base,
+            capacity: 0,
+            seen: 0,
+        };
+        if let Err(err) = dev.program_device() {
+            log::warn!("VirtIO blk setup failed: {err}");
+            return None;
+        }
+
+        let lo = read_reg(base, REG_CONFIG) as u64;
+        let hi = read_reg(base, REG_CONFIG + 4) as u64;
+        let capacity = lo | (hi << 32);
+        if capacity == 0 {
+            log::warn!("VirtIO blk reported zero capacity");
+            return None;
+        }
+        dev.capacity = capacity;
+        Some(dev)
+    }
+
+    /// Negotiate features and install a zeroed queue. `seen` matches the
+    /// used index, which the reset leaves at 0.
+    fn program_device(&mut self) -> Result<(), &'static str> {
+        let base = self.base;
+        let version = read_reg(base, REG_VERSION);
+        let legacy = version < 2;
         write_reg(base, REG_STATUS, 0);
+        dsb();
 
         let mut status = STATUS_ACKNOWLEDGE;
         write_reg(base, REG_STATUS, status);
         status |= STATUS_DRIVER;
         write_reg(base, REG_STATUS, status);
 
-        let _dev_lo = device_features(base, 0);
         let dev_hi = device_features(base, 1);
         set_driver_features(base, 0, 0);
         let drv_hi = if version >= 2 {
@@ -178,41 +215,31 @@ impl VirtioBlk {
             status |= STATUS_FEATURES_OK;
             write_reg(base, REG_STATUS, status);
             if read_reg(base, REG_STATUS) & STATUS_FEATURES_OK == 0 {
-                log::warn!("VirtIO blk rejected features");
-                write_reg(base, REG_STATUS, 128);
-                return None;
+                return Err("blk features rejected");
             }
         }
 
         unsafe {
             core::ptr::write_bytes(addr_of_mut!(QUEUE) as *mut u8, 0, QUEUE_BYTES);
+            write_volatile((*addr_of_mut!(IO)).status.as_mut_ptr(), 0);
         }
-        let legacy = version < 2;
         if !install_queue(base, addr_of_mut!(QUEUE), legacy) {
-            log::warn!("VirtIO blk queue rejected");
-            return None;
+            return Err("blk queue rejected");
         }
-
         status |= STATUS_DRIVER_OK;
         write_reg(base, REG_STATUS, status);
-
-        let lo = read_reg(base, REG_CONFIG) as u64;
-        let hi = read_reg(base, REG_CONFIG + 4) as u64;
-        let capacity = lo | (hi << 32);
-        if capacity == 0 {
-            log::warn!("VirtIO blk reported zero capacity");
-            return None;
-        }
-        Some(Self {
-            base,
-            capacity,
-            seen: 0,
-        })
+        dsb();
+        self.seen = 0;
+        Ok(())
     }
 
     fn read_sector(&mut self, sector: u64, out: &mut [u8; 512]) -> Result<(), &'static str> {
         self.submit(BLK_T_IN, sector, None)?;
         unsafe {
+            let data = (*addr_of_mut!(IO)).data.as_ptr();
+            // Drop a stale cache line before copying out what the device wrote.
+            invalidate_dma(data, 512);
+            dsb();
             out.copy_from_slice(&(*addr_of_mut!(IO)).data);
         }
         Ok(())
@@ -228,8 +255,32 @@ impl VirtioBlk {
         sector: u64,
         data: Option<&[u8; 512]>,
     ) -> Result<(), &'static str> {
+        for attempt in 0..2 {
+            match self.submit_once(kind, sector, data) {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt == 0 && (err == "blk timeout" || err == "blk io error") => {
+                    log::warn!("VirtIO {err}, resetting queue");
+                    self.program_device()?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err("blk io error")
+    }
+
+    fn submit_once(
+        &mut self,
+        kind: u32,
+        sector: u64,
+        data: Option<&[u8; 512]>,
+    ) -> Result<(), &'static str> {
+        let q = addr_of_mut!(QUEUE);
+        let io = addr_of_mut!(IO);
+        // A request that completed after we gave up must not be reported as
+        // the result of the request we are about to publish.
+        self.absorb_used(q);
+
         unsafe {
-            let io = addr_of_mut!(IO);
             let header = &mut (*io).header;
             header[..4].copy_from_slice(&kind.to_le_bytes());
             header[4..8].fill(0);
@@ -239,51 +290,90 @@ impl VirtioBlk {
             }
             write_volatile((*io).status.as_mut_ptr(), 0xff);
 
-            let q = addr_of_mut!(QUEUE);
+            let header_addr = (*io).header.as_ptr() as u64;
+            let data_addr = (*io).data.as_ptr() as u64;
+            let status_addr = (*io).status.as_ptr() as u64;
             let data_flags = if kind == BLK_T_IN {
                 VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
             } else {
                 VIRTQ_DESC_F_NEXT
             };
-            write_desc(q, 0, (*io).header.as_ptr() as u64, 16, VIRTQ_DESC_F_NEXT, 1);
-            write_desc(q, 1, (*io).data.as_ptr() as u64, 512, data_flags, 2);
-            write_desc(
-                q,
-                2,
-                (*io).status.as_ptr() as u64,
-                1,
-                VIRTQ_DESC_F_WRITE,
-                0,
-            );
+            // Descriptors name only the .dma request, never a stack/heap sector.
+            write_desc(q, 0, header_addr, 16, VIRTQ_DESC_F_NEXT, 1);
+            write_desc(q, 1, data_addr, 512, data_flags, 2);
+            write_desc(q, 2, status_addr, 1, VIRTQ_DESC_F_WRITE, 0);
 
             let avail_i = read_volatile(avail_idx(q));
             let slot = (avail_i as usize) % QSIZE;
             write_volatile(avail_ring(q, slot), 0);
-            barrier();
+            dsb();
             write_volatile(avail_idx(q), avail_i.wrapping_add(1));
-            // The queue and the request live in non-cacheable .dma. Clean
-            // them anyway so a cacheable alias cannot hide the write from
-            // the device, then wait until those stores finish before notify.
+            // Clean what the device reads. Do not clean the used ring: that
+            // would write a stale cache line back over the device's update.
+            clean_dma(q as *const u8, AVAIL_OFF + 64);
             clean_dma((*io).header.as_ptr(), 16 + 512 + 1);
-            clean_dma(q as *const u8, 4096 + 64);
             dsb();
             write_reg(self.base, REG_QUEUE_NOTIFY, 0);
-
-            let mut spins = 0;
-            while read_volatile(used_idx(q)) == self.seen {
-                spins += 1;
-                if spins > 2_000_000 {
-                    return Err("blk timeout");
-                }
-                core::hint::spin_loop();
-            }
-            self.seen = self.seen.wrapping_add(1);
             dsb();
-            if read_volatile((*io).status.as_ptr()) != 0 {
-                return Err("blk io error");
-            }
         }
-        Ok(())
+
+        self.wait_complete(q, io)
+    }
+
+    /// If the device already moved the used index, remember that value.
+    fn absorb_used(&mut self, q: *mut QueueArea) {
+        invalidate_dma(unsafe { (q as *const u8).add(USED_OFF) }, 16);
+        dsb();
+        let used = unsafe { read_volatile(used_idx(q)) };
+        let advanced = used.wrapping_sub(self.seen);
+        if advanced > 0 && advanced <= QSIZE as u16 {
+            self.seen = used;
+        }
+    }
+
+    fn wait_complete(
+        &mut self,
+        q: *mut QueueArea,
+        io: *mut IoBufs,
+    ) -> Result<(), &'static str> {
+        let start = crate::timer::get_ticks();
+        let freq = timer_freq();
+        // Half a second of virtual time. ioeventfd completion runs on another
+        // host thread; a couple million spins loses that race when the host
+        // is busy. A missing counter falls back to a much larger spin cap.
+        let budget = freq / 2;
+        let mut spins: u32 = 0;
+        loop {
+            invalidate_dma(unsafe { (q as *const u8).add(USED_OFF) }, 16);
+            let status_ptr = unsafe { (*io).status.as_ptr() };
+            invalidate_dma(status_ptr, 1);
+            dsb();
+            let used = unsafe { read_volatile(used_idx(q)) };
+            let advanced = used.wrapping_sub(self.seen);
+            if advanced > 0 && advanced <= QSIZE as u16 {
+                let status = unsafe { read_volatile(status_ptr) };
+                // 0xff is the sentinel we stored. The device writes 0, 1, or 2.
+                // A moved used index with the sentinel still in place means the
+                // status store is not visible yet, or this is a leftover index.
+                if status != 0xff {
+                    self.seen = used;
+                    if status != 0 {
+                        return Err("blk io error");
+                    }
+                    return Ok(());
+                }
+            }
+            spins = spins.wrapping_add(1);
+            let timed_out = if budget == 0 {
+                spins > 50_000_000
+            } else {
+                crate::timer::get_ticks().wrapping_sub(start) >= budget
+            };
+            if timed_out {
+                return Err("blk timeout");
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -372,12 +462,6 @@ fn write_reg(base: usize, offset: usize, value: u32) {
     unsafe { write_volatile((base + offset) as *mut u32, value) }
 }
 
-fn barrier() {
-    unsafe {
-        core::arch::asm!("dmb sy", options(nostack, preserves_flags));
-    }
-}
-
 fn dsb() {
     unsafe {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
@@ -385,17 +469,38 @@ fn dsb() {
 }
 
 fn clean_dma(addr: *const u8, len: usize) {
-    let start = (addr as usize) & !63;
+    for_each_line(addr, len, |line| unsafe {
+        core::arch::asm!(
+            "dc cvac, {line}",
+            line = in(reg) line,
+            options(nostack, preserves_flags)
+        );
+    });
+}
+
+fn invalidate_dma(addr: *const u8, len: usize) {
+    for_each_line(addr, len, |line| unsafe {
+        core::arch::asm!(
+            "dc ivac, {line}",
+            line = in(reg) line,
+            options(nostack, preserves_flags)
+        );
+    });
+}
+
+fn for_each_line(addr: *const u8, len: usize, mut op: impl FnMut(usize)) {
+    let mut line = (addr as usize) & !63;
     let end = (addr as usize).saturating_add(len);
-    let mut line = start;
     while line < end {
-        unsafe {
-            core::arch::asm!(
-                "dc cvac, {line}",
-                line = in(reg) line,
-                options(nostack, preserves_flags)
-            );
-        }
+        op(line);
         line = line.saturating_add(64);
     }
+}
+
+fn timer_freq() -> u64 {
+    let freq: u64;
+    unsafe {
+        core::arch::asm!("mrs {freq}, cntfrq_el0", freq = out(reg) freq);
+    }
+    freq
 }
