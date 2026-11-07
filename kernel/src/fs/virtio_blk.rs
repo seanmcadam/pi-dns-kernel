@@ -237,7 +237,7 @@ impl VirtioBlk {
             if let Some(data) = data {
                 (*io).data.copy_from_slice(data);
             }
-            (*io).status[0] = 0xff;
+            write_volatile((*io).status.as_mut_ptr(), 0xff);
 
             let q = addr_of_mut!(QUEUE);
             let data_flags = if kind == BLK_T_IN {
@@ -261,7 +261,12 @@ impl VirtioBlk {
             write_volatile(avail_ring(q, slot), 0);
             barrier();
             write_volatile(avail_idx(q), avail_i.wrapping_add(1));
-            barrier();
+            // The queue and the request live in non-cacheable .dma. Clean
+            // them anyway so a cacheable alias cannot hide the write from
+            // the device, then wait until those stores finish before notify.
+            clean_dma((*io).header.as_ptr(), 16 + 512 + 1);
+            clean_dma(q as *const u8, 4096 + 64);
+            dsb();
             write_reg(self.base, REG_QUEUE_NOTIFY, 0);
 
             let mut spins = 0;
@@ -273,8 +278,8 @@ impl VirtioBlk {
                 core::hint::spin_loop();
             }
             self.seen = self.seen.wrapping_add(1);
-            barrier();
-            if (*io).status[0] != 0 {
+            dsb();
+            if read_volatile((*io).status.as_ptr()) != 0 {
                 return Err("blk io error");
             }
         }
@@ -370,5 +375,27 @@ fn write_reg(base: usize, offset: usize, value: u32) {
 fn barrier() {
     unsafe {
         core::arch::asm!("dmb sy", options(nostack, preserves_flags));
+    }
+}
+
+fn dsb() {
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+fn clean_dma(addr: *const u8, len: usize) {
+    let start = (addr as usize) & !63;
+    let end = (addr as usize).saturating_add(len);
+    let mut line = start;
+    while line < end {
+        unsafe {
+            core::arch::asm!(
+                "dc cvac, {line}",
+                line = in(reg) line,
+                options(nostack, preserves_flags)
+            );
+        }
+        line = line.saturating_add(64);
     }
 }

@@ -307,33 +307,46 @@ where
         Err(Error::BadHandle)
     }
 
-    /// Close a volume
+    /// Close a volume.
     ///
-    /// You can't close it if there are any files or directories open on it.
+    /// Files and directories still open on it are closed first. The FAT32
+    /// FSInfo sector is advisory: a failure while writing it must not leave
+    /// the volume in `open_volumes`. This manager is often built with
+    /// `MAX_VOLUMES = 1`, and a slot that survives `close_volume` makes the
+    /// next `open_volume` return `TooManyOpenVolumes`.
     pub fn close_volume(&mut self, volume: RawVolume) -> Result<(), Error<D::Error>> {
-        for f in self.open_files.iter() {
-            if f.volume_id == volume {
-                return Err(Error::VolumeStillInUse);
+        let mut first_err = None;
+        while let Some(file_id) = self
+            .open_files
+            .iter()
+            .find(|info| info.volume_id == volume)
+            .map(|info| info.file_id)
+        {
+            let before = self.open_files.len();
+            if let Err(err) = self.close_file(file_id) {
+                first_err = first_err.or(Some(err));
+            }
+            if self.open_files.len() == before {
+                self.open_files.retain(|info| info.file_id != file_id);
             }
         }
+        self.open_dirs.retain(|info| info.volume_id != volume);
 
-        for d in self.open_dirs.iter() {
-            if d.volume_id == volume {
-                return Err(Error::VolumeStillInUse);
-            }
-        }
-
-        let volume_idx = self.get_volume_by_id(volume)?;
-
+        let volume_idx = match self.get_volume_by_id(volume) {
+            Ok(idx) => idx,
+            Err(err) => return Err(first_err.unwrap_or(err)),
+        };
         match &mut self.open_volumes[volume_idx].volume_type {
-            VolumeType::Fat(fat_volume) => {
-                fat_volume.update_info_sector(&self.block_device)?;
+            VolumeType::Fat(fat) => {
+                // Counts in the info sector are hints. Drop the slot either way.
+                let _ = fat.update_info_sector(&self.block_device);
             }
         }
-
         self.open_volumes.swap_remove(volume_idx);
-
-        Ok(())
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Look in a directory for a named file.
@@ -805,14 +818,15 @@ where
             let volume_idx = self.get_volume_by_id(file_info.volume_id)?;
             match self.open_volumes[volume_idx].volume_type {
                 VolumeType::Fat(ref mut fat) => {
-                    debug!("Updating FAT info sector");
-                    fat.update_info_sector(&self.block_device)?;
                     debug!("Updating dir entry {:?}", file_info.entry);
                     if file_info.entry.size != 0 {
                         // If you have a length, you must have a cluster
                         assert!(file_info.entry.cluster.0 != 0);
                     }
+                    // Directory entry first. FSInfo is advisory, so a failure
+                    // there must not skip the entry or fail the close.
                     fat.write_entry_to_disk(&self.block_device, &file_info.entry)?;
+                    let _ = fat.update_info_sector(&self.block_device);
                 }
             };
         }
@@ -1400,6 +1414,66 @@ mod tests {
                 })
             }
         );
+    }
+
+    /// MAX_VOLUMES is often 1. A failed FSInfo write used to return before the
+    /// slot was removed, so the next open was TooManyOpenVolumes.
+    #[test]
+    fn close_frees_slot_when_info_sector_write_fails() {
+        struct Dev;
+        impl BlockDevice for Dev {
+            type Error = &'static str;
+            fn read(
+                &self,
+                blocks: &mut [Block],
+                _start: BlockIdx,
+                _reason: &str,
+            ) -> Result<(), Self::Error> {
+                for block in blocks.iter_mut() {
+                    block.contents = [0u8; Block::LEN];
+                }
+                Ok(())
+            }
+            fn write(&self, _blocks: &[Block], _start: BlockIdx) -> Result<(), Self::Error> {
+                Err("info write failed")
+            }
+            fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
+                Ok(BlockCount(64))
+            }
+        }
+
+        let mut mgr: VolumeManager<Dev, Clock, 4, 4, 1> = VolumeManager::new(Dev, Clock);
+        let id = RawVolume(SearchId(7));
+        mgr.open_volumes
+            .push(VolumeInfo {
+                volume_id: id,
+                idx: VolumeIdx(0),
+                volume_type: VolumeType::Fat(fat::FatVolume {
+                    lba_start: BlockIdx(2048),
+                    num_blocks: BlockCount(1000),
+                    name: fat::VolumeName::new(*b"PI4DNS     "),
+                    blocks_per_cluster: 1,
+                    first_data_block: BlockCount(32),
+                    fat_start: BlockCount(32),
+                    second_fat_start: None,
+                    free_clusters_count: Some(10),
+                    next_free_cluster: Some(ClusterId(3)),
+                    cluster_count: 100,
+                    fat_specific_info: fat::FatSpecificInfo::Fat32(fat::Fat32Info {
+                        first_root_dir_cluster: ClusterId(2),
+                        info_location: BlockIdx(2049),
+                    }),
+                }),
+            })
+            .unwrap();
+        assert!(mgr.open_volumes.is_full());
+        assert!(mgr.close_volume(id).is_ok());
+        assert!(
+            mgr.open_volumes.is_empty(),
+            "volume slot stuck after FSInfo write failure"
+        );
+        let again = mgr.open_raw_volume(VolumeIdx(0));
+        assert!(!matches!(again, Err(crate::Error::TooManyOpenVolumes)));
     }
 }
 

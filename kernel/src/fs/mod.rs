@@ -84,7 +84,11 @@ pub fn init() -> Result<(), FsError> {
     let mut mgr = VolumeManager::new(DiskDev, Clock);
     match mgr.open_raw_volume(VolumeIdx(0)) {
         Ok(volume) => {
-            mgr.close_volume(volume).ok();
+            // Prove the volume can be opened, then put the slot back. A later
+            // save needs that only slot. release() always drops it.
+            if let Err(err) = release(&mut mgr, volume, None, None) {
+                log::warn!("FAT mount close failed: {err}");
+            }
             *FS.lock() = Some(mgr);
             log::info!("FAT32 filesystem mounted");
             append_log("boot");
@@ -162,6 +166,12 @@ fn write_file(name: &str, data: &[u8]) -> Result<(), FsError> {
     })
 }
 
+/// One open volume, directory, and file, closed on every return path.
+///
+/// `VolumeManager` is built with a single volume slot. Dropping a `RawVolume`
+/// does not free it. `release` is the only place that closes, so a missing
+/// `CONFIG.TXT`, a failed log write, or an error from the callback cannot
+/// leave the slot taken.
 fn with_file<R>(
     name: &str,
     mode: Mode,
@@ -176,32 +186,55 @@ fn with_file<R>(
     let dir = match mgr.open_root_dir(volume) {
         Ok(dir) => dir,
         Err(err) => {
-            mgr.close_volume(volume).ok();
+            let _ = release(mgr, volume, None, None);
             return Err(fs_err("open root", err));
         }
     };
     let file = match mgr.open_file_in_dir(dir, name, mode) {
         Ok(file) => file,
         Err(err) => {
-            mgr.close_dir(dir).ok();
-            mgr.close_volume(volume).ok();
+            let closed = release(mgr, volume, Some(dir), None);
             // A missing CONFIG.TXT on a fresh volume is normal.
             if matches!(err, embedded_sdmmc::Error::NotFound) {
-                return Err(FsError::Io {
+                return closed.and(Err(FsError::Io {
                     op: "open file",
                     detail: String::from("NotFound"),
-                });
+                }));
             }
-            return Err(fs_err("open file", err));
+            return Err(closed.err().unwrap_or_else(|| fs_err("open file", err)));
         }
     };
     let result = f(mgr, file);
-    let close_err = mgr.close_file(file).err();
-    mgr.close_dir(dir).ok();
-    mgr.close_volume(volume).ok();
-    match (result, close_err) {
+    let closed = release(mgr, volume, Some(dir), Some(file));
+    match (result, closed) {
         (Err(err), _) => Err(err),
-        (Ok(_), Some(err)) => Err(fs_err("close file", err)),
-        (Ok(value), None) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn release(
+    mgr: &mut Mgr,
+    volume: embedded_sdmmc::RawVolume,
+    dir: Option<embedded_sdmmc::RawDirectory>,
+    file: Option<RawFile>,
+) -> Result<(), FsError> {
+    let mut error = None;
+    if let Some(file) = file {
+        if let Err(err) = mgr.close_file(file) {
+            error = Some(fs_err("close file", err));
+        }
+    }
+    if let Some(dir) = dir {
+        if let Err(err) = mgr.close_dir(dir) {
+            error.get_or_insert_with(|| fs_err("close dir", err));
+        }
+    }
+    if let Err(err) = mgr.close_volume(volume) {
+        error.get_or_insert_with(|| fs_err("close volume", err));
+    }
+    match error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }

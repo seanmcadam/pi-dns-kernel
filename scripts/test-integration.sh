@@ -287,6 +287,11 @@ sleep 5
 curl -s -u admin:admin --max-time 5 -X POST \
     --data 'name=added.local&type=A&value=9.9.9.9&ttl=120' \
     http://127.0.0.1:${HTTP_HOST_PORT}/records > qemu/record-add.txt || true
+# A second save must also succeed. One leaked volume slot makes this
+# TooManyOpenVolumes even when the first response looked fine.
+curl -s -u admin:admin --max-time 5 -X POST \
+    --data 'name=tmp-again.local&type=A&value=1.2.3.9&ttl=60' \
+    http://127.0.0.1:${HTTP_HOST_PORT}/records > qemu/record-add-2.txt || true
 for i in 1 2 3 4 5 6 7 8; do
     curl -s -u admin:admin --max-time 5 -X POST \
         --data "name=tmp${i}.local&type=A&value=1.2.3.${i}&ttl=60" \
@@ -296,8 +301,18 @@ sleep 1
 kill $PERSIST_PID 2>/dev/null || true
 wait $PERSIST_PID 2>/dev/null || true
 sync
-if ! grep -q "Record added: added.local" qemu/record-add.txt; then
+if grep -q "TooManyOpenVolumes" qemu/record-add.txt qemu/record-add-2.txt qemu/persist-a.txt; then
+    echo "✗ FAT volume slot leaked (TooManyOpenVolumes)"
+    echo "--- record-add ---"; cat qemu/record-add.txt
+    echo "--- record-add-2 ---"; cat qemu/record-add-2.txt
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+elif ! grep -q "Record added: added.local" qemu/record-add.txt; then
     echo "✗ Web UI did not add added.local"
+    cat qemu/record-add.txt
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+elif ! grep -q "Record added: tmp-again.local" qemu/record-add-2.txt; then
+    echo "✗ Second save failed"
+    cat qemu/record-add-2.txt
     TESTS_FAILED=$((TESTS_FAILED + 1))
 elif ! mcopy -i qemu/disk.img@@${DISK_OFF} ::CONFIG.TXT - | grep -q "added.local A 9.9.9.9"; then
     echo "✗ CONFIG.TXT does not contain the new record"
