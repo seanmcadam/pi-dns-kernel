@@ -216,11 +216,11 @@ fn handle_index() -> HttpResponse {
 fn handle_status() -> HttpResponse {
     use alloc::format;
     
-    let uptime = crate::timer::get_ticks() / 1_000_000; // seconds
-    
     let json = format!(
-        r#"{{"status":"running","uptime":{},"dns_port":53,"http_port":80,"cache_entries":{}}}"#,
-        uptime,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{}}}"#,
+        crate::timer::uptime_secs(),
+        crate::timer::irq_ticks(),
+        crate::timer::TICK_HZ,
         crate::dns::cache_entries()
     );
     

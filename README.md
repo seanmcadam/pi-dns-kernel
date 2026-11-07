@@ -48,7 +48,8 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - Web dashboard to add and remove records
 
 ### Exceptions and MMU
-- EL1 vector table installed from `boot.s` before Rust runs. Synchronous exceptions, SError, and unexpected IRQs print ESR/ELR/FAR/SPSR plus the general registers, then halt. IRQs stay masked. There is no timer interrupt and no EL0 yet.
+- EL1 vector table installed from `boot.s` before Rust runs. Synchronous exceptions, SError, and unexpected IRQs print ESR/ELR/FAR/SPSR plus the general registers, then halt. The current-EL IRQ vector saves and restores general and SIMD registers, acknowledges the GICv2, and returns. There is no EL0 yet.
+- The ARM virtual timer (`CNTV`, PPI 11, INTID 27) ticks at 100 Hz. QEMU `virt` with `-cpu cortex-a72` is GICv2 (`0x08000000` distributor, `0x08010000` CPU interface); the run scripts pass `gic-version=2`. The Pi 4 GIC-400 addresses are compiled in and untested. `/status` reports uptime in seconds (`CNTVCT` / frequency) and the IRQ tick count. The poll loop is unchanged and is not preempted. Spurious GIC id 1023 is ignored.
 - Identity-mapped 4 KiB pages on TTBR0. TTBR1 is an empty table reserved for a later high-half kernel. `.text` is read-only and executable, `.rodata` is read-only and not executable, and data, bss, heap, and stack are read-write and not executable. One guard page sits under the stack.
 - Virtio rings and packet buffers are in `.dma` and mapped Normal non-cacheable so DMA stays coherent with the data cache on. Other RAM is write-back cacheable. UART, virtio-mmio, and the GIC are Device-nGnRE.
 - `GET /debug/fault/guard` and `GET /debug/fault/text` (HTTP basic auth) deliberately fault.

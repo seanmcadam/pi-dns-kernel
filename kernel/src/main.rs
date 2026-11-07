@@ -9,6 +9,7 @@ mod dns;
 mod exception;
 mod fs;
 mod http;
+mod gic;
 mod interrupts;
 mod mmu;
 mod logger;

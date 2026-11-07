@@ -79,7 +79,7 @@ echo "Exit: Ctrl-A then X"
 echo ""
 
 exec qemu-system-aarch64 \
-    -M virt \
+    -M virt,gic-version=2 \
     -cpu cortex-a72 \
     -m 512M \
     -kernel "$KERNEL" \

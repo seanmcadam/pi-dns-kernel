@@ -21,7 +21,7 @@ HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
 echo "Host DNS port ${DNS_HOST_PORT} -> guest 53, host HTTP port ${HTTP_HOST_PORT} -> guest 80"
 
 qemu-system-aarch64 \
-    -M virt \
+    -M virt,gic-version=2 \
     -cpu cortex-a72 \
     -m 512M \
     -kernel "$KERNEL" \

@@ -31,10 +31,15 @@
 //
 // The branch-per-slot shape is the same one used by
 // rust-embedded/rust-raspberrypi-OS-tutorials, which is MIT OR Apache-2.0.
-// This file is not a copy of that code. IRQs stay masked. Every handler
-// reports the fault and halts. The restore and eret after the call are the
-// path a later interrupt handler would return on. exception_handler does
-// not return today.
+// This file is not a copy of that code.
+//
+// The current-EL SPx IRQ slot is the one this kernel runs on. It saves the
+// general registers and the SIMD registers, calls irq_handler, restores
+// them, and erets. Hardware saves ELR_EL1 and SPSR_EL1 and masks IRQ for the
+// duration of the handler. eret puts both back, so a handler that returned
+// with IRQs unmasked stays unmasked. irq_handler acknowledges the GIC.
+// Every other slot still reports the fault and halts. exception_handler
+// does not return, so the restore after those calls is not reached.
 //
 // boot.s drops EL2 to EL1 before it installs this table. A real Pi 4
 // firmware handover is at EL2. That path is untested on hardware.
@@ -124,6 +129,87 @@ exception_vectors:
     eret
 .endm
 
+// 256 bytes of x0-x30, 512 bytes of q0-q31, 16 bytes of FPSR and FPCR.
+// 784 is a multiple of 16, and so is the incoming stack pointer.
+.macro enter_irq
+    sub     sp, sp, #784
+    stp     x0,  x1,  [sp, #16 * 0]
+    stp     x2,  x3,  [sp, #16 * 1]
+    stp     x4,  x5,  [sp, #16 * 2]
+    stp     x6,  x7,  [sp, #16 * 3]
+    stp     x8,  x9,  [sp, #16 * 4]
+    stp     x10, x11, [sp, #16 * 5]
+    stp     x12, x13, [sp, #16 * 6]
+    stp     x14, x15, [sp, #16 * 7]
+    stp     x16, x17, [sp, #16 * 8]
+    stp     x18, x19, [sp, #16 * 9]
+    stp     x20, x21, [sp, #16 * 10]
+    stp     x22, x23, [sp, #16 * 11]
+    stp     x24, x25, [sp, #16 * 12]
+    stp     x26, x27, [sp, #16 * 13]
+    stp     x28, x29, [sp, #16 * 14]
+    str     x30,      [sp, #16 * 15]
+    stp     q0,  q1,  [sp, #256 + 32 * 0]
+    stp     q2,  q3,  [sp, #256 + 32 * 1]
+    stp     q4,  q5,  [sp, #256 + 32 * 2]
+    stp     q6,  q7,  [sp, #256 + 32 * 3]
+    stp     q8,  q9,  [sp, #256 + 32 * 4]
+    stp     q10, q11, [sp, #256 + 32 * 5]
+    stp     q12, q13, [sp, #256 + 32 * 6]
+    stp     q14, q15, [sp, #256 + 32 * 7]
+    stp     q16, q17, [sp, #256 + 32 * 8]
+    stp     q18, q19, [sp, #256 + 32 * 9]
+    stp     q20, q21, [sp, #256 + 32 * 10]
+    stp     q22, q23, [sp, #256 + 32 * 11]
+    stp     q24, q25, [sp, #256 + 32 * 12]
+    stp     q26, q27, [sp, #256 + 32 * 13]
+    stp     q28, q29, [sp, #256 + 32 * 14]
+    stp     q30, q31, [sp, #256 + 32 * 15]
+    mrs     x0, fpsr
+    mrs     x1, fpcr
+    add     x2, sp, #768
+    stp     x0, x1, [x2]
+    bl      irq_handler
+    add     x2, sp, #768
+    ldp     x0, x1, [x2]
+    msr     fpsr, x0
+    msr     fpcr, x1
+    ldp     q30, q31, [sp, #256 + 32 * 15]
+    ldp     q28, q29, [sp, #256 + 32 * 14]
+    ldp     q26, q27, [sp, #256 + 32 * 13]
+    ldp     q24, q25, [sp, #256 + 32 * 12]
+    ldp     q22, q23, [sp, #256 + 32 * 11]
+    ldp     q20, q21, [sp, #256 + 32 * 10]
+    ldp     q18, q19, [sp, #256 + 32 * 9]
+    ldp     q16, q17, [sp, #256 + 32 * 8]
+    ldp     q14, q15, [sp, #256 + 32 * 7]
+    ldp     q12, q13, [sp, #256 + 32 * 6]
+    ldp     q10, q11, [sp, #256 + 32 * 5]
+    ldp     q8,  q9,  [sp, #256 + 32 * 4]
+    ldp     q6,  q7,  [sp, #256 + 32 * 3]
+    ldp     q4,  q5,  [sp, #256 + 32 * 2]
+    ldp     q2,  q3,  [sp, #256 + 32 * 1]
+    ldp     q0,  q1,  [sp, #256 + 32 * 0]
+    ldr     x30,      [sp, #16 * 15]
+    ldp     x28, x29, [sp, #16 * 14]
+    ldp     x26, x27, [sp, #16 * 13]
+    ldp     x24, x25, [sp, #16 * 12]
+    ldp     x22, x23, [sp, #16 * 11]
+    ldp     x20, x21, [sp, #16 * 10]
+    ldp     x18, x19, [sp, #16 * 9]
+    ldp     x16, x17, [sp, #16 * 8]
+    ldp     x14, x15, [sp, #16 * 7]
+    ldp     x12, x13, [sp, #16 * 6]
+    ldp     x10, x11, [sp, #16 * 5]
+    ldp     x8,  x9,  [sp, #16 * 4]
+    ldp     x6,  x7,  [sp, #16 * 3]
+    ldp     x4,  x5,  [sp, #16 * 2]
+    ldp     x2,  x3,  [sp, #16 * 1]
+    ldp     x0,  x1,  [sp, #16 * 0]
+    add     sp, sp, #784
+    eret
+.endm
+
 exc_sp0_sync:
     enter 0
 exc_sp0_irq:
@@ -135,7 +221,7 @@ exc_sp0_serr:
 exc_el1_sync:
     enter 4
 exc_el1_irq:
-    enter 5
+    enter_irq
 exc_el1_fiq:
     enter 6
 exc_el1_serr:

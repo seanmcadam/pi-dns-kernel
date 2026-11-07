@@ -15,7 +15,7 @@ echo "Using host ports DNS ${DNS_HOST_PORT} and HTTP ${HTTP_HOST_PORT}"
 # Start QEMU in background
 echo "Starting QEMU..."
 timeout 120 qemu-system-aarch64 \
-    -M virt \
+    -M virt,gic-version=2 \
     -cpu cortex-a72 \
     -m 512M \
     -kernel boot/kernel8.img \
@@ -208,6 +208,40 @@ if command -v dig &> /dev/null; then
     fi
 fi
 
+# Test 15: the virtual timer must advance while this QEMU is still up.
+echo ""
+echo "Test 15: Virtual timer tick rate"
+if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/status-a.txt; then
+    sleep 3
+    if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/status-b.txt \
+        && python3 - qemu/status-a.txt qemu/status-b.txt <<'PY'
+import json, sys
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+du = b["uptime"] - a["uptime"]
+dt = b["ticks"] - a["ticks"]
+print(f"uptime {a['uptime']} -> {b['uptime']} (delta {du})")
+print(f"ticks {a['ticks']} -> {b['ticks']} (delta {dt}) hz {b['tick_hz']}")
+# Host sleep is 3s. Integer uptime can move by 2 or 3, and TCG under load
+# can run a bit slow or a bit fast. 100 Hz over that window is a few hundred
+# ticks. Bounds stay wide on purpose.
+ok = b["tick_hz"] == 100 and b["ticks"] > 0 and 1 <= du <= 6 and 80 <= dt <= 800
+sys.exit(0 if ok else 1)
+PY
+    then
+        echo "✓ Uptime and timer ticks advanced at about 100 Hz"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo "✗ Timer rate was not about 100 Hz"
+        echo "--- first ---"; cat qemu/status-a.txt
+        echo "--- second ---"; cat qemu/status-b.txt
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+else
+    echo "✗ Could not read /status for the timer test"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Cleanup
 echo ""
 echo "Stopping QEMU..."
@@ -220,7 +254,7 @@ echo "Test 9: DHCP client and static fallback"
 ./scripts/build.sh --features dhcp-default >/tmp/build-dhcp.txt
 rm -f qemu/dhcp-serial.txt qemu/dhcp-fallback.txt
 timeout 20 qemu-system-aarch64 \
-    -M virt -cpu cortex-a72 -m 512M \
+    -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/dhcp-serial.txt \
     -display none -monitor none -nographic \
@@ -235,7 +269,7 @@ if grep -q "DHCP configured 10.0.2.15" qemu/dhcp-serial.txt; then
     echo "✓ QEMU user-net DHCP leased 10.0.2.15"
     grep "DHCP configured" qemu/dhcp-serial.txt
     timeout 20 qemu-system-aarch64 \
-        -M virt -cpu cortex-a72 -m 512M \
+        -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
         -kernel boot/kernel8.img \
         -serial file:qemu/dhcp-fallback.txt \
         -display none -monitor none -nographic \
@@ -275,7 +309,7 @@ mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/disk.img >/dev/null
 DISK_OFF=$((2048 * 512))
 rm -f qemu/persist-a.txt qemu/persist-b.txt
 timeout 40 qemu-system-aarch64 \
-    -M virt -cpu cortex-a72 -m 512M \
+    -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/persist-a.txt \
     -display none -monitor none -nographic \
@@ -324,7 +358,7 @@ elif ! mcopy -i qemu/disk.img@@${DISK_OFF} ::LOG.OLD - | grep -q "record added";
     TESTS_FAILED=$((TESTS_FAILED + 1))
 else
     timeout 30 qemu-system-aarch64 \
-        -M virt -cpu cortex-a72 -m 512M \
+        -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
         -kernel boot/kernel8.img \
         -serial file:qemu/persist-b.txt \
         -display none -monitor none -nographic \
@@ -359,7 +393,7 @@ fault_case() {
     local serial="qemu/fault-${name}.txt"
     rm -f "$serial"
     timeout 30 qemu-system-aarch64 \
-        -M virt -cpu cortex-a72 -m 512M \
+        -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
         -kernel boot/kernel8.img \
         -serial "file:${serial}" \
         -display none -monitor none -nographic \
@@ -417,7 +451,7 @@ echo ""
 echo "Test 14: Boot from EL2 (QEMU virtualization=on)"
 rm -f qemu/el2-serial.txt
 timeout 25 qemu-system-aarch64 \
-    -M virt,virtualization=on \
+    -M virt,virtualization=on,gic-version=2 \
     -cpu cortex-a72 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/el2-serial.txt \
