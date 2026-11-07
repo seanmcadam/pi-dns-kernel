@@ -6,9 +6,11 @@ extern crate alloc;
 mod config_manager;
 mod console;
 mod dns;
+mod exception;
 mod fs;
 mod http;
 mod interrupts;
+mod mmu;
 mod logger;
 mod mailbox;
 mod memory;
@@ -47,6 +49,10 @@ pub extern "C" fn kernel_main() -> ! {
     uart_pl011::init_pi4();
 
     uart_write("\r\n=== Pi4 DNS Server Kernel ===\r\n");
+
+    uart_write("[0] Enabling MMU and caches...\r\n");
+    mmu::init();
+    uart_write("[OK] MMU and caches enabled\r\n");
 
     uart_write("[1] Starting memory allocator...\r\n");
     unsafe {
@@ -136,6 +142,7 @@ pub extern "C" fn kernel_main() -> ! {
             uart_write("DNS server listening on port 53\r\n");
             uart_write("HTTP server listening on port 80\r\n");
             uart_write("DNS Server ready\r\n");
+            uart_write("MMU and caches enabled\r\n");
         }
     }
 }

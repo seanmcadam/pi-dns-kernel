@@ -10,18 +10,29 @@ SECTIONS
 
     .text :
     {
+        __text_start = .;
         KEEP(*(.text.boot))
+        . = ALIGN(2048);
+        KEEP(*(.text.vectors))
         *(.text*)
+        . = ALIGN(4096);
+        __text_end = .;
     }
 
     .rodata :
     {
+        __rodata_start = .;
         *(.rodata*)
+        . = ALIGN(4096);
+        __rodata_end = .;
     }
 
     .data :
     {
+        __data_start = .;
         *(.data*)
+        . = ALIGN(4096);
+        __data_end = .;
     }
 
     .bss ALIGN(4096) (NOLOAD) :
@@ -29,10 +40,22 @@ SECTIONS
         __bss_start = .;
         *(.bss*)
         *(COMMON)
+        . = ALIGN(4096);
         __bss_end = .;
     }
 
-    /* Heap sits in RAM, after the image. Stack grows down from 0x40080000. */
+    /* Virtio rings and buffers. Mapped Normal non-cacheable once the MMU is on. */
+    .dma ALIGN(4096) (NOLOAD) :
+    {
+        __dma_start = .;
+        *(.dma)
+        *(.dma.*)
+        . = ALIGN(4096);
+        __dma_end = .;
+    }
+
+    /* Heap sits in RAM, after the image. Stack grows down from 0x40080000.
+       The MMU leaves one guard page unmapped under the 256 KiB stack. */
     . = ALIGN(4096);
     __heap_start = .;
     . += 0x200000; /* 2MB heap */

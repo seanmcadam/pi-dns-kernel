@@ -49,7 +49,8 @@ echo ""
 echo "Test 1: Boot messages"
 if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "DNS server listening on port 53" qemu/boot-output.txt && \
-   grep -q "HTTP server listening on port 80" qemu/boot-output.txt; then
+   grep -q "HTTP server listening on port 80" qemu/boot-output.txt && \
+   grep -q "MMU and caches enabled" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -331,6 +332,68 @@ else
     kill $PERSIST_PID 2>/dev/null || true
     wait $PERSIST_PID 2>/dev/null || true
 fi
+
+# Test 12 and 13: exception report, and a write to .text must fault.
+fault_case() {
+    local name="$1"
+    local path="$2"
+    local marker="$3"
+    local iss="$4"
+    local serial="qemu/fault-${name}.txt"
+    rm -f "$serial"
+    timeout 30 qemu-system-aarch64 \
+        -M virt -cpu cortex-a72 -m 512M \
+        -kernel boot/kernel8.img \
+        -serial "file:${serial}" \
+        -display none -monitor none -nographic \
+        -netdev user,id=net0,${HOSTFWD} \
+        -device virtio-net-device,netdev=net0 \
+        >/tmp/qemu-fault-${name}.txt 2>&1 &
+    local pid=$!
+    sleep 5
+    # The endpoint is behind the same basic auth as the dashboard.
+    local unauth
+    unauth=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        "http://127.0.0.1:${HTTP_HOST_PORT}${path}" || true)
+    if [ "$unauth" != "401" ]; then
+        echo "✗ ${name} fault endpoint without auth returned ${unauth}"
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return
+    fi
+    curl -s -u admin:admin --max-time 5 \
+        "http://127.0.0.1:${HTTP_HOST_PORT}${path}" >/dev/null || true
+    sleep 1
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    if grep -q "=== EXCEPTION ===" "$serial" \
+        && grep -q "ESR_EL1:" "$serial" \
+        && grep -q "ELR_EL1:" "$serial" \
+        && grep -q "FAR_EL1:" "$serial" \
+        && grep -q "SPSR_EL1:" "$serial" \
+        && grep -q "x0:" "$serial" \
+        && grep -q "x30:" "$serial" \
+        && grep -q "halting" "$serial" \
+        && grep -q "$marker" "$serial" \
+        && grep -q "$iss" "$serial"; then
+        echo "✓ Fault report for ${name}"
+        grep -E "type:|ESR_EL1:|ISS:|FAR_EL1:|ELR_EL1:" "$serial"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo "✗ Fault report for ${name} was incomplete"
+        cat "$serial"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+}
+
+echo ""
+echo "Test 12: Data abort on the stack guard page"
+fault_case guard /debug/fault/guard "debug fault: read stack guard" "Translation fault"
+
+echo ""
+echo "Test 13: Write to kernel text is a permission fault"
+fault_case text /debug/fault/text "debug fault: write kernel text" "Permission fault"
 
 # Test 11: Pi 4 image links at 0x80000 and the SD files exist
 echo ""

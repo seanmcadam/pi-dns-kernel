@@ -73,9 +73,11 @@ struct Desc {
     next: u16,
 }
 
+#[link_section = ".dma"]
 static mut QUEUE: QueueArea = QueueArea {
     bytes: [0; QUEUE_BYTES],
 };
+#[link_section = ".dma"]
 static mut IO: IoBufs = IoBufs {
     header: [0; 16],
     data: [0; 512],

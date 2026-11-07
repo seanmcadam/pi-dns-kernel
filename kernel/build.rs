@@ -20,6 +20,7 @@ fn main() {
 
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rerun-if-changed=src/boot.s");
+    println!("cargo:rerun-if-changed=src/exception.s");
     println!("cargo:rerun-if-changed=link.ld");
     println!("cargo:rerun-if-changed=link-pi4.ld");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PI4");

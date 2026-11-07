@@ -35,9 +35,13 @@
 //   1. Work out which core is running and park every core except core 0.
 //   2. Turn on the floating-point / SIMD (NEON) unit so Rust code doesn't trap.
 //   3. Point the stack pointer at __stack_top.
-//   4. Zero the .bss section, since Rust expects zero-initialised statics.
-//   5. Call kernel_main() in main.rs, which never returns.
-//   6. If kernel_main ever returns anyway, park the core forever.
+//   4. Install the EL1 exception vectors in VBAR_EL1.
+//   5. Zero .bss, then the .dma section used by virtio.
+//   6. Call kernel_main() in main.rs, which never returns.
+//   7. If kernel_main ever returns anyway, park the core forever.
+//
+// This file still does not drop from EL2 to EL1. That is a later change.
+// The Pi 4 firmware normally enters at EL2, and that path is untested.
 // =============================================================================
 
 // Put the following code in its own section called .text.boot.
@@ -116,7 +120,19 @@ _start:
     mov     sp, x1              // sp = x1
 
     // -------------------------------------------------------------------------
-    // Step 4: Clear the .bss section.
+    // Step 4: Install the exception vector table.
+    // -------------------------------------------------------------------------
+    // VBAR_EL1 is the Vector Base Address Register for EL1. It must point at
+    // a 16-entry table aligned to 2 KiB. exception_vectors is defined in
+    // exception.s. From here on, a fault prints a report instead of hanging
+    // with no vectors installed. IRQs stay masked. There is still no EL2 to
+    // EL1 drop in this file.
+    ldr     x0, =exception_vectors
+    msr     vbar_el1, x0
+    isb
+
+    // -------------------------------------------------------------------------
+    // Step 5: Clear the .bss section.
     // -------------------------------------------------------------------------
     // .bss holds statics that start out as zero (for example
     // "static mut COUNTER: u64 = 0;"). To keep the image small, the
@@ -131,15 +147,28 @@ _start:
 
 3:
     cmp     x1, x2              // have we reached the end?
-    b.hs    4f                  // if x1 >= x2 (unsigned "higher or same"),
-                                // we're done, so jump forward to label 4
+    b.hs    7f                  // if x1 >= x2 (unsigned "higher or same"),
+                                // .bss is done, so clear .dma next
     str     xzr, [x1], #8       // store the zero register (xzr = always 0) at
                                 // [x1], then add 8 to x1 ("post-index" mode)
     b       3b                  // loop back to label 3
 
+    // .dma holds virtio descriptor rings and packet buffers. It is not part
+    // of .bss, so the loop above does not touch it. The MMU later maps it
+    // non-cacheable. Zero it the same way, 8 bytes at a time. If the section
+    // is empty, the compare falls through immediately.
+7:
+    ldr     x1, =__dma_start
+    ldr     x2, =__dma_end
+6:
+    cmp     x1, x2
+    b.hs    4f
+    str     xzr, [x1], #8
+    b       6b
+
 4:
     // -------------------------------------------------------------------------
-    // Step 5: Jump into Rust.
+    // Step 6: Jump into Rust.
     // -------------------------------------------------------------------------
     // kernel_main is defined in main.rs as
     //     #[no_mangle] pub extern "C" fn kernel_main() -> !
@@ -149,7 +178,7 @@ _start:
     bl      kernel_main
 
     // -------------------------------------------------------------------------
-    // Step 6: Safety net.
+    // Step 7: Safety net.
     // -------------------------------------------------------------------------
     // If kernel_main ever does return, don't run off the end into whatever
     // bytes come next. Sleep forever instead.

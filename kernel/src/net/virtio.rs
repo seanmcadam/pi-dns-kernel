@@ -79,15 +79,19 @@ struct Desc {
     next: u16,
 }
 
+#[link_section = ".dma"]
 static mut RXQ: QueueArea = QueueArea {
     bytes: [0; QUEUE_BYTES],
 };
+#[link_section = ".dma"]
 static mut TXQ: QueueArea = QueueArea {
     bytes: [0; QUEUE_BYTES],
 };
+#[link_section = ".dma"]
 static mut RX_BUFS: PacketBufs = PacketBufs {
     bufs: [[0; BUF_SIZE]; QSIZE],
 };
+#[link_section = ".dma"]
 static mut TX_BUFS: PacketBufs = PacketBufs {
     bufs: [[0; BUF_SIZE]; QSIZE],
 };

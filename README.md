@@ -15,6 +15,8 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 | DHCP | Working | User-net lease, static fallback on timeout |
 | FAT32 config | Working | virtio-blk, records survive reboot, rotating logs |
 | Pi 4 image | Compiles, untested on hardware | `0x80000`, PL011, EMMC2, GENET |
+| EL1 exceptions | Working on QEMU | VBAR_EL1, fault report, then halt |
+| MMU | Working on QEMU | Identity map, caches on, W^X. Pi 4 map untested |
 
 ---
 
@@ -44,6 +46,12 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - DHCP client with a configurable static fallback
 - virtio-blk FAT32 volume for `CONFIG.TXT`, plus `LOG.TXT` rotated to `LOG.OLD`
 - Web dashboard to add and remove records
+
+### Exceptions and MMU
+- EL1 vector table installed from `boot.s` before Rust runs. Synchronous exceptions, SError, and unexpected IRQs print ESR/ELR/FAR/SPSR plus the general registers, then halt. IRQs stay masked. There is no timer interrupt and no EL0 yet.
+- Identity-mapped 4 KiB pages on TTBR0. TTBR1 is an empty table reserved for a later high-half kernel. `.text` is read-only and executable, `.rodata` is read-only and not executable, and data, bss, heap, and stack are read-write and not executable. One guard page sits under the stack.
+- Virtio rings and packet buffers are in `.dma` and mapped Normal non-cacheable so DMA stays coherent with the data cache on. Other RAM is write-back cacheable. UART, virtio-mmio, and the GIC are Device-nGnRE.
+- `GET /debug/fault/guard` and `GET /debug/fault/text` (HTTP basic auth) deliberately fault. This build does not drop EL2 to EL1.
 
 ### Pi 4 image (untested on hardware)
 - Separate link at `0x80000`

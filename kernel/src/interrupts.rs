@@ -1,6 +1,7 @@
 pub fn init() {
-    // For now, we run with interrupts disabled
-    // Future enhancement: set up GIC-400 for proper interrupt handling
+    // VBAR_EL1 is installed in boot.s. IRQ and FIQ stay masked. The vector
+    // stubs only report an interrupt if one arrives. Timer interrupts and
+    // the EL2-to-EL1 drop are not part of this kernel yet.
 }
 
 pub fn enable() {

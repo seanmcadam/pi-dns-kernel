@@ -129,6 +129,8 @@ fn handle_request(request: &HttpRequest) -> HttpResponse {
         "/config" => handle_config(request),
         "/records" => handle_records(request),
         "/records/delete" => handle_record_delete(request),
+        "/debug/fault/guard" => crate::exception::fault_guard(),
+        "/debug/fault/text" => crate::exception::fault_text(),
         _ => HttpResponse::not_found(),
     }
 }
