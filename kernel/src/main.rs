@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod addr;
 mod config_manager;
 mod console;
 mod dns;
@@ -13,14 +14,13 @@ mod gic;
 mod interrupts;
 mod mmu;
 mod logger;
-mod mailbox;
 mod memory;
 mod net;
 mod panic;
 mod task;
 mod user_fd;
 mod timer;
-mod uart;
+#[cfg(feature = "pi4")]
 mod uart_pl011;
 
 use memory::ALLOCATOR;

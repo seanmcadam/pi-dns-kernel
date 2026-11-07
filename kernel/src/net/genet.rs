@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-const BASE: usize = 0xFD58_0000;
+const BASE: usize = crate::addr::phys_to_virt(0xFD58_0000) as usize;
 
 const SYS_REV_CTRL: usize = 0x00;
 const SYS_RBUF_FLUSH_CTRL: usize = 0x08;
@@ -151,7 +151,7 @@ impl GenetDevice {
             let buf = &mut TX_BUFS[index];
             let n = frame.len().min(BUF_LEN);
             buf[..n].copy_from_slice(&frame[..n]);
-            let addr = buf.as_ptr() as u64;
+            let addr = crate::addr::virt_to_phys(buf.as_ptr() as u64);
             let desc = GENET_TX_OFF + index * DMA_DESC_SIZE;
             write(desc + DESC_ADDRESS_LO, addr as u32);
             write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
@@ -217,7 +217,7 @@ fn init_rx_descriptors() {
 
 fn program_rx_desc(index: usize) {
     unsafe {
-        let addr = RX_BUFS[index].as_ptr() as u64;
+        let addr = crate::addr::virt_to_phys(RX_BUFS[index].as_ptr() as u64);
         let desc = GENET_RX_OFF + index * DMA_DESC_SIZE;
         write(desc + DESC_ADDRESS_LO, addr as u32);
         write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
@@ -309,7 +309,7 @@ fn board_mac() -> [u8; 6] {
         pad: [0; 2],
         end: 0,
     };
-    let addr = &mut msg as *mut Msg as u32;
+    let addr = crate::addr::virt_to_phys(&mut msg as *mut Msg as u64) as u32;
     if mailbox_call(addr) {
         if msg.mac.iter().any(|b| *b != 0) {
             return msg.mac;
@@ -319,7 +319,7 @@ fn board_mac() -> [u8; 6] {
 }
 
 fn mailbox_call(addr: u32) -> bool {
-    const MAILBOX: usize = 0xFE00_B880;
+    const MAILBOX: usize = crate::addr::phys_to_virt(0xFE00_B880) as usize;
     const STATUS: usize = 0x18;
     const WRITE: usize = 0x20;
     const READ: usize = 0x00;

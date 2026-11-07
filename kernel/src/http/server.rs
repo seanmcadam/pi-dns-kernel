@@ -1,5 +1,5 @@
 use crate::config_manager::HttpConfig;
-use alloc::{vec, vec::Vec, string::{String, ToString}, format};
+use alloc::{format, string::String, vec};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use http_server::{HttpRequest, HttpResponse, parse_basic_auth};

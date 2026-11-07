@@ -7,7 +7,9 @@ use super::genet::GenetDevice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
+    #[cfg(not(feature = "pi4"))]
     Virtio,
+    #[cfg(feature = "pi4")]
     Genet,
 }
 

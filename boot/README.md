@@ -24,7 +24,7 @@ For a real Pi 4 SD card, you need:
 3. Copy config.txt to the root
 4. Copy the built kernel8.img to the root
 
-The Pi 4 firmware will load kernel8.img at address 0x80000 and jump to it.
+The Pi 4 firmware loads kernel8.img at physical address 0x80000 and jumps to it. The kernel is linked at 0xFFFF000000080000 and turns the MMU on before using that address. This image has not been tested on hardware.
 
 ## Serial Console
 

@@ -2,21 +2,21 @@
 
 A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the Raspberry Pi 4 (BCM2711, AArch64) that implements a complete DNS server appliance.
 
-**Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. A separate Pi 4 image links at `0x80000`. That image has not been tested on hardware.
+**Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. The DNS resolver runs at EL0. The kernel is linked in the upper half. A separate Pi 4 image is linked at `0xFFFF000000080000` and the firmware still loads that raw file at physical `0x80000`. That image has not been tested on hardware.
 
 ## Quick Status
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Boot (QEMU virt) | Working | Raw image linked at `0x40080000` |
+| Boot (QEMU virt) | Working | Linked at `0xFFFF000040080000`, loaded at `0x40080000` |
 | VirtIO-net | Working | Legacy virtio-mmio, ARP/ICMP, UDP, TCP |
-| DNS | Working | Local records, upstream forward, cache |
+| DNS | Working | Resolver at EL0. Local records, upstream forward, cache |
 | HTTP | Working | Dashboard can add and remove records |
 | DHCP | Working | User-net lease, static fallback on timeout |
 | FAT32 config | Working | virtio-blk, records survive reboot, rotating logs |
-| Pi 4 image | Compiles, untested on hardware | `0x80000`, PL011, EMMC2, GENET |
+| Pi 4 image | Compiles, untested on hardware | High link `0xFFFF000000080000`, load `0x80000`, PL011, EMMC2, GENET |
 | EL1 exceptions | Working on QEMU | VBAR_EL1, fault report, then halt |
-| MMU | Working on QEMU | Identity map, caches on, W^X. Pi 4 map untested |
+| MMU | Working on QEMU | Kernel in TTBR1, user window in TTBR0, W^X. Pi 4 map untested |
 
 ---
 
@@ -50,14 +50,42 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 ### Exceptions and MMU
 - EL1 vector table installed from `boot.s` before Rust runs. Synchronous exceptions, SError, and unexpected IRQs from EL1 print ESR/ELR/FAR/SPSR plus the general registers, then halt. The current-EL IRQ vector saves and restores general and SIMD registers, acknowledges the GICv2, and returns. Lower-EL AArch64 sync and IRQ save the user task and can return to it or to the kernel.
 - The ARM virtual timer (`CNTV`, PPI 11, INTID 27) ticks at 100 Hz. QEMU `virt` with `-cpu cortex-a72` is GICv2 (`0x08000000` distributor, `0x08010000` CPU interface); the run scripts pass `gic-version=2`. The Pi 4 GIC-400 addresses are compiled in and untested. `/status` reports uptime in seconds (`CNTVCT` / frequency) and the IRQ tick count. The poll loop is unchanged and is not preempted. Spurious GIC id 1023 is ignored.
-- EL0 runs from a window at `0x1_0000_0000` in TTBR0, outside the identity map. Kernel pages are EL1-only. User code is EL0 read/execute and privileged-execute-never; user data, heap, and stack are EL0 read/write and not executable. User pages are non-global with ASID 1. PAN is enabled when the CPU implements it. The kernel stays identity-mapped: moving it to TTBR1 needs a high link address plus a second identity map for virtio DMA. A boot-time user program logs, yields, waits for a tick, and exits. The DNS resolver then runs in that window: it parses queries, checks the blocklist, answers local names, caches, and forwards upstream. UDP and TCP sockets, the clock, and the config text are syscalls. Bad pointers return an error. A kernel load, a privileged `mrs`, or a branch to the stack kills that task. The kernel keeps the NIC, the socket buffers, storage, and the web UI. Yield is cooperative. The timer IRQ at EL0 resumes the same task and does not preempt. Upstream waits use the timer counter.
-- Identity-mapped 4 KiB pages on TTBR0. TTBR1 is an empty table reserved for a later high-half kernel. `.text` is read-only and executable, `.rodata` is read-only and not executable, and data, bss, heap, and stack are read-write and not executable. One guard page sits under the stack.
+- The kernel is linked in the upper half and runs from TTBR1. QEMU's link address is `0xFFFF000040080000` (the raw image is still loaded at physical `0x40080000`). The Pi 4 link address is `0xFFFF000000080000` (the firmware still loads the raw image at physical `0x80000`; that image is untested on hardware). Bits 47:0 of a kernel virtual address are the physical address. `boot.s` builds a 1 GiB identity map in TTBR0 and the same blocks in TTBR1, turns the MMU on, jumps to the high PC, then clears TTBR0. Rust then installs the strict TTBR1 map. TTBR0 holds only the user window after that. EL0 cannot walk TTBR1, so a user load of kernel memory faults.
+- EL0 runs from a window at `0x1_0000_0000` in its own TTBR0 root. Kernel pages are EL1-only. User code is EL0 read/execute and privileged-execute-never; user data, heap, and stack are EL0 read/write and not executable. User pages are non-global with ASID 1. PAN is enabled when the CPU implements it. A boot-time user program logs, yields, waits for a tick, and exits. The DNS resolver then runs in that window: it parses queries, checks the blocklist, answers local names, caches, and forwards upstream. UDP and TCP sockets, the clock, and the config text are syscalls. Bad pointers return an error. A kernel load, a privileged `mrs`, or a branch to the stack kills that task. The kernel keeps the NIC, the socket buffers, storage, and the web UI. Yield is cooperative. The timer IRQ at EL0 resumes the same task and does not preempt. Upstream waits use the timer counter.
+- Strict TTBR1 map: `.text` is read-only and executable, `.rodata` is read-only and not executable, and data, bss, heap, and stack are read-write and not executable. One guard page sits under the stack. Devices are programmed with physical addresses. The CPU uses the high alias, including for `.dma`.
 - Virtio rings and packet buffers are in `.dma` and mapped Normal non-cacheable so DMA stays coherent with the data cache on. Other RAM is write-back cacheable. UART, virtio-mmio, and the GIC are Device-nGnRE.
 - `GET /debug/fault/guard` and `GET /debug/fault/text` (HTTP basic auth) deliberately fault.
 - `boot.s` drops EL2 to EL1h when `CurrentEL` is EL2 (QEMU `-M virt,virtualization=on`, and a Pi 4 firmware handover). QEMU `-kernel` without that option is already at EL1 and skips the drop. The boot log prints `Entered at EL` and `Running at EL`. The Pi 4 drop is untested on hardware.
 
+### EL0 syscall ABI
+The user program puts the number in `x8`, arguments in `x0`–`x5`, and reads the result from `x0`. A pointer must lie in the user code, data, heap, or stack window. A store into user code returns `-2` and is not performed. The kernel does not allocate on these calls.
+
+| x8 | Call | Result |
+|----|------|--------|
+| 0 | `log(ptr, len)` | `0`, or `-2` if the slice is not in the user window. `len` is 1..=128 |
+| 1 | `yield` | `0`. The kernel poll loop runs, then the same task resumes |
+| 2 | `uptime_ticks` | IRQ tick count (100 Hz) |
+| 3 | `exit(code)` | Does not return |
+| 4 | `time_ms` | `CNTPCT` milliseconds, not the IRQ tick count |
+| 5 | `udp_bind(port)` | fd, or an error |
+| 6 | `udp_recv(fd, buf, cap, addr)` | length, or `-11` if nothing is waiting. `addr` is 8 writable bytes: IPv4, big-endian port, 2 bytes of pad |
+| 7 | `udp_send(fd, buf, len, ip, port)` | `0` on success. `ip` is a `u32` whose big-endian bytes are the address |
+| 8 | `tcp_listen(port)` | fd |
+| 9 | `tcp_accept(fd)` | new fd, or `-11` |
+| 10 | `tcp_recv(fd, buf, cap)` | length, `0` if the peer has closed, or `-11` |
+| 11 | `tcp_send(fd, buf, len)` | bytes sent, or an error |
+| 12 | `tcp_close(fd)` | `0` |
+| 13 | `config_records(buf, cap)` | length of `name TYPE value ttl` lines |
+| 14 | `config_upstreams(buf, cap)` | length of `a.b.c.d` lines |
+| 15 | `config_blocklist(buf, cap)` | length of `name` lines |
+| 16 | `config_cache_size` | configured cache size |
+| 17 | `set_cache_entries(n)` | `0`. `/status` reads this counter |
+| other | | `-1` |
+
+Errors: `-1` unknown number, `-2` bad pointer, `-3` bad fd, `-4` bad argument, `-5` I/O, `-6` too many fds, `-7` the config text does not fit, `-11` try again. Packet and config buffers are at most 4096 bytes. There are 8 fds.
+
 ### Pi 4 image (untested on hardware)
-- Separate link at `0x80000`
+- Linked at `0xFFFF000000080000`. The firmware loads the raw image at physical `0x80000`.
 - PL011 UART on GPIO 14/15
 - EMMC2 SD driver and GENET Ethernet driver, compiled into `boot/pi4/kernel8.img`
 
@@ -205,7 +233,7 @@ All tests run with `std` feature for host-side validation.
 - `dig` for `example.com` through QEMU user networking, and a second query served from the cache
 - a DHCP lease from QEMU user-net, and the static fallback when no DHCP server answers
 - adding a record in the web UI, rebooting the same FAT disk, and resolving that name
-- the Pi 4 image links at `0x80000` and `boot/pi4/config.txt` names `kernel8.img`
+- the Pi 4 image links at `0xFFFF000000080000` and `boot/pi4/config.txt` names `kernel8.img`
 
 ## Deployment
 
@@ -219,7 +247,7 @@ Note: QEMU's raspi3b/raspi4b models have limited peripheral support. Network tes
 
 ### Real Raspberry Pi 4
 
-**This image has not been tested on hardware.** `scripts/build-pi4.sh` is a separate target from the QEMU image. Do not copy `boot/kernel8.img` to the card: that file is linked at `0x40080000` for QEMU. The Pi 4 file is `boot/pi4/kernel8.img`, linked at `0x80000`.
+**This image has not been tested on hardware.** `scripts/build-pi4.sh` is a separate target from the QEMU image. Do not copy `boot/kernel8.img` to the card: that file is the QEMU image, linked at `0xFFFF000040080000` and loaded at physical `0x40080000`. The Pi 4 file is `boot/pi4/kernel8.img`, linked at `0xFFFF000000080000`. The firmware loads that raw file at physical `0x80000`.
 
 1. Build the SD card files:
 
@@ -229,7 +257,7 @@ Note: QEMU's raspi3b/raspi4b models have limited peripheral support. Network tes
 
    That writes:
 
-   - `boot/pi4/kernel8.img` — raw kernel, entry at `0x80000`
+   - `boot/pi4/kernel8.img` — raw kernel. The ELF entry is `0xFFFF000000080000`. The firmware loads the file at physical `0x80000`.
    - `boot/pi4/config.txt` — `arm_64bit=1`, `enable_uart=1`, `kernel=kernel8.img`
 
    The image uses the Pi 4 PL011 UART at `0xFE201000` (GPIO 14/15, 115200 8N1), the EMMC2 SD controller at `0xFE340000`, and the GENET Ethernet controller at `0xFD580000`.

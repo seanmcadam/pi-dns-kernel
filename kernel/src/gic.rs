@@ -8,15 +8,15 @@
 //! that returns 1023 is a spurious interrupt and must not be completed.
 
 #[cfg(not(feature = "pi4"))]
-const GICD: usize = 0x0800_0000;
+const GICD: usize = crate::addr::phys_to_virt(0x0800_0000) as usize;
 #[cfg(not(feature = "pi4"))]
-const GICC: usize = 0x0801_0000;
+const GICC: usize = crate::addr::phys_to_virt(0x0801_0000) as usize;
 
-// BCM2711 GIC-400. Untested on hardware.
+// BCM2711 GIC-400. Untested on hardware. CPU accesses use the high alias.
 #[cfg(feature = "pi4")]
-const GICD: usize = 0xFF84_1000;
+const GICD: usize = crate::addr::phys_to_virt(0xFF84_1000) as usize;
 #[cfg(feature = "pi4")]
-const GICC: usize = 0xFF84_2000;
+const GICC: usize = crate::addr::phys_to_virt(0xFF84_2000) as usize;
 
 /// Virtual timer, PPI 11. `16 + 11`.
 pub const TIMER_IRQ: u32 = 27;

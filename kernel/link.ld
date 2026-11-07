@@ -2,10 +2,12 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* QEMU's virt machine loads a raw kernel at RAM base + 0x80000.
-       RAM starts at 0x40000000, so the image must be linked at 0x40080000.
-       The Pi 4 image uses link-pi4.ld and is linked at 0x80000. */
-    . = 0x40080000;
+    /* QEMU loads the raw image at physical 0x40080000 (RAM 0x40000000 + 0x80000).
+       The link address is that physical address with the upper bits set, so
+       the kernel runs from TTBR1. Bits 47:0 still equal the physical address.
+       objcopy -O binary starts at the lowest LMA, so the file stays the size
+       of the image. The Pi 4 image uses link-pi4.ld. */
+    . = 0xFFFF000040080000;
     __stack_top = .;
 
     .text :

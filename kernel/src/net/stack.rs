@@ -1,5 +1,5 @@
 use super::EthernetDevice;
-use alloc::vec::{self, Vec};
+use alloc::vec::Vec;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
@@ -27,7 +27,6 @@ impl NetworkStack {
 
     pub fn configure_static(&mut self, ip: [u8; 4], netmask: [u8; 4], gateway: [u8; 4]) {
         let ip_addr = Ipv4Address::from_bytes(&ip);
-        let netmask_addr = Ipv4Address::from_bytes(&netmask);
         let prefix_len = netmask_to_prefix_len(netmask);
 
         self.iface.update_ip_addrs(|addrs| {
@@ -43,10 +42,6 @@ impl NetworkStack {
 
     pub fn poll(&mut self, timestamp: Instant, device: &mut EthernetDevice) {
         self.iface.poll(timestamp, device, &mut self.sockets);
-    }
-
-    pub fn iface_mut(&mut self) -> &mut Interface {
-        &mut self.iface
     }
 
     pub fn sockets_mut(&mut self) -> &mut SocketSet<'static> {

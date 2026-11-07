@@ -133,22 +133,6 @@ pub fn get_ticks() -> u64 {
     ticks
 }
 
-pub fn delay_us(us: u64) {
-    // Get timer frequency
-    let freq = get_timer_frequency();
-    
-    let start = get_ticks();
-    let target = start + (us * freq) / 1_000_000;
-    
-    while get_ticks() < target {
-        core::hint::spin_loop();
-    }
-}
-
-pub fn delay_ms(ms: u64) {
-    delay_us(ms * 1000);
-}
-
 fn get_timer_frequency() -> u64 {
     let freq: u64;
     unsafe {

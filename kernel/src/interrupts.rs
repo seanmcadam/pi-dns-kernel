@@ -22,12 +22,6 @@ pub fn enable() {
     }
 }
 
-pub fn disable() {
-    unsafe {
-        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-    }
-}
-
 /// Called from the current-EL IRQ vector with general and SIMD registers
 /// already saved. 1023 is spurious and is not completed. Any other id is
 /// completed so the CPU interface cannot stick.

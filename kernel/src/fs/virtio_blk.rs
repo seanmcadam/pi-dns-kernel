@@ -14,11 +14,10 @@
 //! `blk io error`.
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
 use spin::Mutex;
 
-const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+const VIRTIO_MMIO_BASE: usize = crate::addr::phys_to_virt(0x0a00_0000) as usize;
 const VIRTIO_MMIO_STRIDE: usize = 0x200;
 const VIRTIO_MMIO_SLOTS: usize = 32;
 
@@ -101,7 +100,6 @@ struct VirtioBlk {
 }
 
 static DISK: Mutex<Option<VirtioBlk>> = Mutex::new(None);
-static READY: AtomicBool = AtomicBool::new(false);
 
 pub struct DiskDev;
 
@@ -119,12 +117,7 @@ pub fn probe() -> bool {
         log::info!("VirtIO blk ready, {} sectors", dev.capacity);
     }
     *DISK.lock() = Some(dev);
-    READY.store(true, Ordering::Relaxed);
     true
-}
-
-pub fn is_ready() -> bool {
-    READY.load(Ordering::Relaxed)
 }
 
 impl BlockDevice for DiskDev {
@@ -290,9 +283,9 @@ impl VirtioBlk {
             }
             write_volatile((*io).status.as_mut_ptr(), 0xff);
 
-            let header_addr = (*io).header.as_ptr() as u64;
-            let data_addr = (*io).data.as_ptr() as u64;
-            let status_addr = (*io).status.as_ptr() as u64;
+            let header_addr = crate::addr::virt_to_phys((*io).header.as_ptr() as u64);
+            let data_addr = crate::addr::virt_to_phys((*io).data.as_ptr() as u64);
+            let status_addr = crate::addr::virt_to_phys((*io).status.as_ptr() as u64);
             let data_flags = if kind == BLK_T_IN {
                 VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
             } else {
@@ -397,7 +390,7 @@ fn install_queue(base: usize, q: *mut QueueArea, legacy: bool) -> bool {
         return false;
     }
     write_reg(base, REG_QUEUE_NUM, QSIZE as u32);
-    let q_addr = q as u64;
+    let q_addr = crate::addr::virt_to_phys(q as u64);
     if legacy {
         write_reg(base, REG_GUEST_PAGE_SIZE, 4096);
         write_reg(base, REG_QUEUE_ALIGN, 4096);

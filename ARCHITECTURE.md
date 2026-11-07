@@ -1,5 +1,45 @@
 # Architecture Documentation
 
+## Current address space
+
+The kernel is linked in the upper half and runs from TTBR1. QEMU loads the raw image at physical `0x40080000` and the link address is `0xFFFF000040080000`. The Pi 4 firmware loads the raw image at physical `0x80000` and the link address is `0xFFFF000000080000`. That Pi 4 image has not been tested on hardware. Bits 47:0 of a kernel virtual address equal the physical address.
+
+`boot.s` drops EL2 to EL1 when it entered at EL2, builds a 1 GiB block map, turns the MMU on, jumps to the high PC, and clears TTBR0. Rust then installs a strict TTBR1 map: kernel text is read-only and executable, rodata is read-only, data is not executable, `.dma` is Normal non-cacheable, devices are Device-nGnRE, and one guard page under the stack is unmapped. Devices are given physical addresses. The CPU uses the high alias.
+
+TTBR0 holds only the EL0 window, in its own page tables:
+
+- code `0x1_0000_0000`, 512 KiB, EL0 read/execute
+- a gap, then data `0x1_0009_0000`, 64 KiB
+- heap `0x1_000A_0000`, 1536 KiB
+- stack `0x1_0022_0000`, 64 KiB
+
+User pages are non-global, ASID 1. EL0 cannot walk TTBR1, so a user access to kernel memory faults and kills that task. The DNS resolver runs in this window. The kernel keeps the NIC, the smoltcp sockets, storage, and the HTTP server. Yield is cooperative. A timer IRQ at EL0 resumes the same task.
+
+Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
+
+| x8 | Call |
+|----|------|
+| 0 | `log(ptr, len)` |
+| 1 | `yield` |
+| 2 | `uptime_ticks` |
+| 3 | `exit(code)` |
+| 4 | `time_ms` |
+| 5 | `udp_bind(port)` |
+| 6 | `udp_recv(fd, buf, cap, addr)` |
+| 7 | `udp_send(fd, buf, len, ip, port)` |
+| 8 | `tcp_listen(port)` |
+| 9 | `tcp_accept(fd)` |
+| 10 | `tcp_recv(fd, buf, cap)` |
+| 11 | `tcp_send(fd, buf, len)` |
+| 12 | `tcp_close(fd)` |
+| 13 | `config_records(buf, cap)` |
+| 14 | `config_upstreams(buf, cap)` |
+| 15 | `config_blocklist(buf, cap)` |
+| 16 | `config_cache_size` |
+| 17 | `set_cache_entries(n)` |
+
+Anything else returns `-1`. `-2` is a bad user pointer. `-11` means try again. The older sections below describe earlier revisions of this tree.
+
 ## Overview
 
 This is a bare-metal operating system kernel written in Rust for the Raspberry Pi 4, implementing a DNS server appliance. The design prioritizes simplicity, testability, and clear separation of concerns.
@@ -19,21 +59,13 @@ This is a bare-metal operating system kernel written in Rust for the Raspberry P
 **Location**: `kernel/src/boot.s`, `kernel/src/main.rs`
 
 The boot process:
-1. Pi 4 firmware loads `kernel8.img` at `0x80000`
-2. Assembly code (`_start`) runs on core 0, halts cores 1-3
-3. Sets stack pointer at `0x80000`
-4. Clears BSS section
-5. Jumps to Rust `kernel_main()`
+1. The loader copies the raw image to a physical address: `0x40080000` on QEMU virt, `0x80000` on the Pi 4
+2. Assembly code (`_start`) runs on core 0 and parks the other cores
+3. Sets the stack at that physical address, drops EL2 to EL1 when needed, and zeroes BSS
+4. Turns the MMU on and jumps to the upper-half link address
+5. Calls Rust `kernel_main()`
 
-**Memory Layout** (`link.ld`):
-```
-0x00000 - 0x80000: Reserved (firmware, etc.)
-0x80000 - ...:     Kernel code (.text, .rodata, .data)
-...:              BSS (uninitialized data)
-...:              Heap (1 MB bump allocator)
-```
-
-Stack grows downward from `0x80000`.
+The stack grows down from the load address. The QEMU link script is `kernel/link.ld`. The Pi 4 link script is `kernel/link-pi4.ld`.
 
 ### System Layer
 

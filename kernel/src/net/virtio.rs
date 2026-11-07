@@ -6,11 +6,11 @@
 /// and stay put for the life of the kernel.
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+const VIRTIO_MMIO_BASE: usize = crate::addr::phys_to_virt(0x0a00_0000) as usize;
 const VIRTIO_MMIO_STRIDE: usize = 0x200;
 const VIRTIO_MMIO_SLOTS: usize = 32;
 
@@ -420,10 +420,10 @@ fn find_net_device() -> Option<usize> {
     None
 }
 
-static CACHED_BASE: AtomicU32 = AtomicU32::new(0);
+static CACHED_BASE: AtomicUsize = AtomicUsize::new(0);
 
 fn set_cached_base(base: usize) {
-    CACHED_BASE.store(base as u32, Ordering::Relaxed);
+    CACHED_BASE.store(base, Ordering::Relaxed);
 }
 
 fn cached_base() -> Option<usize> {
@@ -431,7 +431,7 @@ fn cached_base() -> Option<usize> {
     if v == 0 {
         None
     } else {
-        Some(v as usize)
+        Some(v)
     }
 }
 
@@ -444,7 +444,7 @@ fn install_queue(base: usize, index: u32, q: *mut QueueArea, legacy: bool) -> bo
     }
     write_reg(base, REG_QUEUE_NUM, QSIZE as u32);
 
-    let q_addr = q as u64;
+    let q_addr = crate::addr::virt_to_phys(q as u64);
     if legacy {
         write_reg(base, REG_GUEST_PAGE_SIZE, 4096);
         write_reg(base, REG_QUEUE_ALIGN, 4096);
@@ -496,7 +496,7 @@ fn used_elem(q: *mut QueueArea, index: usize) -> (u32, u32) {
 }
 
 fn buf_addr(bufs: *mut PacketBufs, index: usize) -> u64 {
-    unsafe { (*bufs).bufs[index].as_mut_ptr() as u64 }
+    unsafe { crate::addr::virt_to_phys((*bufs).bufs[index].as_mut_ptr() as u64) }
 }
 
 fn device_features(base: usize, sel: u32) -> u32 {
@@ -538,7 +538,7 @@ fn barrier() {
 
 fn uart_log(s: &str) {
     unsafe {
-        let uart = 0x0900_0000 as *mut u32;
+        let uart = crate::addr::phys_to_virt(0x0900_0000) as *mut u32;
         for byte in s.bytes() {
             write_volatile(uart, byte as u32);
         }

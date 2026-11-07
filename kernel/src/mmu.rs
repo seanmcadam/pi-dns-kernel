@@ -1,28 +1,28 @@
-//! Identity-mapped EL1 MMU, plus a small EL0 window.
+//! Upper-half EL1 MMU, plus a small EL0 window in TTBR0.
 //!
-//! TTBR0 maps kernel physical addresses to the same virtual addresses with a
-//! 4 KiB granule. Those pages are EL1-only: EL0 reads and executes fault.
-//! Kernel `.text` is privileged-executable and unprivileged-execute-never.
-//! TTBR1 still points at an empty table.
+//! `boot.s` turns the MMU on with a 1 GiB block map, jumps to the high link
+//! address, and leaves TTBR0 empty. This module replaces that coarse TTBR1
+//! map with 2 MiB blocks and 4 KiB pages. TTBR0 is not used for the kernel.
+//! EL0 cannot walk TTBR1, so a user load or store of a kernel address faults.
 //!
-//! The kernel is not in the high half. It is linked at the physical load
-//! address, and `boot.s` consumes those absolute addresses before the MMU is
-//! on. Virtio also programs devices with physical addresses, so the DMA
-//! pages have to stay identity-mapped. A later change can link the kernel at
-//! a TTBR1 address and keep a second identity map for DMA. Until then, EL0
-//! lives at `USER_CODE_VA` (`0x1_0000_0000`), which is past the identity map
-//! on QEMU (RAM ends at 2 GiB) and past the 4 GiB table budget used for the
-//! Pi 4. User pages are non-global and tagged with ASID 1 in TTBR0. Kernel
-//! pages stay global. Installing or dropping the user window invalidates the
-//! EL1 TLB.
+//! Page-table entries store physical addresses. The CPU writes the tables
+//! through their high virtual addresses. Bits 47:0 of a kernel virtual
+//! address equal the physical address, so the level-1/2/3 indices match.
+//!
+//! EL0 lives at `USER_CODE_VA` (`0x1_0000_0000`) in its own TTBR0 root, not
+//! in the kernel tables. User pages are non-global and tagged with ASID 1.
+//! Kernel pages stay global and EL1-only. Installing the user window
+//! invalidates the EL1 TLB.
 //!
 //! Virtio descriptor rings and packet buffers live in the `.dma` section.
-//! Those pages are Normal non-cacheable, so the device and the CPU see the
-//! same memory without cache maintenance on each kick. RAM everywhere else
-//! is Normal write-back cacheable. MMIO is Device-nGnRE.
+//! Those pages are Normal non-cacheable. The device is programmed with the
+//! physical address; the CPU uses the high alias. Other RAM is Normal
+//! write-back. MMIO is Device-nGnRE.
 //!
 //! boot.s drops EL2 to EL1 before this runs. The Pi 4 ranges below are
 //! untested on hardware.
+
+use crate::addr::{phys_to_virt, virt_to_phys};
 
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -82,7 +82,9 @@ struct Tables {
     l2_user: Table,
     // Two level-3 tables: 4 MiB from USER_CODE_VA. The window uses about 2.2 MiB.
     l3_user: [Table; 2],
-    ttbr1: Table,
+    // Separate TTBR0 root. Not the kernel level-0 table.
+    user_l0: Table,
+    user_l1: Table,
 }
 
 static mut TABLES: Tables = Tables {
@@ -106,7 +108,8 @@ static mut TABLES: Tables = Tables {
     ],
     l2_user: Table { entries: [0; 512] },
     l3_user: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-    ttbr1: Table { entries: [0; 512] },
+    user_l0: Table { entries: [0; 512] },
+    user_l1: Table { entries: [0; 512] },
 };
 
 static mut NEXT_L3: usize = 0;
@@ -123,23 +126,22 @@ struct Layout {
 
 /// First byte of the unmapped page directly under the kernel stack.
 pub fn guard_page() -> u64 {
-    let stack_top = unsafe { addr_of!(__stack_top) as u64 };
+    let stack_top = addr_of!(__stack_top) as u64;
     stack_top - STACK_BYTES - PAGE
 }
 
 pub fn init() {
     let layout = layout();
     unsafe {
-        let l0 = addr_of!(TABLES.l0) as u64;
-        let l1 = addr_of!(TABLES.l1) as u64;
+        let l1 = virt_to_phys(addr_of!(TABLES.l1) as u64);
         (*addr_of_mut!(TABLES.l0)).entries[0] = l1 | VALID | TABLE_OR_PAGE;
 
         map_ram_blocks(&layout);
         map_devices();
         map_fine(&layout);
 
-        let ttbr1 = addr_of!(TABLES.ttbr1) as u64;
-        enable(l0, ttbr1);
+        let ttbr1 = virt_to_phys(addr_of!(TABLES.l0) as u64);
+        install_high_map(ttbr1);
         if pan_supported() {
             // SPAN clear: an exception into EL1 sets PAN, so a user fault
             // cannot leave EL1 able to read the user window by accident.
@@ -190,16 +192,30 @@ fn pan_supported() -> bool {
     (mmfr >> 4) & 0xf != 0
 }
 
-/// Map the EL0 code, data, heap, and stack at the physical pages the kernel owns.
-pub fn map_user_window(code_pa: u64, data_pa: u64, heap_pa: u64, stack_pa: u64) {
+/// Map the EL0 code, data, heap, and stack.
+///
+/// The arguments are kernel virtual addresses of the backing pages. The
+/// descriptors store the physical addresses. The user root is a different
+/// table from the kernel, and TTBR0 is pointed at it so later cache
+/// maintenance of the user alias can walk.
+pub fn map_user_window(code_va: u64, data_va: u64, heap_va: u64, stack_va: u64) {
+    let code_pa = virt_to_phys(code_va);
+    let data_pa = virt_to_phys(data_va);
+    let heap_pa = virt_to_phys(heap_va);
+    let stack_pa = virt_to_phys(stack_va);
     unsafe {
-        let l1 = addr_of_mut!(TABLES.l1);
+        let l0 = addr_of_mut!(TABLES.user_l0);
+        let l1 = addr_of_mut!(TABLES.user_l1);
         let l2 = addr_of_mut!(TABLES.l2_user);
-        (*l1).entries[4] = (l2 as u64) | VALID | TABLE_OR_PAGE;
+        (*l0).entries = [0; 512];
+        (*l1).entries = [0; 512];
+        // USER_CODE_VA is 0x1_0000_0000: level 0 index 0, level 1 index 4.
+        (*l0).entries[0] = virt_to_phys(l1 as u64) | VALID | TABLE_OR_PAGE;
+        (*l1).entries[4] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
         for index in 0..2 {
             let l3 = addr_of_mut!(TABLES.l3_user[index]);
             (*l3).entries = [0; 512];
-            (*l2).entries[index] = (l3 as u64) | VALID | TABLE_OR_PAGE;
+            (*l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
         }
         let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
         let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
@@ -207,6 +223,13 @@ pub fn map_user_window(code_pa: u64, data_pa: u64, heap_pa: u64, stack_pa: u64) 
         map_user_span(USER_DATA_VA, data_pa, USER_DATA_BYTES, data);
         map_user_span(USER_HEAP_VA, heap_pa, USER_HEAP_BYTES, data);
         map_user_span(USER_STACK_VA, stack_pa, USER_STACK_BYTES, data);
+        let ttbr = virt_to_phys(l0 as u64);
+        core::arch::asm!(
+            "msr ttbr0_el1, {ttbr}",
+            "isb",
+            ttbr = in(reg) ttbr,
+            options(nostack),
+        );
     }
     flush_tlb();
 }
@@ -264,7 +287,7 @@ fn checked_end(ptr: u64, len: u64) -> Option<u64> {
 /// Kernel translations are global. User translations are non-global, so
 /// ASID 0 does not match them.
 pub fn set_user_asid(active: bool) {
-    let base = unsafe { addr_of!(TABLES.l0) as u64 };
+    let base = unsafe { virt_to_phys(addr_of!(TABLES.user_l0) as u64) };
     let ttbr = if active { base | (1 << 56) } else { base };
     unsafe {
         core::arch::asm!(
@@ -289,11 +312,11 @@ pub fn flush_tlb() {
 }
 
 fn layout() -> Layout {
-    let text = range(addr_of!(__text_start), addr_of!(__text_end));
-    let rodata = range(addr_of!(__rodata_start), addr_of!(__rodata_end));
-    let dma = range(addr_of!(__dma_start), addr_of!(__dma_end));
-    let heap_end = unsafe { addr_of!(__heap_end) as u64 };
-    let stack_top = unsafe { addr_of!(__stack_top) as u64 };
+    let text = phys_range(addr_of!(__text_start), addr_of!(__text_end));
+    let rodata = phys_range(addr_of!(__rodata_start), addr_of!(__rodata_end));
+    let dma = phys_range(addr_of!(__dma_start), addr_of!(__dma_end));
+    let heap_end = virt_to_phys(addr_of!(__heap_end) as u64);
+    let stack_top = virt_to_phys(addr_of!(__stack_top) as u64);
     let guard = stack_top - STACK_BYTES - PAGE;
     let ram = ram_range();
     let fine_start = align_down(guard, BLOCK);
@@ -309,8 +332,8 @@ fn layout() -> Layout {
     }
 }
 
-fn range(start: *const u8, end: *const u8) -> (u64, u64) {
-    (start as u64, end as u64)
+fn phys_range(start: *const u8, end: *const u8) -> (u64, u64) {
+    (virt_to_phys(start as u64), virt_to_phys(end as u64))
 }
 
 fn ram_range() -> (u64, u64) {
@@ -427,7 +450,7 @@ unsafe fn l2_for(pa: u64) -> *mut Table {
     let l1 = addr_of_mut!(TABLES.l1);
     let l2 = addr_of_mut!(TABLES.l2[gb]);
     if (*l1).entries[gb] & VALID == 0 {
-        (*l1).entries[gb] = (l2 as u64) | VALID | TABLE_OR_PAGE;
+        (*l1).entries[gb] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
     }
     l2
 }
@@ -437,7 +460,7 @@ unsafe fn l3_for(pa: u64) -> *mut Table {
     let index = ((pa >> 21) & 511) as usize;
     let entry = (*l2).entries[index];
     if entry & VALID != 0 && entry & TABLE_OR_PAGE != 0 {
-        return (entry & 0x0000_ffff_ffff_f000) as *mut Table;
+        return phys_to_virt(entry & 0x0000_ffff_ffff_f000) as *mut Table;
     }
     let slot = NEXT_L3;
     if slot >= 8 {
@@ -445,7 +468,7 @@ unsafe fn l3_for(pa: u64) -> *mut Table {
     }
     NEXT_L3 = slot + 1;
     let l3 = addr_of_mut!(TABLES.l3[slot]);
-    (*l2).entries[index] = (l3 as u64) | VALID | TABLE_OR_PAGE;
+    (*l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
     l3
 }
 
@@ -460,44 +483,30 @@ fn give_up(message: &str) -> ! {
     }
 }
 
-unsafe fn enable(ttbr0: u64, ttbr1: u64) {
-    // 48-bit VA on both halves. TG1's 4 KiB encoding is 0b10, not 0b00.
-    // IPS is 32-bit physical: every address this kernel uses fits.
-    let tcr: u64 = 16
-        | (1 << 8)
-        | (1 << 10)
-        | (3 << 12)
-        | (16 << 16)
-        | (1 << 24)
-        | (1 << 26)
-        | (3 << 28)
-        | (0b10 << 30);
-    // Attr0 Normal write-back, Attr1 Device-nGnRE, Attr2 Normal non-cacheable.
-    let mair: u64 = 0x0000_0000_0044_04ff;
-    let mut sctlr: u64 = 0;
+/// Switch TTBR1 from the coarse blocks to the strict map and set WXN.
+///
+/// The MMU is already on. TTBR0 is left alone: it is the empty table from
+/// boot until the user window is installed. Text pages in the new map are
+/// read-only, so WXN does not make them unexecutable. The TLB is invalidated
+/// before WXN is set, so a stale writable translation of text cannot be
+/// fetched under the new bit.
+unsafe fn install_high_map(ttbr1: u64) {
+    let mut sctlr: u64;
     core::arch::asm!(
-        "msr mair_el1, {mair}",
-        "msr tcr_el1, {tcr}",
-        "msr ttbr0_el1, {ttbr0}",
         "msr ttbr1_el1, {ttbr1}",
         "dsb sy",
-        "isb",
-        "ic iallu",
+        "tlbi vmalle1",
         "dsb sy",
         "isb",
         "mrs {sctlr}, sctlr_el1",
-        "orr {sctlr}, {sctlr}, #1",
-        "orr {sctlr}, {sctlr}, #4",
-        "orr {sctlr}, {sctlr}, #0x1000",
         "orr {sctlr}, {sctlr}, #0x80000",
         "msr sctlr_el1, {sctlr}",
         "isb",
-        mair = in(reg) mair,
-        tcr = in(reg) tcr,
-        ttbr0 = in(reg) ttbr0,
         ttbr1 = in(reg) ttbr1,
-        sctlr = inout(reg) sctlr,
+        sctlr = out(reg) sctlr,
+        options(nostack),
     );
+    let _ = sctlr;
 }
 
 fn align_down(value: u64, align: u64) -> u64 {

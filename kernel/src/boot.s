@@ -13,10 +13,18 @@
 // Where this code ends up in memory
 // ---------------------------------
 // The linker scripts place the .text.boot section first in the image, so
-// _start is the very first instruction:
-//   - QEMU virt (kernel/link.ld):    0x40080000  (RAM base 0x40000000 + 0x80000)
-//   - Raspberry Pi 4 (link-pi4.ld):  0x00080000  (where the Pi firmware loads
-//                                                 kernel8.img by default)
+// _start is the first instruction of the file the loader copies:
+//   - QEMU virt (kernel/link.ld):    linked at 0xFFFF000040080000
+//                                    loaded at physical 0x40080000
+//   - Raspberry Pi 4 (link-pi4.ld):  linked at 0xFFFF000000080000
+//                                    firmware loads the raw image at
+//                                    physical 0x80000. Untested on hardware.
+//
+// The upper 16 bits are the only difference between the link address and the
+// physical load address. While the MMU is off the PC is the physical address.
+// ADRP and ADD are PC-relative, so they yield physical addresses until the
+// jump below. An absolute literal would be the high link address and must
+// not be used before that jump.
 //
 // State of the CPU on entry
 // -------------------------
@@ -36,11 +44,18 @@
 //   2. If the core entered at EL2, drop to EL1h. If it is already at EL1,
 //      skip that drop. x20 remembers the entry level for kernel_main.
 //   3. Turn on the floating-point / SIMD (NEON) unit so Rust code doesn't trap.
-//   4. Point the stack pointer at __stack_top.
-//   5. Install the EL1 exception vectors in VBAR_EL1.
-//   6. Zero .bss, then the .dma section used by virtio.
-//   7. Call kernel_main() in main.rs, which never returns.
-//   8. If kernel_main ever returns anyway, park the core forever.
+//   4. Point the stack pointer at the physical alias of __stack_top.
+//   5. Zero .bss, then the .dma section used by virtio.
+//   6. Build a 1 GiB block map. TTBR0 is an identity map of that RAM and of
+//      the device gigabyte, so the physical PC still translates when the MMU
+//      turns on. TTBR1 maps the same blocks at the high link address.
+//   7. Turn the MMU and caches on, add the high offset to the PC and SP, and
+//      branch to the upper half. Then drop the identity map so TTBR0 is empty
+//      and point VBAR_EL1 at the high vector table.
+//   8. Call kernel_main. Rust installs the strict TTBR1 map and, later, the
+//      user window in TTBR0. WXN is not set here: the 1 GiB block is both
+//      writable and executable, and WXN would make it unexecutable.
+//   9. If kernel_main ever returns anyway, park the core forever.
 // =============================================================================
 
 // Put the following code in its own section called .text.boot.
@@ -171,63 +186,44 @@ _start:
                                 // not guaranteed to be seen right away).
 
     // -------------------------------------------------------------------------
-    // Step 4: Set up the stack.
+    // Step 4: Set up the stack at its physical address.
     // -------------------------------------------------------------------------
-    // AArch64 stacks grow downward (toward lower addresses). The linker script
-    // sets __stack_top to the kernel load address, so the stack grows down
-    // into the free RAM *below* the kernel image and never overwrites it:
-    //   QEMU:  stack grows down from 0x40080000 (0x80000 = 512 KiB available)
-    //   Pi 4:  stack grows down from 0x00080000
-    //
-    // "ldr x1, =symbol" is an assembler pseudo-instruction. It stores the
-    // 64-bit address of the symbol in a nearby literal pool and loads it with
-    // a PC-relative load. We can't write sp directly from a literal, so we go
-    // through x1. The stack pointer must stay 16-byte aligned, and __stack_top
-    // is (it is page-aligned).
-    ldr     x1, =__stack_top    // x1 = address of the top of the stack
-    mov     sp, x1              // sp = x1
+    // AArch64 stacks grow downward. The linker sets __stack_top to the high
+    // link address. ADRP while the PC is still physical yields the physical
+    // alias, which is the load address:
+    //   QEMU:  stack grows down from 0x40080000
+    //   Pi 4:  stack grows down from 0x00080000 (untested on hardware)
+    // The stack pointer must stay 16-byte aligned. __stack_top is page-aligned.
+    // After the jump to the upper half, the same offset is added to SP.
+    adrp    x1, __stack_top
+    add     x1, x1, :lo12:__stack_top
+    mov     sp, x1
 
     // -------------------------------------------------------------------------
-    // Step 5: Install the exception vector table.
+    // Step 5: Clear the .bss section, then .dma.
     // -------------------------------------------------------------------------
-    // VBAR_EL1 is the Vector Base Address Register for EL1. It must point at
-    // a 16-entry table aligned to 2 KiB. exception_vectors is defined in
-    // exception.s. From here on, a fault prints a report instead of hanging
-    // with no vectors installed. IRQs stay masked until Rust enables them.
-    // This register is EL1, so it is written after the drop above.
-    ldr     x0, =exception_vectors
-    msr     vbar_el1, x0
-    isb
-
-    // -------------------------------------------------------------------------
-    // Step 6: Clear the .bss section.
-    // -------------------------------------------------------------------------
-    // .bss holds statics that start out as zero (for example
-    // "static mut COUNTER: u64 = 0;"). To keep the image small, the
-    // loader does NOT store those zeros in kernel8.img; the section is marked
-    // NOLOAD in the linker script. Whatever garbage is in that RAM at power-on
-    // is still there, so we must zero it ourselves before Rust runs.
-    //
-    // The linker script aligns .bss to 4096 bytes, and its size is a multiple
-    // of 8, so we can safely clear it 8 bytes (one 64-bit register) at a time.
-    ldr     x1, =__bss_start    // x1 = current address to clear
-    ldr     x2, =__bss_end      // x2 = one past the last byte of .bss
+    // .bss holds statics that start out as zero. The loader does not store
+    // those zeros in kernel8.img. The early page tables live in .bss, so they
+    // are zero before step 6 fills them. Addresses here are still physical.
+    adrp    x1, __bss_start
+    add     x1, x1, :lo12:__bss_start
+    adrp    x2, __bss_end
+    add     x2, x2, :lo12:__bss_end
 
 3:
-    cmp     x1, x2              // have we reached the end?
-    b.hs    7f                  // if x1 >= x2 (unsigned "higher or same"),
-                                // .bss is done, so clear .dma next
-    str     xzr, [x1], #8       // store the zero register (xzr = always 0) at
-                                // [x1], then add 8 to x1 ("post-index" mode)
-    b       3b                  // loop back to label 3
+    cmp     x1, x2
+    b.hs    7f
+    str     xzr, [x1], #8
+    b       3b
 
     // .dma holds virtio descriptor rings and packet buffers. It is not part
-    // of .bss, so the loop above does not touch it. The MMU later maps it
-    // non-cacheable. Zero it the same way, 8 bytes at a time. If the section
-    // is empty, the compare falls through immediately.
+    // of .bss. The strict map later marks it non-cacheable. Zero it the same
+    // way. If the section is empty, the compare falls through.
 7:
-    ldr     x1, =__dma_start
-    ldr     x2, =__dma_end
+    adrp    x1, __dma_start
+    add     x1, x1, :lo12:__dma_start
+    adrp    x2, __dma_end
+    add     x2, x2, :lo12:__dma_end
 6:
     cmp     x1, x2
     b.hs    4f
@@ -236,22 +232,197 @@ _start:
 
 4:
     // -------------------------------------------------------------------------
-    // Step 7: Jump into Rust.
+    // Step 6: Coarse page tables for the jump into the upper half.
     // -------------------------------------------------------------------------
-    // kernel_main is defined in main.rs as
+    // x3 = physical base of the 1 GiB that contains the kernel.
+    // QEMU _start is 0x40080000, so this is 0x40000000 and the level-1 index
+    // is 1. The Pi 4 _start is 0x80000, so this is 0 and the index is 0.
+    // x20 still holds the entry exception level. Do not write x20.
+    adrp    x3, _start
+    lsr     x3, x3, #30
+    lsl     x3, x3, #30
+    lsr     x10, x3, #30
+
+    // RAM block: valid, inner-shareable, access flag, normal memory, UXN.
+    // No privileged-execute-never bit, so EL1 can run from this block. No
+    // AP bit that would let EL0 in. The output address is the physical base.
+    mov     x11, x3
+    orr     x11, x11, #1
+    orr     x11, x11, #0x300
+    orr     x11, x11, #0x400
+    movz    x12, #0x0040, lsl #48
+    orr     x11, x11, x12
+
+    // The other gigabyte is the devices kernel_main prints to before the
+    // strict map exists. QEMU UART, GIC, and virtio-mmio sit in the first
+    // gigabyte. Pi 4 peripherals sit at 0xFC000000 and up, inside the
+    // gigabyte at 0xC0000000. Device-nGnRE, outer shareable, PXN and UXN.
+    cbz     x10, 10f
+    mov     x13, xzr
+    mov     x14, xzr
+    b       11f
+10:
+    movz    x13, #0xC000, lsl #16
+    mov     x14, #3
+11:
+    orr     x13, x13, #1
+    orr     x13, x13, #4
+    orr     x13, x13, #0x200
+    orr     x13, x13, #0x400
+    movz    x12, #0x0060, lsl #48
+    orr     x13, x13, x12
+
+    // Same descriptors in TTBR0 (identity, so the physical PC translates)
+    // and TTBR1 (high alias). x2-x5 are the arguments to build_early.
+    adrp    x0, early_l0_id
+    add     x0, x0, :lo12:early_l0_id
+    adrp    x1, early_l1_id
+    add     x1, x1, :lo12:early_l1_id
+    mov     x2, x11
+    mov     x3, x10
+    mov     x4, x13
+    mov     x5, x14
+    bl      build_early
+
+    adrp    x0, early_l0_hi
+    add     x0, x0, :lo12:early_l0_hi
+    adrp    x1, early_l1_hi
+    add     x1, x1, :lo12:early_l1_hi
+    mov     x2, x11
+    mov     x3, x10
+    mov     x4, x13
+    mov     x5, x14
+    bl      build_early
+
+    // Push the tables to the point of coherency before the walker reads them.
+    // Four pages, 64-byte lines. clean_page clobbers x0 and x2.
+    adrp    x0, early_l0_id
+    add     x0, x0, :lo12:early_l0_id
+    bl      clean_page
+    adrp    x0, early_l1_id
+    add     x0, x0, :lo12:early_l1_id
+    bl      clean_page
+    adrp    x0, early_l0_hi
+    add     x0, x0, :lo12:early_l0_hi
+    bl      clean_page
+    adrp    x0, early_l1_hi
+    add     x0, x0, :lo12:early_l1_hi
+    bl      clean_page
+    dsb     sy
+
+    // -------------------------------------------------------------------------
+    // Step 7: Turn the MMU on and jump to the high alias.
+    // -------------------------------------------------------------------------
+    // MAIR: Attr0 Normal write-back, Attr1 Device-nGnRE, Attr2 Normal
+    // non-cacheable. Same value Rust uses for the strict map.
+    movz    x0, #0x04ff
+    movk    x0, #0x0044, lsl #16
+    msr     mair_el1, x0
+
+    // TCR: 48-bit VA on both halves, 4 KiB granules, inner write-back,
+    // inner shareable, 32-bit physical addresses. 0xB5103510 is that value.
+    // TG1's 4 KiB encoding is 0b10.
+    movz    x0, #0x3510
+    movk    x0, #0xB510, lsl #16
+    msr     tcr_el1, x0
+
+    adrp    x0, early_l0_id
+    add     x0, x0, :lo12:early_l0_id
+    msr     ttbr0_el1, x0
+    adrp    x0, early_l0_hi
+    add     x0, x0, :lo12:early_l0_hi
+    msr     ttbr1_el1, x0
+    dsb     sy
+    isb
+    ic      iallu
+    dsb     sy
+    isb
+
+    // SCTLR M, C, and I. Not WXN. The block map is writable and executable.
+    mrs     x0, sctlr_el1
+    orr     x0, x0, #1
+    orr     x0, x0, #4
+    orr     x0, x0, #0x1000
+    msr     sctlr_el1, x0
+    isb
+
+    // Label 9 is the first instruction fetched through TTBR1.
+    adr     x0, 9f
+    movz    x1, #0xFFFF, lsl #48
+    add     x0, x0, x1
+    add     sp, sp, x1
+    br      x0
+
+9:
+    ic      iallu
+    dsb     sy
+    isb
+    // Drop the identity map. TTBR0's only level-0 entry covered RAM and
+    // devices. After this, a low address faults until Rust installs the
+    // user window. The store is through the high alias of the same page.
+    adrp    x0, early_l0_id
+    add     x0, x0, :lo12:early_l0_id
+    str     xzr, [x0]
+    dc      civac, x0
+    dsb     sy
+    tlbi    vmalle1
+    dsb     sy
+    isb
+
+    // VBAR must be the high address. A physical vector base would fault
+    // now that the identity map is gone. IRQs stay masked until Rust.
+    adrp    x0, exception_vectors
+    add     x0, x0, :lo12:exception_vectors
+    msr     vbar_el1, x0
+    isb
+
+    // -------------------------------------------------------------------------
+    // Step 8: Jump into Rust.
+    // -------------------------------------------------------------------------
+    // kernel_main is
     //     #[no_mangle] pub extern "C" fn kernel_main(entry_el: u64) -> !
-    // x0 is the first argument. x20 still holds the level we entered at
-    // (1 for QEMU virt, 2 after a drop from EL2). "bl" (Branch with Link)
-    // jumps to kernel_main and saves the return address in x30. kernel_main
-    // runs the main poll loop and should never return.
+    // x0 is the first argument. x20 still holds the level we entered at.
     mov     x0, x20
     bl      kernel_main
 
     // -------------------------------------------------------------------------
-    // Step 8: Safety net.
+    // Step 9: Safety net.
     // -------------------------------------------------------------------------
-    // If kernel_main ever does return, don't run off the end into whatever
-    // bytes come next. Sleep forever instead.
 5:
-    wfe                         // sleep until an event
-    b       5b                  // and go straight back to sleep
+    wfe
+    b       5b
+
+// x0 = level-0 table, x1 = level-1 table.
+// x2 = RAM block descriptor, x3 = its level-1 index.
+// x4 = device block descriptor, x5 = its level-1 index.
+// The level-0 entry points at the level-1 table. Both block entries are
+// stored. The two indices are never the same.
+build_early:
+    orr     x6, x1, #3
+    str     x6, [x0]
+    str     x2, [x1, x3, lsl #3]
+    str     x4, [x1, x5, lsl #3]
+    ret
+
+// Clean and invalidate the 4 KiB page at x0, one cache line at a time.
+clean_page:
+    mov     x2, #64
+12:
+    dc      civac, x0
+    add     x0, x0, #64
+    subs    x2, x2, #1
+    b.ne    12b
+    ret
+
+// Early translation tables. Zeroed with the rest of .bss, then filled above.
+// They stay in the image's RAM, so the high map covers them after the jump.
+.section .bss
+.balign 4096
+early_l0_id:
+.space 4096
+early_l1_id:
+.space 4096
+early_l0_hi:
+.space 4096
+early_l1_hi:
+.space 4096

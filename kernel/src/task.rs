@@ -134,7 +134,7 @@ pub fn run_boot_tests() {
         put("EL0 PAN not implemented\r\n");
     }
 
-    let kernel = unsafe { addr_of!(__text_start) as u64 };
+    let kernel = addr_of!(__text_start) as u64;
     let past = crate::mmu::USER_CODE_VA + crate::mmu::USER_CODE_BYTES;
     run_scenario(0, 0);
     run_scenario(1, 0);

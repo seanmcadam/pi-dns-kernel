@@ -13,7 +13,7 @@ extern "C" {
 }
 
 fn text_start() -> u64 {
-    unsafe { addr_of!(__text_start) as u64 }
+    addr_of!(__text_start) as u64
 }
 
 fn guard_page() -> u64 {

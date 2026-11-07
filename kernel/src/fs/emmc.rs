@@ -12,7 +12,7 @@ use core::ptr::{read_volatile, write_volatile};
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
 use spin::Mutex;
 
-const BASE: usize = 0xFE34_0000;
+const BASE: usize = crate::addr::phys_to_virt(0xFE34_0000) as usize;
 
 const BLKSIZECNT: usize = 0x04;
 const ARG1: usize = 0x08;

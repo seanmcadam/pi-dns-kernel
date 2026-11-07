@@ -2,9 +2,11 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* The Pi 4 firmware loads kernel8.img at 0x80000.
-       This link is untested on hardware. There is no EL2-to-EL1 drop yet. */
-    . = 0x80000;
+    /* The Pi 4 firmware loads the raw kernel8.img at physical 0x80000.
+       The link address is that physical address in the upper half (TTBR1).
+       boot.s does drop EL2 to EL1 before the MMU is on. This image has not
+       been tested on hardware. */
+    . = 0xFFFF000000080000;
     __stack_top = .;
 
     .text :

@@ -7,7 +7,7 @@ extern crate std;
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
 
 pub fn parse_config(_data: &str) -> Result<(), ()> {
     // TODO: Implement JSON or simple key=value parser

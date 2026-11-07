@@ -50,9 +50,7 @@ pub enum NetworkMode {
 
 #[derive(Debug)]
 pub enum NetworkError {
-    InitFailed,
     DeviceNotFound,
-    ConfigError,
 }
 
 pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), NetworkError> {
@@ -67,13 +65,9 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
             EthernetDevice::new_virtio().ok_or(NetworkError::DeviceNotFound)?
         }
         #[cfg(feature = "pi4")]
-        DeviceType::Virtio => return Err(NetworkError::DeviceNotFound),
-        #[cfg(feature = "pi4")]
         DeviceType::Genet => {
             EthernetDevice::new_genet().ok_or(NetworkError::DeviceNotFound)?
         }
-        #[cfg(not(feature = "pi4"))]
-        DeviceType::Genet => return Err(NetworkError::DeviceNotFound),
     };
     
     let mut stack = NetworkStack::new(&mut device);

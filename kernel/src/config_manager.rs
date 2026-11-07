@@ -98,22 +98,6 @@ pub fn records() -> Vec<DnsRecord> {
         .unwrap_or_default()
 }
 
-pub fn upstreams() -> Vec<[u8; 4]> {
-    CURRENT
-        .lock()
-        .as_ref()
-        .map(|config| config.dns.upstreams.clone())
-        .unwrap_or_default()
-}
-
-pub fn blocklist() -> Vec<String> {
-    CURRENT
-        .lock()
-        .as_ref()
-        .map(|config| config.dns.blocklist.clone())
-        .unwrap_or_default()
-}
-
 pub fn cache_size() -> usize {
     CURRENT
         .lock()

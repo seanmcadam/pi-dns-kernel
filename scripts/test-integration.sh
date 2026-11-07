@@ -519,7 +519,7 @@ echo "Test 11: Pi 4 image (compile and SD card files only)"
 ./scripts/build-pi4.sh >/tmp/build-pi4.txt
 START_ADDR=$(aarch64-linux-gnu-nm target/aarch64-unknown-none/release/kernel8 | awk '/ _start$/ {print $1}')
 if [ -f boot/pi4/kernel8.img ] && [ -f boot/pi4/config.txt ] \
-    && echo "$START_ADDR" | grep -Eq '^0*80000$' \
+    && echo "$START_ADDR" | grep -Eq '^0*ffff000000080000$' \
     && grep -q 'kernel=kernel8.img' boot/pi4/config.txt \
     && grep -q 'arm_64bit=1' boot/pi4/config.txt; then
     echo "✓ Pi 4 kernel8.img linked at 0x${START_ADDR} with config.txt"

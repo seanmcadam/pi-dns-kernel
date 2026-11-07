@@ -8,7 +8,9 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // Boot assembly is assembled by rustc (global_asm in src/main.rs).
-    // The Pi 4 feature is linked at 0x80000. The QEMU image stays at 0x40080000.
+    // The Pi 4 feature is linked at 0xFFFF000000080000. The firmware still
+    // loads that raw image at physical 0x80000. The QEMU image is linked at
+    // 0xFFFF000040080000 and loaded at physical 0x40080000.
     let script_name = if env::var("CARGO_FEATURE_PI4").is_ok() {
         "link-pi4.ld"
     } else {
