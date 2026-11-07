@@ -51,7 +51,8 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - EL1 vector table installed from `boot.s` before Rust runs. Synchronous exceptions, SError, and unexpected IRQs print ESR/ELR/FAR/SPSR plus the general registers, then halt. IRQs stay masked. There is no timer interrupt and no EL0 yet.
 - Identity-mapped 4 KiB pages on TTBR0. TTBR1 is an empty table reserved for a later high-half kernel. `.text` is read-only and executable, `.rodata` is read-only and not executable, and data, bss, heap, and stack are read-write and not executable. One guard page sits under the stack.
 - Virtio rings and packet buffers are in `.dma` and mapped Normal non-cacheable so DMA stays coherent with the data cache on. Other RAM is write-back cacheable. UART, virtio-mmio, and the GIC are Device-nGnRE.
-- `GET /debug/fault/guard` and `GET /debug/fault/text` (HTTP basic auth) deliberately fault. This build does not drop EL2 to EL1.
+- `GET /debug/fault/guard` and `GET /debug/fault/text` (HTTP basic auth) deliberately fault.
+- `boot.s` drops EL2 to EL1h when `CurrentEL` is EL2 (QEMU `-M virt,virtualization=on`, and a Pi 4 firmware handover). QEMU `-kernel` without that option is already at EL1 and skips the drop. The boot log prints `Entered at EL` and `Running at EL`. The Pi 4 drop is untested on hardware.
 
 ### Pi 4 image (untested on hardware)
 - Separate link at `0x80000`

@@ -13,8 +13,8 @@
 //! same memory without cache maintenance on each kick. RAM everywhere else
 //! is Normal write-back cacheable. MMIO is Device-nGnRE.
 //!
-//! This file does not drop EL2 to EL1. The Pi 4 ranges below are untested
-//! on hardware.
+//! boot.s drops EL2 to EL1 before this runs. The Pi 4 ranges below are
+//! untested on hardware.
 
 use core::ptr::{addr_of, addr_of_mut};
 

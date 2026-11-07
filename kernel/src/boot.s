@@ -20,9 +20,9 @@
 //
 // State of the CPU on entry
 // -------------------------
-//   - We run in AArch64 at EL1 (QEMU virt with -kernel starts at EL1).
-//     On a real Pi 4 the firmware normally hands over at EL2. This file does
-//     not drop from EL2 to EL1; that is still untested on hardware.
+//   - AArch64. QEMU virt with -kernel starts at EL1. QEMU virt with
+//     virtualization=on starts at EL2. A real Pi 4 with arm_64bit=1 normally
+//     hands over at EL2. The EL2 path below is untested on Pi 4 hardware.
 //   - The MMU and caches are off, so every address is a physical address.
 //   - There is no stack yet, so we cannot call any Rust code until we set
 //     one up.
@@ -33,15 +33,14 @@
 // What this file does, in order
 // -----------------------------
 //   1. Work out which core is running and park every core except core 0.
-//   2. Turn on the floating-point / SIMD (NEON) unit so Rust code doesn't trap.
-//   3. Point the stack pointer at __stack_top.
-//   4. Install the EL1 exception vectors in VBAR_EL1.
-//   5. Zero .bss, then the .dma section used by virtio.
-//   6. Call kernel_main() in main.rs, which never returns.
-//   7. If kernel_main ever returns anyway, park the core forever.
-//
-// This file still does not drop from EL2 to EL1. That is a later change.
-// The Pi 4 firmware normally enters at EL2, and that path is untested.
+//   2. If the core entered at EL2, drop to EL1h. If it is already at EL1,
+//      skip that drop. x20 remembers the entry level for kernel_main.
+//   3. Turn on the floating-point / SIMD (NEON) unit so Rust code doesn't trap.
+//   4. Point the stack pointer at __stack_top.
+//   5. Install the EL1 exception vectors in VBAR_EL1.
+//   6. Zero .bss, then the .dma section used by virtio.
+//   7. Call kernel_main() in main.rs, which never returns.
+//   8. If kernel_main ever returns anyway, park the core forever.
 // =============================================================================
 
 // Put the following code in its own section called .text.boot.
@@ -82,8 +81,77 @@ _start:
 
 2:
     // -------------------------------------------------------------------------
-    // Step 2: Enable the FP/SIMD (NEON) unit.
+    // Step 2: Drop from EL2 to EL1, unless we are already at EL1.
     // -------------------------------------------------------------------------
+    // CurrentEL bits [3:2] are the current exception level. Shift them down
+    // so x20 holds 1, 2, or 3. x20 is not used again until the call into
+    // Rust, and eret does not change general registers, so the value survives
+    // the drop. kernel_main prints it.
+    //
+    // EL1 (plain QEMU virt) branches straight to label 8.
+    // EL2 (QEMU virtualization=on, and a Pi 4 firmware handover) falls
+    // through and erets to that same label. Any other level parks. The Pi 4
+    // handover is untested on hardware.
+    mrs     x20, currentel      // x20 = CurrentEL
+    lsr     x20, x20, #2        // x20 = exception level 1, 2, or 3
+    cmp     x20, #1
+    b.eq    8f                  // already EL1: stack, vectors, and Rust
+    cmp     x20, #2
+    b.ne    1b                  // not EL1 or EL2: park with the other cores
+
+    // HCR_EL2.RW, bit 31. The level below EL2 must be AArch64. Leaving this
+    // clear would make eret enter EL1 as AArch32.
+    movz    x0, #0x8000, lsl #16
+    msr     hcr_el2, x0
+
+    // CNTHCTL_EL2 bits [1:0] are EL1PCEN and EL1PCTEN. Set means EL1 may
+    // use the physical timer and the physical counter without trapping to
+    // EL2. CNTVOFF_EL2 is the virtual counter offset. Zero makes the virtual
+    // counter equal the physical counter, so EL1 can use either timer.
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr
+
+    // VPIDR_EL2 and VMPIDR_EL2 are what EL1 reads as MIDR_EL1 and MPIDR_EL1.
+    // Copy the real ids so EL1 still sees this core.
+    mrs     x0, midr_el1
+    msr     vpidr_el2, x0
+    mrs     x0, mpidr_el1
+    msr     vmpidr_el2, x0
+
+    // CPTR_EL2.TFP traps EL1 floating-point to EL2, and this file does not
+    // install an EL2 vector table (a trap there would hang). 0x33ff clears
+    // the trap bits and sets the RES1 bits in CPTR_EL2.
+    movz    x0, #0x33ff
+    msr     cptr_el2, x0
+
+    // SCTLR_EL1 reset value: MMU off, caches off, and the RES1 bits set
+    // (bits 11, 20, 22, 23, 28, and 29). That constant is 0x30d00800.
+    // The MMU code turns caches on later, from EL1.
+    movz    x0, #0x0800
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+
+    // SPSR_EL2 is the PSTATE restored by eret.
+    //   bits [3:0] = 0b0101  EL1h, so EL1 uses SP_EL1
+    //   bits [9:6] = 0b1111  D, A, I, and F all masked
+    // 0x3c5 is those fields together. IRQs stay masked until Rust turns
+    // them on.
+    movz    x0, #0x3c5
+    msr     spsr_el2, x0
+
+    // Land on label 8, which is the first EL1 instruction. adr is a
+    // PC-relative address, so it is correct with the MMU off.
+    adr     x0, 8f
+    msr     elr_el2, x0
+    isb
+    eret
+
+    // -------------------------------------------------------------------------
+    // Step 3: Enable the FP/SIMD (NEON) unit. Now at EL1.
+    // -------------------------------------------------------------------------
+8:
     // The Rust compiler freely uses NEON registers (q0-q31) for things like
     // memcpy and struct copies, even in no_std code. QEMU starts with FP/SIMD
     // access trapped, and the first such instruction would raise an exception
@@ -103,7 +171,7 @@ _start:
                                 // not guaranteed to be seen right away).
 
     // -------------------------------------------------------------------------
-    // Step 3: Set up the stack.
+    // Step 4: Set up the stack.
     // -------------------------------------------------------------------------
     // AArch64 stacks grow downward (toward lower addresses). The linker script
     // sets __stack_top to the kernel load address, so the stack grows down
@@ -120,19 +188,19 @@ _start:
     mov     sp, x1              // sp = x1
 
     // -------------------------------------------------------------------------
-    // Step 4: Install the exception vector table.
+    // Step 5: Install the exception vector table.
     // -------------------------------------------------------------------------
     // VBAR_EL1 is the Vector Base Address Register for EL1. It must point at
     // a 16-entry table aligned to 2 KiB. exception_vectors is defined in
     // exception.s. From here on, a fault prints a report instead of hanging
-    // with no vectors installed. IRQs stay masked. There is still no EL2 to
-    // EL1 drop in this file.
+    // with no vectors installed. IRQs stay masked until Rust enables them.
+    // This register is EL1, so it is written after the drop above.
     ldr     x0, =exception_vectors
     msr     vbar_el1, x0
     isb
 
     // -------------------------------------------------------------------------
-    // Step 5: Clear the .bss section.
+    // Step 6: Clear the .bss section.
     // -------------------------------------------------------------------------
     // .bss holds statics that start out as zero (for example
     // "static mut COUNTER: u64 = 0;"). To keep the image small, the
@@ -168,17 +236,19 @@ _start:
 
 4:
     // -------------------------------------------------------------------------
-    // Step 6: Jump into Rust.
+    // Step 7: Jump into Rust.
     // -------------------------------------------------------------------------
     // kernel_main is defined in main.rs as
-    //     #[no_mangle] pub extern "C" fn kernel_main() -> !
-    // "bl" (Branch with Link) jumps to it and saves the return address in x30
-    // (the link register). kernel_main runs the main poll loop
-    // (network, then DNS, then HTTP) and should never return.
+    //     #[no_mangle] pub extern "C" fn kernel_main(entry_el: u64) -> !
+    // x0 is the first argument. x20 still holds the level we entered at
+    // (1 for QEMU virt, 2 after a drop from EL2). "bl" (Branch with Link)
+    // jumps to kernel_main and saves the return address in x30. kernel_main
+    // runs the main poll loop and should never return.
+    mov     x0, x20
     bl      kernel_main
 
     // -------------------------------------------------------------------------
-    // Step 7: Safety net.
+    // Step 8: Safety net.
     // -------------------------------------------------------------------------
     // If kernel_main ever does return, don't run off the end into whatever
     // bytes come next. Sleep forever instead.

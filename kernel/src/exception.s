@@ -36,8 +36,8 @@
 // path a later interrupt handler would return on. exception_handler does
 // not return today.
 //
-// There is still no drop from EL2 to EL1 in the boot path. A real Pi 4
-// firmware handover is at EL2, and that drop is left for a later change.
+// boot.s drops EL2 to EL1 before it installs this table. A real Pi 4
+// firmware handover is at EL2. That path is untested on hardware.
 // =============================================================================
 
 .section .text.vectors, "ax"

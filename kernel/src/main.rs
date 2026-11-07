@@ -28,6 +28,26 @@ fn uart_write(s: &str) {
     console::write_str(s);
 }
 
+fn current_el() -> u64 {
+    let el: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {el}, CurrentEL",
+            el = out(reg) el,
+            options(nomem, nostack)
+        );
+    }
+    el >> 2
+}
+
+fn report_el(entry_el: u64) {
+    uart_write("Entered at EL");
+    uart_dec(entry_el);
+    uart_write("\r\nRunning at EL");
+    uart_dec(current_el());
+    uart_write("\r\n");
+}
+
 fn uart_dec(mut n: u64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
@@ -44,11 +64,12 @@ fn uart_dec(mut n: u64) {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_main() -> ! {
+pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     #[cfg(feature = "pi4")]
     uart_pl011::init_pi4();
 
     uart_write("\r\n=== Pi4 DNS Server Kernel ===\r\n");
+    report_el(entry_el);
 
     uart_write("[0] Enabling MMU and caches...\r\n");
     mmu::init();
@@ -143,6 +164,7 @@ pub extern "C" fn kernel_main() -> ! {
             uart_write("HTTP server listening on port 80\r\n");
             uart_write("DNS Server ready\r\n");
             uart_write("MMU and caches enabled\r\n");
+            report_el(entry_el);
         }
     }
 }

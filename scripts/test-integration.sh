@@ -50,7 +50,9 @@ echo "Test 1: Boot messages"
 if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "DNS server listening on port 53" qemu/boot-output.txt && \
    grep -q "HTTP server listening on port 80" qemu/boot-output.txt && \
-   grep -q "MMU and caches enabled" qemu/boot-output.txt; then
+   grep -q "MMU and caches enabled" qemu/boot-output.txt && \
+   grep -q "Entered at EL1" qemu/boot-output.txt && \
+   grep -q "Running at EL1" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -411,6 +413,36 @@ echo "Test 13: Write to kernel text is a permission fault"
 fault_case text /debug/fault/text "debug fault: write kernel text" "Permission fault"
 
 # Test 11: Pi 4 image links at 0x80000 and the SD files exist
+echo ""
+echo "Test 14: Boot from EL2 (QEMU virtualization=on)"
+rm -f qemu/el2-serial.txt
+timeout 25 qemu-system-aarch64 \
+    -M virt,virtualization=on \
+    -cpu cortex-a72 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/el2-serial.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    >/tmp/qemu-el2.txt 2>&1 &
+EL2_PID=$!
+sleep 6
+EL2_DNS=$(timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short +time=3 +tries=1 || true)
+kill $EL2_PID 2>/dev/null || true
+wait $EL2_PID 2>/dev/null || true
+if grep -q "Entered at EL2" qemu/el2-serial.txt \
+    && grep -q "Running at EL1" qemu/el2-serial.txt \
+    && grep -q "DNS Server ready" qemu/el2-serial.txt \
+    && echo "$EL2_DNS" | grep -q "192.168.1.100"; then
+    echo "✓ EL2 entry dropped to EL1 and answered test.local"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ EL2 boot path failed"
+    echo "dig: $EL2_DNS"
+    cat qemu/el2-serial.txt
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 echo ""
 echo "Test 11: Pi 4 image (compile and SD card files only)"
 ./scripts/build-pi4.sh >/tmp/build-pi4.txt

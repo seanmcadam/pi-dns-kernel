@@ -1,7 +1,7 @@
 pub fn init() {
-    // VBAR_EL1 is installed in boot.s. IRQ and FIQ stay masked. The vector
-    // stubs only report an interrupt if one arrives. Timer interrupts and
-    // the EL2-to-EL1 drop are not part of this kernel yet.
+    // VBAR_EL1 is installed in boot.s, after the EL2-to-EL1 drop. IRQ and
+    // FIQ stay masked. The vector stubs only report an interrupt if one
+    // arrives. There is no timer interrupt yet.
 }
 
 pub fn enable() {
