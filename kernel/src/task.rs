@@ -4,20 +4,20 @@
 //! table. They share the virtual window at `0x1_0000_0000`. Switching tasks
 //! writes that task's TTBR0 and ASID, then erets into its saved context.
 //!
-//! The switch is cooperative. A task yields when its socket would block or
-//! after it has finished one turn. A timer IRQ at EL0 saves that task, ticks,
-//! and erets to the same task. It does not preempt. The boot test depends on
-//! that: ticks must advance while the test program is still the current task.
-//! DNS and HTTP both yield often enough that the other task runs between
-//! packets. Preempting on the timer would also have to switch inside the
-//! syscall path, and the network stack is only touched from EL1.
+//! A task yields when its socket would block or after it has finished one
+//! turn. A timer IRQ at EL0 also ends the turn after two ticks (20 ms). The
+//! IRQ returns to the poll loop instead of switching inside the handler, so
+//! the NIC is polled on that path and smoltcp is never reentered. An IRQ
+//! taken during a syscall stays at EL1 and does not preempt: the stack is
+//! only touched from the poll loop. The boot test still watches the tick
+//! count, and it now does so across a preemption.
 //!
 //! Syscall number in x8, arguments in x0-x5, result in x0.
 //!   0 log(ptr, len)
 //!   1 yield
 //!   2 uptime_ticks
 //!   3 exit(code)
-//!   4-26 sockets, time, config, and the HTTP helpers. See user_fd.
+//!   4-27 sockets, time, config, and the HTTP helpers. See user_fd.
 //! Anything else returns -1. A log pointer outside the user window returns -2.
 //! Neither path faults. The boot program proves the round trip on slot 0.
 //! DNS reuses that slot. HTTP uses slot 1.
@@ -37,6 +37,11 @@ const RESUME: u64 = 0;
 const YIELD: u64 = 1;
 const EXIT: u64 = 2;
 const FAULT: u64 = 3;
+const PREEMPT: u64 = 4;
+
+/// The virtual timer is 100 Hz, so each tick is 10 ms. A task that never
+/// yields is forced back to the poll loop after this many EL0 ticks.
+const QUANTUM_TICKS: u64 = 2;
 
 #[repr(C, align(16))]
 pub struct TaskContext {
@@ -97,6 +102,20 @@ static mut KERNEL_RESUME: KernelResume = KernelResume {
 #[no_mangle]
 static mut EL0_ACTION: u64 = 0;
 
+static mut SPIN_TASK: Task = Task {
+    ctx: TaskContext {
+        x: [0; 31],
+        sp_el0: 0,
+        elr: 0,
+        spsr: 0,
+        fpsr: 0,
+        fpcr: 0,
+        q: [0; 64],
+    },
+    _gap: [0; 4096],
+    kstack: [0; KSTACK_BYTES],
+};
+
 static mut HTTP_TASK: Task = Task {
     ctx: TaskContext {
         x: [0; 31],
@@ -136,18 +155,38 @@ static mut BAD_POINTER: bool = false;
 static mut KERN_KILLED: bool = false;
 static mut PRIV_KILLED: bool = false;
 static mut EXEC_KILLED: bool = false;
+static mut PREEMPT_OK: bool = false;
+static mut SLICE: u64 = 0;
+static mut ACTIVE_SLOT: usize = 0;
 static EL0_IRQS: AtomicU64 = AtomicU64::new(0);
 static mut DNS_LIVE: bool = false;
 static mut HTTP_LIVE: bool = false;
+static mut SPIN_LIVE: bool = false;
 
 const DNS_SLOT: usize = 0;
 const HTTP_SLOT: usize = 1;
+const SPIN_SLOT: usize = 2;
 const DNS_ASID: u64 = 1;
 const HTTP_ASID: u64 = 2;
+const SPIN_ASID: u64 = 3;
+
+/// `b .` — a task that never makes a syscall. Preemption is the only way out.
+const SPIN_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x14];
 
 extern "C" {
     fn enter_user(ctx: *mut TaskContext, kernel_sp: u64) -> u64;
     static __text_start: u8;
+}
+
+fn enter(ctx: *mut TaskContext, ksp: u64) -> u64 {
+    unsafe {
+        SLICE = 0;
+        enter_user(ctx, ksp)
+    }
+}
+
+fn still_scheduled(action: u64) -> bool {
+    action == YIELD || action == PREEMPT
 }
 
 pub fn run_boot_tests() {
@@ -215,12 +254,16 @@ fn run_scenario(scenario: u64, arg1: u64) {
         CURRENT_CTX = ctx;
         let ksp = addr_of!(TASK.kstack) as u64 + KSTACK_BYTES as u64;
         TASK_KSP = ksp;
+        ACTIVE_SLOT = 0;
         crate::mmu::set_user_asid(true);
         loop {
-            let action = enter_user(ctx, ksp);
+            let action = enter(ctx, ksp);
             if action == YIELD {
                 YIELD_OK = true;
                 put("EL0 yield: back in kernel\r\n");
+                continue;
+            }
+            if action == PREEMPT {
                 continue;
             }
             break;
@@ -238,7 +281,9 @@ pub fn print_summary() {
     put(", yield ");
     put(if unsafe { YIELD_OK } { "ok" } else { "FAIL" });
     put(", irq ");
-    let irq = unsafe { TICKS_SEEN } && EL0_IRQS.load(Ordering::Relaxed) > 0;
+    // Ticks must move, and a timer IRQ must have preempted scenario 0.
+    // Re-entering the same task is what lets it observe the new count.
+    let irq = unsafe { TICKS_SEEN && PREEMPT_OK } && EL0_IRQS.load(Ordering::Relaxed) > 0;
     put(if irq { "ok" } else { "FAIL" });
     put(", exit ");
     put(if unsafe { EXIT_OK } { "0" } else { "FAIL" });
@@ -286,6 +331,16 @@ pub extern "C" fn el0_dispatch(kind: u64) -> u64 {
     if kind == 1 {
         EL0_IRQS.fetch_add(1, Ordering::Relaxed);
         crate::interrupts::irq_handler();
+        unsafe {
+            SLICE += 1;
+            if SLICE >= QUANTUM_TICKS {
+                SLICE = 0;
+                if SCENARIO == 0 {
+                    PREEMPT_OK = true;
+                }
+                return PREEMPT;
+            }
+        }
         return RESUME;
     }
     let esr = reg("esr_el1");
@@ -324,7 +379,7 @@ fn syscall() -> u64 {
             }
             EXIT
         }
-        4..=26 => {
+        4..=27 => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
@@ -439,6 +494,17 @@ static mut USER_MEM: UserMem = UserMem {
     stack: [0; 64 * 1024],
 };
 
+#[repr(C, align(4096))]
+struct SpinMem {
+    code: [u8; 4096],
+    stack: [u8; 4096],
+}
+
+static mut SPIN_MEM: SpinMem = SpinMem {
+    code: [0; 4096],
+    stack: [0; 4096],
+};
+
 static mut HTTP_MEM: UserMem = UserMem {
     code: [0; 512 * 1024],
     data: [0; 64 * 1024],
@@ -481,13 +547,18 @@ pub fn start_dns() -> Result<(), ()> {
         CURRENT_CTX = ctx;
         let ksp = addr_of!(TASK.kstack) as u64 + KSTACK_BYTES as u64;
         TASK_KSP = ksp;
+        ACTIVE_SLOT = DNS_SLOT;
         DNS_LIVE = true;
-        if enter_user(ctx, ksp) == YIELD {
-            Ok(())
-        } else {
-            DNS_LIVE = false;
-            CURRENT_CTX = core::ptr::null_mut();
-            Err(())
+        loop {
+            match enter(ctx, ksp) {
+                YIELD => return Ok(()),
+                PREEMPT => continue,
+                _ => {
+                    DNS_LIVE = false;
+                    CURRENT_CTX = core::ptr::null_mut();
+                    return Err(());
+                }
+            }
         }
     }
 }
@@ -521,19 +592,73 @@ pub fn start_http() -> Result<(), ()> {
         CURRENT_CTX = ctx;
         let ksp = addr_of!(HTTP_TASK.kstack) as u64 + KSTACK_BYTES as u64;
         TASK_KSP = ksp;
+        ACTIVE_SLOT = HTTP_SLOT;
         HTTP_LIVE = true;
-        if enter_user(ctx, ksp) == YIELD {
-            Ok(())
-        } else {
-            HTTP_LIVE = false;
-            CURRENT_CTX = core::ptr::null_mut();
-            Err(())
+        loop {
+            match enter(ctx, ksp) {
+                YIELD => return Ok(()),
+                PREEMPT => continue,
+                _ => {
+                    HTTP_LIVE = false;
+                    CURRENT_CTX = core::ptr::null_mut();
+                    return Err(());
+                }
+            }
         }
     }
 }
 
 pub fn poll_http() {
     resume(HTTP_SLOT, HTTP_ASID, addr_of_mut!(HTTP_TASK), false);
+}
+
+pub fn poll_spin() {
+    if !unsafe { SPIN_LIVE } {
+        return;
+    }
+    crate::user_fd::set_task(SPIN_SLOT);
+    crate::mmu::use_user_slot(SPIN_SLOT, SPIN_ASID);
+    unsafe {
+        ACTIVE_SLOT = SPIN_SLOT;
+        let ctx = addr_of_mut!(SPIN_TASK.ctx);
+        let ksp = addr_of!(SPIN_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        CURRENT_CTX = ctx;
+        TASK_KSP = ksp;
+        if !still_scheduled(enter(ctx, ksp)) {
+            SPIN_LIVE = false;
+            put("EL0 spin stopped\r\n");
+            CURRENT_CTX = core::ptr::null_mut();
+        }
+    }
+}
+
+/// Arm the EL0 program that branches to itself. The caller is in a syscall,
+/// so this only publishes the task. The poll loop runs it.
+pub fn arm_spinner() -> i64 {
+    unsafe {
+        if SPIN_LIVE {
+            return 0;
+        }
+        let code = addr_of_mut!(SPIN_MEM.code) as *mut u8;
+        core::ptr::write_bytes(code, 0, 4096);
+        core::ptr::copy_nonoverlapping(SPIN_CODE.as_ptr(), code, SPIN_CODE.len());
+        crate::mmu::map_user_stub(
+            SPIN_SLOT,
+            addr_of!(SPIN_MEM.code) as u64,
+            addr_of!(SPIN_MEM.stack) as u64,
+        );
+        maintain_code(code, 64);
+        let ctx = addr_of_mut!(SPIN_TASK.ctx);
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = crate::mmu::USER_CODE_VA;
+        (*ctx).spsr = 0;
+        (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + 4096;
+        SPIN_LIVE = true;
+        let slot = ACTIVE_SLOT;
+        crate::mmu::use_user_slot(slot, slot as u64 + 1);
+        put("EL0 spin task armed\r\n");
+        0
+    }
 }
 
 fn resume(slot: usize, asid: u64, task: *mut Task, dns: bool) {
@@ -544,11 +669,12 @@ fn resume(slot: usize, asid: u64, task: *mut Task, dns: bool) {
     crate::user_fd::set_task(slot);
     crate::mmu::use_user_slot(slot, asid);
     unsafe {
+        ACTIVE_SLOT = slot;
         let ctx = &mut (*task).ctx as *mut TaskContext;
         let ksp = addr_of!((*task).kstack) as u64 + KSTACK_BYTES as u64;
         CURRENT_CTX = ctx;
         TASK_KSP = ksp;
-        if enter_user(ctx, ksp) != YIELD {
+        if !still_scheduled(enter(ctx, ksp)) {
             if dns {
                 DNS_LIVE = false;
                 put("EL0 dns stopped\r\n");

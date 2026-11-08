@@ -13,7 +13,7 @@ TTBR0 holds only the EL0 window, in its own page tables:
 - heap `0x1_000A_0000`, 1536 KiB
 - stack `0x1_0022_0000`, 64 KiB
 
-User pages are non-global. The boot test and the DNS task use ASID 1. The HTTP task uses ASID 2. EL0 cannot walk TTBR1, so a user access to kernel memory faults and kills that task. The DNS resolver and the HTTP dashboard each run in this window, in separate page tables. The kernel keeps the NIC, the smoltcp sockets, storage, and the config file. It switches tasks when one yields. A timer IRQ at EL0 resumes the same task.
+User pages are non-global. The boot test and the DNS task use ASID 1. The HTTP task uses ASID 2. The spinner uses ASID 3. EL0 cannot walk TTBR1, so a user access to kernel memory faults and kills that task. The DNS resolver and the HTTP dashboard each run in this window, in separate page tables. The kernel keeps the NIC, the smoltcp sockets, storage, and the config file. A task yields when a socket would block. A timer IRQ at EL0 also returns to the poll loop after two 10 ms ticks, and that loop polls the NIC before running the next task.
 
 Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 
@@ -46,6 +46,7 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 | 24 | `fault_text` |
 | 25 | `http_info(buf, cap)` |
 | 26 | `tick_hz` |
+| 27 | `debug_spin` |
 
 Anything else returns `-1`. `-2` is a bad user pointer. `-11` means try again. The older sections below describe earlier revisions of this tree.
 

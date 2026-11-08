@@ -2,7 +2,9 @@
 //!
 //! `VBAR_EL1` is installed in `boot.s` after the EL2-to-EL1 drop. This module
 //! enables the GICv2 and the virtual-timer interrupt, then clears DAIF.I.
-//! The poll loop is not preempted: the tick is only a time source. The Pi 4
+//! An IRQ taken at EL0 can end the current time slice. This handler only
+//! counts the tick. It does not touch smoltcp: the poll loop is the only
+//! caller, and it is not on the stack while a task is in EL0. The Pi 4
 //! GIC-400 path is untested on hardware.
 
 pub fn init() {

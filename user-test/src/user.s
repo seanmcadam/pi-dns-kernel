@@ -2,7 +2,8 @@
 // as format placeholders, so this file has none.
 //
 // x0 on entry is the scenario. x1 is an address chosen by the kernel:
-//   0  log, yield, wait until the tick count changes, log, exit 0
+//   0  log, yield, spin until the tick count has moved by 3, log, exit 0
+//      The kernel preempts every 2 EL0 ticks, so that delta crosses a slice.
 //   1  unknown syscall number in x8, then a log so we know it returned
 //   2  log(x1, 4) with a pointer the kernel must reject
 //   3  load from x1, which is kernel text. This must not return.
@@ -43,19 +44,20 @@ _start:
     svc     #0
     mov     x8, #1
     svc     #0
-    mov     x21, #8
-10:
     mov     x8, #2
     svc     #0
     mov     x22, x0
+    mov     x21, #64
+10:
     movz    x23, #0x40, lsl #16
 11:
     subs    x23, x23, #1
     b.ne    11b
     mov     x8, #2
     svc     #0
-    cmp     x0, x22
-    b.ne    12f
+    sub     x0, x0, x22
+    cmp     x0, #3
+    b.ge    12f
     subs    x21, x21, #1
     b.ne    10b
     mov     x0, #2

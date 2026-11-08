@@ -24,6 +24,7 @@ const FAULT_GUARD: u64 = 23;
 const FAULT_TEXT: u64 = 24;
 const HTTP_INFO: u64 = 25;
 const TICK_HZ: u64 = 26;
+const DEBUG_SPIN: u64 = 27;
 
 const EAGAIN: i64 = -11;
 
@@ -121,6 +122,7 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/config" => handle_config(request),
         "/records" => handle_records(request),
         "/records/delete" => handle_record_delete(request),
+        "/debug/spin" => handle_spin(),
         "/debug/fault/guard" => {
             let _ = sys(FAULT_GUARD, 0, 0, 0, 0, 0, 0);
             loop {}
@@ -131,6 +133,11 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         }
         _ => HttpResponse::not_found(),
     }
+}
+
+fn handle_spin() -> HttpResponse {
+    let _ = sys(DEBUG_SPIN, 0, 0, 0, 0, 0, 0);
+    HttpResponse::ok("spinning\n")
 }
 
 fn check_auth(request: &HttpRequest) -> bool {

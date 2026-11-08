@@ -242,6 +242,32 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
+# Test 17: a task that never yields must not starve DNS or HTTP.
+echo ""
+echo "Test 17: Preemption while an EL0 task spins"
+UNAUTH_SPIN=$(timeout 5 curl -s -o /dev/null -w "%{http_code}" \
+    "http://127.0.0.1:${HTTP_HOST_PORT}/debug/spin" || echo "000")
+SPIN_BODY=$(timeout 5 curl -s -u admin:admin \
+    "http://127.0.0.1:${HTTP_HOST_PORT}/debug/spin" || true)
+sleep 1
+SPIN_DIG=$(timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short +time=3 +tries=1 || true)
+SPIN_STATUS=$(timeout 5 curl -s -u admin:admin \
+    "http://127.0.0.1:${HTTP_HOST_PORT}/status" || true)
+if [ "$UNAUTH_SPIN" = "401" ] \
+    && echo "$SPIN_BODY" | grep -q "spinning" \
+    && echo "$SPIN_DIG" | grep -q "192.168.1.100" \
+    && echo "$SPIN_STATUS" | grep -q '"status":"running"'; then
+    echo "✓ DNS and HTTP answered while an EL0 task spun"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ A spinning task starved DNS or HTTP"
+    echo "unauth=$UNAUTH_SPIN"
+    echo "spin=$SPIN_BODY"
+    echo "dig=$SPIN_DIG"
+    echo "status=$SPIN_STATUS"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Cleanup
 echo ""
 echo "Stopping QEMU..."

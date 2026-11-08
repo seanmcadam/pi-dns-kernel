@@ -121,6 +121,11 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
     Ok(())
 }
 
+/// Drive the NIC and the socket stack.
+///
+/// Called only from the kernel poll loop. A timer IRQ never calls this.
+/// `NETWORK` is a spin lock, so a poll from that IRQ would deadlock if a
+/// syscall already held it, and would reenter smoltcp if it did not.
 pub fn poll() {
     let mut net = NETWORK.lock();
     let Some(state) = net.as_mut() else {

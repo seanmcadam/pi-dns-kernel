@@ -29,6 +29,7 @@
 //!  24  fault_text. Does not return.
 //!  25  http_info(buf, cap) -> "port username"
 //!  26  tick_hz
+//!  27  debug_spin. Arms the EL0 task that never yields. Returns 0.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -63,6 +64,7 @@ const FAULT_GUARD: u64 = 23;
 const FAULT_TEXT: u64 = 24;
 const HTTP_INFO: u64 = 25;
 const TICK_HZ: u64 = 26;
+const DEBUG_SPIN: u64 = 27;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -87,9 +89,13 @@ enum Kind {
     Closing(SocketHandle),
 }
 
-const TASKS: usize = 2;
+const TASKS: usize = 3;
 
-static mut FDS: [[Kind; MAX_FD]; TASKS] = [[Kind::Empty; MAX_FD], [Kind::Empty; MAX_FD]];
+static mut FDS: [[Kind; MAX_FD]; TASKS] = [
+    [Kind::Empty; MAX_FD],
+    [Kind::Empty; MAX_FD],
+    [Kind::Empty; MAX_FD],
+];
 static mut TASK_SLOT: usize = 0;
 
 pub fn set_task(slot: usize) {
@@ -132,6 +138,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         FAULT_TEXT => crate::exception::fault_text(),
         HTTP_INFO => config_out(args[0], args[1], crate::config_manager::write_http_info),
         TICK_HZ => crate::timer::TICK_HZ as i64,
+        DEBUG_SPIN => crate::task::arm_spinner(),
         _ => -1,
     };
     value as u64

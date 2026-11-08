@@ -78,14 +78,17 @@ struct Tables {
     l1: Table,
     l2: [Table; 4],
     l3: [Table; 8],
-    // One TTBR0 root per EL0 task. Both tasks use the same virtual window
+    // One TTBR0 root per EL0 task. The tasks use the same virtual window
     // and different physical pages, so each root has its own tables.
     // Level-1 index 4 is the 4 GiB point. Two level-3 tables cover the window.
-    l2_user: [Table; 2],
-    l3_user: [[Table; 2]; 2],
-    user_l0: [Table; 2],
-    user_l1: [Table; 2],
+    // Slot 2 is the one-page spinner, which only fills the first entry of each.
+    l2_user: [Table; USER_SLOTS],
+    l3_user: [[Table; 2]; USER_SLOTS],
+    user_l0: [Table; USER_SLOTS],
+    user_l1: [Table; USER_SLOTS],
 }
+
+pub const USER_SLOTS: usize = 3;
 
 static mut TABLES: Tables = Tables {
     l0: Table { entries: [0; 512] },
@@ -106,13 +109,26 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
     ],
-    l2_user: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
+    l2_user: [
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+    ],
     l3_user: [
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
+        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
     ],
-    user_l0: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-    user_l1: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
+    user_l0: [
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+    ],
+    user_l1: [
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+    ],
 };
 
 static mut NEXT_L3: usize = 0;
@@ -197,18 +213,40 @@ fn pan_supported() -> bool {
 
 /// Map one task's EL0 code, data, heap, and stack.
 ///
-/// `slot` is 0 or 1. The arguments are kernel virtual addresses of that
+/// `slot` is 0, 1, or 2. The arguments are kernel virtual addresses of that
 /// task's backing pages. Descriptors store physical addresses. TTBR0 is
 /// pointed at this slot with ASID 0 so the caller can maintain the user
 /// instruction cache. The scheduler later installs the task ASID.
 pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, stack_va: u64) {
-    if slot > 1 {
+    if slot >= USER_SLOTS {
         give_up("user slot out of range");
     }
-    let code_pa = virt_to_phys(code_va);
-    let data_pa = virt_to_phys(data_va);
-    let heap_pa = virt_to_phys(heap_va);
-    let stack_pa = virt_to_phys(stack_va);
+    prepare_user_root(slot);
+    let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
+    let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), USER_CODE_BYTES, code);
+    map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), USER_DATA_BYTES, data);
+    map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), USER_HEAP_BYTES, data);
+    map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), USER_STACK_BYTES, data);
+    use_user_slot(slot, 0);
+    flush_tlb();
+}
+
+/// Map one code page and one stack page. The spinner has no heap.
+pub fn map_user_stub(slot: usize, code_va: u64, stack_va: u64) {
+    if slot >= USER_SLOTS {
+        give_up("user slot out of range");
+    }
+    prepare_user_root(slot);
+    let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
+    let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), PAGE, code);
+    map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), PAGE, data);
+    use_user_slot(slot, 0);
+    flush_tlb();
+}
+
+fn prepare_user_root(slot: usize) {
     unsafe {
         let l0 = addr_of_mut!(TABLES.user_l0[slot]);
         let l1 = addr_of_mut!(TABLES.user_l1[slot]);
@@ -223,15 +261,7 @@ pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, st
             (*l3).entries = [0; 512];
             (*l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
         }
-        let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
-        let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
-        map_user_span(slot, USER_CODE_VA, code_pa, USER_CODE_BYTES, code);
-        map_user_span(slot, USER_DATA_VA, data_pa, USER_DATA_BYTES, data);
-        map_user_span(slot, USER_HEAP_VA, heap_pa, USER_HEAP_BYTES, data);
-        map_user_span(slot, USER_STACK_VA, stack_pa, USER_STACK_BYTES, data);
     }
-    use_user_slot(slot, 0);
-    flush_tlb();
 }
 
 fn map_user_span(slot: usize, va: u64, pa: u64, bytes: u64, flags: u64) {
@@ -285,15 +315,15 @@ fn checked_end(ptr: u64, len: u64) -> Option<u64> {
 
 /// ASID lives in TTBR0[63:56] (TCR_EL1.AS is 0, so the ASID is 8 bits).
 /// Kernel translations are global. User translations are non-global, so
-/// ASID 0 does not match them. Slot 0 uses ASID 1. Slot 1 uses ASID 2.
-/// The two roots map the same virtual addresses to different physical pages,
-/// and the ASID keeps those translations from aliasing in the TLB.
+/// ASID 0 does not match them. Slot 0 uses ASID 1, slot 1 uses ASID 2, and
+/// slot 2 uses ASID 3. The roots map the same virtual addresses to different
+/// physical pages, and the ASID keeps those translations from aliasing.
 pub fn set_user_asid(active: bool) {
     use_user_slot(0, if active { 1 } else { 0 });
 }
 
 pub fn use_user_slot(slot: usize, asid: u64) {
-    if slot > 1 {
+    if slot >= USER_SLOTS {
         return;
     }
     let base = unsafe { virt_to_phys(addr_of!(TABLES.user_l0[slot]) as u64) };

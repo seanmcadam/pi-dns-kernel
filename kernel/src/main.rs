@@ -148,6 +148,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         net::poll();
         task::poll_dns();
         task::poll_http();
+        task::poll_spin();
         net::poll();
 
         let now = timer::millis();
