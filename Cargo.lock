@@ -177,7 +177,6 @@ dependencies = [
  "embedded-hal",
  "embedded-sdmmc",
  "heapless",
- "http-server",
  "log",
  "smoltcp",
  "spin",

@@ -1,5 +1,6 @@
 //! DNS resolver running at EL0. The kernel keeps the sockets, the NIC,
-//! storage, and the web UI. This program asks for them through syscalls.
+//! and storage. The web UI is a second EL0 task. This program asks for
+//! sockets and config through syscalls.
 
 #![no_std]
 #![no_main]

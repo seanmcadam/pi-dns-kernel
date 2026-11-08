@@ -128,15 +128,13 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("[OK] HTTP server initialized\r\n");
 
     uart_write("[9] Creating sockets...\r\n");
-    net::with_stack(|stack, _device| {
-        match http::init_sockets(stack) {
-            Ok(()) => uart_write("[OK] HTTP socket created\r\n"),
-            Err(_) => uart_write("[ERROR] HTTP socket failed\r\n"),
-        }
-    });
     match task::start_dns() {
         Ok(()) => uart_write("[OK] DNS user program running\r\n"),
         Err(()) => uart_write("[ERROR] DNS user program failed\r\n"),
+    }
+    match task::start_http() {
+        Ok(()) => uart_write("[OK] HTTP socket created\r\n"),
+        Err(()) => uart_write("[ERROR] HTTP socket failed\r\n"),
     }
 
     uart_write("\r\n=== Kernel Initialized Successfully ===\r\n");
@@ -149,9 +147,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     loop {
         net::poll();
         task::poll_dns();
-        net::with_stack(|stack, device| {
-            http::poll(stack, device);
-        });
+        task::poll_http();
         net::poll();
 
         let now = timer::millis();

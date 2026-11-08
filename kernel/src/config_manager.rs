@@ -90,14 +90,6 @@ pub fn load_config() -> Config {
     config
 }
 
-pub fn records() -> Vec<DnsRecord> {
-    CURRENT
-        .lock()
-        .as_ref()
-        .map(|config| config.dns.records.clone())
-        .unwrap_or_default()
-}
-
 pub fn cache_size() -> usize {
     CURRENT
         .lock()
@@ -139,6 +131,26 @@ pub fn write_upstreams(out: &mut [u8]) -> Option<usize> {
         used = push_slice(out, used, b"\n")?;
     }
     Some(used)
+}
+
+pub fn credentials_match(user: &str, pass: &str) -> bool {
+    let current = CURRENT.lock();
+    let Some(config) = current.as_ref() else {
+        return false;
+    };
+    config.http.username == user && config.http.password == pass
+}
+
+/// `port username` without the password. The HTTP task builds `/config` from this.
+pub fn write_http_info(out: &mut [u8]) -> Option<usize> {
+    let current = CURRENT.lock();
+    let Some(config) = current.as_ref() else {
+        return Some(0);
+    };
+    let mut used = push_u32(out, 0, config.http.port as u32)?;
+    used = push_slice(out, used, b" ")?;
+    used = push_slice(out, used, config.http.username.as_bytes())?;
+    push_slice(out, used, b"\n")
 }
 
 pub fn write_blocklist(out: &mut [u8]) -> Option<usize> {

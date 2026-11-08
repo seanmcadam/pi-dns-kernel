@@ -22,7 +22,6 @@ log = { workspace = true }
 embedded-sdmmc = { path = "../vendor/embedded-sdmmc", default-features = false }
 embedded-hal = { workspace = true }
 
-http-server = { path = "../http-server", default-features = false }
 config = { path = "../config", default-features = false }
 
 [[bin]]

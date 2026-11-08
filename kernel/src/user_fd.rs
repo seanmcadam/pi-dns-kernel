@@ -20,6 +20,17 @@
 //!  15  config_blocklist(buf, cap) -> len
 //!  16  config_cache_size
 //!  17  set_cache_entries(n)
+//!  18  auth(user, user_len, pass, pass_len) -> 0 if the pair matches
+//!  19  config_add(buf, len). buf is "name TYPE value ttl"
+//!  20  config_remove(buf, len) -> 0 removed, 1 not found
+//!  21  uptime_secs
+//!  22  cache_entries
+//!  23  fault_guard. Does not return.
+//!  24  fault_text. Does not return.
+//!  25  http_info(buf, cap) -> "port username"
+//!  26  tick_hz
+//!
+//! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -43,6 +54,15 @@ const CONFIG_UPSTREAMS: u64 = 14;
 const CONFIG_BLOCKLIST: u64 = 15;
 const CONFIG_CACHE_SIZE: u64 = 16;
 const SET_CACHE_ENTRIES: u64 = 17;
+const AUTH: u64 = 18;
+const CONFIG_ADD: u64 = 19;
+const CONFIG_REMOVE: u64 = 20;
+const UPTIME_SECS: u64 = 21;
+const CACHE_ENTRIES: u64 = 22;
+const FAULT_GUARD: u64 = 23;
+const FAULT_TEXT: u64 = 24;
+const HTTP_INFO: u64 = 25;
+const TICK_HZ: u64 = 26;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -54,26 +74,33 @@ const EAGAIN: i64 = -11;
 
 const MAX_FD: usize = 8;
 const MAX_PACKET: usize = 4096;
+/// Listeners allocated once. A socket leaves LISTEN on the SYN, and a peer
+/// that stops in FIN-WAIT-2 must not be the only socket on the port.
+const LISTENERS: usize = 4;
 
 #[derive(Clone, Copy)]
 enum Kind {
     Empty,
     Udp(SocketHandle),
-    TcpListen(SocketHandle, u16),
+    TcpListen([Option<SocketHandle>; LISTENERS], u16),
     TcpConn(SocketHandle),
     Closing(SocketHandle),
 }
 
-static mut FDS: [Kind; MAX_FD] = [
-    Kind::Empty,
-    Kind::Empty,
-    Kind::Empty,
-    Kind::Empty,
-    Kind::Empty,
-    Kind::Empty,
-    Kind::Empty,
-    Kind::Empty,
-];
+const TASKS: usize = 2;
+
+static mut FDS: [[Kind; MAX_FD]; TASKS] = [[Kind::Empty; MAX_FD], [Kind::Empty; MAX_FD]];
+static mut TASK_SLOT: usize = 0;
+
+pub fn set_task(slot: usize) {
+    if slot < TASKS {
+        unsafe { TASK_SLOT = slot };
+    }
+}
+
+fn table() -> &'static mut [Kind; MAX_FD] {
+    unsafe { &mut FDS[TASK_SLOT] }
+}
 
 static mut PACKET: [u8; MAX_PACKET] = [0; MAX_PACKET];
 
@@ -96,6 +123,15 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
             crate::dns::set_cache_entries(args[0] as usize);
             0
         }
+        AUTH => auth(args[0], args[1], args[2], args[3]),
+        CONFIG_ADD => config_add(args[0], args[1]),
+        CONFIG_REMOVE => config_remove(args[0], args[1]),
+        UPTIME_SECS => crate::timer::uptime_secs() as i64,
+        CACHE_ENTRIES => crate::dns::cache_entries() as i64,
+        FAULT_GUARD => crate::exception::fault_guard(),
+        FAULT_TEXT => crate::exception::fault_text(),
+        HTTP_INFO => config_out(args[0], args[1], crate::config_manager::write_http_info),
+        TICK_HZ => crate::timer::TICK_HZ as i64,
         _ => -1,
     };
     value as u64
@@ -141,7 +177,7 @@ fn udp_bind(port: u64) -> i64 {
             return EIO;
         }
         let fd = find_free().unwrap();
-        unsafe { FDS[fd] = Kind::Udp(handle) };
+        set_kind(fd, Kind::Udp(handle));
         fd as i64
     });
     let fd = result.unwrap_or(EIO);
@@ -245,19 +281,25 @@ fn tcp_listen(port: u64) -> i64 {
         return EINVAL;
     };
     let result = with_stack(|stack, _| {
-        reap(stack);
+        recycle(stack);
         let Some(fd) = find_free() else {
             return EMFILE;
         };
-        match add_listener(stack, port) {
-            Some(handle) => {
-                unsafe { FDS[fd] = Kind::TcpListen(handle, port) };
-                fd as i64
-            }
-            None => EIO,
+        let mut slots = [None; LISTENERS];
+        for slot in slots.iter_mut() {
+            *slot = add_listener(stack, port);
         }
+        if slots.iter().all(|slot| slot.is_none()) {
+            return EIO;
+        }
+        set_kind(fd, Kind::TcpListen(slots, port));
+        fd as i64
     });
-    result.unwrap_or(EIO)
+    let fd = result.unwrap_or(EIO);
+    if fd >= 0 && port == 80 {
+        log::info!("HTTP socket listening on port 80");
+    }
+    fd
 }
 
 fn tcp_accept(fd: u64) -> i64 {
@@ -265,28 +307,32 @@ fn tcp_accept(fd: u64) -> i64 {
         return EBADF;
     };
     let result = with_stack(|stack, _| {
-        reap(stack);
-        let (handle, port) = match kind_at(fd) {
-            Kind::TcpListen(handle, port) => (handle, port),
-            _ => return EBADF,
+        recycle(stack);
+        let Kind::TcpListen(mut slots, port) = kind_at(fd) else {
+            return EBADF;
         };
-        let ready = {
-            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-            socket.is_active()
-        };
-        if !ready {
+        let ready = slots.iter().position(|slot| {
+            let Some(handle) = slot else {
+                return false;
+            };
+            let socket = stack.sockets_mut().get::<tcp::Socket>(*handle);
+            // SYN-RECEIVED is active but may_recv is false. Handing it out
+            // makes the first recv look like EOF and aborts the handshake.
+            socket.may_recv()
+        });
+        let Some(index) = ready else {
             return EAGAIN;
-        }
+        };
+        let Some(handle) = slots[index].take() else {
+            return EAGAIN;
+        };
         let Some(conn) = find_free() else {
+            slots[index] = Some(handle);
+            set_kind(fd, Kind::TcpListen(slots, port));
             return EMFILE;
         };
-        let Some(fresh) = add_listener(stack, port) else {
-            return EIO;
-        };
-        unsafe {
-            FDS[fd] = Kind::TcpListen(fresh, port);
-            FDS[conn] = Kind::TcpConn(handle);
-        }
+        set_kind(fd, Kind::TcpListen(slots, port));
+        set_kind(conn, Kind::TcpConn(handle));
         conn as i64
     });
     result.unwrap_or(EIO)
@@ -306,7 +352,12 @@ fn tcp_recv(fd: u64, buf: u64, cap: u64) -> i64 {
         };
         let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
         if !socket.can_recv() {
-            if socket.may_recv() {
+            if socket.may_recv()
+                || matches!(
+                    socket.state(),
+                    tcp::State::SynSent | tcp::State::SynReceived
+                )
+            {
                 return Err(EAGAIN);
             }
             return Ok(0);
@@ -343,7 +394,7 @@ fn tcp_send(fd: u64, buf: u64, len: u64) -> i64 {
         return EFAULT;
     }
     let sent = with_stack(|stack, _| {
-        reap(stack);
+        recycle(stack);
         let Kind::TcpConn(handle) = kind_at(fd) else {
             return Err(EBADF);
         };
@@ -366,13 +417,19 @@ fn tcp_close(fd: u64) -> i64 {
     };
     let result = with_stack(|stack, _| {
         match kind_at(fd) {
-            Kind::TcpConn(handle) | Kind::TcpListen(handle, _) => {
+            Kind::TcpConn(handle) => {
                 stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
-                unsafe { FDS[fd] = Kind::Closing(handle) };
+                set_kind(fd, Kind::Closing(handle));
+            }
+            Kind::TcpListen(slots, _) => {
+                for handle in slots.into_iter().flatten() {
+                    stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
+                }
+                set_kind(fd, Kind::Empty);
             }
             Kind::Udp(handle) => {
                 stack.sockets_mut().remove(handle);
-                unsafe { FDS[fd] = Kind::Empty };
+                set_kind(fd, Kind::Empty);
             }
             _ => return EBADF,
         }
@@ -382,8 +439,8 @@ fn tcp_close(fd: u64) -> i64 {
 }
 
 fn add_listener(stack: &mut crate::net::NetworkStack, port: u16) -> Option<SocketHandle> {
-    let rx = tcp::SocketBuffer::new(vec![0u8; 4096]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; 8192]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; 8192]);
     let handle = stack.sockets_mut().add(tcp::Socket::new(rx, tx));
     let listening = stack
         .sockets_mut()
@@ -397,17 +454,47 @@ fn add_listener(stack: &mut crate::net::NetworkStack, port: u16) -> Option<Socke
     Some(handle)
 }
 
-fn reap(stack: &mut crate::net::NetworkStack) {
+fn recycle(stack: &mut crate::net::NetworkStack) {
+    let Some(listen_fd) = (0..MAX_FD).find(|index| matches!(kind_at(*index), Kind::TcpListen(_, _)))
+    else {
+        return;
+    };
+    let Kind::TcpListen(mut slots, port) = kind_at(listen_fd) else {
+        return;
+    };
     for index in 0..MAX_FD {
         let Kind::Closing(handle) = kind_at(index) else {
             continue;
         };
-        let finished = !stack.sockets_mut().get::<tcp::Socket>(handle).is_open();
-        if finished {
-            stack.sockets_mut().remove(handle);
-            unsafe { FDS[index] = Kind::Empty };
+        if slots.iter().all(|slot| slot.is_some()) {
+            break;
+        }
+        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+        if socket.send_queue() > 0 {
+            continue;
+        }
+        if matches!(
+            socket.state(),
+            tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived | tcp::State::SynSent
+        ) {
+            continue;
+        }
+        if socket.is_open() {
+            socket.abort();
+        }
+        if socket.listen(port).is_err() {
+            continue;
+        }
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(handle);
+            set_kind(index, Kind::Empty);
         }
     }
+    set_kind(listen_fd, Kind::TcpListen(slots, port));
+}
+
+fn reap(stack: &mut crate::net::NetworkStack) {
+    recycle(stack);
 }
 
 fn meta(n: usize) -> Vec<udp::PacketMetadata> {
@@ -439,7 +526,90 @@ fn find_free() -> Option<usize> {
 }
 
 fn kind_at(index: usize) -> Kind {
-    unsafe { FDS[index] }
+    table()[index]
+}
+
+fn set_kind(index: usize, kind: Kind) {
+    table()[index] = kind;
+}
+
+fn copy_user(ptr: u64, dst: &mut [u8]) -> bool {
+    if !crate::mmu::user_slice_ok(ptr, dst.len() as u64) {
+        return false;
+    }
+    crate::mmu::set_pan(false);
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, dst.as_mut_ptr(), dst.len());
+    }
+    crate::mmu::set_pan(true);
+    true
+}
+
+fn auth(user: u64, user_len: u64, pass: u64, pass_len: u64) -> i64 {
+    if user_len == 0 || user_len > 64 || pass_len > 64 {
+        return EINVAL;
+    }
+    let mut user_buf = [0u8; 64];
+    let mut pass_buf = [0u8; 64];
+    if !copy_user(user, &mut user_buf[..user_len as usize]) {
+        return EFAULT;
+    }
+    if pass_len > 0 && !copy_user(pass, &mut pass_buf[..pass_len as usize]) {
+        return EFAULT;
+    }
+    let user_text = core::str::from_utf8(&user_buf[..user_len as usize]).unwrap_or("");
+    let pass_text = core::str::from_utf8(&pass_buf[..pass_len as usize]).unwrap_or("");
+    if crate::config_manager::credentials_match(user_text, pass_text) {
+        0
+    } else {
+        -1
+    }
+}
+
+fn config_add(ptr: u64, len: u64) -> i64 {
+    if len == 0 || len > 256 {
+        return EINVAL;
+    }
+    let mut raw = [0u8; 256];
+    if !copy_user(ptr, &mut raw[..len as usize]) {
+        return EFAULT;
+    }
+    let Ok(text) = core::str::from_utf8(&raw[..len as usize]) else {
+        return EINVAL;
+    };
+    let mut parts = text.split_whitespace();
+    let Some(name) = parts.next() else {
+        return EINVAL;
+    };
+    let Some(kind) = parts.next() else {
+        return EINVAL;
+    };
+    let Some(value) = parts.next() else {
+        return EINVAL;
+    };
+    let ttl = parts.next().and_then(|text| text.parse().ok()).unwrap_or(300);
+    match crate::config_manager::add_record(name, kind, value, ttl) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
+}
+
+fn config_remove(ptr: u64, len: u64) -> i64 {
+    if len == 0 || len > 256 {
+        return EINVAL;
+    }
+    let mut raw = [0u8; 256];
+    if !copy_user(ptr, &mut raw[..len as usize]) {
+        return EFAULT;
+    }
+    let Ok(text) = core::str::from_utf8(&raw[..len as usize]) else {
+        return EINVAL;
+    };
+    match crate::config_manager::remove_record(text.trim()) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => EINVAL,
+    }
 }
 
 fn read_user(ptr: u64, len: usize) -> bool {

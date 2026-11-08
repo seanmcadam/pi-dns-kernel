@@ -78,13 +78,13 @@ struct Tables {
     l1: Table,
     l2: [Table; 4],
     l3: [Table; 8],
-    // Level-1 index 4, the 4 GiB point. Outside the identity map.
-    l2_user: Table,
-    // Two level-3 tables: 4 MiB from USER_CODE_VA. The window uses about 2.2 MiB.
-    l3_user: [Table; 2],
-    // Separate TTBR0 root. Not the kernel level-0 table.
-    user_l0: Table,
-    user_l1: Table,
+    // One TTBR0 root per EL0 task. Both tasks use the same virtual window
+    // and different physical pages, so each root has its own tables.
+    // Level-1 index 4 is the 4 GiB point. Two level-3 tables cover the window.
+    l2_user: [Table; 2],
+    l3_user: [[Table; 2]; 2],
+    user_l0: [Table; 2],
+    user_l1: [Table; 2],
 }
 
 static mut TABLES: Tables = Tables {
@@ -106,10 +106,13 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
     ],
-    l2_user: Table { entries: [0; 512] },
-    l3_user: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-    user_l0: Table { entries: [0; 512] },
-    user_l1: Table { entries: [0; 512] },
+    l2_user: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
+    l3_user: [
+        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
+        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
+    ],
+    user_l0: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
+    user_l1: [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
 };
 
 static mut NEXT_L3: usize = 0;
@@ -192,49 +195,46 @@ fn pan_supported() -> bool {
     (mmfr >> 4) & 0xf != 0
 }
 
-/// Map the EL0 code, data, heap, and stack.
+/// Map one task's EL0 code, data, heap, and stack.
 ///
-/// The arguments are kernel virtual addresses of the backing pages. The
-/// descriptors store the physical addresses. The user root is a different
-/// table from the kernel, and TTBR0 is pointed at it so later cache
-/// maintenance of the user alias can walk.
-pub fn map_user_window(code_va: u64, data_va: u64, heap_va: u64, stack_va: u64) {
+/// `slot` is 0 or 1. The arguments are kernel virtual addresses of that
+/// task's backing pages. Descriptors store physical addresses. TTBR0 is
+/// pointed at this slot with ASID 0 so the caller can maintain the user
+/// instruction cache. The scheduler later installs the task ASID.
+pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, stack_va: u64) {
+    if slot > 1 {
+        give_up("user slot out of range");
+    }
     let code_pa = virt_to_phys(code_va);
     let data_pa = virt_to_phys(data_va);
     let heap_pa = virt_to_phys(heap_va);
     let stack_pa = virt_to_phys(stack_va);
     unsafe {
-        let l0 = addr_of_mut!(TABLES.user_l0);
-        let l1 = addr_of_mut!(TABLES.user_l1);
-        let l2 = addr_of_mut!(TABLES.l2_user);
+        let l0 = addr_of_mut!(TABLES.user_l0[slot]);
+        let l1 = addr_of_mut!(TABLES.user_l1[slot]);
+        let l2 = addr_of_mut!(TABLES.l2_user[slot]);
         (*l0).entries = [0; 512];
         (*l1).entries = [0; 512];
         // USER_CODE_VA is 0x1_0000_0000: level 0 index 0, level 1 index 4.
         (*l0).entries[0] = virt_to_phys(l1 as u64) | VALID | TABLE_OR_PAGE;
         (*l1).entries[4] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
         for index in 0..2 {
-            let l3 = addr_of_mut!(TABLES.l3_user[index]);
+            let l3 = addr_of_mut!(TABLES.l3_user[slot][index]);
             (*l3).entries = [0; 512];
             (*l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
         }
         let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
         let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
-        map_user_span(USER_CODE_VA, code_pa, USER_CODE_BYTES, code);
-        map_user_span(USER_DATA_VA, data_pa, USER_DATA_BYTES, data);
-        map_user_span(USER_HEAP_VA, heap_pa, USER_HEAP_BYTES, data);
-        map_user_span(USER_STACK_VA, stack_pa, USER_STACK_BYTES, data);
-        let ttbr = virt_to_phys(l0 as u64);
-        core::arch::asm!(
-            "msr ttbr0_el1, {ttbr}",
-            "isb",
-            ttbr = in(reg) ttbr,
-            options(nostack),
-        );
+        map_user_span(slot, USER_CODE_VA, code_pa, USER_CODE_BYTES, code);
+        map_user_span(slot, USER_DATA_VA, data_pa, USER_DATA_BYTES, data);
+        map_user_span(slot, USER_HEAP_VA, heap_pa, USER_HEAP_BYTES, data);
+        map_user_span(slot, USER_STACK_VA, stack_pa, USER_STACK_BYTES, data);
     }
+    use_user_slot(slot, 0);
     flush_tlb();
 }
 
-fn map_user_span(va: u64, pa: u64, bytes: u64, flags: u64) {
+fn map_user_span(slot: usize, va: u64, pa: u64, bytes: u64, flags: u64) {
     let mut off = 0;
     while off < bytes {
         let page = va + off;
@@ -244,7 +244,7 @@ fn map_user_span(va: u64, pa: u64, bytes: u64, flags: u64) {
             return;
         }
         unsafe {
-            let l3 = addr_of_mut!(TABLES.l3_user[l2_index]);
+            let l3 = addr_of_mut!(TABLES.l3_user[slot][l2_index]);
             (*l3).entries[l3_index] = (pa + off) | flags | VALID | TABLE_OR_PAGE;
         }
         off += PAGE;
@@ -285,10 +285,19 @@ fn checked_end(ptr: u64, len: u64) -> Option<u64> {
 
 /// ASID lives in TTBR0[63:56] (TCR_EL1.AS is 0, so the ASID is 8 bits).
 /// Kernel translations are global. User translations are non-global, so
-/// ASID 0 does not match them.
+/// ASID 0 does not match them. Slot 0 uses ASID 1. Slot 1 uses ASID 2.
+/// The two roots map the same virtual addresses to different physical pages,
+/// and the ASID keeps those translations from aliasing in the TLB.
 pub fn set_user_asid(active: bool) {
-    let base = unsafe { virt_to_phys(addr_of!(TABLES.user_l0) as u64) };
-    let ttbr = if active { base | (1 << 56) } else { base };
+    use_user_slot(0, if active { 1 } else { 0 });
+}
+
+pub fn use_user_slot(slot: usize, asid: u64) {
+    if slot > 1 {
+        return;
+    }
+    let base = unsafe { virt_to_phys(addr_of!(TABLES.user_l0[slot]) as u64) };
+    let ttbr = base | ((asid & 0xff) << 56);
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, {ttbr}",

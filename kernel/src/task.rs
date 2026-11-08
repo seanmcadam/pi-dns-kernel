@@ -1,19 +1,26 @@
-//! One EL0 task, entered at boot to prove the round trip.
+//! Two EL0 tasks: the boot test, then DNS and HTTP.
 //!
-//! Cooperative yield returns to the kernel and the kernel resumes the same
-//! task. A timer IRQ at EL0 saves the task, ticks, and erets to it. There is
-//! no preemption: the IRQ does not switch tasks.
+//! Each task has its own user pages, TTBR0 root, ASID, kernel stack, and fd
+//! table. They share the virtual window at `0x1_0000_0000`. Switching tasks
+//! writes that task's TTBR0 and ASID, then erets into its saved context.
+//!
+//! The switch is cooperative. A task yields when its socket would block or
+//! after it has finished one turn. A timer IRQ at EL0 saves that task, ticks,
+//! and erets to the same task. It does not preempt. The boot test depends on
+//! that: ticks must advance while the test program is still the current task.
+//! DNS and HTTP both yield often enough that the other task runs between
+//! packets. Preempting on the timer would also have to switch inside the
+//! syscall path, and the network stack is only touched from EL1.
 //!
 //! Syscall number in x8, arguments in x0-x5, result in x0.
 //!   0 log(ptr, len)
 //!   1 yield
 //!   2 uptime_ticks
 //!   3 exit(code)
-//!   4-17 sockets, time, and config. See user_fd.
+//!   4-26 sockets, time, config, and the HTTP helpers. See user_fd.
 //! Anything else returns -1. A log pointer outside the user window returns -2.
-//! Neither path faults. The boot program proves the round trip. After the
-//! network is up, `start_dns` loads the DNS program into the same window and
-//! the poll loop resumes it on every yield. Yield is cooperative.
+//! Neither path faults. The boot program proves the round trip on slot 0.
+//! DNS reuses that slot. HTTP uses slot 1.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +29,9 @@ core::arch::global_asm!(include_str!("task.s"));
 
 const USER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.bin"));
 const DNS_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns.bin"));
+const HTTP_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/http.bin"));
 include!(concat!(env!("OUT_DIR"), "/dns_meta.rs"));
+include!(concat!(env!("OUT_DIR"), "/http_meta.rs"));
 
 const RESUME: u64 = 0;
 const YIELD: u64 = 1;
@@ -88,6 +97,20 @@ static mut KERNEL_RESUME: KernelResume = KernelResume {
 #[no_mangle]
 static mut EL0_ACTION: u64 = 0;
 
+static mut HTTP_TASK: Task = Task {
+    ctx: TaskContext {
+        x: [0; 31],
+        sp_el0: 0,
+        elr: 0,
+        spsr: 0,
+        fpsr: 0,
+        fpcr: 0,
+        q: [0; 64],
+    },
+    _gap: [0; 4096],
+    kstack: [0; KSTACK_BYTES],
+};
+
 static mut TASK: Task = Task {
     ctx: TaskContext {
         x: [0; 31],
@@ -115,6 +138,12 @@ static mut PRIV_KILLED: bool = false;
 static mut EXEC_KILLED: bool = false;
 static EL0_IRQS: AtomicU64 = AtomicU64::new(0);
 static mut DNS_LIVE: bool = false;
+static mut HTTP_LIVE: bool = false;
+
+const DNS_SLOT: usize = 0;
+const HTTP_SLOT: usize = 1;
+const DNS_ASID: u64 = 1;
+const HTTP_ASID: u64 = 2;
 
 extern "C" {
     fn enter_user(ctx: *mut TaskContext, kernel_sp: u64) -> u64;
@@ -295,7 +324,7 @@ fn syscall() -> u64 {
             }
             EXIT
         }
-        4..=17 => {
+        4..=26 => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
@@ -410,13 +439,20 @@ static mut USER_MEM: UserMem = UserMem {
     stack: [0; 64 * 1024],
 };
 
+static mut HTTP_MEM: UserMem = UserMem {
+    code: [0; 512 * 1024],
+    data: [0; 64 * 1024],
+    heap: [0; 1536 * 1024],
+    stack: [0; 64 * 1024],
+};
+
 fn map_window() {
     unsafe {
         let code_pa = addr_of!(USER_MEM.code) as u64;
         let data_pa = addr_of!(USER_MEM.data) as u64;
         let heap_pa = addr_of!(USER_MEM.heap) as u64;
         let stack_pa = addr_of!(USER_MEM.stack) as u64;
-        crate::mmu::map_user_window(code_pa, data_pa, heap_pa, stack_pa);
+        crate::mmu::map_user_window(0, code_pa, data_pa, heap_pa, stack_pa);
     }
 }
 
@@ -426,7 +462,13 @@ pub fn start_dns() -> Result<(), ()> {
         return Err(());
     }
     map_window();
-    load_dns_image();
+    load_image(
+        addr_of_mut!(USER_MEM),
+        DNS_BIN,
+        DNS_DATA_OFF,
+        DNS_DATA_LEN,
+        DNS_DATA_PLACE,
+    );
     unsafe {
         SCENARIO = 0xff;
         let ctx = addr_of_mut!(TASK.ctx);
@@ -434,10 +476,11 @@ pub fn start_dns() -> Result<(), ()> {
         (*ctx).elr = crate::mmu::USER_CODE_VA;
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::mmu::USER_STACK_BYTES;
+        crate::user_fd::set_task(DNS_SLOT);
+        crate::mmu::use_user_slot(DNS_SLOT, DNS_ASID);
         CURRENT_CTX = ctx;
         let ksp = addr_of!(TASK.kstack) as u64 + KSTACK_BYTES as u64;
         TASK_KSP = ksp;
-        crate::mmu::set_user_asid(true);
         DNS_LIVE = true;
         if enter_user(ctx, ksp) == YIELD {
             Ok(())
@@ -450,47 +493,107 @@ pub fn start_dns() -> Result<(), ()> {
 }
 
 pub fn poll_dns() {
-    if !unsafe { DNS_LIVE } {
-        return;
+    resume(DNS_SLOT, DNS_ASID, addr_of_mut!(TASK), true);
+}
+
+pub fn start_http() -> Result<(), ()> {
+    if HTTP_BIN.len() > crate::mmu::USER_CODE_BYTES as usize {
+        put("EL0 http: program does not fit\r\n");
+        return Err(());
     }
+    map_http_window();
+    load_image(
+        addr_of_mut!(HTTP_MEM),
+        HTTP_BIN,
+        HTTP_DATA_OFF,
+        HTTP_DATA_LEN,
+        HTTP_DATA_PLACE,
+    );
     unsafe {
-        let ctx = addr_of_mut!(TASK.ctx);
-        let ksp = TASK_KSP;
-        if enter_user(ctx, ksp) != YIELD {
-            DNS_LIVE = false;
+        SCENARIO = 0xff;
+        let ctx = addr_of_mut!(HTTP_TASK.ctx);
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = crate::mmu::USER_CODE_VA;
+        (*ctx).spsr = 0;
+        (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::mmu::USER_STACK_BYTES;
+        crate::user_fd::set_task(HTTP_SLOT);
+        crate::mmu::use_user_slot(HTTP_SLOT, HTTP_ASID);
+        CURRENT_CTX = ctx;
+        let ksp = addr_of!(HTTP_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        TASK_KSP = ksp;
+        HTTP_LIVE = true;
+        if enter_user(ctx, ksp) == YIELD {
+            Ok(())
+        } else {
+            HTTP_LIVE = false;
             CURRENT_CTX = core::ptr::null_mut();
-            put("EL0 dns stopped\r\n");
+            Err(())
         }
     }
 }
 
-fn load_dns_image() {
+pub fn poll_http() {
+    resume(HTTP_SLOT, HTTP_ASID, addr_of_mut!(HTTP_TASK), false);
+}
+
+fn resume(slot: usize, asid: u64, task: *mut Task, dns: bool) {
+    let live = unsafe { if dns { DNS_LIVE } else { HTTP_LIVE } };
+    if !live {
+        return;
+    }
+    crate::user_fd::set_task(slot);
+    crate::mmu::use_user_slot(slot, asid);
     unsafe {
-        let code = addr_of_mut!(USER_MEM.code) as *mut u8;
-        let data = addr_of_mut!(USER_MEM.data) as *mut u8;
+        let ctx = &mut (*task).ctx as *mut TaskContext;
+        let ksp = addr_of!((*task).kstack) as u64 + KSTACK_BYTES as u64;
+        CURRENT_CTX = ctx;
+        TASK_KSP = ksp;
+        if enter_user(ctx, ksp) != YIELD {
+            if dns {
+                DNS_LIVE = false;
+                put("EL0 dns stopped\r\n");
+            } else {
+                HTTP_LIVE = false;
+                put("EL0 http stopped\r\n");
+            }
+            CURRENT_CTX = core::ptr::null_mut();
+        }
+    }
+}
+
+fn map_http_window() {
+    unsafe {
+        let code_pa = addr_of!(HTTP_MEM.code) as u64;
+        let data_pa = addr_of!(HTTP_MEM.data) as u64;
+        let heap_pa = addr_of!(HTTP_MEM.heap) as u64;
+        let stack_pa = addr_of!(HTTP_MEM.stack) as u64;
+        crate::mmu::map_user_window(1, code_pa, data_pa, heap_pa, stack_pa);
+    }
+}
+
+fn load_image(mem: *mut UserMem, bin: &[u8], data_off: usize, data_len: usize, data_place: usize) {
+    unsafe {
+        let code = addr_of_mut!((*mem).code) as *mut u8;
+        let data = addr_of_mut!((*mem).data) as *mut u8;
         core::ptr::write_bytes(code, 0, crate::mmu::USER_CODE_BYTES as usize);
         core::ptr::write_bytes(data, 0, crate::mmu::USER_DATA_BYTES as usize);
         core::ptr::write_bytes(
-            addr_of_mut!(USER_MEM.heap) as *mut u8,
+            addr_of_mut!((*mem).heap) as *mut u8,
             0,
             crate::mmu::USER_HEAP_BYTES as usize,
         );
         core::ptr::write_bytes(
-            addr_of_mut!(USER_MEM.stack) as *mut u8,
+            addr_of_mut!((*mem).stack) as *mut u8,
             0,
             crate::mmu::USER_STACK_BYTES as usize,
         );
-        let code_len = DNS_BIN.len().min(crate::mmu::USER_CODE_BYTES as usize);
-        core::ptr::copy_nonoverlapping(DNS_BIN.as_ptr(), code, code_len);
-        if DNS_DATA_LEN > 0
-            && DNS_DATA_OFF + DNS_DATA_LEN <= DNS_BIN.len()
-            && DNS_DATA_PLACE + DNS_DATA_LEN <= crate::mmu::USER_DATA_BYTES as usize
+        let code_len = bin.len().min(crate::mmu::USER_CODE_BYTES as usize);
+        core::ptr::copy_nonoverlapping(bin.as_ptr(), code, code_len);
+        if data_len > 0
+            && data_off + data_len <= bin.len()
+            && data_place + data_len <= crate::mmu::USER_DATA_BYTES as usize
         {
-            core::ptr::copy_nonoverlapping(
-                DNS_BIN.as_ptr().add(DNS_DATA_OFF),
-                data.add(DNS_DATA_PLACE),
-                DNS_DATA_LEN,
-            );
+            core::ptr::copy_nonoverlapping(bin.as_ptr().add(data_off), data.add(data_place), data_len);
         }
         maintain_code(code, code_len);
     }
