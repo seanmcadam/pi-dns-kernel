@@ -110,10 +110,56 @@ pub fn write_config(data: &str) -> Result<(), String> {
     write_file(CONFIG_NAME, data.as_bytes()).map_err(|err| alloc::format!("save failed: {err}"))
 }
 
+pub fn read_named(name: &str, out: &mut [u8]) -> Result<usize, FsError> {
+    if out.is_empty() {
+        return Ok(0);
+    }
+    with_file(name, Mode::ReadOnly, |mgr, file| {
+        let mut got = 0;
+        let mut buf = [0u8; 512];
+        loop {
+            if got >= out.len() {
+                break;
+            }
+            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
+            if n == 0 {
+                break;
+            }
+            let copy = n.min(out.len() - got);
+            out[got..got + copy].copy_from_slice(&buf[..copy]);
+            got += copy;
+        }
+        Ok(got)
+    })
+}
+
+pub fn write_named(name: &str, data: &[u8], append: bool) -> Result<(), FsError> {
+    let mode = if append {
+        Mode::ReadWriteCreateOrAppend
+    } else {
+        Mode::ReadWriteCreateOrTruncate
+    };
+    with_file(name, mode, |mgr, file| {
+        if data.is_empty() {
+            return Ok(());
+        }
+        mgr.write(file, data).map_err(|err| fs_err("write", err))?;
+        Ok(())
+    })
+}
+
 pub fn append_log(message: &str) {
     if FS.lock().is_none() {
         return;
     }
+    if crate::task::log_live() {
+        crate::logger::post(1, 1, message.as_bytes());
+        return;
+    }
+    append_log_direct(message);
+}
+
+fn append_log_direct(message: &str) {
     let _ = rotate_log();
     let mut line = alloc::string::String::from(message);
     while line.len() < 72 {

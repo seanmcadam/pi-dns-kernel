@@ -25,6 +25,7 @@ const FAULT_TEXT: u64 = 24;
 const HTTP_INFO: u64 = 25;
 const TICK_HZ: u64 = 26;
 const DEBUG_SPIN: u64 = 27;
+const LOG_RECENT: u64 = 31;
 
 const EAGAIN: i64 = -11;
 
@@ -122,6 +123,7 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/config" => handle_config(request),
         "/records" => handle_records(request),
         "/records/delete" => handle_record_delete(request),
+        "/logs" => handle_logs(),
         "/debug/spin" => handle_spin(),
         "/debug/fault/guard" => {
             let _ = sys(FAULT_GUARD, 0, 0, 0, 0, 0, 0);
@@ -133,6 +135,27 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         }
         _ => HttpResponse::not_found(),
     }
+}
+
+fn handle_logs() -> HttpResponse {
+    let mut buf = [0u8; 1024];
+    let n = sys(
+        LOG_RECENT,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    let text = if n > 0 {
+        core::str::from_utf8(&buf[..n as usize]).unwrap_or("")
+    } else {
+        ""
+    };
+    let mut response = HttpResponse::ok(text);
+    response.add_header("Content-Type", "text/plain; charset=utf-8");
+    response
 }
 
 fn handle_spin() -> HttpResponse {
@@ -207,6 +230,7 @@ fn handle_index() -> HttpResponse {
         <li><a href="/status">System Status (JSON)</a></li>
         <li><a href="/config">Configuration</a></li>
         <li><a href="/records">DNS Records (JSON)</a></li>
+        <li><a href="/logs">Log</a></li>
     </ul>
 </body>
 </html>"#

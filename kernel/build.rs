@@ -31,6 +31,7 @@ fn main() {
     build_user(&out_dir, &manifest_dir);
     build_dns(&out_dir, &manifest_dir);
     build_http(&out_dir, &manifest_dir);
+    build_log(&out_dir, &manifest_dir);
 }
 
 fn build_user(out_dir: &Path, manifest_dir: &Path) {
@@ -325,6 +326,95 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         out_dir.join("http_meta.rs"),
         format!(
             "const HTTP_DATA_OFF: usize = {data_off};\nconst HTTP_DATA_LEN: usize = {data_len};\nconst HTTP_DATA_PLACE: usize = {data_place};\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn build_log(out_dir: &Path, manifest_dir: &Path) {
+    let dir = manifest_dir.join("../log-el0");
+    for rel in ["src/main.rs", "src/start.s", "link.ld"] {
+        println!("cargo:rerun-if-changed={}", dir.join(rel).display());
+    }
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let elf = out_dir.join("log.elf");
+    let link = dir.join("link.ld");
+    let link_arg = format!("link-arg=-T{}", link.display());
+    let status = Command::new(&rustc)
+        .args([
+            "--target",
+            "aarch64-unknown-none",
+            "--edition",
+            "2021",
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=z",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "linker=aarch64-linux-gnu-ld",
+            "-C",
+            &link_arg,
+        ])
+        .arg("-o")
+        .arg(&elf)
+        .arg(dir.join("src/main.rs"))
+        .status()
+        .unwrap_or_else(|err| panic!("failed to link log-el0: {err}"));
+    if !status.success() {
+        panic!("log-el0 link failed");
+    }
+    let nm = Command::new("aarch64-linux-gnu-nm")
+        .arg(&elf)
+        .output()
+        .unwrap_or_else(|err| panic!("nm log-el0: {err}"));
+    let listing = String::from_utf8_lossy(&nm.stdout);
+    let start = listing
+        .lines()
+        .find(|line| line.ends_with(" _start"))
+        .unwrap_or_else(|| panic!("log-el0 has no _start:\n{listing}"));
+    let addr = start.split_whitespace().next().unwrap_or("");
+    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
+        panic!("log-el0 _start is {addr}, expected 0x100000000");
+    }
+    let bin = out_dir.join("log.bin");
+    let status = Command::new("aarch64-linux-gnu-objcopy")
+        .args(["-O", "binary"])
+        .arg(&elf)
+        .arg(&bin)
+        .status()
+        .unwrap_or_else(|err| panic!("objcopy log-el0: {err}"));
+    if !status.success() {
+        panic!("log-el0 objcopy failed");
+    }
+    let sections = elf_sections(&elf);
+    let code_limit = 0x1_0002_0000u64;
+    let data_base = 0x1_0009_0000u64;
+    let data_limit = 0x1_0009_1000u64;
+    let mut data_off = 0usize;
+    let mut data_len = 0usize;
+    let mut data_place = 0usize;
+    for (name, addr, size) in &sections {
+        if *size == 0 || *addr == 0 || name.starts_with(".comment") || name.starts_with(".ARM") || name.starts_with(".debug") {
+            continue;
+        }
+        let end = addr + size;
+        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
+        let in_data = *addr >= data_base && end <= data_limit;
+        if !in_code && !in_data {
+            panic!("log-el0 section {name} at {addr:#x} size {size:#x} is outside the user window");
+        }
+        if name == ".data" {
+            data_off = (*addr - 0x1_0000_0000) as usize;
+            data_len = *size as usize;
+            data_place = (*addr - data_base) as usize;
+        }
+    }
+    fs::write(
+        out_dir.join("log_meta.rs"),
+        format!(
+            "const LOG_DATA_OFF: usize = {data_off};\nconst LOG_DATA_LEN: usize = {data_len};\nconst LOG_DATA_PLACE: usize = {data_place};\n"
         ),
     )
     .unwrap();

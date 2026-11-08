@@ -88,7 +88,7 @@ struct Tables {
     user_l1: [Table; USER_SLOTS],
 }
 
-pub const USER_SLOTS: usize = 3;
+pub const USER_SLOTS: usize = 4;
 
 static mut TABLES: Tables = Tables {
     l0: Table { entries: [0; 512] },
@@ -113,8 +113,10 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
     ],
     l3_user: [
+        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
@@ -123,8 +125,10 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
     ],
     user_l1: [
+        Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
@@ -228,6 +232,31 @@ pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, st
     map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), USER_DATA_BYTES, data);
     map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), USER_HEAP_BYTES, data);
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), USER_STACK_BYTES, data);
+    use_user_slot(slot, 0);
+    flush_tlb();
+}
+
+/// Map a task that does not need the full DNS/HTTP windows.
+pub fn map_user_sized(
+    slot: usize,
+    code_va: u64,
+    code_len: u64,
+    data_va: u64,
+    data_len: u64,
+    stack_va: u64,
+    stack_len: u64,
+) {
+    if slot >= USER_SLOTS {
+        give_up("user slot out of range");
+    }
+    prepare_user_root(slot);
+    let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
+    let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), code_len, code);
+    if data_len > 0 {
+        map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), data_len, data);
+    }
+    map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), stack_len, data);
     use_user_slot(slot, 0);
     flush_tlb();
 }

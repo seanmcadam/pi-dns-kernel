@@ -30,8 +30,10 @@ core::arch::global_asm!(include_str!("task.s"));
 const USER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.bin"));
 const DNS_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns.bin"));
 const HTTP_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/http.bin"));
+const LOG_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/log.bin"));
 include!(concat!(env!("OUT_DIR"), "/dns_meta.rs"));
 include!(concat!(env!("OUT_DIR"), "/http_meta.rs"));
+include!(concat!(env!("OUT_DIR"), "/log_meta.rs"));
 
 const RESUME: u64 = 0;
 const YIELD: u64 = 1;
@@ -102,6 +104,20 @@ static mut KERNEL_RESUME: KernelResume = KernelResume {
 #[no_mangle]
 static mut EL0_ACTION: u64 = 0;
 
+static mut LOG_TASK: Task = Task {
+    ctx: TaskContext {
+        x: [0; 31],
+        sp_el0: 0,
+        elr: 0,
+        spsr: 0,
+        fpsr: 0,
+        fpcr: 0,
+        q: [0; 64],
+    },
+    _gap: [0; 4096],
+    kstack: [0; KSTACK_BYTES],
+};
+
 static mut SPIN_TASK: Task = Task {
     ctx: TaskContext {
         x: [0; 31],
@@ -162,13 +178,20 @@ static EL0_IRQS: AtomicU64 = AtomicU64::new(0);
 static mut DNS_LIVE: bool = false;
 static mut HTTP_LIVE: bool = false;
 static mut SPIN_LIVE: bool = false;
+static mut LOG_LIVE: bool = false;
 
 const DNS_SLOT: usize = 0;
 const HTTP_SLOT: usize = 1;
 const SPIN_SLOT: usize = 2;
+const LOG_SLOT: usize = 3;
 const DNS_ASID: u64 = 1;
 const HTTP_ASID: u64 = 2;
 const SPIN_ASID: u64 = 3;
+const LOG_ASID: u64 = 4;
+
+const LOG_CODE_BYTES: usize = 128 * 1024;
+const LOG_DATA_BYTES: usize = 4096;
+const LOG_STACK_BYTES: usize = 16 * 1024;
 
 /// `b .` — a task that never makes a syscall. Preemption is the only way out.
 const SPIN_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x14];
@@ -379,7 +402,7 @@ fn syscall() -> u64 {
             }
             EXIT
         }
-        4..=27 => {
+        4..=33 => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
@@ -500,6 +523,19 @@ struct SpinMem {
     stack: [u8; 4096],
 }
 
+#[repr(C, align(4096))]
+struct LogMem {
+    code: [u8; LOG_CODE_BYTES],
+    data: [u8; LOG_DATA_BYTES],
+    stack: [u8; LOG_STACK_BYTES],
+}
+
+static mut LOG_MEM: LogMem = LogMem {
+    code: [0; LOG_CODE_BYTES],
+    data: [0; LOG_DATA_BYTES],
+    stack: [0; LOG_STACK_BYTES],
+};
+
 static mut SPIN_MEM: SpinMem = SpinMem {
     code: [0; 4096],
     stack: [0; 4096],
@@ -610,6 +646,85 @@ pub fn start_http() -> Result<(), ()> {
 
 pub fn poll_http() {
     resume(HTTP_SLOT, HTTP_ASID, addr_of_mut!(HTTP_TASK), false);
+}
+
+pub fn log_live() -> bool {
+    unsafe { LOG_LIVE }
+}
+
+pub fn start_log() -> Result<(), ()> {
+    if LOG_BIN.len() > LOG_CODE_BYTES {
+        put("EL0 log: program does not fit\r\n");
+        return Err(());
+    }
+    unsafe {
+        let code = addr_of_mut!(LOG_MEM.code) as *mut u8;
+        core::ptr::write_bytes(code, 0, LOG_CODE_BYTES);
+        core::ptr::copy_nonoverlapping(LOG_BIN.as_ptr(), code, LOG_BIN.len());
+        if LOG_DATA_LEN > 0
+            && LOG_DATA_OFF + LOG_DATA_LEN <= LOG_BIN.len()
+            && LOG_DATA_PLACE + LOG_DATA_LEN <= LOG_DATA_BYTES
+        {
+            core::ptr::copy_nonoverlapping(
+                LOG_BIN.as_ptr().add(LOG_DATA_OFF),
+                addr_of_mut!(LOG_MEM.data).cast(),
+                LOG_DATA_LEN,
+            );
+        }
+        crate::mmu::map_user_sized(
+            LOG_SLOT,
+            addr_of!(LOG_MEM.code) as u64,
+            LOG_CODE_BYTES as u64,
+            addr_of!(LOG_MEM.data) as u64,
+            LOG_DATA_BYTES as u64,
+            addr_of!(LOG_MEM.stack) as u64,
+            LOG_STACK_BYTES as u64,
+        );
+        maintain_code(code, LOG_BIN.len());
+        let ctx = addr_of_mut!(LOG_TASK.ctx);
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = crate::mmu::USER_CODE_VA;
+        (*ctx).spsr = 0;
+        (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + LOG_STACK_BYTES as u64;
+        crate::user_fd::set_task(LOG_SLOT);
+        crate::mmu::use_user_slot(LOG_SLOT, LOG_ASID);
+        CURRENT_CTX = ctx;
+        let ksp = addr_of!(LOG_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        TASK_KSP = ksp;
+        ACTIVE_SLOT = LOG_SLOT;
+        LOG_LIVE = true;
+        loop {
+            match enter(ctx, ksp) {
+                YIELD => return Ok(()),
+                PREEMPT => continue,
+                _ => {
+                    LOG_LIVE = false;
+                    CURRENT_CTX = core::ptr::null_mut();
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
+pub fn poll_log() {
+    if !unsafe { LOG_LIVE } {
+        return;
+    }
+    crate::user_fd::set_task(LOG_SLOT);
+    crate::mmu::use_user_slot(LOG_SLOT, LOG_ASID);
+    unsafe {
+        ACTIVE_SLOT = LOG_SLOT;
+        let ctx = addr_of_mut!(LOG_TASK.ctx);
+        let ksp = addr_of!(LOG_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        CURRENT_CTX = ctx;
+        TASK_KSP = ksp;
+        if !still_scheduled(enter(ctx, ksp)) {
+            LOG_LIVE = false;
+            put("EL0 log stopped\r\n");
+            CURRENT_CTX = core::ptr::null_mut();
+        }
+    }
 }
 
 pub fn poll_spin() {

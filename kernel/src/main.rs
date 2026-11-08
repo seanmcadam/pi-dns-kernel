@@ -128,6 +128,10 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("[OK] HTTP server initialized\r\n");
 
     uart_write("[9] Creating sockets...\r\n");
+    match task::start_log() {
+        Ok(()) => uart_write("[OK] Log task running\r\n"),
+        Err(()) => uart_write("[ERROR] Log task failed\r\n"),
+    }
     match task::start_dns() {
         Ok(()) => uart_write("[OK] DNS user program running\r\n"),
         Err(()) => uart_write("[ERROR] DNS user program failed\r\n"),
@@ -148,6 +152,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         net::poll();
         task::poll_dns();
         task::poll_http();
+        task::poll_log();
         task::poll_spin();
         net::poll();
 

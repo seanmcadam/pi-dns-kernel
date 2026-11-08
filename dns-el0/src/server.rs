@@ -23,6 +23,7 @@ const CONFIG_UPSTREAMS: u64 = 14;
 const CONFIG_BLOCKLIST: u64 = 15;
 const CONFIG_CACHE_SIZE: u64 = 16;
 const SET_CACHE_ENTRIES: u64 = 17;
+const LOG_POST: u64 = 28;
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
@@ -211,6 +212,7 @@ fn handle_bytes(
     }
     let question = &query.questions[0];
     let name = normalize_name(&question.name);
+    post_query(&name);
     let qtype = question.qtype as u16;
 
     if blocked(&name) {
@@ -556,6 +558,24 @@ fn yield_now() {
 fn exit(code: u64) -> ! {
     let _ = sys(EXIT, code, 0, 0, 0, 0, 0);
     loop {}
+}
+
+fn post_query(name: &str) {
+    let mut buf = [0u8; 64];
+    let prefix = b"dns query ";
+    let bytes = name.as_bytes();
+    let take = bytes.len().min(buf.len() - prefix.len());
+    buf[..prefix.len()].copy_from_slice(prefix);
+    buf[prefix.len()..prefix.len() + take].copy_from_slice(&bytes[..take]);
+    let _ = sys(
+        LOG_POST,
+        buf.as_ptr() as u64,
+        (prefix.len() + take) as u64,
+        0,
+        0,
+        0,
+        0,
+    );
 }
 
 fn log_line(text: &str) -> i64 {

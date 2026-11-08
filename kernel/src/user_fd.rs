@@ -30,6 +30,12 @@
 //!  25  http_info(buf, cap) -> "port username"
 //!  26  tick_hz
 //!  27  debug_spin. Arms the EL0 task that never yields. Returns 0.
+//!  28  log_post(ptr, len) -> 0 queued, 1 dropped. Never waits.
+//!  29  log_drain(buf, cap) -> len, or 0. Bytes are level, flags, text.
+//!  30  log_emit(ptr, len). UART plus the recent-log buffer.
+//!  31  log_recent(buf, cap) -> len
+//!  32  file_read(name, name_len, buf, cap) -> len
+//!  33  file_write(name, name_len, buf, len, flags). flags 1 appends.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -65,6 +71,12 @@ const FAULT_TEXT: u64 = 24;
 const HTTP_INFO: u64 = 25;
 const TICK_HZ: u64 = 26;
 const DEBUG_SPIN: u64 = 27;
+const LOG_POST: u64 = 28;
+const LOG_DRAIN: u64 = 29;
+const LOG_EMIT: u64 = 30;
+const LOG_RECENT: u64 = 31;
+const FILE_READ: u64 = 32;
+const FILE_WRITE: u64 = 33;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -89,9 +101,10 @@ enum Kind {
     Closing(SocketHandle),
 }
 
-const TASKS: usize = 3;
+const TASKS: usize = 4;
 
 static mut FDS: [[Kind; MAX_FD]; TASKS] = [
+    [Kind::Empty; MAX_FD],
     [Kind::Empty; MAX_FD],
     [Kind::Empty; MAX_FD],
     [Kind::Empty; MAX_FD],
@@ -139,6 +152,12 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         HTTP_INFO => config_out(args[0], args[1], crate::config_manager::write_http_info),
         TICK_HZ => crate::timer::TICK_HZ as i64,
         DEBUG_SPIN => crate::task::arm_spinner(),
+        LOG_POST => log_post(args[0], args[1]),
+        LOG_DRAIN => log_drain(args[0], args[1]),
+        LOG_EMIT => log_emit(args[0], args[1]),
+        LOG_RECENT => log_recent(args[0], args[1]),
+        FILE_READ => file_read(args[0], args[1], args[2], args[3]),
+        FILE_WRITE => file_write(args[0], args[1], args[2], args[3], args[4]),
         _ => -1,
     };
     value as u64
@@ -638,6 +657,145 @@ fn write_user(ptr: u64, src: &[u8]) -> bool {
     crate::mmu::set_pan(false);
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
+    }
+    crate::mmu::set_pan(true);
+    true
+}
+
+static mut IOBUF: [u8; 1024] = [0; 1024];
+
+fn log_post(ptr: u64, len: u64) -> i64 {
+    if len == 0 || len > 80 || !crate::mmu::user_slice_ok(ptr, len) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 80];
+    if !copy_user(ptr, &mut raw[..len as usize]) {
+        return EFAULT;
+    }
+    crate::logger::post(1, 0, &raw[..len as usize])
+}
+
+fn log_drain(ptr: u64, cap: u64) -> i64 {
+    if cap < 2 || cap > 128 || !crate::mmu::user_write_ok(ptr, cap) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 128];
+    let n = crate::logger::drain(&mut raw[..cap as usize]);
+    if n == 0 {
+        return 0;
+    }
+    if write_user(ptr, &raw[..n]) {
+        n as i64
+    } else {
+        EFAULT
+    }
+}
+
+fn log_emit(ptr: u64, len: u64) -> i64 {
+    if len == 0 || len > 96 || !crate::mmu::user_slice_ok(ptr, len) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 96];
+    if !copy_user(ptr, &mut raw[..len as usize]) {
+        return EFAULT;
+    }
+    let Ok(text) = core::str::from_utf8(&raw[..len as usize]) else {
+        return EINVAL;
+    };
+    crate::logger::emit_line(text);
+    0
+}
+
+fn log_recent(ptr: u64, cap: u64) -> i64 {
+    if cap == 0 || cap > 1024 || !crate::mmu::user_write_ok(ptr, cap) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 1024];
+    let n = crate::logger::recent(&mut raw[..cap as usize]);
+    if n == 0 {
+        return 0;
+    }
+    if write_user(ptr, &raw[..n]) {
+        n as i64
+    } else {
+        EFAULT
+    }
+}
+
+fn file_name(ptr: u64, len: u64) -> Option<[u8; 12]> {
+    if len == 0 || len > 12 || !crate::mmu::user_slice_ok(ptr, len) {
+        return None;
+    }
+    let mut raw = [0u8; 12];
+    if !copy_user(ptr, &mut raw[..len as usize]) {
+        return None;
+    }
+    let name = &raw[..len as usize];
+    if !name
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'.' || *byte == b'_')
+    {
+        return None;
+    }
+    Some(raw)
+}
+
+fn file_read(name: u64, name_len: u64, buf: u64, cap: u64) -> i64 {
+    let Some(raw) = file_name(name, name_len) else {
+        return EINVAL;
+    };
+    if cap == 0 || cap > 1024 || !crate::mmu::user_write_ok(buf, cap) {
+        return EFAULT;
+    }
+    let Ok(text) = core::str::from_utf8(&raw[..name_len as usize]) else {
+        return EINVAL;
+    };
+    let n = unsafe { crate::fs::read_named(text, &mut IOBUF[..cap as usize]) };
+    match n {
+        Ok(0) => 0,
+        Ok(copied) => {
+            if unsafe { write_user(buf, &IOBUF[..copied]) } {
+                copied as i64
+            } else {
+                EFAULT
+            }
+        }
+        Err(crate::fs::FsError::NotInitialized) => 0,
+        Err(crate::fs::FsError::Io { detail, .. }) if detail == "NotFound" => 0,
+        Err(_) => EIO,
+    }
+}
+
+fn file_write(name: u64, name_len: u64, buf: u64, len: u64, flags: u64) -> i64 {
+    let Some(raw) = file_name(name, name_len) else {
+        return EINVAL;
+    };
+    if len > 1024 {
+        return EINVAL;
+    }
+    if len > 0 && !crate::mmu::user_slice_ok(buf, len) {
+        return EFAULT;
+    }
+    let Ok(text) = core::str::from_utf8(&raw[..name_len as usize]) else {
+        return EINVAL;
+    };
+    if len > 0 && !read_user_io(buf, len as usize) {
+        return EFAULT;
+    }
+    let data = unsafe { &IOBUF[..len as usize] };
+    match crate::fs::write_named(text, data, (flags & 1) == 1) {
+        Ok(()) => 0,
+        Err(_) => EIO,
+    }
+}
+
+fn read_user_io(ptr: u64, len: usize) -> bool {
+    if !crate::mmu::user_slice_ok(ptr, len as u64) {
+        return false;
+    }
+    crate::mmu::set_pan(false);
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, core::ptr::addr_of_mut!(IOBUF).cast(), len);
     }
     crate::mmu::set_pan(true);
     true

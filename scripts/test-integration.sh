@@ -87,6 +87,28 @@ else
     echo "⚠ dig not available, skipping DNS test"
 fi
 
+# Test 18: the DNS task posts a query line and the log task publishes it.
+echo ""
+echo "Test 18: DNS query reaches the log task"
+LOG_TEXT=""
+LOG_OK=0
+for _try in 1 2 3 4 5; do
+    LOG_TEXT=$(timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/logs" || true)
+    if echo "$LOG_TEXT" | grep -q "dns query test.local"; then
+        LOG_OK=1
+        break
+    fi
+    sleep 0.3
+done
+if [ "$LOG_OK" = "1" ]; then
+    echo "✓ Log task published the DNS query"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ DNS query did not reach the log task"
+    echo "$LOG_TEXT"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Test 3: DNS query for pi4.local
 echo ""
 echo "Test 3: DNS query for pi4.local"
