@@ -972,12 +972,35 @@ if status != 200:
 doc = json.loads(body)
 if doc.get("version") != 1 or doc.get("max_bytes") != 4096 or doc.get("archives") != 3:
     fail("default LOG.JSN %s" % body[:200])
+if body != b'{\n  "version": 1,\n  "max_bytes": 4096,\n  "archives": 3\n}\n':
+    fail("default LOG.JSN is not pretty %s" % body[:200])
+if len(body) > 4096:
+    fail("default LOG.JSN exceeds 4096")
 status, again = req("POST", "/config/file/log", body.decode(), {"Content-Type": "application/json"})
 if status != 200 or b"applied" not in again:
     fail("round trip %s %s" % (status, again[:160]))
 status, after = req("GET", "/config/file/log")
 if after != body:
     fail("round trip bytes changed")
+compact = '{"archives":3,"max_bytes":4096,"version":1}'
+status, applied = req("POST", "/config/file/log", compact, {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in applied:
+    fail("compact upload %s %s" % (status, applied[:160]))
+status, pretty = req("GET", "/config/file/log")
+ordered = b'{\n  "archives": 3,\n  "max_bytes": 4096,\n  "version": 1\n}\n'
+if pretty != ordered or json.loads(pretty) != doc:
+    fail("compact upload was not formatted %s" % pretty[:200])
+messy = '{\n\t"archives" : 3, "version" : 1, "max_bytes" : 4096 }\n'
+status, applied = req("POST", "/config/file/log", messy, {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in applied:
+    fail("whitespace upload %s %s" % (status, applied[:160]))
+status, again = req("GET", "/config/file/log")
+if again != b'{\n  "archives": 3,\n  "version": 1,\n  "max_bytes": 4096\n}\n':
+    fail("whitespace upload was not canonical %s" % again[:200])
+status, applied = req("POST", "/config/file/log", body.decode(), {"Content-Type": "application/json"})
+status, restored = req("GET", "/config/file/log")
+if restored != body:
+    fail("did not restore the default log file")
 print("defaults and round trip")
 
 kept = body
@@ -989,6 +1012,12 @@ cases = [
     ('{"version":1,"max_bytes":65536,"archives":16}', "out of bounds"),
     ('{"version":1,"max_bytes":4096,"archives":1,"extra":1}', "unknown"),
     ("{" + "x" * 5000, "exceeds"),
+    ('{"version":1,"max_bytes":4096,"archives":3,"a":"\\u"}', "malformed"),
+    ('{"version":1,"max_bytes":4096,"archives":3,"a":"\\uXXXX"}', "malformed"),
+    ('{"version":1,"version":1,"max_bytes":4096,"archives":3}', "malformed"),
+    ('{"version":1,"max_bytes":4095,"archives":0}', "out of bounds"),
+    ('{"version":1,"max_bytes":65537,"archives":0}', "out of bounds"),
+    ('{"version":1,"max_bytes":4096,"archives":17}', "out of bounds"),
 ]
 for payload, needle in cases:
     status, err = req("POST", "/config/file/log", payload, {"Content-Type": "application/json"})
@@ -997,6 +1026,39 @@ for payload, needle in cases:
 status, now = req("GET", "/config/file/log")
 if now != kept:
     fail("rejected upload changed the file")
+exact = '{"version":1,"max_bytes":4096,"archives":3}'
+padded = exact[:-1] + (" " * (4096 - len(exact))) + "}"
+if len(padded) != 4096:
+    fail("pad length %s" % len(padded))
+status, applied = req("POST", "/config/file/log", padded, {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in applied:
+    fail("4096 upload %s %s" % (status, applied[:160]))
+status, saved = req("GET", "/config/file/log")
+if json.loads(saved) != doc or len(saved) > 4096:
+    fail("4096 upload changed values %s" % saved[:200])
+status, rejected = req("POST", "/config/file/log", padded + " ", {"Content-Type": "application/json"})
+if status != 400 or b"exceeds" not in rejected:
+    fail("4097 upload %s %s" % (status, rejected[:160]))
+status, now = req("GET", "/config/file/log")
+if now != saved:
+    fail("oversize upload changed the file")
+for payload, expect in (
+    ('{"version":1,"max_bytes":65536,"archives":15}', (65536, 15)),
+    ('{"version":1,"max_bytes":4096,"archives":0}', (4096, 0)),
+):
+    status, applied = req("POST", "/config/file/log", payload, {"Content-Type": "application/json"})
+    if status != 200 or b"applied" not in applied:
+        fail("boundary %s %s" % (status, applied[:160]))
+    status, got = req("GET", "/config/file/log")
+    parsed = json.loads(got)
+    if (parsed.get("max_bytes"), parsed.get("archives")) != expect or len(got) > 4096:
+        fail("boundary stored %s" % got[:200])
+    if b"\n" not in got:
+        fail("boundary was not pretty %s" % got[:200])
+    status, again = req("POST", "/config/file/log", got.decode(), {"Content-Type": "application/json"})
+    status, twice = req("GET", "/config/file/log")
+    if twice != got:
+        fail("boundary reformatted again")
 print("rejections")
 
 status, page = req("GET", "/log-config")
@@ -1083,6 +1145,12 @@ if status != 200:
     fail("config download %s" % status)
 kept = raw
 doc = json.loads(raw)
+if not raw.startswith(b"{\n  \"version\": 1,\n") or b"\n    \"mode\":" not in raw:
+    fail("default CONFIG.JSN is not pretty %s" % raw[:180])
+if b"legacy.local" not in raw or b'"vnc": 0' not in raw or b'"hdmi": 0' not in raw:
+    fail("default CONFIG.JSN values %s" % raw[:180])
+if len(raw) > 4096:
+    fail("default CONFIG.JSN exceeds 4096")
 cases = []
 bad = json.loads(raw)
 bad["dns"]["cache_reap_interval_secs"] = 0
@@ -1104,6 +1172,104 @@ for mutated, needle in cases:
 status, now = req("GET", "/config/file/config")
 if now != kept:
     fail("rejected upload changed CONFIG.JSN")
+escaped = json.loads(raw)
+escaped["http"]["password"] = 'a"b\\c'
+compact = json.dumps(escaped, separators=(",", ":"), ensure_ascii=True)
+if len(compact) > 4096:
+    fail("escape fixture too large")
+status, applied = req("POST", "/config/file/config", compact, {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in applied:
+    fail("escape upload %s %s" % (status, applied[:180]))
+fresh = urllib.request.HTTPBasicAuthHandler()
+fresh.add_password(realm="DNS Server", uri=base, user="admin", passwd='a"b\\c')
+fresh_opener = urllib.request.build_opener(fresh)
+def req_as(op, method, path, body=None, headers=None):
+    data = body.encode() if isinstance(body, str) else body
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if headers:
+        for k, v in headers.items():
+            r.add_header(k, v)
+    try:
+        resp = op.open(r, timeout=8)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+status, stored = req_as(fresh_opener, "GET", "/config/file/config")
+if status != 200:
+    fail("escape download %s %s" % (status, stored[:120]))
+parsed = json.loads(stored)
+if parsed["http"]["password"] != 'a"b\\c' or parsed["dns"]["records"] != doc["dns"]["records"]:
+    fail("escape changed values %s" % stored[:240])
+if b'\\"' not in stored or b"\\\\" not in stored or len(stored) > 4096 or b"\n" not in stored:
+    fail("escape formatting %s" % stored[:240])
+status, again = req_as(
+    fresh_opener,
+    "POST",
+    "/config/file/config",
+    stored.decode(),
+    {"Content-Type": "application/json"},
+)
+status, twice = req_as(fresh_opener, "GET", "/config/file/config")
+if twice != stored:
+    fail("pretty config was not stable")
+status, restored = req_as(
+    fresh_opener,
+    "POST",
+    "/config/file/config",
+    kept.decode(),
+    {"Content-Type": "application/json"},
+)
+if status != 200:
+    fail("password restore %s %s" % (status, restored[:120]))
+wide = json.loads(raw)
+names = []
+count = 0
+while count < 64:
+    trial = json.loads(json.dumps(wide))
+    trial["dns"]["records"] = list(wide["dns"]["records"])
+    trial["dns"]["records"].extend(
+        {
+            "name": "n%02d.pad.local" % n,
+            "type": "A",
+            "value": "10.1.%d.%d" % (n // 200, n % 200),
+            "ttl": 300,
+        }
+        for n in range(count)
+    )
+    compact = json.dumps(trial, separators=(",", ":"), ensure_ascii=True)
+    pretty = json.dumps(trial, indent=2, ensure_ascii=True) + "\n"
+    if len(compact) > 4096:
+        break
+    if len(pretty) > 4096 and len(compact) > 2500:
+        names = [item["name"] for item in trial["dns"]["records"]]
+        wide = trial
+        break
+    count += 1
+else:
+    fail("could not build a config whose pretty form exceeds 4096")
+compact = json.dumps(wide, separators=(",", ":"), ensure_ascii=True)
+if not (2500 < len(compact) <= 4096):
+    fail("wide compact length %s" % len(compact))
+status, applied = req("POST", "/config/file/config", compact, {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in applied:
+    fail("wide upload %s %s" % (status, applied[:180]))
+status, stored = req("GET", "/config/file/config")
+parsed = json.loads(stored)
+got_names = [item["name"] for item in parsed["dns"]["records"]]
+if got_names != names or parsed["http"]["username"] != doc["http"]["username"]:
+    fail("wide upload dropped values")
+if len(stored) > 4096 or b"\n" in stored:
+    fail("wide upload was truncated or pretty past the limit (%s)" % len(stored))
+status, again = req("POST", "/config/file/config", stored.decode(), {"Content-Type": "application/json"})
+status, twice = req("GET", "/config/file/config")
+if twice != stored:
+    fail("compact fallback was not stable")
+status, restored = req("POST", "/config/file/config", kept.decode(), {"Content-Type": "application/json"})
+if status != 200:
+    fail("restore %s" % restored[:120])
+status, now = req("GET", "/config/file/config")
+if now != kept:
+    fail("restore bytes %s" % now[:180])
 print("rejections")
 
 status, saved = req(
@@ -1345,7 +1511,7 @@ for line in debug.splitlines():
 if not row.startswith(b"vnc off"):
     fail("vnc still up: %s" % row)
 status, raw = req("GET", "/config/file/config")
-if status != 200 or b'"vnc":0' not in raw:
+if status != 200 or b'"vnc": 0' not in raw:
     fail("config not disabled %s" % raw[:240])
 kept = raw
 cases = []
@@ -1403,7 +1569,7 @@ if ! mcopy -i qemu/json-disk.img@@${DISK_OFF} ::CONFIG.JSN - | grep -q "legacy.l
     echo "✗ migrated CONFIG.JSN missing legacy.local"
     JSON_OK=0
 fi
-if ! mcopy -i qemu/json-disk.img@@${DISK_OFF} ::LOG.JSN - | grep -q '"archives":1'; then
+if ! mcopy -i qemu/json-disk.img@@${DISK_OFF} ::LOG.JSN - | grep -q '"archives": 1'; then
     echo "✗ LOG.JSN was not updated"
     JSON_OK=0
 fi

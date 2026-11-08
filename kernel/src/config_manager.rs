@@ -2,6 +2,7 @@ use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::net::NetworkMode;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -142,8 +143,8 @@ pub fn copy_config_file(which: u8, out: &mut [u8]) -> Result<usize, String> {
             } else {
                 let current = CURRENT.lock();
                 match current.as_ref() {
-                    Some(config) => serialize_config(config),
-                    None => serialize_config(&default_config()),
+                    Some(config) => serialize_config(config)?,
+                    None => serialize_config(&default_config())?,
                 }
             }
         }
@@ -167,15 +168,18 @@ pub fn store_config_file(which: u8, text: &str) -> Result<bool, String> {
     if text.len() > config::UPLOAD_MAX {
         return Err(String::from("upload exceeds 4096 bytes"));
     }
+    let value = config::parse(text).map_err(|err| err.text())?;
     match which {
         0 => {
-            let next = config_from_text(text)?;
+            config::check(&value, config::main_fields()).map_err(|err| err.text())?;
+            let next = config_from_value(&value)?;
+            let stored = config::format_document(&value).map_err(|err| err.text())?;
             let previous = CURRENT.lock().clone();
             let restart = previous
                 .as_ref()
                 .map(|old| needs_restart(old, &next))
                 .unwrap_or(false);
-            crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes())
+            crate::fs::replace_file(crate::fs::CONFIG_NAME, stored.as_bytes())
                 .map_err(|err| alloc::format!("save failed: {err}"))?;
             *CURRENT.lock() = Some(next.clone());
             let old = previous.unwrap_or_else(default_config);
@@ -184,10 +188,12 @@ pub fn store_config_file(which: u8, text: &str) -> Result<bool, String> {
             Ok(restart)
         }
         1 => {
-            let (max, archives) = log_from_text(text)?;
-            crate::fs::replace_file(crate::fs::LOG_CONFIG_NAME, text.as_bytes())
+            config::check(&value, config::log_fields()).map_err(|err| err.text())?;
+            let (max, archives) = log_numbers(&value)?;
+            let stored = config::format_document(&value).map_err(|err| err.text())?;
+            crate::fs::replace_file(crate::fs::LOG_CONFIG_NAME, stored.as_bytes())
                 .map_err(|err| alloc::format!("save failed: {err}"))?;
-            remember_log(max, archives, text);
+            remember_log(max, archives, &stored);
             log::info!("Replaced LOG.JSN");
             Ok(false)
         }
@@ -242,7 +248,7 @@ pub fn set_dns_cache(slots: u64, reap_secs: u64) -> Result<bool, String> {
     let restart = next.dns.cache_size != slots as usize;
     next.dns.cache_size = slots as usize;
     next.dns.cache_reap_secs = reap_secs;
-    let text = serialize_config(&next);
+    let text = serialize_config(&next)?;
     crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes())
         .map_err(|err| alloc::format!("save failed: {err}"))?;
     *CURRENT.lock() = Some(next);
@@ -292,7 +298,7 @@ pub fn set_display(vnc: u64, port: u64, password: &str, hdmi: u64) -> Result<(),
         vnc_password: String::from(password),
         hdmi: hdmi != 0,
     };
-    let text = serialize_config(&next);
+    let text = serialize_config(&next)?;
     match crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes()) {
         Ok(()) => {}
         Err(crate::fs::FsError::NotInitialized) => {}
@@ -310,7 +316,7 @@ pub fn set_display(vnc: u64, port: u64, password: &str, hdmi: u64) -> Result<(),
 pub fn request_vnc(on: bool) -> Result<(), String> {
     let mut next = CURRENT.lock().clone().unwrap_or_else(default_config);
     next.display.vnc = on;
-    let text = serialize_config(&next);
+    let text = serialize_config(&next)?;
     match crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes()) {
         Ok(()) => {}
         Err(crate::fs::FsError::NotInitialized) => {}
@@ -522,7 +528,7 @@ pub fn remove_record(name: &str) -> Result<bool, String> {
 
 fn save_current() -> Result<(), String> {
     let config = CURRENT.lock().clone().ok_or_else(|| String::from("no config"))?;
-    let text = serialize_config(&config);
+    let text = serialize_config(&config)?;
     crate::fs::write_config(&text)
 }
 
@@ -588,9 +594,10 @@ fn load_main() -> Config {
         }
     } else if let Ok(text) = crate::fs::read_text(crate::fs::LEGACY_CONFIG) {
         if let Some(config) = parse_legacy(&text) {
-            let json = serialize_config(&config);
-            if crate::fs::write_config(&json).is_ok() {
-                log::info!("Migrated CONFIG.TXT to CONFIG.JSN");
+            if let Ok(json) = serialize_config(&config) {
+                if crate::fs::write_config(&json).is_ok() {
+                    log::info!("Migrated CONFIG.TXT to CONFIG.JSN");
+                }
             }
             log::info!("Loaded config from filesystem");
             return config;
@@ -603,7 +610,7 @@ fn load_main() -> Config {
         }
     }
     let config = default_config();
-    match crate::fs::write_config(&serialize_config(&config)) {
+    match serialize_config(&config).and_then(|json| crate::fs::write_config(&json)) {
         Ok(()) => log::info!("Wrote default CONFIG.JSN"),
         Err(_) => log::info!("Using default config"),
     }
@@ -628,7 +635,7 @@ fn write_default_log() -> Result<(), String> {
 }
 
 fn default_log_json() -> String {
-    String::from("{\"version\":1,\"max_bytes\":4096,\"archives\":3}")
+    String::from(config::DEFAULT_LOG_JSON)
 }
 
 fn file_name(which: u8) -> Result<&'static str, String> {
@@ -663,6 +670,10 @@ fn remember_log(max: u32, archives: u32, text: &str) {
 fn log_from_text(text: &str) -> Result<(u32, u32), String> {
     let value = config::parse(text).map_err(|err| err.text())?;
     config::check(&value, config::log_fields()).map_err(|err| err.text())?;
+    log_numbers(&value)
+}
+
+fn log_numbers(value: &Value) -> Result<(u32, u32), String> {
     let max = value
         .get("max_bytes")
         .and_then(Value::as_u64)
@@ -678,6 +689,10 @@ fn log_from_text(text: &str) -> Result<(u32, u32), String> {
 fn config_from_text(text: &str) -> Result<Config, String> {
     let value = config::parse(text).map_err(|err| err.text())?;
     config::check(&value, config::main_fields()).map_err(|err| err.text())?;
+    config_from_value(&value)
+}
+
+fn config_from_value(value: &Value) -> Result<Config, String> {
     let network = value
         .get("network")
         .ok_or_else(|| String::from("network: missing field"))?;
@@ -954,7 +969,11 @@ fn parse_legacy(text: &str) -> Option<Config> {
     Some(config)
 }
 
-fn serialize_config(config: &Config) -> String {
+fn serialize_config(config: &Config) -> Result<String, String> {
+    config::format_document(&config_value(config)).map_err(|err| err.text())
+}
+
+fn config_value(config: &Config) -> Value {
     let (mode, ip, netmask, gateway, timeout_ms) = match config.network.mode {
         NetworkMode::Static { ip, netmask, gateway } => {
             ("static", ip, netmask, gateway, config.timeout_ms)
@@ -972,65 +991,94 @@ fn serialize_config(config: &Config) -> String {
             timeout_ms,
         ),
     };
-    let mut out = String::from("{\"version\":1,\"network\":{");
-    out.push_str(&alloc::format!("\"mode\":\"{mode}\","));
-    push_ip_json(&mut out, "ip", ip);
-    out.push(',');
-    push_ip_json(&mut out, "netmask", netmask);
-    out.push(',');
-    push_ip_json(&mut out, "gateway", gateway);
-    out.push_str(&alloc::format!(",\"timeout_ms\":{timeout_ms}"));
-    out.push_str("},\"dns\":{");
-    out.push_str(&alloc::format!(
-        "\"cache_size\":{},\"cache_reap_interval_secs\":{},\"upstreams\":[",
-        config.dns.cache_size, config.dns.cache_reap_secs
-    ));
-    for (index, upstream) in config.dns.upstreams.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push('"');
-        push_ip_text(&mut out, *upstream);
-        out.push('"');
+    let mut upstreams = Vec::new();
+    for upstream in &config.dns.upstreams {
+        upstreams.push(Value::String(ip_text(*upstream)));
     }
-    out.push_str("],\"blocklist\":[");
-    for (index, name) in config.dns.blocklist.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        push_json_str(&mut out, name);
+    let mut blocklist = Vec::new();
+    for name in &config.dns.blocklist {
+        blocklist.push(Value::String(name.clone()));
     }
-    out.push_str("],\"records\":[");
-    for (index, record) in config.dns.records.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str("{\"name\":");
-        push_json_str(&mut out, &record.name);
-        out.push_str(",\"type\":");
-        push_json_str(&mut out, record.record_type.as_str());
-        out.push_str(",\"value\":");
-        push_json_str(&mut out, &record.value);
-        out.push_str(&alloc::format!(",\"ttl\":{}}}", record.ttl));
+    let mut records = Vec::new();
+    for record in &config.dns.records {
+        records.push(Value::Object(vec![
+            (String::from("name"), Value::String(record.name.clone())),
+            (
+                String::from("type"),
+                Value::String(String::from(record.record_type.as_str())),
+            ),
+            (String::from("value"), Value::String(record.value.clone())),
+            (String::from("ttl"), Value::Number(u64::from(record.ttl))),
+        ]));
     }
-    out.push_str("]},\"http\":{\"port\":");
-    out.push_str(&alloc::format!("{},\"username\":", config.http.port));
-    push_json_str(&mut out, &config.http.username);
-    out.push_str(",\"password\":");
-    push_json_str(&mut out, &config.http.password);
-    out.push_str("},\"display\":{");
-    out.push_str(&alloc::format!(
-        "\"vnc\":{},\"vnc_port\":{},\"vnc_password\":",
-        u8::from(config.display.vnc),
-        config.display.vnc_port
-    ));
-    push_json_str(&mut out, &config.display.vnc_password);
-    // Append the flag and both closing braces as plain text. A trailing
-    // escaped brace in format! was dropped from the last piece on this target.
-    out.push_str(",\"hdmi\":");
-    out.push(char::from(b'0' + u8::from(config.display.hdmi)));
-    out.push_str("}}");
-    out
+    Value::Object(vec![
+        (String::from("version"), Value::Number(config::SCHEMA_VERSION)),
+        (
+            String::from("network"),
+            Value::Object(vec![
+                (String::from("mode"), Value::String(String::from(mode))),
+                (String::from("ip"), Value::String(ip_text(ip))),
+                (String::from("netmask"), Value::String(ip_text(netmask))),
+                (String::from("gateway"), Value::String(ip_text(gateway))),
+                (String::from("timeout_ms"), Value::Number(timeout_ms)),
+            ]),
+        ),
+        (
+            String::from("dns"),
+            Value::Object(vec![
+                (
+                    String::from("cache_size"),
+                    Value::Number(config.dns.cache_size as u64),
+                ),
+                (
+                    String::from("cache_reap_interval_secs"),
+                    Value::Number(config.dns.cache_reap_secs),
+                ),
+                (String::from("upstreams"), Value::Array(upstreams)),
+                (String::from("blocklist"), Value::Array(blocklist)),
+                (String::from("records"), Value::Array(records)),
+            ]),
+        ),
+        (
+            String::from("http"),
+            Value::Object(vec![
+                (String::from("port"), Value::Number(u64::from(config.http.port))),
+                (
+                    String::from("username"),
+                    Value::String(config.http.username.clone()),
+                ),
+                (
+                    String::from("password"),
+                    Value::String(config.http.password.clone()),
+                ),
+            ]),
+        ),
+        (
+            String::from("display"),
+            Value::Object(vec![
+                (
+                    String::from("vnc"),
+                    Value::Number(u64::from(config.display.vnc)),
+                ),
+                (
+                    String::from("vnc_port"),
+                    Value::Number(u64::from(config.display.vnc_port)),
+                ),
+                (
+                    String::from("vnc_password"),
+                    Value::String(config.display.vnc_password.clone()),
+                ),
+                (
+                    String::from("hdmi"),
+                    Value::Number(u64::from(config.display.hdmi)),
+                ),
+            ]),
+        ),
+    ])
+}
+
+fn ip_text(ip: [u8; 4]) -> String {
+    alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }
 
 fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
@@ -1041,32 +1089,6 @@ fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
     } else {
         value
     }
-}
-
-fn push_ip_json(out: &mut String, key: &str, ip: [u8; 4]) {
-    out.push('"');
-    out.push_str(key);
-    out.push_str("\":\"");
-    push_ip_text(out, ip);
-    out.push('"');
-}
-
-fn push_ip_text(out: &mut String, ip: [u8; 4]) {
-    out.push_str(&alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
-}
-
-fn push_json_str(out: &mut String, text: &str) {
-    out.push('"');
-    for byte in text.bytes() {
-        match byte {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b if (0x20..=0x7e).contains(&b) => out.push(b as char),
-            b => out.push_str(&alloc::format!("\\u{b:04x}")),
-        }
-    }
-    out.push('"');
 }
 
 fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
