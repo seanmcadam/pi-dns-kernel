@@ -1,9 +1,10 @@
 //! FAT32 config and log storage.
 //!
 //! The board supplies the block device: virtio-blk on QEMU virt, EMMC on
-//! the Pi 4 image. `CONFIG.TXT` holds records, network settings, and
-//! upstream resolvers. `LOG.TXT` is appended until it passes `ROTATE_AT`,
-//! then renamed in spirit by copying it to `LOG.OLD` and starting a fresh log.
+//! the Pi 4 image. `CONFIG.JSN` is the main config. A leftover `CONFIG.TXT`
+//! is migrated once. `LOG.JSN` is the log service config. `LOG.TXT` is the
+//! active log; when it reaches the configured size it is renamed to
+//! `LOG1.TXT`, and older archives shift up to `LOG16.TXT`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -12,10 +13,10 @@ use spin::Mutex;
 
 use crate::board::DiskDev;
 
-const ROTATE_AT: u32 = 512;
-const CONFIG_NAME: &str = "CONFIG.TXT";
-const LOG_NAME: &str = "LOG.TXT";
-const LOG_OLD: &str = "LOG.OLD";
+pub const CONFIG_NAME: &str = "CONFIG.JSN";
+pub const LEGACY_CONFIG: &str = "CONFIG.TXT";
+pub const LOG_CONFIG_NAME: &str = "LOG.JSN";
+pub const LOG_NAME: &str = "LOG.TXT";
 
 #[derive(Debug)]
 pub enum FsError {
@@ -84,13 +85,65 @@ pub fn init() -> Result<(), FsError> {
     }
 }
 
-pub fn read_config() -> Result<String, FsError> {
-    let bytes = read_file(CONFIG_NAME)?;
+pub fn read_text(name: &str) -> Result<String, FsError> {
+    let bytes = read_file(name)?;
     String::from_utf8(bytes).map_err(|err| fs_err("config encoding", err))
 }
 
 pub fn write_config(data: &str) -> Result<(), String> {
-    write_file(CONFIG_NAME, data.as_bytes()).map_err(|err| alloc::format!("save failed: {err}"))
+    replace_file(CONFIG_NAME, data.as_bytes()).map_err(|err| alloc::format!("save failed: {err}"))
+}
+
+/// Write `data` to a temp name, then swing the directory entry onto `name`.
+/// A power loss leaves either the previous file or `CFG.OLD` / `LOGC.OLD`.
+pub fn replace_file(name: &str, data: &[u8]) -> Result<(), FsError> {
+    let (tmp, old) = scratch(name).ok_or_else(|| FsError::Io {
+        op: "replace",
+        detail: String::from("unsupported name"),
+    })?;
+    write_file(tmp, data)?;
+    let _ = delete_file(old);
+    if file_exists(name)? {
+        rename_file(name, old)?;
+    }
+    match rename_file(tmp, name) {
+        Ok(()) => {
+            let _ = delete_file(old);
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub fn file_exists(name: &str) -> Result<bool, FsError> {
+    match file_len(name) {
+        Ok(_) => Ok(true),
+        Err(FsError::Io { detail, .. }) if detail == "NotFound" => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+pub fn file_len(name: &str) -> Result<u32, FsError> {
+    with_file(name, Mode::ReadOnly, |mgr, file| {
+        mgr.file_length(file).map_err(|err| fs_err("file length", err))
+    })
+}
+
+pub fn delete_file(name: &str) -> Result<(), FsError> {
+    match with_dir(|mgr, dir| {
+        mgr.delete_file_in_dir(dir, name)
+            .map_err(|err| fs_err("delete", err))
+    }) {
+        Err(FsError::Io { detail, .. }) if detail.contains("NotFound") => Ok(()),
+        other => other,
+    }
+}
+
+pub fn rename_file(from: &str, to: &str) -> Result<(), FsError> {
+    with_dir(|mgr, dir| {
+        mgr.rename_file_in_dir(dir, from, to)
+            .map_err(|err| fs_err("rename", err))
+    })
 }
 
 pub fn read_named(name: &str, out: &mut [u8]) -> Result<usize, FsError> {
@@ -117,6 +170,9 @@ pub fn read_named(name: &str, out: &mut [u8]) -> Result<usize, FsError> {
 }
 
 pub fn write_named(name: &str, data: &[u8], append: bool) -> Result<(), FsError> {
+    if append {
+        maybe_rotate(name);
+    }
     let mode = if append {
         Mode::ReadWriteCreateOrAppend
     } else {
@@ -142,34 +198,87 @@ pub fn append_log(message: &str) {
     append_log_direct(message);
 }
 
-fn append_log_direct(message: &str) {
-    let _ = rotate_log();
+pub fn append_log_direct(message: &str) {
     let mut line = alloc::string::String::from(message);
     while line.len() < 72 {
         line.push(' ');
     }
     line.push('\n');
-    let _ = with_file(LOG_NAME, Mode::ReadWriteCreateOrAppend, |mgr, file| {
-        mgr.write(file, line.as_bytes())
-            .map_err(|err| fs_err("append log", err))
-    });
+    let _ = write_named(LOG_NAME, line.as_bytes(), true);
+}
+
+fn maybe_rotate(name: &str) {
+    if name != LOG_NAME {
+        return;
+    }
+    let _ = rotate_log();
 }
 
 fn rotate_log() -> Result<(), FsError> {
-    let len = match with_file(LOG_NAME, Mode::ReadOnly, |mgr, file| {
-        mgr.file_length(file).map_err(|err| fs_err("log length", err))
-    }) {
+    let len = match file_len(LOG_NAME) {
         Ok(len) => len,
         Err(_) => return Ok(()),
     };
-    if len < ROTATE_AT {
+    let (max, archives) = crate::config_manager::log_limits();
+    if len < max {
         return Ok(());
     }
-    let data = read_file(LOG_NAME)?;
-    write_file(LOG_OLD, &data)?;
-    write_file(LOG_NAME, b"")?;
-    log::info!("Rotated log to LOG.OLD ({} bytes)", data.len());
+    if archives == 0 {
+        write_file(LOG_NAME, b"")?;
+        log::info!("Truncated log at {len} bytes");
+        return Ok(());
+    }
+    let _ = delete_archive(archives);
+    let mut index = archives;
+    while index > 1 {
+        let from = archive_name(index - 1);
+        let to = archive_name(index);
+        if file_exists(from)? {
+            let _ = delete_file(to);
+            rename_file(from, to)?;
+        }
+        index -= 1;
+    }
+    if file_exists(LOG_NAME)? {
+        let to = archive_name(1);
+        let _ = delete_file(to);
+        rename_file(LOG_NAME, to)?;
+    }
+    log::info!("Rotated log ({len} bytes, {archives} archives)");
     Ok(())
+}
+
+fn delete_archive(index: u32) -> Result<(), FsError> {
+    delete_file(archive_name(index))
+}
+
+fn archive_name(index: u32) -> &'static str {
+    match index {
+        1 => "LOG1.TXT",
+        2 => "LOG2.TXT",
+        3 => "LOG3.TXT",
+        4 => "LOG4.TXT",
+        5 => "LOG5.TXT",
+        6 => "LOG6.TXT",
+        7 => "LOG7.TXT",
+        8 => "LOG8.TXT",
+        9 => "LOG9.TXT",
+        10 => "LOG10.TXT",
+        11 => "LOG11.TXT",
+        12 => "LOG12.TXT",
+        13 => "LOG13.TXT",
+        14 => "LOG14.TXT",
+        15 => "LOG15.TXT",
+        _ => "LOG16.TXT",
+    }
+}
+
+fn scratch(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        CONFIG_NAME => Some(("CFG.TMP", "CFG.OLD")),
+        LOG_CONFIG_NAME => Some(("LOGC.TMP", "LOGC.OLD")),
+        _ => None,
+    }
 }
 
 fn read_file(name: &str) -> Result<Vec<u8>, FsError> {
@@ -178,7 +287,7 @@ fn read_file(name: &str) -> Result<Vec<u8>, FsError> {
         let mut buf = [0u8; 512];
         loop {
             let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
-            if n == 0 || out.len() >= 8192 {
+            if n == 0 || out.len() >= 16384 {
                 break;
             }
             out.extend_from_slice(&buf[..n]);
@@ -235,6 +344,29 @@ fn with_file<R>(
     };
     let result = f(mgr, file);
     let closed = release(mgr, volume, Some(dir), Some(file));
+    match (result, closed) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn with_dir<R>(f: impl FnOnce(&mut Mgr, embedded_sdmmc::RawDirectory) -> Result<R, FsError>) -> Result<R, FsError> {
+    let mut guard = FS.lock();
+    let mgr = guard.as_mut().ok_or(FsError::NotInitialized)?;
+    let volume = match mgr.open_raw_volume(VolumeIdx(0)) {
+        Ok(volume) => volume,
+        Err(err) => return Err(fs_err("open volume", err)),
+    };
+    let dir = match mgr.open_root_dir(volume) {
+        Ok(dir) => dir,
+        Err(err) => {
+            let _ = release(mgr, volume, None, None);
+            return Err(fs_err("open root", err));
+        }
+    };
+    let result = f(mgr, dir);
+    let closed = release(mgr, volume, Some(dir), None);
     match (result, closed) {
         (Err(err), _) => Err(err),
         (Ok(_), Err(err)) => Err(err),

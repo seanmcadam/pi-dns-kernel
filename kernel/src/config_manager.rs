@@ -1,13 +1,18 @@
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
 use crate::net::NetworkMode;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use spin::Mutex;
+
+use config::{self, Value};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub network: NetworkConfig,
     pub dns: DnsConfig,
     pub http: HttpConfig,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,26 +73,122 @@ pub struct HttpConfig {
 }
 
 static CURRENT: Mutex<Option<Config>> = Mutex::new(None);
+static LOG_MAX: AtomicU32 = AtomicU32::new(config::LOG_MIN_BYTES as u32);
+static LOG_ARCHIVES: AtomicU32 = AtomicU32::new(3);
+static LOG_CACHED: Mutex<[u8; 512]> = Mutex::new([0; 512]);
+static LOG_CACHED_LEN: AtomicUsize = AtomicUsize::new(0);
 
 pub fn load_config() -> Config {
-    let config = match crate::fs::read_config() {
-        Ok(data) => match parse_config(&data) {
-            Some(config) => {
-                log::info!("Loaded config from filesystem");
-                config
-            }
-            None => {
-                log::info!("Config file unreadable, using defaults");
-                default_config()
-            }
-        },
-        Err(_) => {
-            log::info!("Using default config");
-            default_config()
-        }
-    };
+    let config = load_main();
     *CURRENT.lock() = Some(config.clone());
+    if let Err(err) = reload_log() {
+        log::info!("Log config unchanged: {err}");
+    }
     config
+}
+
+pub fn log_limits() -> (u32, u32) {
+    (
+        LOG_MAX.load(Ordering::Relaxed),
+        LOG_ARCHIVES.load(Ordering::Relaxed),
+    )
+}
+
+/// Re-read `LOG.JSN`. The log task calls this when it starts and while it runs,
+/// so a replacement file is picked up without a reboot.
+pub fn reload_log() -> Result<(), String> {
+    match crate::fs::read_text(crate::fs::LOG_CONFIG_NAME) {
+        Ok(text) => {
+            if cached_log(&text) {
+                return Ok(());
+            }
+            match log_from_text(&text) {
+                Ok((max, archives)) => {
+                    remember_log(max, archives, &text);
+                    log::info!("Loaded log config from filesystem");
+                    Ok(())
+                }
+                Err(err) => {
+                    log::info!("LOG.JSN unreadable ({err}), writing default");
+                    write_default_log()
+                }
+            }
+        }
+        Err(crate::fs::FsError::NotInitialized) => Ok(()),
+        Err(_) => write_default_log(),
+    }
+}
+
+pub fn copy_config_file(which: u8, out: &mut [u8]) -> Result<usize, String> {
+    let name = file_name(which)?;
+    let text = match crate::fs::read_text(name) {
+        Ok(text) => text,
+        Err(crate::fs::FsError::NotInitialized) => {
+            if which == 1 {
+                default_log_json()
+            } else {
+                let current = CURRENT.lock();
+                match current.as_ref() {
+                    Some(config) => serialize_config(config),
+                    None => serialize_config(&default_config()),
+                }
+            }
+        }
+        Err(_) if which == 1 => {
+            write_default_log()?;
+            default_log_json()
+        }
+        Err(err) => return Err(alloc::format!("{err}")),
+    };
+    if text.len() > out.len() {
+        return Err(String::from("config does not fit"));
+    }
+    out[..text.len()].copy_from_slice(text.as_bytes());
+    Ok(text.len())
+}
+
+/// Validate the whole document, then replace the file. Nothing is written
+/// when validation fails. `Ok(true)` means the NIC or the HTTP port changed
+/// and a reboot is required before that part takes effect.
+pub fn store_config_file(which: u8, text: &str) -> Result<bool, String> {
+    if text.len() > config::UPLOAD_MAX {
+        return Err(String::from("upload exceeds 4096 bytes"));
+    }
+    match which {
+        0 => {
+            let next = config_from_text(text)?;
+            let restart = {
+                let current = CURRENT.lock();
+                current
+                    .as_ref()
+                    .map(|old| needs_restart(old, &next))
+                    .unwrap_or(false)
+            };
+            crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes())
+                .map_err(|err| alloc::format!("save failed: {err}"))?;
+            *CURRENT.lock() = Some(next);
+            log::info!("Replaced CONFIG.JSN");
+            Ok(restart)
+        }
+        1 => {
+            let (max, archives) = log_from_text(text)?;
+            crate::fs::replace_file(crate::fs::LOG_CONFIG_NAME, text.as_bytes())
+                .map_err(|err| alloc::format!("save failed: {err}"))?;
+            remember_log(max, archives, text);
+            log::info!("Replaced LOG.JSN");
+            Ok(false)
+        }
+        _ => Err(String::from("unknown config")),
+    }
+}
+
+pub fn fill_log(count: u32) {
+    let count = count.min(200);
+    let mut index = 0;
+    while index < count {
+        crate::fs::append_log_direct(&alloc::format!("mark {index:04}"));
+        index += 1;
+    }
 }
 
 pub fn cache_size() -> usize {
@@ -288,6 +389,7 @@ fn default_config() -> Config {
             username: String::from("admin"),
             password: String::from("admin"),
         },
+        timeout_ms: 3_000,
     }
 }
 
@@ -295,7 +397,258 @@ fn default_network_mode() -> NetworkMode {
     crate::board::default_network()
 }
 
-fn parse_config(text: &str) -> Option<Config> {
+fn load_main() -> Config {
+    if let Ok(text) = crate::fs::read_text(crate::fs::CONFIG_NAME) {
+        match config_from_text(&text) {
+            Ok(config) => {
+                log::info!("Loaded config from filesystem");
+                return config;
+            }
+            Err(err) => log::info!("CONFIG.JSN unreadable ({err})"),
+        }
+    } else if let Ok(text) = crate::fs::read_text(crate::fs::LEGACY_CONFIG) {
+        if let Some(config) = parse_legacy(&text) {
+            let json = serialize_config(&config);
+            if crate::fs::write_config(&json).is_ok() {
+                log::info!("Migrated CONFIG.TXT to CONFIG.JSN");
+            }
+            log::info!("Loaded config from filesystem");
+            return config;
+        }
+    } else if let Ok(text) = crate::fs::read_text("CFG.OLD") {
+        if let Ok(config) = config_from_text(&text) {
+            let _ = crate::fs::rename_file("CFG.OLD", crate::fs::CONFIG_NAME);
+            log::info!("Loaded config from filesystem");
+            return config;
+        }
+    }
+    let config = default_config();
+    match crate::fs::write_config(&serialize_config(&config)) {
+        Ok(()) => log::info!("Wrote default CONFIG.JSN"),
+        Err(_) => log::info!("Using default config"),
+    }
+    config
+}
+
+fn write_default_log() -> Result<(), String> {
+    let text = default_log_json();
+    let (max, archives) = log_from_text(&text)?;
+    match crate::fs::replace_file(crate::fs::LOG_CONFIG_NAME, text.as_bytes()) {
+        Ok(()) => {
+            remember_log(max, archives, &text);
+            log::info!("Wrote default LOG.JSN");
+            Ok(())
+        }
+        Err(crate::fs::FsError::NotInitialized) => {
+            remember_log(max, archives, &text);
+            Ok(())
+        }
+        Err(err) => Err(alloc::format!("{err}")),
+    }
+}
+
+fn default_log_json() -> String {
+    String::from("{\"version\":1,\"max_bytes\":4096,\"archives\":3}")
+}
+
+fn file_name(which: u8) -> Result<&'static str, String> {
+    match which {
+        0 => Ok(crate::fs::CONFIG_NAME),
+        1 => Ok(crate::fs::LOG_CONFIG_NAME),
+        _ => Err(String::from("unknown config")),
+    }
+}
+
+fn cached_log(text: &str) -> bool {
+    let len = LOG_CACHED_LEN.load(Ordering::Relaxed);
+    if len == 0 || len != text.len() || len > 512 {
+        return false;
+    }
+    let cached = LOG_CACHED.lock();
+    cached[..len] == *text.as_bytes()
+}
+
+fn remember_log(max: u32, archives: u32, text: &str) {
+    LOG_MAX.store(max, Ordering::Relaxed);
+    LOG_ARCHIVES.store(archives, Ordering::Relaxed);
+    let mut cached = LOG_CACHED.lock();
+    if text.len() <= cached.len() {
+        cached[..text.len()].copy_from_slice(text.as_bytes());
+        LOG_CACHED_LEN.store(text.len(), Ordering::Relaxed);
+    } else {
+        LOG_CACHED_LEN.store(0, Ordering::Relaxed);
+    }
+}
+
+fn log_from_text(text: &str) -> Result<(u32, u32), String> {
+    let value = config::parse(text).map_err(|err| err.text())?;
+    config::check(&value, config::log_fields()).map_err(|err| err.text())?;
+    let max = value
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| String::from("max_bytes: missing field"))?;
+    let archives = value
+        .get("archives")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| String::from("archives: missing field"))?;
+    config::log_budget(max, archives).map_err(|err| err.text())?;
+    Ok((max as u32, archives as u32))
+}
+
+fn config_from_text(text: &str) -> Result<Config, String> {
+    let value = config::parse(text).map_err(|err| err.text())?;
+    config::check(&value, config::main_fields()).map_err(|err| err.text())?;
+    let network = value
+        .get("network")
+        .ok_or_else(|| String::from("network: missing field"))?;
+    let dns = value
+        .get("dns")
+        .ok_or_else(|| String::from("dns: missing field"))?;
+    let http = value
+        .get("http")
+        .ok_or_else(|| String::from("http: missing field"))?;
+    let mode = network
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("static");
+    let ip = require_ipv4(network, "ip")?;
+    let netmask = require_ipv4(network, "netmask")?;
+    let gateway = require_ipv4(network, "gateway")?;
+    let timeout_ms = network
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(3_000);
+    let username = require_secret(http, "username")?;
+    let password = require_secret(http, "password")?;
+    let port = http.get("port").and_then(Value::as_u64).unwrap_or(80) as u16;
+    let cache_size = dns
+        .get("cache_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(1000) as usize;
+    let mut upstreams = Vec::new();
+    if let Some(items) = dns.get("upstreams").and_then(Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            let text = item.as_str().unwrap_or("");
+            let ip = parse_ipv4(text).ok_or_else(|| {
+                alloc::format!("dns.upstreams[{index}]: expected ipv4 address")
+            })?;
+            upstreams.push(ip);
+        }
+    }
+    let mut blocklist = Vec::new();
+    if let Some(items) = dns.get("blocklist").and_then(Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            let text = item.as_str().unwrap_or("");
+            if !valid_label(text) {
+                return Err(alloc::format!("dns.blocklist[{index}]: out of bounds"));
+            }
+            blocklist.push(text.to_string());
+        }
+    }
+    let mut records = Vec::new();
+    if let Some(items) = dns.get("records").and_then(Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+            let data = item.get("value").and_then(Value::as_str).unwrap_or("");
+            let ttl = item.get("ttl").and_then(Value::as_u64).unwrap_or(300) as u32;
+            if !valid_label(name) || !valid_label(data) {
+                return Err(alloc::format!("dns.records[{index}]: out of bounds"));
+            }
+            if records.iter().any(|record: &DnsRecord| names_eq(&record.name, name)) {
+                return Err(alloc::format!("dns.records[{index}].name: duplicate"));
+            }
+            let record_type = RecordType::parse(kind)
+                .ok_or_else(|| alloc::format!("dns.records[{index}].type: out of bounds"))?;
+            records.push(DnsRecord {
+                name: name.to_string(),
+                record_type,
+                value: data.to_string(),
+                ttl,
+            });
+        }
+    }
+    let network = if mode == "dhcp" {
+        NetworkMode::Dhcp {
+            fallback_ip: ip,
+            fallback_netmask: netmask,
+            fallback_gateway: gateway,
+            timeout_ms,
+        }
+    } else {
+        NetworkMode::Static { ip, netmask, gateway }
+    };
+    Ok(Config {
+        network: NetworkConfig { mode: network },
+        dns: DnsConfig {
+            records,
+            upstreams,
+            blocklist,
+            cache_size,
+        },
+        http: HttpConfig {
+            port,
+            username,
+            password,
+        },
+        timeout_ms,
+    })
+}
+
+fn require_ipv4(value: &Value, key: &str) -> Result<[u8; 4], String> {
+    let text = value.get(key).and_then(Value::as_str).unwrap_or("");
+    parse_ipv4(text).ok_or_else(|| alloc::format!("{key}: expected ipv4 address"))
+}
+
+fn require_secret(value: &Value, key: &str) -> Result<String, String> {
+    let text = value.get(key).and_then(Value::as_str).unwrap_or("");
+    if text.is_empty()
+        || text.len() > config::SECRET_MAX
+        || !text.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return Err(alloc::format!("{key}: out of bounds"));
+    }
+    Ok(text.to_string())
+}
+
+fn needs_restart(old: &Config, new: &Config) -> bool {
+    old.http.port != new.http.port || !same_mode(&old.network.mode, &new.network.mode)
+}
+
+fn same_mode(left: &NetworkMode, right: &NetworkMode) -> bool {
+    match (left, right) {
+        (
+            NetworkMode::Static { ip, netmask, gateway },
+            NetworkMode::Static {
+                ip: ip2,
+                netmask: mask2,
+                gateway: gw2,
+            },
+        ) => ip == ip2 && netmask == mask2 && gateway == gw2,
+        (
+            NetworkMode::Dhcp {
+                fallback_ip,
+                fallback_netmask,
+                fallback_gateway,
+                timeout_ms,
+            },
+            NetworkMode::Dhcp {
+                fallback_ip: ip2,
+                fallback_netmask: mask2,
+                fallback_gateway: gw2,
+                timeout_ms: timeout2,
+            },
+        ) => {
+            fallback_ip == ip2
+                && fallback_netmask == mask2
+                && fallback_gateway == gw2
+                && timeout_ms == timeout2
+        }
+        _ => false,
+    }
+}
+
+fn parse_legacy(text: &str) -> Option<Config> {
     let mut config = default_config();
     config.dns.records.clear();
     config.dns.upstreams.clear();
@@ -372,58 +725,99 @@ fn parse_config(text: &str) -> Option<Config> {
     } else {
         NetworkMode::Static { ip, netmask, gateway }
     };
+    config.timeout_ms = timeout_ms;
     Some(config)
 }
 
 fn serialize_config(config: &Config) -> String {
-    let mut out = String::new();
-    match config.network.mode {
+    let (mode, ip, netmask, gateway, timeout_ms) = match config.network.mode {
         NetworkMode::Static { ip, netmask, gateway } => {
-            out.push_str("mode=static\n");
-            push_ip(&mut out, "ip", ip);
-            push_ip(&mut out, "netmask", netmask);
-            push_ip(&mut out, "gateway", gateway);
+            ("static", ip, netmask, gateway, config.timeout_ms)
         }
         NetworkMode::Dhcp {
             fallback_ip,
             fallback_netmask,
             fallback_gateway,
             timeout_ms,
-        } => {
-            out.push_str("mode=dhcp\n");
-            push_ip(&mut out, "ip", fallback_ip);
-            push_ip(&mut out, "netmask", fallback_netmask);
-            push_ip(&mut out, "gateway", fallback_gateway);
-            out.push_str(&alloc::format!("timeout_ms={timeout_ms}\n"));
+        } => (
+            "dhcp",
+            fallback_ip,
+            fallback_netmask,
+            fallback_gateway,
+            timeout_ms,
+        ),
+    };
+    let mut out = String::from("{\"version\":1,\"network\":{");
+    out.push_str(&alloc::format!("\"mode\":\"{mode}\","));
+    push_ip_json(&mut out, "ip", ip);
+    out.push(',');
+    push_ip_json(&mut out, "netmask", netmask);
+    out.push(',');
+    push_ip_json(&mut out, "gateway", gateway);
+    out.push_str(&alloc::format!(",\"timeout_ms\":{timeout_ms}"));
+    out.push_str("},\"dns\":{");
+    out.push_str(&alloc::format!("\"cache_size\":{},\"upstreams\":[", config.dns.cache_size));
+    for (index, upstream) in config.dns.upstreams.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
         }
+        out.push('"');
+        push_ip_text(&mut out, *upstream);
+        out.push('"');
     }
-    for upstream in &config.dns.upstreams {
-        push_ip(&mut out, "upstream", *upstream);
+    out.push_str("],\"blocklist\":[");
+    for (index, name) in config.dns.blocklist.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_json_str(&mut out, name);
     }
-    out.push_str(&alloc::format!("cache={}\n", config.dns.cache_size));
-    for name in &config.dns.blocklist {
-        out.push_str(&alloc::format!("block={name}\n"));
+    out.push_str("],\"records\":[");
+    for (index, record) in config.dns.records.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        push_json_str(&mut out, &record.name);
+        out.push_str(",\"type\":");
+        push_json_str(&mut out, record.record_type.as_str());
+        out.push_str(",\"value\":");
+        push_json_str(&mut out, &record.value);
+        out.push_str(&alloc::format!(",\"ttl\":{}}}", record.ttl));
     }
-    out.push_str(&alloc::format!("user={}\n", config.http.username));
-    out.push_str(&alloc::format!("pass={}\n", config.http.password));
-    out.push_str(&alloc::format!("port={}\n", config.http.port));
-    for record in &config.dns.records {
-        out.push_str(&alloc::format!(
-            "record={} {} {} {}\n",
-            record.name,
-            record.record_type.as_str(),
-            record.value,
-            record.ttl
-        ));
-    }
+    out.push_str("]},\"http\":{\"port\":");
+    out.push_str(&alloc::format!("{},\"username\":", config.http.port));
+    push_json_str(&mut out, &config.http.username);
+    out.push_str(",\"password\":");
+    push_json_str(&mut out, &config.http.password);
+    out.push_str("}}");
     out
 }
 
-fn push_ip(out: &mut String, key: &str, ip: [u8; 4]) {
-    out.push_str(&alloc::format!(
-        "{key}={}.{}.{}.{}\n",
-        ip[0], ip[1], ip[2], ip[3]
-    ));
+fn push_ip_json(out: &mut String, key: &str, ip: [u8; 4]) {
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":\"");
+    push_ip_text(out, ip);
+    out.push('"');
+}
+
+fn push_ip_text(out: &mut String, ip: [u8; 4]) {
+    out.push_str(&alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
+}
+
+fn push_json_str(out: &mut String, text: &str) {
+    out.push('"');
+    for byte in text.bytes() {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b if (0x20..=0x7e).contains(&b) => out.push(b as char),
+            b => out.push_str(&alloc::format!("\\u{b:04x}")),
+        }
+    }
+    out.push('"');
 }
 
 fn parse_ipv4(text: &str) -> Option<[u8; 4]> {

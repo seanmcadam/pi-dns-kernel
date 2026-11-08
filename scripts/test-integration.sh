@@ -873,11 +873,11 @@ elif ! grep -q "Record added: tmp-again.local" qemu/record-add-2.txt; then
     echo "✗ Second save failed"
     cat qemu/record-add-2.txt
     TESTS_FAILED=$((TESTS_FAILED + 1))
-elif ! mcopy -i qemu/disk.img@@${DISK_OFF} ::CONFIG.TXT - | grep -q "added.local A 9.9.9.9"; then
-    echo "✗ CONFIG.TXT does not contain the new record"
+elif ! mcopy -i qemu/disk.img@@${DISK_OFF} ::CONFIG.JSN - | grep -q "added.local"; then
+    echo "✗ CONFIG.JSN does not contain the new record"
     TESTS_FAILED=$((TESTS_FAILED + 1))
-elif ! mcopy -i qemu/disk.img@@${DISK_OFF} ::LOG.OLD - | grep -q "record added"; then
-    echo "✗ LOG.OLD does not contain a rotated log line"
+elif ! mcopy -i qemu/disk.img@@${DISK_OFF} ::LOG.TXT - | grep -q "record added"; then
+    echo "✗ LOG.TXT does not contain the new record"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 else
     timeout 30 qemu-system-aarch64 \
@@ -906,6 +906,256 @@ else
     kill $PERSIST_PID 2>/dev/null || true
     wait $PERSIST_PID 2>/dev/null || true
 fi
+
+# JSON config: defaults, validation, rotation, and a log-task restart.
+echo ""
+echo "Test 30: JSON config files"
+DISK_OFF=$((2048 * 512))
+rm -f qemu/json-disk.img qemu/json-a.txt qemu/json-b.txt
+dd if=/dev/zero of=qemu/json-disk.img bs=1M count=64 status=none
+sfdisk --quiet qemu/json-disk.img <<'EOF'
+label: dos
+start=2048, type=c
+EOF
+mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/json-disk.img >/dev/null
+printf 'record=legacy.local A 9.8.7.6 300\nmode=static\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\n' \
+    > /tmp/legacy-config.txt
+mcopy -i qemu/json-disk.img@@${DISK_OFF} /tmp/legacy-config.txt ::CONFIG.TXT
+timeout 70 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/json-a.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/json-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-json-a.txt 2>&1 &
+JSON_PID=$!
+sleep 6
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import json, sys, urllib.error, urllib.request
+http, dns = sys.argv[1], sys.argv[2]
+base = "http://127.0.0.1:%s" % http
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+
+def req(method, path, body=None, headers=None, auth=True):
+    data = body.encode() if isinstance(body, str) else body
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if headers:
+        for k, v in headers.items():
+            r.add_header(k, v)
+    try:
+        if auth:
+            resp = opener.open(r, timeout=8)
+        else:
+            resp = urllib.request.urlopen(r, timeout=8)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+status, _ = req("GET", "/config/file/log", auth=False)
+if status != 401:
+    fail("unauth log download %s" % status)
+status, body = req("GET", "/config/file/log")
+if status != 200:
+    fail("log download %s %s" % (status, body[:120]))
+doc = json.loads(body)
+if doc.get("version") != 1 or doc.get("max_bytes") != 4096 or doc.get("archives") != 3:
+    fail("default LOG.JSN %s" % body[:200])
+status, again = req("POST", "/config/file/log", body.decode(), {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in again:
+    fail("round trip %s %s" % (status, again[:160]))
+status, after = req("GET", "/config/file/log")
+if after != body:
+    fail("round trip bytes changed")
+print("defaults and round trip")
+
+kept = body
+cases = [
+    ("{", "malformed"),
+    ('{"version":1,"max_bytes":4096}', "missing"),
+    ('{"version":1,"max_bytes":"4096","archives":1}', "expected"),
+    ('{"version":1,"max_bytes":100,"archives":1}', "out of bounds"),
+    ('{"version":1,"max_bytes":65536,"archives":16}', "out of bounds"),
+    ('{"version":1,"max_bytes":4096,"archives":1,"extra":1}', "unknown"),
+    ("{" + "x" * 5000, "exceeds"),
+]
+for payload, needle in cases:
+    status, err = req("POST", "/config/file/log", payload, {"Content-Type": "application/json"})
+    if status != 400 or needle.encode() not in err:
+        fail("reject %s -> %s %s" % (needle, status, err[:180]))
+status, now = req("GET", "/config/file/log")
+if now != kept:
+    fail("rejected upload changed the file")
+print("rejections")
+
+status, page = req("GET", "/log-config")
+if status != 200 or b"4096" not in page or b"65536" not in page or b"1048576" not in page:
+    fail("log page %s" % page[:200])
+status, saved = req("POST", "/log-config", "max_bytes=4096&archives=1",
+                    {"Content-Type": "application/x-www-form-urlencoded"})
+if status != 200 or b"applied" not in saved:
+    fail("form %s %s" % (status, saved[:160]))
+status, cur = req("GET", "/config/file/log")
+form = json.loads(cur)
+if form.get("max_bytes") != 4096 or form.get("archives") != 1:
+    fail("form did not apply %s" % cur[:200])
+print("form")
+
+status, filled = req("POST", "/debug/log-fill", "n=120",
+                     {"Content-Type": "application/x-www-form-urlencoded"})
+if status != 200 or b"filled" not in filled:
+    fail("fill %s %s" % (status, filled[:120]))
+print("filled")
+PY
+then
+    echo "✓ Default LOG.JSN created and download round-trips"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ Bad JSON uploads are rejected and the file stays put"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ The log settings form applied max_bytes and archives"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ JSON config HTTP checks failed"
+    TESTS_FAILED=$((TESTS_FAILED + 3))
+fi
+kill $JSON_PID 2>/dev/null || true
+wait $JSON_PID 2>/dev/null || true
+sync
+JSON_OK=1
+if ! grep -q "Migrated CONFIG.TXT to CONFIG.JSN" qemu/json-a.txt; then
+    echo "✗ legacy CONFIG.TXT was not migrated"
+    JSON_OK=0
+fi
+if ! mcopy -i qemu/json-disk.img@@${DISK_OFF} ::CONFIG.JSN - | grep -q "legacy.local"; then
+    echo "✗ migrated CONFIG.JSN missing legacy.local"
+    JSON_OK=0
+fi
+if ! mcopy -i qemu/json-disk.img@@${DISK_OFF} ::LOG.JSN - | grep -q '"archives":1'; then
+    echo "✗ LOG.JSN was not updated"
+    JSON_OK=0
+fi
+LOG1=$(mcopy -i qemu/json-disk.img@@${DISK_OFF} ::LOG1.TXT - 2>/dev/null || true)
+LOGTXT=$(mcopy -i qemu/json-disk.img@@${DISK_OFF} ::LOG.TXT - 2>/dev/null || true)
+if printf '%s' "$LOGTXT$LOG1" | grep -q "mark 0000"; then
+    echo "✗ oldest mark was kept (archives=1 should drop it)"
+    JSON_OK=0
+fi
+if printf '%s' "$LOGTXT$LOG1" | grep -q "mark 0119"; then
+    true
+else
+    echo "✗ newest mark missing after rotation"
+    JSON_OK=0
+fi
+if mcopy -i qemu/json-disk.img@@${DISK_OFF} ::LOG2.TXT - >/dev/null 2>&1; then
+    echo "✗ LOG2.TXT exists with archives=1"
+    JSON_OK=0
+fi
+# 120 lines of 73 bytes is two rotations of 4096 with one archive kept.
+LOG1_BYTES=$(printf '%s' "$LOG1" | wc -c)
+if [ "$LOG1_BYTES" -lt 4096 ]; then
+    echo "✗ LOG1.TXT is smaller than max_bytes ($LOG1_BYTES)"
+    JSON_OK=0
+fi
+if [ "$JSON_OK" -eq 1 ]; then
+    echo "✓ Rotation kept one archive and dropped nothing early"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ CONFIG.TXT migrated into CONFIG.JSN"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ JSON rotation or migration failed"
+    TESTS_FAILED=$((TESTS_FAILED + 2))
+fi
+
+timeout 40 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/json-b.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/json-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-json-b.txt 2>&1 &
+JSON_PID=$!
+sleep 6
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import json, sys, urllib.error, urllib.request
+http, dns = sys.argv[1], sys.argv[2]
+base = "http://127.0.0.1:%s" % http
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+
+def req(method, path, body=None, headers=None):
+    data = body.encode() if isinstance(body, str) else body
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if headers:
+        for k, v in headers.items():
+            r.add_header(k, v)
+    try:
+        resp = opener.open(r, timeout=8)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+status, body = req("GET", "/config/file/log")
+try:
+    doc = json.loads(body)
+except Exception:
+    fail("log json after reboot %s" % body[:160])
+if doc.get("max_bytes") != 4096 or doc.get("archives") != 1:
+    fail("settings did not persist %s" % body[:200])
+print("persisted")
+status, armed = req("GET", "/debug/crash/log")
+if status != 200 or b"armed" not in armed:
+    fail("crash log %s %s" % (status, armed[:80]))
+import time
+deadline = time.time() + 8
+seen = False
+while time.time() < deadline:
+    status, page = req("GET", "/debug")
+    if b"log running" in page and b"restarts=" in page:
+        # restarts at least 1
+        for line in page.splitlines():
+            if line.startswith(b"log "):
+                if b"restarts=0" not in line:
+                    seen = True
+        if seen:
+            break
+    time.sleep(0.3)
+if not seen:
+    fail("log task did not restart\n%s" % page[:300])
+status, body = req("GET", "/config/file/log")
+doc = json.loads(body)
+if doc.get("archives") != 1 or doc.get("max_bytes") != 4096:
+    fail("restart changed log config %s" % body[:200])
+print("log restart kept config")
+PY
+then
+    echo "✓ Log settings survived reboot and a log-el0 restart"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Log settings did not survive reboot"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+kill $JSON_PID 2>/dev/null || true
+wait $JSON_PID 2>/dev/null || true
 
 # Test 12 and 13: exception report, and a write to .text must fault.
 fault_case() {

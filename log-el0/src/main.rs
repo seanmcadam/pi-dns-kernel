@@ -10,8 +10,8 @@ core::arch::global_asm!(include_str!("start.s"));
 const DRAIN: u64 = 29;
 const EMIT: u64 = 30;
 const PUBLISH: u64 = 39;
-const FILE_READ: u64 = 32;
 const FILE_WRITE: u64 = 33;
+const LOG_RELOAD: u64 = 45;
 const YIELD: u64 = 1;
 const EXIT: u64 = 3;
 
@@ -23,7 +23,9 @@ pub extern "C" fn rust_main() -> ! {
 }
 
 fn run() -> ! {
+    let _ = sys(LOG_RELOAD, 0, 0, 0, 0, 0, 0);
     let mut raw = [0u8; 96];
+    let mut persisted = 0u32;
     loop {
         let n = sys(DRAIN, raw.as_mut_ptr() as u64, raw.len() as u64, 0, 0, 0, 0);
         if n < 2 {
@@ -50,6 +52,10 @@ fn run() -> ! {
         let _ = sys(EMIT, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
         let _ = sys(PUBLISH, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
         if flags & PERSIST != 0 {
+            if persisted % 16 == 0 {
+                let _ = sys(LOG_RELOAD, 0, 0, 0, 0, 0, 0);
+            }
+            persisted = persisted.wrapping_add(1);
             persist(msg);
         }
         yield_now();
@@ -57,34 +63,11 @@ fn run() -> ! {
 }
 
 fn persist(msg: &[u8]) {
-    let mut file = [0u8; 600];
-    let n = file_read(b"LOG.TXT", &mut file);
-    if n >= 512 {
-        let _ = file_write(b"LOG.OLD", &file[..n], false);
-        let _ = file_write(b"LOG.TXT", b"", false);
-    }
     let mut line = [b' '; 73];
     let take = msg.len().min(72);
     line[..take].copy_from_slice(&msg[..take]);
     line[72] = b'\n';
     let _ = file_write(b"LOG.TXT", &line, true);
-}
-
-fn file_read(name: &[u8], buf: &mut [u8]) -> usize {
-    let n = sys(
-        FILE_READ,
-        name.as_ptr() as u64,
-        name.len() as u64,
-        buf.as_mut_ptr() as u64,
-        buf.len() as u64,
-        0,
-        0,
-    );
-    if n < 0 {
-        0
-    } else {
-        n as usize
-    }
 }
 
 fn file_write(name: &[u8], data: &[u8], append: bool) -> i64 {

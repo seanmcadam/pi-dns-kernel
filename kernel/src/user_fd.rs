@@ -78,6 +78,10 @@ const LOG_EMIT: u64 = 30;
 const LOG_RECENT: u64 = 31;
 const FILE_READ: u64 = 32;
 const FILE_WRITE: u64 = 33;
+const LOG_RELOAD: u64 = 45;
+const CONFIG_READ: u64 = 46;
+const CONFIG_WRITE: u64 = 47;
+const LOG_FILL: u64 = 48;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -172,6 +176,16 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         LOG_RECENT => log_recent(args[0], args[1]),
         FILE_READ => file_read(args[0], args[1], args[2], args[3]),
         FILE_WRITE => file_write(args[0], args[1], args[2], args[3], args[4]),
+        LOG_RELOAD => match crate::config_manager::reload_log() {
+            Ok(()) => 0,
+            Err(_) => EIO,
+        },
+        CONFIG_READ => config_read(args[0], args[1], args[2]),
+        CONFIG_WRITE => config_write(args[0], args[1], args[2], args[3], args[4]),
+        LOG_FILL => {
+            crate::config_manager::fill_log(args[0] as u32);
+            0
+        }
         _ => -1,
     };
     value as u64
@@ -1160,6 +1174,65 @@ fn log_recent(ptr: u64, cap: u64) -> i64 {
     } else {
         EFAULT
     }
+}
+
+fn config_read(which: u64, buf: u64, cap: u64) -> i64 {
+    if which > 1 || cap == 0 || cap > 8192 || !crate::mmu::user_write_ok(buf, cap) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 8192];
+    match crate::config_manager::copy_config_file(which as u8, &mut raw[..cap as usize]) {
+        Ok(n) => {
+            if write_user(buf, &raw[..n]) {
+                n as i64
+            } else {
+                EFAULT
+            }
+        }
+        Err(_) => EIO,
+    }
+}
+
+fn config_write(which: u64, ptr: u64, len: u64, err: u64, err_cap: u64) -> i64 {
+    if which > 1 {
+        return EINVAL;
+    }
+    if len > config::UPLOAD_MAX as u64 {
+        let _ = write_err(err, err_cap, "upload exceeds 4096 bytes");
+        return EINVAL;
+    }
+    if len > 0 && !crate::mmu::user_slice_ok(ptr, len) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 4096];
+    if len > 0 && !copy_user(ptr, &mut raw[..len as usize]) {
+        return EFAULT;
+    }
+    let Ok(text) = core::str::from_utf8(&raw[..len as usize]) else {
+        let _ = write_err(err, err_cap, "malformed json");
+        return EINVAL;
+    };
+    match crate::config_manager::store_config_file(which as u8, text) {
+        Ok(restart) => {
+            if restart {
+                1
+            } else {
+                0
+            }
+        }
+        Err(message) => {
+            let _ = write_err(err, err_cap, &message);
+            EINVAL
+        }
+    }
+}
+
+fn write_err(ptr: u64, cap: u64, message: &str) -> bool {
+    if cap == 0 || ptr == 0 {
+        return false;
+    }
+    let n = message.len().min(cap as usize);
+    write_user(ptr, &message.as_bytes()[..n])
 }
 
 fn file_name(ptr: u64, len: u64) -> Option<[u8; 12]> {

@@ -618,6 +618,65 @@ where
         Ok(())
     }
 
+    /// Change the 8.3 name of a closed file. The directory entry is rewritten
+    /// in place, so the cluster chain stays put. The destination name must
+    /// not already exist.
+    pub fn rename_file_in_dir<N, M>(
+        &mut self,
+        directory: RawDirectory,
+        from: N,
+        to: M,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+        M: ToShortFileName,
+    {
+        let from = from.to_short_filename().map_err(Error::FilenameError)?;
+        let to = to.to_short_filename().map_err(Error::FilenameError)?;
+        if from == to {
+            return Ok(());
+        }
+        let dir_idx = self.get_dir_by_id(directory)?;
+        let dir_info = DirectoryInfo {
+            directory_id: directory,
+            volume_id: self.open_dirs[dir_idx].volume_id,
+            cluster: self.open_dirs[dir_idx].cluster,
+        };
+        let volume_idx = self.get_volume_by_id(dir_info.volume_id)?;
+        let dest = match &self.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.find_directory_entry(&self.block_device, &dir_info, &to),
+        };
+        if dest.is_ok() {
+            return Err(Error::FormatError("destination exists"));
+        }
+        let volume_idx = self.get_volume_by_id(dir_info.volume_id)?;
+        let entry = match &self.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.find_directory_entry(&self.block_device, &dir_info, &from)?
+            }
+        };
+        if entry.attributes.is_directory() {
+            return Err(Error::DeleteDirAsFile);
+        }
+        if self.file_is_open(dir_info.volume_id, &entry) {
+            return Err(Error::FileAlreadyOpen);
+        }
+        let mut blocks = [Block::new()];
+        self.block_device
+            .read(&mut blocks, entry.entry_block, "rename")
+            .map_err(Error::DeviceError)?;
+        let start = entry.entry_offset as usize;
+        let end = start + 11;
+        if end > blocks[0].contents.len() {
+            return Err(Error::FormatError("directory entry offset"));
+        }
+        blocks[0].contents[start..end].copy_from_slice(&to.contents);
+        self.block_device
+            .write(&blocks, entry.entry_block)
+            .map_err(Error::DeviceError)?;
+        Ok(())
+    }
+
     /// Check if a file is open
     ///
     /// Returns `true` if it's open, `false`, otherwise.

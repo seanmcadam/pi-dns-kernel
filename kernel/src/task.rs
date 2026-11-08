@@ -61,6 +61,10 @@ const LOG_FOLLOW: u64 = 40;
 const LOG_WAKE: u64 = 41;
 const DEBUG_STATUS: u64 = 42;
 const DEBUG_CRASH: u64 = 43;
+const LOG_RELOAD: u64 = 45;
+const CONFIG_READ: u64 = 46;
+const CONFIG_WRITE: u64 = 47;
+const LOG_FILL: u64 = 48;
 const THREAD_CREATE: u64 = 34;
 const THREAD_EXIT: u64 = 35;
 const THREAD_JOIN: u64 = 36;
@@ -468,6 +472,11 @@ fn syscall() -> u64 {
         LOG_WAKE => {
             wake_log_readers();
             ctx.x[0] = 0;
+            RESUME
+        }
+        LOG_RELOAD | CONFIG_READ | CONFIG_WRITE | LOG_FILL => {
+            let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
+            ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
         }
         4..=33 => {

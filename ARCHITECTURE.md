@@ -64,6 +64,10 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 | 42 | `debug_status(buf, cap)` |
 | 43 | `debug_crash(slot, worker)` |
 | 44 | `thread_try_join(tid)` |
+| 45 | `log_reload` |
+| 46 | `config_read(which, buf, cap)` |
+| 47 | `config_write(which, buf, len, err, err_cap)` |
+| 48 | `log_fill(n)` |
 
 `log_publish` is the log task only. It copies one line into a kernel ring and returns. It does not wait. `log_follow` copies the next line for that cursor and writes the new cursor and how many lines were skipped. It sleeps until a line is published, unless its fifth argument is `1`, in which case it returns `0`. `tcp_recv` takes a fourth argument: `1` returns `-11` instead of sleeping when the peer has not sent data. Anything else returns `-1`. `-2` is a bad user pointer. `-4` is a bad argument. `-6` means the thread table is full. `-11` means try again. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned. `futex_wait` and `futex_wake` require a 4-byte-aligned user address. The kernel re-reads the word under the scheduler lock, so a wake that lands before the wait returns a mismatch and the caller retries. The older sections below describe earlier revisions of this tree.
 

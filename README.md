@@ -45,7 +45,7 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - VirtIO-net packet I/O on the `virt` machine
 - Local DNS records and forwarding of other names to the configured upstreams, with TTL caching
 - DHCP client with a configurable static fallback
-- virtio-blk FAT32 volume for `CONFIG.TXT`, plus `LOG.TXT` rotated to `LOG.OLD`
+- virtio-blk FAT32 volume for `CONFIG.JSN` and `LOG.JSN`. A leftover `CONFIG.TXT` is migrated once. `LOG.TXT` rotates to `LOG1.TXT` through `LOG16.TXT`
 - Web dashboard to add and remove records
 
 ### Exceptions and MMU
@@ -110,6 +110,10 @@ The user program puts the number in `x8`, arguments in `x0`–`x5`, and reads th
 | 42 | `debug_status(buf, cap)` | length of the supervisor text page |
 | 43 | `debug_crash(slot, worker)` | `0` if a fault was armed. `worker` 1 faults one pool thread of that process; `0` faults the main thread. Slots are dns 0, http 1, spin 2, log 3, telnet 4 |
 | 44 | `thread_try_join(tid)` | exit code, `-11` if the thread is still running, `-4` if the id is empty |
+| 45 | `log_reload` | `0`. The log task re-reads `LOG.JSN` and applies it |
+| 46 | `config_read(which, buf, cap)` | length of `CONFIG.JSN` (`which` 0) or `LOG.JSN` (`which` 1) |
+| 47 | `config_write(which, buf, len, err, err_cap)` | `0` applied, `1` applied but a reboot is needed for the NIC or HTTP port, `-4` if the JSON was rejected. `err` receives the field message |
+| 48 | `log_fill(n)` | `0`. Appends `n` persisted lines (1..=200) so rotation can be tested |
 | other | | `-1` |
 
 Errors: `-1` unknown number, `-2` bad pointer, `-3` bad fd, `-4` bad argument, `-5` I/O, `-6` too many fds or threads, `-7` the config text does not fit, `-11` try again. Packet and config buffers are at most 4096 bytes. Each task has 24 fds. `tcp_recv`'s fourth argument is `1` to return `-11` instead of sleeping. Telnet listens on guest port 23. `run-local.sh` forwards host port 2323 (`TELNET_HOST_PORT`).
@@ -419,7 +423,7 @@ upstream=1.1.1.1
 upstream=10.0.2.3
 ```
 
-`10.0.2.3` is QEMU's user-net DNS proxy. Build with `--features dhcp-default` to request a lease first and fall back to `10.0.2.15/24` after three seconds. The same fields are stored in `CONFIG.TXT` on the FAT volume (`record=name TYPE value ttl`). The dashboard at `/` adds and removes records; `DELETE /records` with `name=` removes one. `LOG.TXT` is copied to `LOG.OLD` once it passes 512 bytes.
+`10.0.2.3` is QEMU's user-net DNS proxy. Build with `--features dhcp-default` to request a lease first and fall back to `10.0.2.15/24` after three seconds. Config files are JSON, schema version 1. `CONFIG.JSN` holds the network, DNS, and HTTP settings. If it is missing and `CONFIG.TXT` is still the old `key=value` file, that file is read once and written out as `CONFIG.JSN`. `LOG.JSN` holds `max_bytes` (4096..=65536) and `archives` (0..=16). `max_bytes * (archives + 1)` must be at most 1048576 bytes, which fits the 8 MiB raspi4b card and the 64 MiB virt disk. A missing or unreadable `LOG.JSN` is replaced with `{"version":1,"max_bytes":4096,"archives":3}`. When `LOG.TXT` reaches `max_bytes` it is renamed to `LOG1.TXT` and older archives shift up; the oldest past `archives` is deleted. `archives` of 0 truncates `LOG.TXT` instead. Authenticated `GET /log-config` edits those two fields. `GET /config/file/config` and `GET /config/file/log` download the files. `POST` of either path replaces the file only after the JSON parses, every required field is present, types and bounds match, and no key is unknown. A bad upload is HTTP 400 with the field error and does not change the file. Writes go to a temp name and then the directory entry is renamed, so a power loss keeps the previous file. Log settings apply on the next append; the log task also re-reads `LOG.JSN` when it starts. The dashboard at `/` adds and removes records; `DELETE /records` with `name=` removes one.
 
 ## Project Structure
 

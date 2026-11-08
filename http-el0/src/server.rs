@@ -43,6 +43,10 @@ const DEBUG_SPIN: u64 = 27;
 const LOG_RECENT: u64 = 31;
 const DEBUG_STATUS: u64 = 42;
 const DEBUG_CRASH: u64 = 43;
+const LOG_RELOAD: u64 = 45;
+const CONFIG_READ: u64 = 46;
+const CONFIG_WRITE: u64 = 47;
+const LOG_FILL: u64 = 48;
 
 const EAGAIN: i64 = -11;
 
@@ -113,8 +117,10 @@ fn handoff(conn: u32) -> bool {
 fn serve(conn: i64) {
     let mut buf: Vec<u8> = Vec::new();
     loop {
-        if buf.len() >= 2048 {
-            send_response(conn, &HttpResponse::new(400, "Bad Request"));
+        if buf.len() >= 5120 {
+            let mut response = HttpResponse::new(400, "Bad Request");
+            response.set_body(b"upload exceeds 4096 bytes");
+            send_response(conn, &response);
             return;
         }
         let mut tmp = [0u8; 512];
@@ -141,6 +147,12 @@ fn serve(conn: i64) {
                 send_response(conn, &HttpResponse::new(400, "Bad Request"));
                 return;
             }
+            Ready::Oversize => {
+                let mut response = HttpResponse::new(400, "Bad Request");
+                response.set_body(b"upload exceeds 4096 bytes");
+                send_response(conn, &response);
+                return;
+            }
             Ready::Request(request) => {
                 let response = handle(&request);
                 send_response(conn, &response);
@@ -153,6 +165,7 @@ fn serve(conn: i64) {
 enum Ready {
     Wait,
     Bad,
+    Oversize,
     Request(HttpRequest),
 }
 
@@ -162,7 +175,10 @@ fn ready(buf: &[u8]) -> Ready {
         Err(_) => Ready::Bad,
         Ok(request) => {
             if let Some(length) = content_length(&request) {
-                if request.body.len() < length && buf.len() < 2048 {
+                if length > 4096 || request.body.len() > 4096 {
+                    return Ready::Oversize;
+                }
+                if request.body.len() < length {
                     return Ready::Wait;
                 }
             }
@@ -188,6 +204,10 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/records" => handle_records(request),
         "/records/delete" => handle_record_delete(request),
         "/logs" => handle_logs(),
+        "/log-config" => handle_log_config(request),
+        "/config/file/config" => handle_config_file(request, 0),
+        "/config/file/log" => handle_config_file(request, 1),
+        "/debug/log-fill" => handle_log_fill(request),
         "/debug" => handle_debug(),
         "/debug/spin" => handle_spin(),
         "/debug/crash/dns" => handle_crash(0, 0),
@@ -206,6 +226,131 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         }
         _ => HttpResponse::not_found(),
     }
+}
+
+fn handle_log_config(request: &HttpRequest) -> HttpResponse {
+    match request.method {
+        HttpMethod::GET => log_config_page(),
+        HttpMethod::POST => {
+            let body = core::str::from_utf8(&request.body).unwrap_or("");
+            let max = form_value(body, "max_bytes").unwrap_or("");
+            let archives = form_value(body, "archives").unwrap_or("");
+            let json = format!(
+                "{{\"version\":1,\"max_bytes\":{max},\"archives\":{archives}}}"
+            );
+            store_config(1, &json)
+        }
+        _ => HttpResponse::new(405, "Method Not Allowed"),
+    }
+}
+
+fn log_config_page() -> HttpResponse {
+    let current = read_config_file(1).unwrap_or_default();
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><body>
+<h1>Log configuration</h1>
+<p>File <code>LOG.JSN</code>. Schema version 1.</p>
+<p>max_bytes 4096..=65536. archives 0..=16. max_bytes * (archives + 1) must be &lt;= 1048576.</p>
+<p>Current: {current}</p>
+<form method="POST" action="/log-config">
+<label>max_bytes <input name="max_bytes" required></label>
+<label>archives <input name="archives" required></label>
+<button type="submit">Save</button>
+</form>
+<p><a href="/config/file/log">Download LOG.JSN</a></p>
+<p><a href="/config/file/config">Download CONFIG.JSN</a></p>
+</body></html>"#
+    );
+    html_response(&html)
+}
+
+fn handle_config_file(request: &HttpRequest, which: u64) -> HttpResponse {
+    match request.method {
+        HttpMethod::GET => {
+            let Some(text) = read_config_file(which) else {
+                return HttpResponse::internal_error();
+            };
+            let mut response = HttpResponse::ok(&text);
+            response.add_header("Content-Type", "application/json");
+            response
+        }
+        HttpMethod::POST | HttpMethod::PUT => {
+            let Ok(text) = core::str::from_utf8(&request.body) else {
+                return bad_json("malformed json");
+            };
+            store_config(which, text)
+        }
+        _ => HttpResponse::new(405, "Method Not Allowed"),
+    }
+}
+
+fn handle_log_fill(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    let count = form_value(body, "n").and_then(|text| text.parse().ok()).unwrap_or(0u64);
+    if count == 0 || count > 200 {
+        return bad_json("n out of bounds");
+    }
+    let _ = sys(LOG_FILL, count, 0, 0, 0, 0, 0);
+    let mut response = HttpResponse::ok("filled\n");
+    response.add_header("Content-Type", "text/plain; charset=utf-8");
+    response
+}
+
+fn store_config(which: u64, text: &str) -> HttpResponse {
+    let mut err = [0u8; 240];
+    let rc = sys(
+        CONFIG_WRITE,
+        which,
+        text.as_ptr() as u64,
+        text.len() as u64,
+        err.as_mut_ptr() as u64,
+        err.len() as u64,
+        0,
+    );
+    if rc < 0 {
+        let end = err.iter().position(|byte| *byte == 0).unwrap_or(err.len());
+        let message = core::str::from_utf8(&err[..end]).unwrap_or("rejected");
+        return bad_json(message);
+    }
+    let body = if rc == 1 {
+        "{\"status\":\"applied\",\"restart\":true}\n"
+    } else {
+        "{\"status\":\"applied\",\"restart\":false}\n"
+    };
+    let mut response = HttpResponse::ok(body);
+    response.add_header("Content-Type", "application/json");
+    response
+}
+
+fn bad_json(message: &str) -> HttpResponse {
+    let body = format!("{{\"field\":\"{message}\"}}");
+    let mut response = HttpResponse::new(400, "Bad Request");
+    response.set_body(body.as_bytes());
+    response.add_header("Content-Type", "application/json");
+    response
+}
+
+fn read_config_file(which: u64) -> Option<String> {
+    let mut buf = [0u8; 8192];
+    let n = sys(
+        CONFIG_READ,
+        which,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+    );
+    if n < 0 {
+        return None;
+    }
+    core::str::from_utf8(&buf[..n as usize])
+        .ok()
+        .map(|text| text.into())
 }
 
 fn handle_logs() -> HttpResponse {
@@ -333,6 +478,9 @@ fn handle_index() -> HttpResponse {
         <li><a href="/config">Configuration</a></li>
         <li><a href="/records">DNS Records (JSON)</a></li>
         <li><a href="/logs">Log</a></li>
+        <li><a href="/log-config">Log configuration</a></li>
+        <li><a href="/config/file/config">Download CONFIG.JSN</a></li>
+        <li><a href="/config/file/log">Download LOG.JSN</a></li>
     </ul>
 </body>
 </html>"#
