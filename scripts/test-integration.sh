@@ -1938,8 +1938,9 @@ POWER_FWD="hostfwd=udp::${POWER_DNS_PORT}-:53,hostfwd=tcp::${POWER_HTTP_PORT}-:8
 FOREIGN_QEMU=$(ps -eo pid=,args= | awk 'index($0, "qemu-system-aarch64") && index($0, "awk") == 0 {print $1}')
 start_power_guest() {
     local serial="$1"
+    local limit="${2:-70}"
     rm -f "$serial"
-    timeout 70 qemu-system-aarch64 \
+    timeout "$limit" qemu-system-aarch64 \
         -M virt,gic-version=2 \
         -cpu cortex-a72 \
         -smp 4 \
@@ -1962,7 +1963,10 @@ wait_power_http() {
     done
     return 1
 }
-start_power_guest qemu/power-reboot.txt
+# VNC and the reboot poll share this guest. A slow TCG boot used to hit
+# the old 70s limit while the poll was still running, which looks like
+# "uptime did not drop" because every socket error is ignored.
+start_power_guest qemu/power-reboot.txt 300
 echo "Power guest PID: $POWER_PID"
 VNC_BUTTON_OK=0
 REBOOT_OK=0
@@ -2076,10 +2080,13 @@ PY
     then
         VNC_BUTTON_OK=1
     fi
-    if [ "$VNC_BUTTON_OK" = 1 ] && python3 - "$POWER_HTTP_PORT" <<'PY'
+    if [ "$VNC_BUTTON_OK" = 1 ] && python3 - "$POWER_HTTP_PORT" qemu/power-reboot.txt <<'PY'
 import json, sys, time, urllib.error, urllib.request
 http_port = sys.argv[1]
+serial_path = sys.argv[2]
 base = "http://127.0.0.1:%s" % http_port
+# Printed once from main, not by the 2s status reprint.
+MARKER = b"=== Pi4 DNS Server Kernel ==="
 auth = urllib.request.HTTPBasicAuthHandler()
 auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
 opener = urllib.request.build_opener(auth)
@@ -2088,45 +2095,84 @@ def fail(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
 
-def req(method, path, data=None):
+def req(method, path, data=None, timeout=8):
     body = data.encode() if isinstance(data, str) else data
     r = urllib.request.Request(base + path, data=body, method=method)
     if data is not None:
         r.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
-        with opener.open(r, timeout=8) as resp:
+        with opener.open(r, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
 
-before = 0
-deadline = time.time() + 8
-while time.time() < deadline and before < 4:
-    status, page = req("GET", "/status")
-    before = json.loads(page)["uptime"]
+def uptime():
+    status, page = req("GET", "/status", timeout=3)
+    if status != 200:
+        fail("status %s" % status)
+    return json.loads(page)["uptime"]
+
+def boot_mark():
+    try:
+        data = open(serial_path, "rb").read()
+    except OSError:
+        return 0, 0
+    return len(data), data.count(MARKER)
+
+def second_boot(old_len, old_n, new_len, new_n):
+    # file: appends across QEMU reset. Some builds truncate and rewrite.
+    if new_n > old_n and new_n >= 2:
+        return True
+    if old_n >= 1 and new_len < old_len and new_n >= 1:
+        return True
+    return False
+
+status, page = req("GET", "/status")
+if status != 200:
+    fail("status %s" % status)
+entry = json.loads(page)["uptime"]
+# Ten guest-seconds past the uptime we found on entry. The second boot's
+# first /status is often already 3 or more, so a fixed ceiling of 2 fails
+# after a real reset. The extra wait keeps that sample below `before`.
+need = entry + 10
+before = entry
+deadline = time.time() + 90
+while time.time() < deadline and before < need:
     time.sleep(0.3)
-if before < 4:
-    fail("uptime never reached 4 (%s)" % before)
+    try:
+        before = uptime()
+    except Exception:
+        continue
+if before < need:
+    fail("uptime never advanced 10s past %s (now %s)" % (entry, before))
+old_len, old_n = boot_mark()
 status, body = req("POST", "/power", "action=reboot&confirm=reboot")
 if status != 200 or b"Reboot requested." not in body:
     fail("reboot response %s %s" % (status, body[:200]))
-deadline = time.time() + 20
+deadline = time.time() + 60
+samples = []
 while time.time() < deadline:
     try:
-        status, page = req("GET", "/status")
+        status, page = req("GET", "/status", timeout=2)
         now = json.loads(page)["uptime"]
     except Exception:
-        time.sleep(0.4)
+        time.sleep(0.3)
         continue
-    if status == 200 and now <= 2:
+    samples.append(now)
+    new_len, new_n = boot_mark()
+    if status == 200 and second_boot(old_len, old_n, new_len, new_n) and now < before:
         status, home = req("GET", "/")
         if b'value="start">Start</button>' not in home or b">Shutdown</button>" not in home:
             fail("home after reboot %s" % home[:240])
-        print("reboot", before, now)
+        print("reboot", before, now, "banners", old_n, new_n)
         break
-    time.sleep(0.4)
+    time.sleep(0.3)
 else:
-    fail("guest uptime did not drop")
+    new_len, new_n = boot_mark()
+    fail(
+        "guest uptime did not drop (before %s samples %s banners %s->%s len %s->%s)"
+        % (before, samples[-8:], old_n, new_n, old_len, new_len)
+    )
 PY
     then
         REBOOT_OK=1
@@ -2146,7 +2192,7 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 if [ "$REBOOT_OK" = 1 ]; then
-    echo "✓ Guest reboot came back with a lower uptime"
+    echo "✓ Guest reboot printed a second banner and uptime dropped"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo "✗ Guest reboot failed"
