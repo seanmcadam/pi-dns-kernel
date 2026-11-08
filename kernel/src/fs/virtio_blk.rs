@@ -214,7 +214,7 @@ impl VirtioBlk {
 
         unsafe {
             core::ptr::write_bytes(addr_of_mut!(QUEUE) as *mut u8, 0, QUEUE_BYTES);
-            write_volatile((*addr_of_mut!(IO)).status.as_mut_ptr(), 0);
+            write_volatile((&mut (*addr_of_mut!(IO)).status).as_mut_ptr(), 0);
         }
         if !install_queue(base, addr_of_mut!(QUEUE), legacy) {
             return Err("blk queue rejected");
@@ -229,7 +229,7 @@ impl VirtioBlk {
     fn read_sector(&mut self, sector: u64, out: &mut [u8; 512]) -> Result<(), &'static str> {
         self.submit(BLK_T_IN, sector, None)?;
         unsafe {
-            let data = (*addr_of_mut!(IO)).data.as_ptr();
+            let data = (&(*addr_of_mut!(IO)).data).as_ptr();
             // Drop a stale cache line before copying out what the device wrote.
             invalidate_dma(data, 512);
             dsb();
@@ -279,13 +279,13 @@ impl VirtioBlk {
             header[4..8].fill(0);
             header[8..16].copy_from_slice(&sector.to_le_bytes());
             if let Some(data) = data {
-                (*io).data.copy_from_slice(data);
+                (&mut (*io).data).copy_from_slice(data);
             }
-            write_volatile((*io).status.as_mut_ptr(), 0xff);
+            write_volatile((&mut (*io).status).as_mut_ptr(), 0xff);
 
-            let header_addr = crate::addr::virt_to_phys((*io).header.as_ptr() as u64);
-            let data_addr = crate::addr::virt_to_phys((*io).data.as_ptr() as u64);
-            let status_addr = crate::addr::virt_to_phys((*io).status.as_ptr() as u64);
+            let header_addr = crate::addr::virt_to_phys((&(*io).header).as_ptr() as u64);
+            let data_addr = crate::addr::virt_to_phys((&(*io).data).as_ptr() as u64);
+            let status_addr = crate::addr::virt_to_phys((&(*io).status).as_ptr() as u64);
             let data_flags = if kind == BLK_T_IN {
                 VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
             } else {
@@ -304,7 +304,7 @@ impl VirtioBlk {
             // Clean what the device reads. Do not clean the used ring: that
             // would write a stale cache line back over the device's update.
             clean_dma(q as *const u8, AVAIL_OFF + 64);
-            clean_dma((*io).header.as_ptr(), 16 + 512 + 1);
+            clean_dma((&(*io).header).as_ptr(), 16 + 512 + 1);
             dsb();
             write_reg(self.base, REG_QUEUE_NOTIFY, 0);
             dsb();
@@ -338,7 +338,7 @@ impl VirtioBlk {
         let mut spins: u32 = 0;
         loop {
             invalidate_dma(unsafe { (q as *const u8).add(USED_OFF) }, 16);
-            let status_ptr = unsafe { (*io).status.as_ptr() };
+            let status_ptr = unsafe { (&(*io).status).as_ptr() };
             invalidate_dma(status_ptr, 1);
             dsb();
             let used = unsafe { read_volatile(used_idx(q)) };

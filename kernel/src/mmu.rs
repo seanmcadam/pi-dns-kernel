@@ -161,7 +161,7 @@ pub fn init() {
     let layout = layout();
     unsafe {
         let l1 = virt_to_phys(addr_of!(TABLES.l1) as u64);
-        (*addr_of_mut!(TABLES.l0)).entries[0] = l1 | VALID | TABLE_OR_PAGE;
+        (&mut *addr_of_mut!(TABLES.l0)).entries[0] = l1 | VALID | TABLE_OR_PAGE;
 
         map_ram_blocks(&layout);
         map_devices();
@@ -289,15 +289,15 @@ fn prepare_user_root(slot: usize) {
         let l0 = addr_of_mut!(TABLES.user_l0[slot]);
         let l1 = addr_of_mut!(TABLES.user_l1[slot]);
         let l2 = addr_of_mut!(TABLES.l2_user[slot]);
-        (*l0).entries = [0; 512];
-        (*l1).entries = [0; 512];
+        (&mut *l0).entries = [0; 512];
+        (&mut *l1).entries = [0; 512];
         // USER_CODE_VA is 0x1_0000_0000: level 0 index 0, level 1 index 4.
-        (*l0).entries[0] = virt_to_phys(l1 as u64) | VALID | TABLE_OR_PAGE;
-        (*l1).entries[4] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
+        (&mut *l0).entries[0] = virt_to_phys(l1 as u64) | VALID | TABLE_OR_PAGE;
+        (&mut *l1).entries[4] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
         for index in 0..2 {
             let l3 = addr_of_mut!(TABLES.l3_user[slot][index]);
-            (*l3).entries = [0; 512];
-            (*l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
+            (&mut *l3).entries = [0; 512];
+            (&mut *l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
         }
     }
 }
@@ -313,7 +313,7 @@ fn map_user_span(slot: usize, va: u64, pa: u64, bytes: u64, flags: u64) {
         }
         unsafe {
             let l3 = addr_of_mut!(TABLES.l3_user[slot][l2_index]);
-            (*l3).entries[l3_index] = (pa + off) | flags | VALID | TABLE_OR_PAGE;
+            (&mut *l3).entries[l3_index] = (pa + off) | flags | VALID | TABLE_OR_PAGE;
         }
         off += PAGE;
     }
@@ -503,7 +503,7 @@ fn map_block(pa: u64, flags: u64) {
     unsafe {
         let l2 = l2_for(pa);
         let index = ((pa >> 21) & 511) as usize;
-        (*l2).entries[index] = (pa & !((1 << 21) - 1)) | flags | VALID;
+        (&mut *l2).entries[index] = (pa & !((1 << 21) - 1)) | flags | VALID;
     }
 }
 
@@ -511,7 +511,7 @@ fn map_page(pa: u64, flags: u64) {
     unsafe {
         let l3 = l3_for(pa);
         let index = ((pa >> 12) & 511) as usize;
-        (*l3).entries[index] = if flags == 0 {
+        (&mut *l3).entries[index] = if flags == 0 {
             0
         } else {
             (pa & !((1 << 12) - 1)) | flags | VALID | TABLE_OR_PAGE
@@ -526,8 +526,8 @@ unsafe fn l2_for(pa: u64) -> *mut Table {
     }
     let l1 = addr_of_mut!(TABLES.l1);
     let l2 = addr_of_mut!(TABLES.l2[gb]);
-    if (*l1).entries[gb] & VALID == 0 {
-        (*l1).entries[gb] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
+    if (&mut *l1).entries[gb] & VALID == 0 {
+        (&mut *l1).entries[gb] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
     }
     l2
 }
@@ -535,7 +535,7 @@ unsafe fn l2_for(pa: u64) -> *mut Table {
 unsafe fn l3_for(pa: u64) -> *mut Table {
     let l2 = l2_for(pa);
     let index = ((pa >> 21) & 511) as usize;
-    let entry = (*l2).entries[index];
+    let entry = (&mut *l2).entries[index];
     if entry & VALID != 0 && entry & TABLE_OR_PAGE != 0 {
         return phys_to_virt(entry & 0x0000_ffff_ffff_f000) as *mut Table;
     }
@@ -545,7 +545,7 @@ unsafe fn l3_for(pa: u64) -> *mut Table {
     }
     NEXT_L3 = slot + 1;
     let l3 = addr_of_mut!(TABLES.l3[slot]);
-    (*l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
+    (&mut *l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
     l3
 }
 

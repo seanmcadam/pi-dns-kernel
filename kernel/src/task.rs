@@ -272,8 +272,8 @@ fn run_scenario(scenario: u64, arg1: u64) {
         SCENARIO = scenario;
         let ctx = addr_of_mut!(TASK.ctx);
         core::ptr::write_bytes(ctx, 0, 1);
-        (*ctx).x[0] = scenario;
-        (*ctx).x[1] = arg1;
+        (&mut *ctx).x[0] = scenario;
+        (&mut *ctx).x[1] = arg1;
         (*ctx).elr = crate::mmu::USER_CODE_VA;
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::mmu::USER_STACK_BYTES;
@@ -1095,7 +1095,7 @@ fn unlink_futex(mine: usize) {
 pub fn wake_locked(slot: usize, thread_index: u64, result: u64) {
     if thread_index == 0 {
         unsafe {
-            (*main_ctx(slot)).x[0] = result;
+            (&mut *main_ctx(slot)).x[0] = result;
         }
         if slot < TASK_SLOTS {
             MAIN_BLOCKED[slot].store(false, Ordering::Release);
@@ -1276,7 +1276,7 @@ fn wake_waiter(index: usize) {
         let slot = THREADS[index].waiter_slot as usize;
         THREADS[index].waiter = WAITER_NONE;
         if waiter == WAITER_MAIN {
-            (*main_ctx(slot)).x[0] = code as u64;
+            (&mut *main_ctx(slot)).x[0] = code as u64;
             MAIN_FUTEX[slot] = 0;
             if slot < TASK_SLOTS {
                 MAIN_BLOCKED[slot].store(false, Ordering::Release);
@@ -1587,7 +1587,7 @@ fn futex_wake(addr: u64, n: u64) -> u64 {
         while slot < TASK_SLOTS && woke < limit {
             if MAIN_BLOCKED[slot].load(Ordering::Acquire) && MAIN_FUTEX[slot] == addr {
                 MAIN_FUTEX[slot] = 0;
-                (*main_ctx(slot)).x[0] = 0;
+                (&mut *main_ctx(slot)).x[0] = 0;
                 MAIN_BLOCKED[slot].store(false, Ordering::Release);
                 woke += 1;
                 sev();

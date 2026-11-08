@@ -267,7 +267,7 @@ pub fn fan_read(cursor: u64) -> Option<FanLine> {
             let n = slot.len.load(Ordering::Relaxed).min(FAN_CAP);
             let mut bytes = [0u8; FAN_CAP];
             unsafe {
-                bytes[..n].copy_from_slice(&(*slot.data.get())[..n]);
+                core::ptr::copy_nonoverlapping(slot.data.get().cast::<u8>(), bytes.as_mut_ptr(), n);
             }
             if slot.seq.load(Ordering::Acquire) != seq {
                 let now = slot.seq.load(Ordering::Acquire);

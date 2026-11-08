@@ -336,10 +336,8 @@ impl RxToken for VirtioRxToken {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = unsafe {
-            let bufs = addr_of_mut!(RX_BUFS);
-            let frame = (*bufs).bufs[self.idx as usize]
-                .as_mut_ptr()
-                .add(HDR_LEN);
+            let bufs = &mut *addr_of_mut!(RX_BUFS);
+            let frame = bufs.bufs[self.idx as usize].as_mut_ptr().add(HDR_LEN);
             let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
             f(slice)
         };
@@ -364,8 +362,8 @@ impl<'a> TxToken for VirtioTxToken<'a> {
             .alloc_tx()
             .expect("TX token handed out with no free slot");
         let result = unsafe {
-            let bufs = addr_of_mut!(TX_BUFS);
-            let buf = &mut (*bufs).bufs[idx];
+            let bufs = &mut *addr_of_mut!(TX_BUFS);
+            let buf = &mut bufs.bufs[idx];
             buf[..HDR_LEN].fill(0);
             let frame = &mut buf[HDR_LEN..HDR_LEN + len];
             let result = f(frame);
@@ -496,7 +494,7 @@ fn used_elem(q: *mut QueueArea, index: usize) -> (u32, u32) {
 }
 
 fn buf_addr(bufs: *mut PacketBufs, index: usize) -> u64 {
-    unsafe { crate::addr::virt_to_phys((*bufs).bufs[index].as_mut_ptr() as u64) }
+    unsafe { crate::addr::virt_to_phys((&mut *bufs).bufs[index].as_mut_ptr() as u64) }
 }
 
 fn device_features(base: usize, sel: u32) -> u32 {
