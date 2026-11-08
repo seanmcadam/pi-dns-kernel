@@ -221,6 +221,31 @@ exc_sp0_fiq:
 exc_sp0_serr:
     enter 3
 exc_el1_sync:
+    // A device probe can ask to survive one synchronous external abort.
+    // PROBE_RECOVER holds the instruction to resume at. Any other fault,
+    // and a fault with that word clear, still prints and halts. x16 and
+    // x17 are restored on that path so the report shows the real values.
+    stp     x16, x17, [sp, #-16]!
+    mrs     x16, esr_el1
+    lsr     x17, x16, #26
+    cmp     x17, #0x25
+    b.ne    92f
+    and     x17, x16, #0x3f
+    cmp     x17, #0x10
+    b.eq    91f
+    cmp     x17, #0x14
+    b.ne    92f
+91:
+    adrp    x16, PROBE_RECOVER
+    add     x16, x16, :lo12:PROBE_RECOVER
+    ldr     x17, [x16]
+    cbz     x17, 92f
+    str     xzr, [x16]
+    msr     elr_el1, x17
+    add     sp, sp, #16
+    eret
+92:
+    ldp     x16, x17, [sp], #16
     enter 4
 exc_el1_irq:
     enter_irq

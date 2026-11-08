@@ -91,35 +91,18 @@ fn classify(id: u32) -> u64 {
         crate::net::service::note_kick();
         return CLASS_NET;
     }
-    #[cfg(not(feature = "pi4"))]
-    {
-        if crate::net::virtio::take_irq(id) {
+    match crate::board::handle_irq(id) {
+        crate::board::IrqHit::Net => {
             NIC_IRQS.fetch_add(1, Ordering::Relaxed);
             crate::net::service::note_kick();
             return CLASS_NET;
         }
-        if crate::fs::virtio_blk::take_irq(id) {
+        crate::board::IrqHit::Block => {
             BLK_IRQS.fetch_add(1, Ordering::Relaxed);
             event();
             return CLASS_OTHER;
         }
-    }
-    #[cfg(feature = "pi4")]
-    {
-        // GENET's INTRL2 mask is not programmed. If a line is ever enabled
-        // and sticks high, drop it after one count so it cannot spin the core.
-        if id == crate::gic::PI4_GENET_IRQ0 || id == crate::gic::PI4_GENET_IRQ1 {
-            crate::gic::disable_id(id);
-            NIC_IRQS.fetch_add(1, Ordering::Relaxed);
-            crate::net::service::note_kick();
-            return CLASS_NET;
-        }
-        if id == crate::gic::PI4_EMMC_IRQ {
-            crate::gic::disable_id(id);
-            BLK_IRQS.fetch_add(1, Ordering::Relaxed);
-            event();
-            return CLASS_OTHER;
-        }
+        crate::board::IrqHit::None => {}
     }
     CLASS_OTHER
 }

@@ -136,12 +136,6 @@ fn table() -> &'static mut [Kind; MAX_FD] {
     unsafe { &mut FDS[slot()] }
 }
 
-static mut PACKET: [[u8; MAX_PACKET]; 4] = [[0; MAX_PACKET]; 4];
-
-fn packet() -> &'static mut [u8] {
-    unsafe { &mut PACKET[crate::percpu::id()] }
-}
-
 pub fn call(num: u64, args: [u64; 6]) -> u64 {
     let _fd = FD_LOCK[slot()].lock();
     let value = match num {
@@ -931,18 +925,6 @@ fn config_remove(ptr: u64, len: u64) -> i64 {
     }
 }
 
-fn read_user(ptr: u64, len: usize) -> bool {
-    if !crate::mmu::user_slice_ok(ptr, len as u64) {
-        return false;
-    }
-    crate::mmu::set_pan(false);
-    unsafe {
-        core::ptr::copy_nonoverlapping(ptr as *const u8, packet().as_mut_ptr(), len);
-    }
-    crate::mmu::set_pan(true);
-    true
-}
-
 fn write_user(ptr: u64, src: &[u8]) -> bool {
     if !crate::mmu::user_write_ok(ptr, src.len() as u64) {
         return false;
@@ -1047,11 +1029,11 @@ fn file_read(name: u64, name_len: u64, buf: u64, cap: u64) -> i64 {
     let Ok(text) = core::str::from_utf8(&raw[..name_len as usize]) else {
         return EINVAL;
     };
-    let n = unsafe { crate::fs::read_named(text, &mut iobuf()[..cap as usize]) };
+    let n = crate::fs::read_named(text, &mut iobuf()[..cap as usize]);
     match n {
         Ok(0) => 0,
         Ok(copied) => {
-            if unsafe { write_user(buf, &iobuf()[..copied]) } {
+            if write_user(buf, &iobuf()[..copied]) {
                 copied as i64
             } else {
                 EFAULT
@@ -1079,7 +1061,7 @@ fn file_write(name: u64, name_len: u64, buf: u64, len: u64, flags: u64) -> i64 {
     if len > 0 && !read_user_io(buf, len as usize) {
         return EFAULT;
     }
-    let data = unsafe { &iobuf()[..len as usize] };
+    let data = &iobuf()[..len as usize];
     match crate::fs::write_named(text, data, (flags & 1) == 1) {
         Ok(()) => 0,
         Err(_) => EIO,

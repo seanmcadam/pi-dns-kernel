@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod addr;
+mod board;
 mod config_manager;
 mod console;
 mod dns;
@@ -23,8 +24,6 @@ mod spin;
 mod task;
 mod user_fd;
 mod timer;
-#[cfg(feature = "pi4")]
-mod uart_pl011;
 
 use memory::ALLOCATOR;
 
@@ -71,10 +70,12 @@ fn uart_dec(mut n: u64) {
 
 #[no_mangle]
 pub extern "C" fn kernel_main(entry_el: u64) -> ! {
-    #[cfg(feature = "pi4")]
-    uart_pl011::init_pi4();
+    board::early_init();
 
     uart_write("\r\n=== Pi4 DNS Server Kernel ===\r\n");
+    uart_write("board ");
+    uart_write(board::NAME);
+    uart_write("\r\n");
     report_el(entry_el);
 
     uart_write("[0] Enabling MMU and caches...\r\n");
@@ -120,47 +121,59 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("[OK] Config loaded\r\n");
 
     uart_write("[6] Initializing network...\r\n");
-    match net::init(&config.network) {
-        Ok(()) => uart_write("[OK] Network initialized\r\n"),
-        Err(_) => {
-            uart_write("[ERROR] Network init failed\r\n");
-            loop {
-                cortex_a::asm::wfe();
-            }
+    // A missing NIC is fatal on the virt image because every service there
+    // needs the stack. The Pi 4 image can boot on QEMU raspi4b, which has
+    // no GENET, so that case continues with the log task only.
+    let net_up = match net::init(&config.network) {
+        Ok(()) => {
+            uart_write("[OK] Network initialized\r\n");
+            true
         }
+        Err(_) => {
+            uart_write("[WARN] No NIC, DNS HTTP and telnet not started\r\n");
+            false
+        }
+    };
+
+    if net_up {
+        uart_write("[7] Initializing DNS server...\r\n");
+        dns::init(&config.dns);
+        uart_write("[OK] DNS server initialized\r\n");
+
+        uart_write("[8] Initializing HTTP server...\r\n");
+        http::init(&config.http);
+        uart_write("[OK] HTTP server initialized\r\n");
+    } else {
+        uart_write("[7] Skipping DNS, HTTP, and telnet without a NIC\r\n");
     }
-
-    uart_write("[7] Initializing DNS server...\r\n");
-    dns::init(&config.dns);
-    uart_write("[OK] DNS server initialized\r\n");
-
-    uart_write("[8] Initializing HTTP server...\r\n");
-    http::init(&config.http);
-    uart_write("[OK] HTTP server initialized\r\n");
 
     uart_write("[9] Creating sockets...\r\n");
     match task::start_log() {
         Ok(()) => uart_write("[OK] Log task running\r\n"),
         Err(()) => uart_write("[ERROR] Log task failed\r\n"),
     }
-    match task::start_dns() {
-        Ok(()) => uart_write("[OK] DNS user program running\r\n"),
-        Err(()) => uart_write("[ERROR] DNS user program failed\r\n"),
-    }
-    match task::start_http() {
-        Ok(()) => uart_write("[OK] HTTP socket created\r\n"),
-        Err(()) => uart_write("[ERROR] HTTP socket failed\r\n"),
-    }
-    match task::start_telnet() {
-        Ok(()) => uart_write("[OK] Telnet log listening on port 23\r\n"),
-        Err(()) => uart_write("[ERROR] Telnet log failed\r\n"),
-    }
+    if net_up {
+        match task::start_dns() {
+            Ok(()) => uart_write("[OK] DNS user program running\r\n"),
+            Err(()) => uart_write("[ERROR] DNS user program failed\r\n"),
+        }
+        match task::start_http() {
+            Ok(()) => uart_write("[OK] HTTP socket created\r\n"),
+            Err(()) => uart_write("[ERROR] HTTP socket failed\r\n"),
+        }
+        match task::start_telnet() {
+            Ok(()) => uart_write("[OK] Telnet log listening on port 23\r\n"),
+            Err(()) => uart_write("[ERROR] Telnet log failed\r\n"),
+        }
 
-    uart_write("\r\n=== Kernel Initialized Successfully ===\r\n");
-    uart_write("DNS server listening on port 53\r\n");
-    uart_write("HTTP server listening on port 80\r\n");
-    uart_write("DNS Server ready\r\n");
-    uart_write("Ready for queries...\r\n\r\n");
+        uart_write("\r\n=== Kernel Initialized Successfully ===\r\n");
+        uart_write("DNS server listening on port 53\r\n");
+        uart_write("HTTP server listening on port 80\r\n");
+        uart_write("DNS Server ready\r\n");
+        uart_write("Ready for queries...\r\n\r\n");
+    } else {
+        uart_write("\r\n=== Kernel Initialized Without a NIC ===\r\n");
+    }
 
     let mut next_status = timer::millis() + 2000;
     loop {
@@ -196,9 +209,11 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
             uart_write("\r\n");
             // Repeat the lines the integration test greps for, in case the
             // serial client connects after the boot banner has already gone by.
-            uart_write("DNS server listening on port 53\r\n");
-            uart_write("HTTP server listening on port 80\r\n");
-            uart_write("DNS Server ready\r\n");
+            if net_up {
+                uart_write("DNS server listening on port 53\r\n");
+                uart_write("HTTP server listening on port 80\r\n");
+                uart_write("DNS Server ready\r\n");
+            }
             uart_write("MMU and caches enabled\r\n");
             uart_write("cores online ");
             uart_dec(smp::online() as u64);

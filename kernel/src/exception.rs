@@ -131,6 +131,53 @@ fn iss_summary(ec: u64, iss: u64) {
     put("\r\n");
 }
 
+/// `exception.s` reads this. A non-zero value is the ELR to resume at after
+/// one synchronous external abort, so a missing MMIO device can be probed.
+#[no_mangle]
+static mut PROBE_RECOVER: u64 = 0;
+
+/// Read one word. An external abort returns `None` instead of halting.
+///
+/// The Pi 4 GENET probe is the caller. The virt image has no such probe.
+#[allow(dead_code)]
+///
+/// Only the caller that stored `PROBE_RECOVER` is resumed. A fault on
+/// another core during that window would resume there too, so this is for
+/// the boot probe, before other cores run device code.
+pub fn read_u32_catching(addr: *const u32) -> Option<u32> {
+    let value: u32;
+    let failed: u64;
+    let recover: u64;
+    unsafe {
+        core::arch::asm!(
+            "adr {recover}, 1f",
+            "str {recover}, [{slot}]",
+            "ldr {value:w}, [{addr}]",
+            "str xzr, [{slot}]",
+            "mov {failed}, xzr",
+            "b 2f",
+            "1:",
+            "mov {failed}, #1",
+            "mov {value:w}, wzr",
+            "2:",
+            addr = in(reg) addr,
+            slot = in(reg) core::ptr::addr_of_mut!(PROBE_RECOVER),
+            recover = out(reg) recover,
+            value = out(reg) value,
+            failed = out(reg) failed,
+            out("x16") _,
+            out("x17") _,
+            options(nostack),
+        );
+    }
+    let _ = recover;
+    if failed == 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 /// Print the fault and stop. Called from `exception.s` with a saved frame.
 #[no_mangle]
 pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {

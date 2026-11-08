@@ -54,6 +54,10 @@
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
+// rustc 1.99 warns about lifetime syntax and `core::u32::MAX` in this vendored tree.
+#![allow(unknown_lints)]
+#![allow(mismatched_lifetime_syntaxes)]
+#![allow(deprecated)]
 
 // ****************************************************************************
 //

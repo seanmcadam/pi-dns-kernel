@@ -292,23 +292,7 @@ fn default_config() -> Config {
 }
 
 fn default_network_mode() -> NetworkMode {
-    #[cfg(feature = "dhcp-default")]
-    {
-        NetworkMode::Dhcp {
-            fallback_ip: [10, 0, 2, 15],
-            fallback_netmask: [255, 255, 255, 0],
-            fallback_gateway: [10, 0, 2, 2],
-            timeout_ms: 3_000,
-        }
-    }
-    #[cfg(not(feature = "dhcp-default"))]
-    {
-        NetworkMode::Static {
-            ip: [10, 0, 2, 15],
-            netmask: [255, 255, 255, 0],
-            gateway: [10, 0, 2, 2],
-        }
-    }
+    crate::board::default_network()
 }
 
 fn parse_config(text: &str) -> Option<Config> {

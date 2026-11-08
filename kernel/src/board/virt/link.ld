@@ -6,7 +6,7 @@ SECTIONS
        The link address is that physical address with the upper bits set, so
        the kernel runs from TTBR1. Bits 47:0 still equal the physical address.
        objcopy -O binary starts at the lowest LMA, so the file stays the size
-       of the image. The Pi 4 image uses link-pi4.ld. */
+       of the image. The Pi 4 image uses board/pi4/link.ld. */
     . = 0xFFFF000040080000;
     __stack_top = .;
 

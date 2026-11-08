@@ -14,10 +14,24 @@
 //! That path has not been run on a Pi 4.
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
 use spin::Mutex;
 
-const BASE: usize = crate::addr::phys_to_virt(0xFE34_0000) as usize;
+/// Real Pi 4 SD slot. QEMU raspi4b models this controller but does not
+/// attach `-drive if=sd` to it.
+const EMMC2_PHYS: u64 = 0xFE34_0000;
+/// Legacy Arasan. QEMU raspi4b attaches the SD card here. On a real Pi 4
+/// this is usually the WiFi SDIO, so it is only tried after EMMC2 has no card.
+const EMMC1_PHYS: u64 = 0xFE30_0000;
+static HOST_PHYS: AtomicU64 = AtomicU64::new(EMMC2_PHYS);
+
+/// Present-state register. Bit 16 is card inserted on the Arasan SDHCI.
+const PRESENT: usize = 0x24;
+const CARD_INSERTED: u32 = 1 << 16;
+
+/// Same GIC line the board handler matches. EMMC and EMMC2 share it.
+const EMMC_IRQ: u32 = 32 + 126;
 
 const BLKSIZECNT: usize = 0x04;
 const ARG1: usize = 0x08;
@@ -60,24 +74,38 @@ static CARD: Mutex<Option<Card>> = Mutex::new(None);
 pub struct DiskDev;
 
 pub fn probe() -> bool {
+    if bring_up(EMMC2_PHYS, "EMMC2") {
+        return true;
+    }
+    // raspi4b (QEMU 9+) wires the SD card to the legacy controller. The
+    // hardware slot is EMMC2, which was already tried.
+    if bring_up(EMMC1_PHYS, "EMMC1") {
+        log::info!("SD card is on the legacy controller, not EMMC2");
+        return true;
+    }
+    false
+}
+
+fn bring_up(phys: u64, name: &str) -> bool {
+    HOST_PHYS.store(phys, Ordering::Relaxed);
     let version = read(SLOTISR_VER);
     if version == 0 || version == 0xffff_ffff {
-        log::warn!("EMMC2 controller is not present");
+        log::warn!("{name} controller is not present");
         return false;
     }
-    log::info!("EMMC2 slot version {:#x}", version);
+    if read(PRESENT) & CARD_INSERTED == 0 {
+        log::info!("{name} slot version {version:#x}, no card");
+        return false;
+    }
+    log::info!("{name} slot version {version:#x}");
     match identify() {
         Ok(card) => {
-            log::info!(
-                "EMMC2 card rca {:#x}, {} blocks",
-                card.rca,
-                card.blocks
-            );
+            log::info!("{name} card rca {:#x}, {} blocks", card.rca, card.blocks);
             *CARD.lock() = Some(card);
             true
         }
         Err(err) => {
-            log::warn!("EMMC2 card init failed: {}", err);
+            log::warn!("{name} card init failed: {err}");
             false
         }
     }
@@ -136,10 +164,12 @@ fn identify() -> Result<Card, &'static str> {
     command(2, 0, RESP_136, false, false)?;
     let rca_resp = command(3, 0, RESP_48, false, false)?;
     let rca = rca_resp & 0xffff_0000;
+    // CMD9 is legal in standby. After CMD7 the card is in transfer and
+    // the CSD read is rejected, which is why the block count stayed 0.
+    let blocks = read_capacity(rca).unwrap_or(0);
     command(7, rca, RESP_48_BUSY, false, false)?;
     command(16, 512, RESP_48, false, false)?;
     set_clock(0x02)?;
-    let blocks = read_capacity(rca).unwrap_or(0);
     Ok(Card {
         rca,
         high_capacity,
@@ -150,13 +180,41 @@ fn identify() -> Result<Card, &'static str> {
 fn read_capacity(rca: u32) -> Option<u32> {
     command(9, rca, RESP_136, false, false).ok()?;
     let words = [read(RESP0), read(RESP0 + 4), read(RESP0 + 8), read(RESP0 + 12)];
-    // CSD structure is the top two bits of the 128-bit register. RESP0 holds
-    // the last word shifted out, so the structure field is in the top bits of
-    // the last response word.
-    let structure = words[3] >> 30;
+    // SDHCI stores an R2 response with the first CSD byte in bits 23:16 of
+    // the last response register. The CRC byte is not stored.
+    let mut csd = [0u8; 16];
+    csd[0] = (words[3] >> 16) as u8;
+    csd[1] = (words[3] >> 8) as u8;
+    csd[2] = words[3] as u8;
+    let w2 = words[2].to_be_bytes();
+    let w1 = words[1].to_be_bytes();
+    let w0 = words[0].to_be_bytes();
+    csd[3] = w2[0];
+    csd[4] = w2[1];
+    csd[5] = w2[2];
+    csd[6] = w2[3];
+    csd[7] = w1[0];
+    csd[8] = w1[1];
+    csd[9] = w1[2];
+    csd[10] = w1[3];
+    csd[11] = w0[0];
+    csd[12] = w0[1];
+    csd[13] = w0[2];
+    csd[14] = w0[3];
+    let structure = csd[0] >> 6;
     if structure == 1 {
-        let c_size = ((words[2] & 0x3f) << 16) | (words[1] >> 16);
+        let c_size = ((csd[7] as u32) << 16) | ((csd[8] as u32) << 8) | csd[9] as u32;
         Some((c_size + 1).saturating_mul(1024))
+    } else if structure == 0 {
+        let read_bl_len = (csd[5] & 0x0f) as u32;
+        let c_size = (((csd[6] & 0x03) as u32) << 10)
+            | ((csd[7] as u32) << 2)
+            | ((csd[8] as u32) >> 6);
+        let c_size_mult = (((csd[9] & 0x03) as u32) << 1) | ((csd[10] as u32) >> 7);
+        let block_len = 1u32 << read_bl_len;
+        let mult = 1u32 << (c_size_mult + 2);
+        let bytes = (c_size + 1).saturating_mul(mult).saturating_mul(block_len);
+        Some(bytes / 512)
     } else {
         None
     }
@@ -210,12 +268,8 @@ fn reset_host() -> Result<(), &'static str> {
             // Level IRQ. The handler masks the GIC line; each wait unmasks it.
             // Untested on hardware. A stuck line cannot spin because the
             // handler disables it before EOI.
-            crate::gic::arm_spi(
-                crate::gic::PI4_EMMC_IRQ,
-                0x80,
-                crate::gic::online_cpu_mask(),
-            );
-            crate::gic::disable_id(crate::gic::PI4_EMMC_IRQ);
+            crate::gic::arm_spi(EMMC_IRQ, 0x80, crate::gic::online_cpu_mask());
+            crate::gic::disable_id(EMMC_IRQ);
             return Ok(());
         }
         spin(100);
@@ -262,15 +316,20 @@ fn command(index: u32, arg: u32, resp: u32, data: bool, read_data: bool) -> Resu
 }
 
 fn wait_interrupt(bit: u32) -> Result<u32, &'static str> {
-    crate::gic::enable_id(crate::gic::PI4_EMMC_IRQ);
+    crate::gic::enable_id(EMMC_IRQ);
     let start = crate::timer::get_ticks();
     let freq = cntfrq();
     let budget = freq / 2;
     let mut spins = 0u32;
     loop {
         let status = read(INTERRUPT);
-        if status & (bit | INT_ERR | INT_CMD_TIMEOUT) != 0 {
-            write(INTERRUPT, status);
+        // Clear only the bits this wait consumed. QEMU's SDHCI sets the
+        // buffer-ready bit in the same status word as command-complete.
+        // Clearing the whole word there drops the data interrupt, and the
+        // following read then waits until the counter expires.
+        let interesting = bit | INT_ERR | INT_CMD_TIMEOUT;
+        if status & interesting != 0 {
+            write(INTERRUPT, status & interesting);
             return Ok(status);
         }
         let timed_out = if budget == 0 {
@@ -296,12 +355,16 @@ fn cntfrq() -> u64 {
     freq
 }
 
+fn host() -> usize {
+    crate::addr::phys_to_virt(HOST_PHYS.load(Ordering::Relaxed)) as usize
+}
+
 fn read(offset: usize) -> u32 {
-    unsafe { read_volatile((BASE + offset) as *const u32) }
+    unsafe { read_volatile((host() + offset) as *const u32) }
 }
 
 fn write(offset: usize, value: u32) {
-    unsafe { write_volatile((BASE + offset) as *mut u32, value) }
+    unsafe { write_volatile((host() + offset) as *mut u32, value) }
 }
 
 fn spin(count: u32) {

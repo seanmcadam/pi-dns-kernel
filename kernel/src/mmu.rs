@@ -414,29 +414,13 @@ fn phys_range(start: *const u8, end: *const u8) -> (u64, u64) {
 }
 
 fn ram_range() -> (u64, u64) {
-    #[cfg(not(feature = "pi4"))]
-    {
-        (0x4000_0000, 0x4000_0000 + 512 * 1024 * 1024)
-    }
-    #[cfg(feature = "pi4")]
-    {
-        // SDRAM up to the peripheral window. Untested on hardware.
-        (0x0000_0000, 0xFC00_0000)
-    }
+    (crate::board::RAM_START, crate::board::RAM_END)
 }
 
 fn map_devices() {
     let device = attrs(ATTR_DEVICE, SH_OUTER, 0, true);
-    #[cfg(not(feature = "pi4"))]
-    {
-        // GIC at 0x08000000, PL011 UART at 0x09000000, virtio-mmio at 0x0a000000.
-        map_blocks(0x0800_0000, 0x0c00_0000, device);
-    }
-    #[cfg(feature = "pi4")]
-    {
-        // GENET at 0xFD580000, EMMC2 and PL011 inside 0xFE000000, GIC near 0xFF800000.
-        // Untested on hardware.
-        map_blocks(0xFC00_0000, 0x1_0000_0000, device);
+    for &(start, end) in crate::board::device_ranges() {
+        map_blocks(start, end, device);
     }
 }
 

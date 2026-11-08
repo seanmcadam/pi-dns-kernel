@@ -14,11 +14,11 @@
 // ---------------------------------
 // The linker scripts place the .text.boot section first in the image, so
 // _start is the first instruction of the file the loader copies:
-//   - QEMU virt (kernel/link.ld):    linked at 0xFFFF000040080000
-//                                    loaded at physical 0x40080000
-//   - Raspberry Pi 4 (link-pi4.ld):  linked at 0xFFFF000000080000
-//                                    firmware loads the raw image at
-//                                    physical 0x80000. Untested on hardware.
+//   - QEMU virt (board/virt/link.ld): linked at 0xFFFF000040080000
+//                                     loaded at physical 0x40080000
+//   - Raspberry Pi 4 (board/pi4/link.ld): linked at 0xFFFF000000080000
+//                                     firmware loads the raw image at
+//                                     physical 0x80000. Untested on hardware.
 //
 // The upper 16 bits are the only difference between the link address and the
 // physical load address. While the MMU is off the PC is the physical address.
@@ -414,13 +414,19 @@ clean_page:
     ret
 
 // Secondary cores arrive here with the MMU off. x0 is the PSCI context
-// id, or whatever the Pi 4 stub left in x0 (this image writes the cpu id
-// only for PSCI). The Pi 4 spin-table path is untested on hardware.
+// id. QEMU virt passes the cpu id there, so that path is unchanged.
+// The Pi spin-table stub, including QEMU raspi4b, zeroes x0-x3 and then
+// branches. A zero x0 means take the MPIDR affinity instead. Core 0
+// never enters here. The hardware spin table is still untested.
 .section .text
 .global secondary_entry
 .type secondary_entry, %function
 secondary_entry:
     mov     x21, x0
+    cbnz    x21, 18f
+    mrs     x21, mpidr_el1
+    and     x21, x21, #0xff
+18:
     cmp     x21, #3
     b.hi    29f
     mrs     x20, currentel

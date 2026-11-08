@@ -109,7 +109,9 @@ The boot process:
 4. Turns the MMU on and jumps to the upper-half link address
 5. Calls Rust `kernel_main()`
 
-The stack grows down from the load address. The QEMU link script is `kernel/link.ld`. The Pi 4 link script is `kernel/link-pi4.ld`.
+The stack grows down from the load address. The QEMU link script is `kernel/src/board/virt/link.ld`. The Pi 4 link script is `kernel/src/board/pi4/link.ld`. `kernel/build.rs` copies the one selected by the Cargo feature into the link search path.
+
+Board-specific code is `kernel/src/board`. `board-virt` is the default feature. `board-pi4` is selected with `--no-default-features --features board-pi4` (`./scripts/build.sh pi4` or `./scripts/build-pi4.sh`). `board-pi5` is reserved and refuses to compile. The scheduler, syscalls, network owner, filesystem, logger, and EL0 services call `crate::board` and do not name a feature. The board supplies the memory map, UART base, GIC bases and the timer INTID, the NIC, the block device, secondary-core startup, the link script, and the default network config.
 
 ### System Layer
 
@@ -437,11 +439,9 @@ Main event loop: net::poll()
 
 ### QEMU Testing
 
-**Machine**: `raspi3b` (better support than `raspi4b`)
-**Limitations**:
-- No GENET emulation
-- Limited EMMC support
-- Use `virt` machine with virtio-net for network testing
+**Virt machine**: `-M virt,gic-version=2`. This is the integration suite. virtio-net and virtio-blk are the devices.
+
+**raspi4b** (QEMU 9.0 or newer): `-M raspi4b -smp 4 -kernel boot/pi4/kernel8.img` plus `-drive if=sd`. The integration script runs this as an extra stage and skips with a message when the machine is missing. QEMU 8.2 does not have it. The stage checks the UART, the upper-half MMU, four cores, a FAT `CONFIG.TXT`, and the EL0 log task. raspi4b does not emulate GENET, so the kernel continues without DNS, HTTP, or telnet. The SD card is attached to the legacy Arasan at `0xFE300000`, not to EMMC2; the driver tries EMMC2 first (the real Pi 4 slot) and then that legacy controller. None of this has been run on Pi 4 hardware.
 
 ## Dependencies
 

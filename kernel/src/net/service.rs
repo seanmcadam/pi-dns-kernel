@@ -243,8 +243,7 @@ pub fn try_become_owner() -> bool {
     }
     TURN.store(1, Ordering::Release);
     IN_STACK.store(false, Ordering::Release);
-    #[cfg(not(feature = "pi4"))]
-    crate::net::virtio::retarget(1);
+    crate::board::retarget_nic(1);
     // Drive once on the new owner even if the last deadline was far away.
     note_kick();
     true
@@ -343,7 +342,8 @@ pub fn drive() {
     KICK.store(false, Ordering::Release);
     let t0 = crate::timer::get_ticks();
     unsafe {
-        if let Some(state) = STATE.as_mut() {
+        let state_slot = core::ptr::addr_of_mut!(STATE);
+        if let Some(state) = (*state_slot).as_mut() {
             super::poll_device(state);
             crate::user_fd::recycle_all(&mut state.stack);
             pull();

@@ -1,24 +1,16 @@
 //! FAT32 config and log storage.
 //!
-//! QEMU uses a virtio-blk disk. The Pi 4 image uses the EMMC2 driver.
-//! `CONFIG.TXT` holds records, network settings, and upstream resolvers.
-//! `LOG.TXT` is appended until it passes `ROTATE_AT`, then renamed in spirit
-//! by copying it to `LOG.OLD` and starting a fresh log.
+//! The board supplies the block device: virtio-blk on QEMU virt, EMMC on
+//! the Pi 4 image. `CONFIG.TXT` holds records, network settings, and
+//! upstream resolvers. `LOG.TXT` is appended until it passes `ROTATE_AT`,
+//! then renamed in spirit by copying it to `LOG.OLD` and starting a fresh log.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use embedded_sdmmc::{Mode, RawFile, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use spin::Mutex;
 
-#[cfg(feature = "pi4")]
-mod emmc;
-#[cfg(not(feature = "pi4"))]
-pub(crate) mod virtio_blk;
-
-#[cfg(feature = "pi4")]
-use emmc::DiskDev;
-#[cfg(not(feature = "pi4"))]
-use virtio_blk::DiskDev;
+use crate::board::DiskDev;
 
 const ROTATE_AT: u32 = 512;
 const CONFIG_NAME: &str = "CONFIG.TXT";
@@ -66,22 +58,13 @@ type Mgr = VolumeManager<DiskDev, Clock, 4, 4, 1>;
 static FS: Mutex<Option<Mgr>> = Mutex::new(None);
 
 pub fn init() -> Result<(), FsError> {
-    let found = {
-        #[cfg(feature = "pi4")]
-        {
-            emmc::probe()
-        }
-        #[cfg(not(feature = "pi4"))]
-        {
-            virtio_blk::probe()
-        }
-    };
+    let found = crate::board::probe_disk();
     if !found {
         log::info!("No block device, filesystem not mounted");
         return Err(FsError::NotInitialized);
     }
 
-    let mut mgr = VolumeManager::new(DiskDev, Clock);
+    let mut mgr = VolumeManager::new(crate::board::disk(), Clock);
     match mgr.open_raw_volume(VolumeIdx(0)) {
         Ok(volume) => {
             // Prove the volume can be opened, then put the slot back. A later

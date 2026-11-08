@@ -1,16 +1,11 @@
-mod device;
-#[cfg(feature = "pi4")]
-mod genet;
 pub mod service;
 mod stack;
-#[cfg(not(feature = "pi4"))]
-pub(crate) mod virtio;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
 
-pub use device::{DeviceType, EthernetDevice};
+pub use crate::board::Nic as EthernetDevice;
 pub use stack::NetworkStack;
 
 pub(crate) struct NetworkState {
@@ -52,20 +47,9 @@ pub enum NetworkError {
 
 pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), NetworkError> {
     log::info!("Detecting network device...");
+    log::info!("Network device: {}", crate::board::nic_name());
 
-    let device_type = device::detect_device_type();
-    log::info!("Network device: {:?}", device_type);
-
-    let mut device = match device_type {
-        #[cfg(not(feature = "pi4"))]
-        DeviceType::Virtio => {
-            EthernetDevice::new_virtio().ok_or(NetworkError::DeviceNotFound)?
-        }
-        #[cfg(feature = "pi4")]
-        DeviceType::Genet => {
-            EthernetDevice::new_genet().ok_or(NetworkError::DeviceNotFound)?
-        }
-    };
+    let mut device = crate::board::probe_nic().ok_or(NetworkError::DeviceNotFound)?;
     
     let mut stack = NetworkStack::new(&mut device);
     
@@ -212,13 +196,6 @@ fn prefix_to_mask(prefix: u8) -> [u8; 4] {
 }
 
 pub fn packet_counts() -> (u32, u32) {
-    #[cfg(not(feature = "pi4"))]
-    {
-        virtio::packet_counts()
-    }
-    #[cfg(feature = "pi4")]
-    {
-        genet::packet_counts()
-    }
+    crate::board::packet_counts()
 }
 

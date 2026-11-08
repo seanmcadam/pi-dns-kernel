@@ -246,7 +246,7 @@ Document in this file under "Hardware Testing Procedures" with:
 
 ### Kernel build fails
 - Ensure `aarch64-unknown-none` target is installed
-- Check that `link.ld` is in `kernel/` directory
+- Check that the board link script is `kernel/src/board/virt/link.ld` or `kernel/src/board/pi4/link.ld`
 - Verify no `std` usage in kernel code
 
 ### QEMU doesn't boot

@@ -8,26 +8,29 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // Boot assembly is assembled by rustc (global_asm in src/main.rs).
-    // The Pi 4 feature is linked at 0xFFFF000000080000. The firmware still
-    // loads that raw image at physical 0x80000. The QEMU image is linked at
-    // 0xFFFF000040080000 and loaded at physical 0x40080000.
-    let script_name = if env::var("CARGO_FEATURE_PI4").is_ok() {
-        "link-pi4.ld"
+    // The Pi 4 image is linked at 0xFFFF000000080000. The firmware still
+    // loads that raw image at physical 0x80000. The QEMU virt image is
+    // linked at 0xFFFF000040080000 and loaded at physical 0x40080000.
+    let script_rel = if env::var("CARGO_FEATURE_BOARD_PI4").is_ok() {
+        "src/board/pi4/link.ld"
+    } else if env::var("CARGO_FEATURE_BOARD_VIRT").is_ok() {
+        "src/board/virt/link.ld"
     } else {
-        "link.ld"
+        panic!("select board-virt or board-pi4 so a linker script is copied");
     };
-    let linker_script_src = manifest_dir.join(script_name);
+    let linker_script_src = manifest_dir.join(script_rel);
     let linker_script_dst = out_dir.join("link.ld");
     fs::copy(&linker_script_src, &linker_script_dst)
-        .unwrap_or_else(|err| panic!("Failed to copy {script_name}: {err}"));
+        .unwrap_or_else(|err| panic!("Failed to copy {script_rel}: {err}"));
 
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rerun-if-changed=src/boot.s");
     println!("cargo:rerun-if-changed=src/exception.s");
     println!("cargo:rerun-if-changed=src/task.s");
-    println!("cargo:rerun-if-changed=link.ld");
-    println!("cargo:rerun-if-changed=link-pi4.ld");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PI4");
+    println!("cargo:rerun-if-changed=src/board/virt/link.ld");
+    println!("cargo:rerun-if-changed=src/board/pi4/link.ld");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_VIRT");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_PI4");
     build_user(&out_dir, &manifest_dir);
     build_dns(&out_dir, &manifest_dir);
     build_http(&out_dir, &manifest_dir);

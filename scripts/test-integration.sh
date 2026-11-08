@@ -905,6 +905,63 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
+# raspi4b is optional. QEMU 8.2 has no such machine. A skip is not a failure
+# and does not change the 26 virt results. QEMU 9.0 or newer is required
+# to actually run it. The machine has no GENET, so DNS, HTTP, and telnet
+# are not required.
+echo ""
+echo "Test 27: QEMU raspi4b smoke (needs QEMU 9.0 or newer)"
+if ! qemu-system-aarch64 -machine help 2>/dev/null | grep -q '^raspi4b '; then
+    echo "SKIP raspi4b: this QEMU has no raspi4b machine (need QEMU 9.0 or newer)"
+else
+    ./scripts/build-pi4.sh >/tmp/build-pi4-raspi.txt
+    rm -f qemu/raspi4b-sd.img qemu/raspi4b.txt
+    dd if=/dev/zero of=qemu/raspi4b-sd.img bs=1M count=8 status=none
+    sfdisk --quiet qemu/raspi4b-sd.img <<'EOF'
+label: dos
+start=2048, type=c
+EOF
+    mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/raspi4b-sd.img >/dev/null
+    RASPI_OFF=$((2048 * 512))
+    printf 'record=pi4.local A 10.0.2.15 300\n' > /tmp/raspi-config.txt
+    mcopy -i "qemu/raspi4b-sd.img@@${RASPI_OFF}" /tmp/raspi-config.txt ::CONFIG.TXT
+    timeout 45 qemu-system-aarch64 \
+        -M raspi4b \
+        -smp 4 \
+        -kernel boot/pi4/kernel8.img \
+        -serial file:qemu/raspi4b.txt \
+        -display none -monitor none -nographic \
+        -drive file=qemu/raspi4b-sd.img,if=sd,format=raw \
+        >/tmp/qemu-raspi4b.txt 2>&1 || true
+    RASPI_OK=1
+    for need in \
+        "MMU and caches enabled" \
+        "Running at EL1" \
+        "cores online 4" \
+        "[OK] Filesystem mounted" \
+        "Loaded config from filesystem" \
+        "[OK] Log task running" \
+        "EL0 test" \
+        "[WARN] No NIC"
+    do
+        if ! grep -q "$need" qemu/raspi4b.txt; then
+            echo "✗ raspi4b missing: $need"
+            RASPI_OK=0
+        fi
+    done
+    if [ "$RASPI_OK" -eq 1 ]; then
+        echo "✓ raspi4b booted, 4 cores, FAT config, EL0 log task, no NIC"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo "✗ raspi4b smoke failed"
+        echo "--- serial ---"
+        cat qemu/raspi4b.txt 2>/dev/null || true
+        echo "--- qemu ---"
+        cat /tmp/qemu-raspi4b.txt 2>/dev/null || true
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+fi
+
 # Summary
 echo ""
 echo "=== Test Summary ==="

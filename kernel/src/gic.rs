@@ -16,31 +16,15 @@
 //! 189 and 190) and EMMC2 is SPI 126 (INTID 158). Those Pi 4 lines are
 //! compiled in and untested on hardware.
 
-#[cfg(not(feature = "pi4"))]
-const GICD: usize = crate::addr::phys_to_virt(0x0800_0000) as usize;
-#[cfg(not(feature = "pi4"))]
-const GICC: usize = crate::addr::phys_to_virt(0x0801_0000) as usize;
+const GICD: usize = crate::addr::phys_to_virt(crate::board::GICD_PHYS) as usize;
+const GICC: usize = crate::addr::phys_to_virt(crate::board::GICC_PHYS) as usize;
 
-// BCM2711 GIC-400. Untested on hardware. CPU accesses use the high alias.
-#[cfg(feature = "pi4")]
-const GICD: usize = crate::addr::phys_to_virt(0xFF84_1000) as usize;
-#[cfg(feature = "pi4")]
-const GICC: usize = crate::addr::phys_to_virt(0xFF84_2000) as usize;
-
-/// Virtual timer, PPI 11. `16 + 11`.
-pub const TIMER_IRQ: u32 = 27;
+/// Virtual timer, PPI 11 on both boards. The board names the INTID.
+pub const TIMER_IRQ: u32 = crate::board::TIMER_IRQ;
 pub const SPURIOUS_IRQ: u32 = 1023;
 
 /// Socket-queue kick. Each CPU enables this banked SGI in `init_cpu`.
 pub const SGI_NET: u32 = 1;
-
-/// BCM2711. SPI number plus 32. Untested on hardware.
-#[cfg(feature = "pi4")]
-pub const PI4_GENET_IRQ0: u32 = 32 + 157;
-#[cfg(feature = "pi4")]
-pub const PI4_GENET_IRQ1: u32 = 32 + 158;
-#[cfg(feature = "pi4")]
-pub const PI4_EMMC_IRQ: u32 = 32 + 126;
 
 const GICD_CTLR: usize = 0x000;
 const GICD_TYPER: usize = 0x004;
@@ -169,7 +153,9 @@ pub fn enable_id(intid: u32) {
     dsb();
 }
 
-#[cfg_attr(not(feature = "pi4"), allow(dead_code))]
+/// The Pi 4 board masks a level line from its IRQ handler. The virt board
+/// acknowledges virtio-mmio instead, so this stays available either way.
+#[allow(dead_code)]
 pub fn disable_id(intid: u32) {
     let word = ((intid / 32) * 4) as usize;
     let bit = 1u32 << (intid % 32);

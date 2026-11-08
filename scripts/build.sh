@@ -1,18 +1,49 @@
 #!/bin/bash
 set -e
 
-echo "=== Building Pi4 DNS Server Kernel ==="
+cd "$(dirname "$0")/.."
 
-# Build the kernel
-echo "Building kernel..."
+# `./scripts/build.sh` and `./scripts/build.sh --features dhcp-default`
+# build the QEMU virt image. `./scripts/build.sh pi4` builds the Pi 4 image.
+BOARD=virt
+if [ "${1:-}" = "virt" ] || [ "${1:-}" = "pi4" ]; then
+    BOARD="$1"
+    shift
+fi
+
+if [ "$BOARD" = "pi4" ]; then
+    echo "=== Building Raspberry Pi 4 kernel (untested on hardware) ==="
+    cargo build --release --target aarch64-unknown-none -p pi4-dns-kernel \
+        --no-default-features --features board-pi4 "$@"
+    mkdir -p boot/pi4
+    aarch64-linux-gnu-objcopy -O binary \
+        target/aarch64-unknown-none/release/kernel8 boot/pi4/kernel8.img
+    cat > boot/pi4/config.txt <<'EOF'
+# Raspberry Pi 4 boot file for this kernel.
+# The ELF is linked at 0xFFFF000000080000 (TTBR1). The firmware loads the
+# raw kernel8.img at physical 0x80000. This image has not been tested on hardware.
+arm_64bit=1
+enable_uart=1
+uart_2ndstage=1
+kernel=kernel8.img
+core_freq=250
+EOF
+    START_ADDR=$(aarch64-linux-gnu-nm target/aarch64-unknown-none/release/kernel8 | awk '/ _start$/ {print $1}')
+    echo "_start = 0x${START_ADDR}"
+    echo "$START_ADDR" | grep -Eq '^0*ffff000000080000$'
+    echo "Kernel size: $(stat -c%s boot/pi4/kernel8.img) bytes"
+    echo "SD card files: boot/pi4/kernel8.img and boot/pi4/config.txt"
+    echo "This build has not been tested on Raspberry Pi hardware."
+    exit 0
+fi
+
+echo "=== Building virt kernel ==="
 cargo build --release --target aarch64-unknown-none -p pi4-dns-kernel "$@"
 
-# QEMU's -kernel on the virt machine loads a raw image at 0x40080000.
 echo "Creating kernel8.img..."
 aarch64-linux-gnu-objcopy -O binary \
     target/aarch64-unknown-none/release/kernel8 boot/kernel8.img
 
-# Create objdump for debugging
 echo "Creating kernel8.asm (disassembly)..."
 aarch64-linux-gnu-objdump -d target/aarch64-unknown-none/release/kernel8 > boot/kernel8.asm 2>/dev/null || \
     echo "Warning: Could not create disassembly (objdump not found)"

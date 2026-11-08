@@ -2,7 +2,7 @@
 
 A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the Raspberry Pi 4 (BCM2711, AArch64) that implements a complete DNS server appliance.
 
-**Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. The DNS resolver runs at EL0. The kernel is linked in the upper half. A separate Pi 4 image is linked at `0xFFFF000000080000` and the firmware still loads that raw file at physical `0x80000`. That image has not been tested on hardware.
+**Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. The DNS resolver runs at EL0. The kernel is linked in the upper half. Board code lives in `kernel/src/board/{virt,pi4}` and is selected with a Cargo feature (`board-virt` is the default, `board-pi4` is the Pi 4 image). `board-pi5` is reserved and does not build. A separate Pi 4 image is linked at `0xFFFF000000080000` and the firmware still loads that raw file at physical `0x80000`. That image has not been tested on hardware. QEMU 9.0 or newer can boot it on `-M raspi4b` (UART, MMU, four cores, SD). That machine has no GENET.
 
 ## Quick Status
 
@@ -14,7 +14,7 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 | HTTP | Working | Dashboard can add and remove records |
 | DHCP | Working | User-net lease, static fallback on timeout |
 | FAT32 config | Working | virtio-blk, records survive reboot, rotating logs |
-| Pi 4 image | Compiles, untested on hardware | High link `0xFFFF000000080000`, load `0x80000`, PL011, EMMC2, GENET |
+| Pi 4 image | QEMU raspi4b smoke, untested on hardware | High link `0xFFFF000000080000`, load `0x80000`, PL011, EMMC, GENET. raspi4b needs QEMU 9.0+ and has no GENET |
 | EL1 exceptions | Working on QEMU | VBAR_EL1, fault report, then halt |
 | MMU | Working on QEMU | Kernel in TTBR1, user window in TTBR0, W^X. Pi 4 map untested |
 
@@ -259,6 +259,19 @@ All tests run with `std` feature for host-side validation.
 - a DHCP lease from QEMU user-net, and the static fallback when no DHCP server answers
 - adding a record in the web UI, rebooting the same FAT disk, and resolving that name
 - the Pi 4 image links at `0xFFFF000000080000` and `boot/pi4/config.txt` names `kernel8.img`
+- when `qemu-system-aarch64 -machine help` lists `raspi4b` (QEMU 9.0 or newer), the Pi 4 image boots on that machine: UART, upper-half MMU, four cores, FAT `CONFIG.TXT`, and the EL0 log task. The stage skips with a message on an older QEMU. raspi4b does not emulate GENET, so DNS, HTTP, and telnet are not part of that stage
+
+## Boards
+
+Shared kernel code (scheduler, syscalls, the network owner, the filesystem, the logger, and the EL0 services) does not name a board. `kernel/src/board` picks one implementation:
+
+| Feature | Board | Link script | NIC | Disk | Secondary cores |
+|---------|--------|-------------|-----|------|-----------------|
+| `board-virt` (default) | QEMU `virt` | `kernel/src/board/virt/link.ld` | virtio-net | virtio-blk | PSCI `CPU_ON` via HVC |
+| `board-pi4` | Raspberry Pi 4 | `kernel/src/board/pi4/link.ld` | GENET | EMMC2, then the legacy SDHCI | spin table at `0xE0` / `0xE8` / `0xF0` |
+| `board-pi5` | reserved | does not compile | | | |
+
+`board-pi4` replaces the default feature. `./scripts/build.sh pi4` and `./scripts/build-pi4.sh` pass `--no-default-features --features board-pi4`. `./scripts/build.sh` and `./scripts/build.sh --features dhcp-default` still build the virt image.
 
 ## Deployment
 
@@ -268,7 +281,7 @@ All tests run with `std` feature for host-side validation.
 ./scripts/run-qemu.sh
 ```
 
-Note: QEMU's raspi3b/raspi4b models have limited peripheral support. Network testing may require the `virt` machine type with virtio devices.
+The virt machine is what the integration suite uses for DNS, HTTP, and telnet. `raspi4b` exists in QEMU 9.0 and newer. It can boot the Pi 4 image far enough to check the UART, the MMU, all four cores, and the SD card. It does not emulate GENET, so network tests stay on `virt`. QEMU 8.2 has no `raspi4b` machine; the integration script skips that stage.
 
 ### Real Raspberry Pi 4
 
@@ -322,24 +335,25 @@ upstream=10.0.2.3
 
 ```
 .
-├── kernel/              # Main bare-metal kernel
+├── kernel/
 │   ├── src/
-│   │   ├── main.rs      # Entry point
-│   │   ├── boot.s       # Assembly boot code
-│   │   ├── uart.rs      # Serial driver
-│   │   ├── memory.rs    # Allocator
-│   │   ├── net/         # Network stack
-│   │   ├── dns/         # DNS server
-│   │   ├── http/        # HTTP server
-│   │   └── fs/          # Filesystem
-│   └── link.ld          # Linker script
-├── dns-protocol/        # DNS packet parser (with std tests)
-├── http-server/         # HTTP handler (with std tests)
-├── dns-cache/           # DNS cache (with std tests)
-├── config/              # Config parser (with std tests)
-├── boot/                # Boot files for Pi 4
-├── scripts/             # Build and test scripts
-└── tests/               # Integration tests
+│   │   ├── main.rs             # Entry point
+│   │   ├── boot.s              # Assembly boot, shared by every board
+│   │   ├── board/
+│   │   │   ├── mod.rs          # The only place a board feature is selected
+│   │   │   ├── virt/           # PSCI, virtio-net, virtio-blk, link.ld
+│   │   │   └── pi4/            # Spin table, GENET, EMMC, PL011, link.ld
+│   │   ├── net/                # smoltcp owner, sockets, DHCP
+│   │   ├── dns/                # DNS service
+│   │   ├── http/               # HTTP service
+│   │   └── fs/                 # FAT32 on the board block device
+│   └── build.rs                # Copies the selected board link script
+├── dns-protocol/               # DNS packet parser (with std tests)
+├── http-server/                # HTTP handler (with std tests)
+├── dns-cache/                  # DNS cache (with std tests)
+├── config/                     # Config parser (with std tests)
+├── boot/                       # virt kernel8.img, and boot/pi4/ for the Pi
+└── scripts/                    # build.sh virt|pi4, build-pi4.sh, tests
 
 ```
 

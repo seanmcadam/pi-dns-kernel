@@ -115,11 +115,15 @@ pub fn packet_counts() -> (u32, u32) {
 
 impl GenetDevice {
     pub fn new() -> Option<Self> {
-        let rev = read(SYS_REV_CTRL);
-        if rev == 0 || rev == 0xffff_ffff {
-            log::warn!("GENET revision register is not present");
-            return None;
-        }
+        // raspi4b has no GENET. A read of the register is an external abort
+        // there, not a zero. A real controller returns a revision.
+        let rev = match crate::exception::read_u32_catching((BASE + SYS_REV_CTRL) as *const u32) {
+            Some(rev) if rev != 0 && rev != 0xffff_ffff => rev,
+            _ => {
+                log::warn!("GENET revision register is not present");
+                return None;
+            }
+        };
         log::info!("GENET revision {:#x}", rev);
 
         umac_reset();

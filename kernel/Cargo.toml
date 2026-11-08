@@ -5,11 +5,17 @@ edition.workspace = true
 authors.workspace = true
 
 [features]
-default = []
+default = ["board-virt"]
 # Boot with the DHCP client (static address remains the fallback).
 dhcp-default = []
-# Raspberry Pi 4 image: link at 0x80000, PL011, EMMC2, and GENET.
-pi4 = []
+# QEMU virt. The default image.
+board-virt = []
+# Raspberry Pi 4: link at 0xFFFF000000080000, PL011, EMMC, GENET.
+# Build with --no-default-features --features board-pi4. Enabling it on
+# top of the default features selects two boards and does not compile.
+board-pi4 = []
+# Reserved. Selecting it does not compile. A Pi 5 board is a later change.
+board-pi5 = []
 
 [dependencies]
 cortex-a = { workspace = true }
