@@ -7,8 +7,23 @@
 
 mod emmc;
 mod genet;
+mod hdmi_task {
+    use core::ptr::{addr_of, addr_of_mut};
+    include!("../hdmi_task.rs");
+}
+mod mbox {
+    include!("../mailbox.rs");
+}
 mod smp;
 mod uart;
+
+/// HDMI0 at child `0x7ef00700`. The bcm2711 soc ranges add `0xFE000000 - 0x7E000000`.
+/// `HDMI_HOTPLUG` is offset `0x1c`, bit 0. Neither the address nor the bit has
+/// been confirmed on hardware. HDMI1 is the same block at `0x7ef05700`.
+const HDMI0_HOTPLUG: u64 = 0xFEF0_071C;
+const HDMI1_HOTPLUG: u64 = 0xFEF0_571C;
+/// BCM2711 mailbox at `0x7E00B880`, same translation. Channel 8 is the property channel.
+const MBOX_BASE: u64 = 0xFE00_B880;
 
 use crate::board::{Board, IrqHit};
 use crate::net::NetworkMode;
@@ -90,6 +105,48 @@ impl Board for Pi4 {
             return IrqHit::Block;
         }
         IrqHit::None
+    }
+
+    fn hdmi_present() -> bool {
+        true
+    }
+
+    fn hdmi_pages() -> u32 {
+        crate::board::HDMI_PAGES
+    }
+
+    fn hdmi_hpd() -> i64 {
+        read_hotplug()
+    }
+
+    fn hdmi_mailbox(words: &mut [u32]) -> i64 {
+        mbox::run(MBOX_BASE, words)
+    }
+
+    fn hdmi_image() -> Option<crate::board::HdmiImage> {
+        Some(hdmi_task::image())
+    }
+
+    fn hdmi_code_ptr() -> *mut u8 {
+        hdmi_task::code_ptr()
+    }
+
+    fn hdmi_code_bytes() -> usize {
+        crate::board::HDMI_CODE_BYTES
+    }
+}
+
+fn read_hotplug() -> i64 {
+    let a = crate::exception::read_u32_catching(HDMI0_HOTPLUG as *const u32);
+    let b = crate::exception::read_u32_catching(HDMI1_HOTPLUG as *const u32);
+    if a.is_none() && b.is_none() {
+        return -1;
+    }
+    let connected = a.unwrap_or(0) & 1 != 0 || b.unwrap_or(0) & 1 != 0;
+    if connected {
+        1
+    } else {
+        0
     }
 }
 

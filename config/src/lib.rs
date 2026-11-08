@@ -42,6 +42,10 @@ pub const NAME_MAX: usize = 64;
 pub const SECRET_MAX: usize = 32;
 pub const TTL_MAX: u64 = 86_400;
 pub const PORT_MAX: u64 = 65_535;
+/// VNC listens here unless `display.vnc_port` says otherwise.
+pub const VNC_PORT_DEFAULT: u64 = 5900;
+/// RFB password, zero means no authentication. Eight bytes is the DES key.
+pub const VNC_PASS_MAX: usize = 8;
 pub const TIMEOUT_MIN: u64 = 100;
 pub const TIMEOUT_MAX: u64 = 60_000;
 
@@ -326,6 +330,35 @@ const HTTP_FIELDS: &[Field] = &[
     },
 ];
 
+const DISPLAY_FIELDS: &[Field] = &[
+    Field {
+        name: "vnc",
+        required: true,
+        kind: FieldKind::U64 { min: 0, max: 1 },
+    },
+    Field {
+        name: "vnc_port",
+        required: true,
+        kind: FieldKind::U64 {
+            min: 1,
+            max: PORT_MAX,
+        },
+    },
+    Field {
+        name: "vnc_password",
+        required: true,
+        kind: FieldKind::Str {
+            min: 0,
+            max: VNC_PASS_MAX,
+        },
+    },
+    Field {
+        name: "hdmi",
+        required: true,
+        kind: FieldKind::U64 { min: 0, max: 1 },
+    },
+];
+
 const MAIN_FIELDS: &[Field] = &[
     Field {
         name: "version",
@@ -349,6 +382,11 @@ const MAIN_FIELDS: &[Field] = &[
         name: "http",
         required: true,
         kind: FieldKind::Object(HTTP_FIELDS),
+    },
+    Field {
+        name: "display",
+        required: true,
+        kind: FieldKind::Object(DISPLAY_FIELDS),
     },
 ];
 

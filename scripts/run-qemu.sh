@@ -19,7 +19,8 @@ echo ""
 DNS_HOST_PORT="${DNS_HOST_PORT:-15353}"
 HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
 TELNET_HOST_PORT="${TELNET_HOST_PORT:-2323}"
-echo "Host DNS port ${DNS_HOST_PORT} -> guest 53, host HTTP port ${HTTP_HOST_PORT} -> guest 80, host telnet port ${TELNET_HOST_PORT} -> guest 23"
+VNC_HOST_PORT="${VNC_HOST_PORT:-15900}"
+echo "Host DNS port ${DNS_HOST_PORT} -> guest 53, host HTTP port ${HTTP_HOST_PORT} -> guest 80, host telnet port ${TELNET_HOST_PORT} -> guest 23, host VNC port ${VNC_HOST_PORT} -> guest 5900"
 
 qemu-system-aarch64 \
     -M virt,gic-version=2 \
@@ -30,5 +31,5 @@ qemu-system-aarch64 \
     -serial stdio \
     -nographic \
     -display none \
-    -netdev user,id=net0,hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80,hostfwd=tcp::${TELNET_HOST_PORT}-:23 \
+    -netdev user,id=net0,hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80,hostfwd=tcp::${TELNET_HOST_PORT}-:23,hostfwd=tcp::${VNC_HOST_PORT}-:5900 \
     -device virtio-net-device,netdev=net0

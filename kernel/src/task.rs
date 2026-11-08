@@ -44,10 +44,12 @@ const DNS_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns.bin"));
 const HTTP_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/http.bin"));
 const LOG_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/log.bin"));
 const TELNET_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/telnet.bin"));
+const VNC_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vnc.bin"));
 include!(concat!(env!("OUT_DIR"), "/dns_meta.rs"));
 include!(concat!(env!("OUT_DIR"), "/http_meta.rs"));
 include!(concat!(env!("OUT_DIR"), "/log_meta.rs"));
 include!(concat!(env!("OUT_DIR"), "/telnet_meta.rs"));
+include!(concat!(env!("OUT_DIR"), "/vnc_meta.rs"));
 
 const RESUME: u64 = 0;
 const YIELD: u64 = 1;
@@ -71,6 +73,8 @@ const TIMER_TICKS: u64 = 51;
 const TIMER_FREQ: u64 = 52;
 const SET_CACHE_STATS: u64 = 53;
 const CACHE_PLANT: u64 = 54;
+const DISPLAY_IO: u64 = 55;
+const DISPLAY_SET: u64 = 56;
 const THREAD_CREATE: u64 = 34;
 const THREAD_EXIT: u64 = 35;
 const THREAD_JOIN: u64 = 36;
@@ -195,13 +199,17 @@ static mut HTTP_LIVE: bool = false;
 static mut SPIN_LIVE: bool = false;
 static mut LOG_LIVE: bool = false;
 static mut TELNET_LIVE: bool = false;
+static mut VNC_LIVE: bool = false;
+static mut HDMI_LIVE: bool = false;
 
 pub const DNS_SLOT: usize = 0;
 pub const HTTP_SLOT: usize = 1;
 pub const SPIN_SLOT: usize = 2;
 pub const LOG_SLOT: usize = 3;
 pub const TELNET_SLOT: usize = 4;
-const TASK_SLOTS: usize = 5;
+pub const VNC_SLOT: usize = 5;
+pub const HDMI_SLOT: usize = 6;
+const TASK_SLOTS: usize = 7;
 
 const LOG_CODE_BYTES: usize = 128 * 1024;
 const LOG_DATA_BYTES: usize = 4096;
@@ -210,6 +218,10 @@ const TELNET_CODE_BYTES: usize = 128 * 1024;
 const TELNET_DATA_BYTES: usize = 4096;
 const TELNET_HEAP_BYTES: usize = 256 * 1024;
 const TELNET_STACK_BYTES: usize = 16 * 1024;
+const VNC_CODE_BYTES: usize = 128 * 1024;
+const VNC_DATA_BYTES: usize = 4096;
+const VNC_HEAP_BYTES: usize = 384 * 1024;
+const VNC_STACK_BYTES: usize = 16 * 1024;
 
 /// `b .` — a task that never makes a syscall. Preemption is the only way out.
 const SPIN_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x14];
@@ -489,7 +501,9 @@ fn syscall() -> u64 {
         | TIMER_TICKS
         | TIMER_FREQ
         | SET_CACHE_STATS
-        | CACHE_PLANT => {
+        | CACHE_PLANT
+        | DISPLAY_IO
+        | DISPLAY_SET => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
@@ -657,6 +671,49 @@ static mut TELNET_MEM: TelnetMem = TelnetMem {
     data: [0; TELNET_DATA_BYTES],
     heap: [0; TELNET_HEAP_BYTES],
     stack: [0; TELNET_STACK_BYTES],
+};
+
+#[repr(C, align(4096))]
+struct VncMem {
+    code: [u8; VNC_CODE_BYTES],
+    data: [u8; VNC_DATA_BYTES],
+    heap: [u8; VNC_HEAP_BYTES],
+    stack: [u8; VNC_STACK_BYTES],
+}
+
+static mut VNC_MEM: VncMem = VncMem {
+    code: [0; VNC_CODE_BYTES],
+    data: [0; VNC_DATA_BYTES],
+    heap: [0; VNC_HEAP_BYTES],
+    stack: [0; VNC_STACK_BYTES],
+};
+
+static mut VNC_TASK: Task = Task {
+    ctx: TaskContext {
+        x: [0; 31],
+        sp_el0: 0,
+        elr: 0,
+        spsr: 0,
+        fpsr: 0,
+        fpcr: 0,
+        q: [0; 64],
+    },
+    _gap: [0; 4096],
+    kstack: [0; KSTACK_BYTES],
+};
+
+static mut HDMI_TASK: Task = Task {
+    ctx: TaskContext {
+        x: [0; 31],
+        sp_el0: 0,
+        elr: 0,
+        spsr: 0,
+        fpsr: 0,
+        fpcr: 0,
+        q: [0; 64],
+    },
+    _gap: [0; 4096],
+    kstack: [0; KSTACK_BYTES],
 };
 
 static mut TELNET_TASK: Task = Task {
@@ -904,6 +961,177 @@ pub fn poll_telnet() {
     }
 }
 
+pub fn start_vnc() -> Result<(), ()> {
+    if VNC_BIN.len() > VNC_CODE_BYTES {
+        put("EL0 vnc: program does not fit\r\n");
+        return Err(());
+    }
+    unsafe {
+        let code = addr_of_mut!(VNC_MEM.code) as *mut u8;
+        core::ptr::write_bytes(code, 0, VNC_CODE_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(VNC_MEM.heap) as *mut u8, 0, VNC_HEAP_BYTES);
+        core::ptr::copy_nonoverlapping(VNC_BIN.as_ptr(), code, VNC_BIN.len());
+        if VNC_DATA_LEN > 0
+            && VNC_DATA_OFF + VNC_DATA_LEN <= VNC_BIN.len()
+            && VNC_DATA_PLACE + VNC_DATA_LEN <= VNC_DATA_BYTES
+        {
+            core::ptr::copy_nonoverlapping(
+                VNC_BIN.as_ptr().add(VNC_DATA_OFF),
+                addr_of_mut!(VNC_MEM.data).cast(),
+                VNC_DATA_LEN,
+            );
+        }
+        crate::mmu::map_user_sized(
+            VNC_SLOT,
+            addr_of!(VNC_MEM.code) as u64,
+            VNC_CODE_BYTES as u64,
+            addr_of!(VNC_MEM.data) as u64,
+            VNC_DATA_BYTES as u64,
+            addr_of!(VNC_MEM.stack) as u64,
+            VNC_STACK_BYTES as u64,
+            addr_of!(VNC_MEM.heap) as u64,
+            VNC_HEAP_BYTES as u64,
+        );
+        maintain_code(code, VNC_BIN.len());
+        let ctx = addr_of_mut!(VNC_TASK.ctx);
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = crate::mmu::USER_CODE_VA;
+        (*ctx).spsr = 0;
+        (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + VNC_STACK_BYTES as u64;
+        crate::user_fd::set_task(VNC_SLOT);
+        let ksp = addr_of!(VNC_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        crate::percpu::set_slot(VNC_SLOT);
+        crate::percpu::set_thread_index(0);
+        VNC_LIVE = true;
+        run_until_yield(VNC_SLOT, ctx, ksp)
+    }
+}
+
+pub fn poll_vnc() {
+    if !unsafe { VNC_LIVE } {
+        return;
+    }
+    if main_blocked(VNC_SLOT) {
+        return;
+    }
+    crate::user_fd::set_task(VNC_SLOT);
+    crate::mmu::use_user_slot(VNC_SLOT, crate::supervisor::asid(VNC_SLOT));
+    unsafe {
+        crate::percpu::set_slot(VNC_SLOT);
+        crate::percpu::set_thread_index(0);
+        let ctx = addr_of_mut!(VNC_TASK.ctx);
+        let ksp = addr_of!(VNC_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        let action = enter(ctx, ksp);
+        if action == BLOCK || still_scheduled(action) {
+            return;
+        }
+        crate::supervisor::died(VNC_SLOT);
+    }
+}
+
+pub fn start_hdmi() -> Result<(), ()> {
+    let Some(image) = crate::board::hdmi_image() else {
+        return Err(());
+    };
+    if image.bin_len > crate::board::HDMI_CODE_BYTES || image.bin_len == 0 {
+        put("EL0 hdmi: program does not fit\r\n");
+        return Err(());
+    }
+    unsafe {
+        crate::mmu::map_user_sized(
+            HDMI_SLOT,
+            image.code,
+            crate::board::HDMI_CODE_BYTES as u64,
+            image.data,
+            crate::board::HDMI_DATA_BYTES as u64,
+            image.stack,
+            crate::board::HDMI_STACK_BYTES as u64,
+            image.heap,
+            crate::board::HDMI_HEAP_BYTES as u64,
+        );
+        maintain_code(image.code as *mut u8, image.bin_len);
+        let ctx = addr_of_mut!(HDMI_TASK.ctx);
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = crate::mmu::USER_CODE_VA;
+        (*ctx).spsr = 0;
+        (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::board::HDMI_STACK_BYTES as u64;
+        crate::user_fd::set_task(HDMI_SLOT);
+        let ksp = addr_of!(HDMI_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        crate::percpu::set_slot(HDMI_SLOT);
+        crate::percpu::set_thread_index(0);
+        HDMI_LIVE = true;
+        run_until_yield(HDMI_SLOT, ctx, ksp)
+    }
+}
+
+pub fn poll_hdmi() {
+    if !unsafe { HDMI_LIVE } {
+        return;
+    }
+    if main_blocked(HDMI_SLOT) {
+        return;
+    }
+    crate::user_fd::set_task(HDMI_SLOT);
+    crate::mmu::use_user_slot(HDMI_SLOT, crate::supervisor::asid(HDMI_SLOT));
+    unsafe {
+        crate::percpu::set_slot(HDMI_SLOT);
+        crate::percpu::set_thread_index(0);
+        let ctx = addr_of_mut!(HDMI_TASK.ctx);
+        let ksp = addr_of!(HDMI_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        let action = enter(ctx, ksp);
+        if action == BLOCK || still_scheduled(action) {
+            return;
+        }
+        crate::supervisor::died(HDMI_SLOT);
+    }
+}
+
+/// Apply a display start or stop requested by a syscall, then run the tasks.
+/// The syscall only stores the request. This runs from the poll loop, which
+/// is not holding an FD lock.
+pub fn vnc_is_live() -> bool {
+    unsafe { VNC_LIVE }
+}
+
+pub fn poll_display() {
+    let (vnc, hdmi) = crate::config_manager::take_display_cmd();
+    let vnc_left = apply_display(VNC_SLOT, vnc);
+    let hdmi_left = if crate::board::hdmi_present() {
+        apply_display(HDMI_SLOT, hdmi)
+    } else {
+        0
+    };
+    if vnc_left != 0 || hdmi_left != 0 {
+        crate::config_manager::restore_display_cmd(vnc_left, hdmi_left);
+    }
+    poll_vnc();
+    poll_hdmi();
+}
+
+fn apply_display(slot: usize, cmd: u8) -> u8 {
+    match cmd {
+        1 => {
+            let _ = crate::supervisor::launch(slot);
+            0
+        }
+        2 => {
+            let _ = crate::supervisor::stop(slot);
+            if crate::supervisor::is_live(slot) { 2 } else { 0 }
+        }
+        3 => {
+            if crate::supervisor::is_live(slot) {
+                let _ = crate::supervisor::stop(slot);
+                if crate::supervisor::is_live(slot) {
+                    return 3;
+                }
+            }
+            let _ = crate::supervisor::launch(slot);
+            0
+        }
+        _ => 0,
+    }
+}
+
 pub fn poll_spin() {
     if !unsafe { SPIN_LIVE } {
         return;
@@ -1107,6 +1335,8 @@ pub fn clear_live(slot: usize) {
             SPIN_SLOT => SPIN_LIVE = false,
             LOG_SLOT => LOG_LIVE = false,
             TELNET_SLOT => TELNET_LIVE = false,
+            VNC_SLOT => VNC_LIVE = false,
+            HDMI_SLOT => HDMI_LIVE = false,
             _ => {}
         }
     }
@@ -1372,6 +1602,8 @@ fn code_bytes(slot: usize) -> usize {
     match slot {
         LOG_SLOT => LOG_CODE_BYTES,
         TELNET_SLOT => TELNET_CODE_BYTES,
+        VNC_SLOT => VNC_CODE_BYTES,
+        HDMI_SLOT => crate::board::hdmi_code_bytes(),
         SPIN_SLOT => 4096,
         _ => crate::mmu::USER_CODE_BYTES as usize,
     }
@@ -1384,6 +1616,8 @@ fn code_ptr(slot: usize) -> *mut u8 {
             SPIN_SLOT => addr_of_mut!(SPIN_MEM.code).cast(),
             LOG_SLOT => addr_of_mut!(LOG_MEM.code).cast(),
             TELNET_SLOT => addr_of_mut!(TELNET_MEM.code).cast(),
+            VNC_SLOT => addr_of_mut!(VNC_MEM.code).cast(),
+            HDMI_SLOT => crate::board::hdmi_code_ptr(),
             _ => addr_of_mut!(USER_MEM.code).cast(),
         }
     }
@@ -1564,6 +1798,8 @@ fn main_ctx(slot: usize) -> *mut TaskContext {
             SPIN_SLOT => addr_of_mut!(SPIN_TASK.ctx),
             LOG_SLOT => addr_of_mut!(LOG_TASK.ctx),
             TELNET_SLOT => addr_of_mut!(TELNET_TASK.ctx),
+            VNC_SLOT => addr_of_mut!(VNC_TASK.ctx),
+            HDMI_SLOT => addr_of_mut!(HDMI_TASK.ctx),
             _ => addr_of_mut!(TASK.ctx),
         }
     }

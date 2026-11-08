@@ -42,6 +42,22 @@ fn main() {
     build_http(&out_dir, &manifest_dir);
     build_log(&out_dir, &manifest_dir);
     build_telnet(&out_dir, &manifest_dir);
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let rfb = out_dir.join("librfb.rlib");
+    let edid = out_dir.join("libedid.rlib");
+    let console = out_dir.join("libdisplay_console.rlib");
+    compile_rlib(&rustc, &manifest_dir.join("../rfb/src/lib.rs"), "rfb", &rfb);
+    compile_rlib(&rustc, &manifest_dir.join("../edid/src/lib.rs"), "edid", &edid);
+    compile_rlib(
+        &rustc,
+        &manifest_dir.join("../display-console/src/lib.rs"),
+        "display_console",
+        &console,
+    );
+    build_vnc(&out_dir, &manifest_dir, &rustc, &rfb, &console);
+    if env::var("CARGO_FEATURE_BOARD_PI4").is_ok() || env::var("CARGO_FEATURE_BOARD_PI5").is_ok() {
+        build_hdmi(&out_dir, &manifest_dir, &rustc, &edid, &console);
+    }
 }
 
 fn build_user(out_dir: &Path, manifest_dir: &Path) {
@@ -524,6 +540,158 @@ fn build_telnet(out_dir: &Path, manifest_dir: &Path) {
         out_dir.join("telnet_meta.rs"),
         format!(
             "const TELNET_DATA_OFF: usize = {data_off};\nconst TELNET_DATA_LEN: usize = {data_len};\nconst TELNET_DATA_PLACE: usize = {data_place};\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn build_vnc(out_dir: &Path, manifest_dir: &Path, rustc: &str, rfb: &Path, console: &Path) {
+    let dir = manifest_dir.join("../vnc-el0");
+    for rel in ["src/main.rs", "src/start.s", "link.ld"] {
+        println!("cargo:rerun-if-changed={}", dir.join(rel).display());
+    }
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("../rfb/src/lib.rs").display());
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("../rfb/src/des.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../display-console/src/lib.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../display-console/src/font.rs").display()
+    );
+    link_el0(
+        out_dir,
+        rustc,
+        &dir.join("src/main.rs"),
+        &dir.join("link.ld"),
+        "vnc",
+        &[
+            format!("rfb={}", rfb.display()),
+            format!("display_console={}", console.display()),
+        ],
+    );
+}
+
+fn build_hdmi(out_dir: &Path, manifest_dir: &Path, rustc: &str, edid: &Path, console: &Path) {
+    let dir = if env::var("CARGO_FEATURE_BOARD_PI5").is_ok() {
+        manifest_dir.join("../hdmi-el0/pi5")
+    } else {
+        manifest_dir.join("../hdmi-el0/pi4")
+    };
+    for rel in ["src/main.rs", "src/start.s", "link.ld"] {
+        println!("cargo:rerun-if-changed={}", dir.join(rel).display());
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../hdmi-el0/runner.rs").display()
+    );
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("../edid/src/lib.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../display-console/src/lib.rs").display()
+    );
+    link_el0(
+        out_dir,
+        rustc,
+        &dir.join("src/main.rs"),
+        &dir.join("link.ld"),
+        "hdmi",
+        &[
+            format!("edid={}", edid.display()),
+            format!("display_console={}", console.display()),
+        ],
+    );
+}
+
+fn link_el0(out_dir: &Path, rustc: &str, src: &Path, link: &Path, name: &str, externs: &[String]) {
+    let elf = out_dir.join(format!("{name}.elf"));
+    let link_arg = format!("link-arg=-T{}", link.display());
+    let mut cmd = Command::new(rustc);
+    cmd.args([
+        "--target",
+        "aarch64-unknown-none",
+        "--edition",
+        "2021",
+        "-C",
+        "panic=abort",
+        "-C",
+        "opt-level=z",
+        "-C",
+        "relocation-model=static",
+        "-C",
+        "linker=aarch64-linux-gnu-ld",
+        "-C",
+        &link_arg,
+    ]);
+    for item in externs {
+        cmd.arg("--extern").arg(item);
+    }
+    let status = cmd
+        .arg("-o")
+        .arg(&elf)
+        .arg(src)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to link {name}: {err}"));
+    if !status.success() {
+        panic!("{name} link failed");
+    }
+    let nm = Command::new("aarch64-linux-gnu-nm")
+        .arg(&elf)
+        .output()
+        .unwrap_or_else(|err| panic!("nm {name}: {err}"));
+    let listing = String::from_utf8_lossy(&nm.stdout);
+    let start = listing
+        .lines()
+        .find(|line| line.ends_with(" _start"))
+        .unwrap_or_else(|| panic!("{name} has no _start:\n{listing}"));
+    let addr = start.split_whitespace().next().unwrap_or("");
+    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
+        panic!("{name} _start is {addr}, expected 0x100000000");
+    }
+    let bin = out_dir.join(format!("{name}.bin"));
+    let status = Command::new("aarch64-linux-gnu-objcopy")
+        .args(["-O", "binary"])
+        .arg(&elf)
+        .arg(&bin)
+        .status()
+        .unwrap_or_else(|err| panic!("objcopy {name}: {err}"));
+    if !status.success() {
+        panic!("{name} objcopy failed");
+    }
+    let sections = elf_sections(&elf);
+    let code_limit = 0x1_0002_0000u64;
+    let data_base = 0x1_0009_0000u64;
+    let data_limit = 0x1_0009_1000u64;
+    let mut data_off = 0usize;
+    let mut data_len = 0usize;
+    let mut data_place = 0usize;
+    for (sec_name, addr, size) in &sections {
+        if *size == 0
+            || *addr == 0
+            || sec_name.starts_with(".comment")
+            || sec_name.starts_with(".ARM")
+            || sec_name.starts_with(".debug")
+        {
+            continue;
+        }
+        let end = addr + size;
+        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
+        let in_data = *addr >= data_base && end <= data_limit;
+        if !in_code && !in_data {
+            panic!("{name} section {sec_name} at {addr:#x} size {size:#x} is outside the user window");
+        }
+        if sec_name == ".data" {
+            data_off = (*addr - 0x1_0000_0000) as usize;
+            data_len = *size as usize;
+            data_place = (*addr - data_base) as usize;
+        }
+    }
+    let prefix = name.to_uppercase();
+    fs::write(
+        out_dir.join(format!("{name}_meta.rs")),
+        format!(
+            "const {prefix}_DATA_OFF: usize = {data_off};\nconst {prefix}_DATA_LEN: usize = {data_len};\nconst {prefix}_DATA_PLACE: usize = {data_place};\n"
         ),
     )
     .unwrap();

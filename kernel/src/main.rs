@@ -166,6 +166,12 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
             Ok(()) => uart_write("[OK] Telnet log listening on port 23\r\n"),
             Err(()) => uart_write("[ERROR] Telnet log failed\r\n"),
         }
+        if config.display.vnc {
+            match supervisor::launch(task::VNC_SLOT) {
+                Ok(()) => uart_write("[OK] VNC task running\r\n"),
+                Err(()) => uart_write("[WARN] VNC task failed\r\n"),
+            }
+        }
 
         uart_write("\r\n=== Kernel Initialized Successfully ===\r\n");
         uart_write("DNS server listening on port 53\r\n");
@@ -174,6 +180,12 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         uart_write("Ready for queries...\r\n\r\n");
     } else {
         uart_write("\r\n=== Kernel Initialized Without a NIC ===\r\n");
+    }
+    if config.display.hdmi && crate::board::hdmi_present() {
+        match supervisor::launch(task::HDMI_SLOT) {
+            Ok(()) => uart_write("[OK] HDMI task running\r\n"),
+            Err(()) => uart_write("[WARN] HDMI task failed\r\n"),
+        }
     }
 
     let mut next_status = timer::millis() + 2000;
@@ -184,6 +196,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         task::poll_log();
         task::poll_telnet();
         task::poll_spin();
+        task::poll_display();
         let _ = task::schedule_one();
         net::poll();
         supervisor::tick();

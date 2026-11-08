@@ -22,19 +22,22 @@ const HEALTHY_MS: u64 = 60_000;
 const BACKOFF_START_MS: u64 = 100;
 const BACKOFF_CAP_MS: u64 = 10_000;
 const PAGE_POOL: u32 = 4096;
-const SLOTS: usize = 5;
+const SLOTS: usize = 7;
 
 const OFF: u8 = 0;
 const RUNNING: u8 = 1;
 const DRAINING: u8 = 2;
 const BACKOFF: u8 = 3;
 const GAVEUP: u8 = 4;
+const STOPPED: u8 = 5;
 
 struct Svc {
     phase: u8,
     adopted: bool,
     accounted: bool,
     pending_restart: bool,
+    /// Set by `stop`. `finish` then parks the slot instead of counting a crash.
+    hold: bool,
     asid: u8,
     restarts: u32,
     backoff_ms: u64,
@@ -54,6 +57,7 @@ const fn blank() -> Svc {
         adopted: false,
         accounted: false,
         pending_restart: false,
+        hold: false,
         asid: 0,
         restarts: 0,
         backoff_ms: BACKOFF_START_MS,
@@ -120,8 +124,63 @@ pub fn launch(slot: usize) -> Result<(), ()> {
         2 => crate::task::start_spin(),
         3 => crate::task::start_log(),
         4 => crate::task::start_telnet(),
+        5 => crate::task::start_vnc(),
+        6 => crate::task::start_hdmi(),
         _ => Err(()),
     }
+}
+
+pub fn phase(slot: usize) -> u8 {
+    if slot >= SLOTS {
+        return OFF;
+    }
+    let _hold = guard();
+    unsafe { (*svc(slot)).phase }
+}
+
+pub fn is_live(slot: usize) -> bool {
+    matches!(phase(slot), RUNNING | DRAINING)
+}
+
+/// Stop a service without counting a crash. The poll loop calls this. A
+/// syscall must not: it holds that task's FD lock, and this takes the
+/// supervisor lock on its own.
+pub fn stop(slot: usize) -> Result<(), ()> {
+    let kill = {
+        let _hold = guard();
+        if slot >= SLOTS {
+            return Err(());
+        }
+        unsafe {
+            let row = &mut *svc(slot);
+            match row.phase {
+                GAVEUP => return Err(()),
+                RUNNING => {
+                    row.hold = true;
+                    row.phase = DRAINING;
+                    DEAD[slot].store(1, Ordering::Release);
+                    true
+                }
+                DRAINING => {
+                    row.hold = true;
+                    false
+                }
+                _ => {
+                    row.hold = false;
+                    row.phase = STOPPED;
+                    row.adopted = false;
+                    row.pending_restart = false;
+                    false
+                }
+            }
+        }
+    };
+    if kill {
+        crate::task::clear_live(slot);
+        crate::task::kill_slot(slot);
+        finish(slot);
+    }
+    Ok(())
 }
 
 /// Called once the user image is mapped and the main thread is about to run.
@@ -399,17 +458,25 @@ fn finish(slot: usize) {
                 USED_PAGES = USED_PAGES.saturating_sub(pages(slot));
                 row.accounted = false;
             }
-            let gave = record_crash(row);
-            row.pending_restart = !gave;
-            row.phase = if gave { GAVEUP } else { BACKOFF };
-            gave
+            if row.hold {
+                row.hold = false;
+                row.pending_restart = false;
+                row.adopted = false;
+                row.phase = STOPPED;
+                2
+            } else {
+                let gave = record_crash(row);
+                row.pending_restart = !gave;
+                row.phase = if gave { GAVEUP } else { BACKOFF };
+                u8::from(gave)
+            }
         }
     };
     let label = name(slot);
-    if outcome {
-        say(3, label, "gave up", ec, elr, far);
-    } else {
-        say(2, label, "fault", ec, elr, far);
+    match outcome {
+        2 => say(1, label, "stopped", 0, 0, 0),
+        1 => say(3, label, "gave up", ec, elr, far),
+        _ => say(2, label, "fault", ec, elr, far),
     }
 }
 
@@ -521,6 +588,8 @@ fn pages(slot: usize) -> u32 {
         2 => 2,
         3 => 37,
         4 => 101,
+        5 => 133,
+        6 => crate::board::hdmi_pages(),
         _ => 0,
     }
 }
@@ -532,6 +601,8 @@ fn name(slot: usize) -> &'static str {
         2 => "spin",
         3 => "log",
         4 => "telnet",
+        5 => "vnc",
+        6 => "hdmi",
         _ => "task",
     }
 }

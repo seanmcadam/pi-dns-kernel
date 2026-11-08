@@ -1,0 +1,6 @@
+[package]
+name = "edid"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

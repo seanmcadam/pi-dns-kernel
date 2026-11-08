@@ -37,6 +37,8 @@
 //!  31  log_recent(buf, cap) -> len
 //!  32  file_read(name, name_len, buf, cap) -> len
 //!  33  file_write(name, name_len, buf, len, flags). flags 1 appends.
+//!  55  display_io(op, a, b, c). HDMI mailbox and framebuffer, plus VNC settings.
+//!  56  display_set(vnc, port, pass, pass_len, hdmi, err). Queues start or stop.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -88,6 +90,8 @@ const TIMER_TICKS: u64 = 51;
 const TIMER_FREQ: u64 = 52;
 const SET_CACHE_STATS: u64 = 53;
 const CACHE_PLANT: u64 = 54;
+const DISPLAY_IO: u64 = 55;
+const DISPLAY_SET: u64 = 56;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -113,24 +117,12 @@ enum Kind {
     Closing(SocketHandle),
 }
 
-const TASKS: usize = 5;
+const TASKS: usize = 7;
 
-static mut FDS: [[Kind; MAX_FD]; TASKS] = [
-    [Kind::Empty; MAX_FD],
-    [Kind::Empty; MAX_FD],
-    [Kind::Empty; MAX_FD],
-    [Kind::Empty; MAX_FD],
-    [Kind::Empty; MAX_FD],
-];
+static mut FDS: [[Kind; MAX_FD]; TASKS] = [[Kind::Empty; MAX_FD]; TASKS];
 static mut TASK_SLOT: [usize; 4] = [0; 4];
 static mut GEN: [[u32; MAX_FD]; TASKS] = [[0; MAX_FD]; TASKS];
-static FD_LOCK: [crate::spin::Spin; TASKS] = [
-    crate::spin::Spin::new(),
-    crate::spin::Spin::new(),
-    crate::spin::Spin::new(),
-    crate::spin::Spin::new(),
-    crate::spin::Spin::new(),
-];
+static FD_LOCK: [crate::spin::Spin; TASKS] = [const { crate::spin::Spin::new() }; TASKS];
 
 pub fn set_task(slot: usize) {
     if slot < TASKS {
@@ -198,6 +190,8 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         TIMER_FREQ => crate::timer::frequency() as i64,
         SET_CACHE_STATS => set_cache_stats(args[0]),
         CACHE_PLANT => cache_plant(args[0], args[1]),
+        DISPLAY_IO => display_io(args[0], args[1], args[2], args[3]),
+        DISPLAY_SET => display_set(args[0], args[1], args[2], args[3], args[4], args[5]),
         _ => -1,
     };
     value as u64
@@ -1354,6 +1348,105 @@ fn file_write(name: u64, name_len: u64, buf: u64, len: u64, flags: u64) -> i64 {
     match crate::fs::write_named(text, data, (flags & 1) == 1) {
         Ok(()) => 0,
         Err(_) => EIO,
+    }
+}
+
+fn display_io(op: u64, a: u64, b: u64, _c: u64) -> i64 {
+    match op {
+        0 if hdmi_caller() => crate::board::hdmi_hpd(),
+        1 if hdmi_caller() => mailbox_user(a, b),
+        2 if hdmi_caller() => map_fb(a, b),
+        3 if hdmi_caller() => {
+            crate::mmu::unmap_user_fb(crate::task::HDMI_SLOT);
+            0
+        }
+        4 => crate::config_manager::vnc_port() as i64,
+        5 => copy_vnc_password(a, b),
+        6 => {
+            if crate::task::vnc_is_live() {
+                1
+            } else {
+                0
+            }
+        }
+        7 => {
+            if crate::board::hdmi_present() {
+                1
+            } else {
+                0
+            }
+        }
+        0 | 1 | 2 | 3 => EBADF,
+        _ => EINVAL,
+    }
+}
+
+fn hdmi_caller() -> bool {
+    slot() == crate::task::HDMI_SLOT
+}
+
+fn mailbox_user(ptr: u64, len: u64) -> i64 {
+    if len < 16 || len > 1024 || len % 4 != 0 || ptr % 4 != 0 || !crate::mmu::user_write_ok(ptr, len)
+    {
+        return EINVAL;
+    }
+    let n = (len as usize) / 4;
+    let mut words = [0u32; 256];
+    crate::mmu::set_pan(false);
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u32, words.as_mut_ptr(), n);
+    }
+    crate::mmu::set_pan(true);
+    let rc = crate::board::hdmi_mailbox(&mut words[..n]);
+    if rc != 0 {
+        return rc;
+    }
+    crate::mmu::set_pan(false);
+    unsafe {
+        core::ptr::copy_nonoverlapping(words.as_ptr(), ptr as *mut u32, n);
+    }
+    crate::mmu::set_pan(true);
+    0
+}
+
+fn map_fb(bus: u64, bytes: u64) -> i64 {
+    let Some((phys, bytes)) = crate::board::fb_bus_to_phys(bus, bytes) else {
+        return EINVAL;
+    };
+    crate::mmu::map_user_fb(crate::task::HDMI_SLOT, phys, bytes)
+}
+
+fn copy_vnc_password(ptr: u64, cap: u64) -> i64 {
+    if cap == 0 || cap > 8 || !crate::mmu::user_write_ok(ptr, cap) {
+        return EFAULT;
+    }
+    let pass = crate::config_manager::vnc_password();
+    let n = pass.len().min(cap as usize);
+    if n > 0 && !write_user(ptr, &pass.as_bytes()[..n]) {
+        return EFAULT;
+    }
+    n as i64
+}
+
+fn display_set(vnc: u64, port: u64, pass_ptr: u64, pass_len: u64, hdmi: u64, err: u64) -> i64 {
+    if pass_len > 8 {
+        let _ = write_err(err, 160, "display.vnc_password: out of bounds (0..=8)");
+        return EINVAL;
+    }
+    let mut raw = [0u8; 8];
+    if pass_len > 0 && !copy_user(pass_ptr, &mut raw[..pass_len as usize]) {
+        return EFAULT;
+    }
+    let Ok(password) = core::str::from_utf8(&raw[..pass_len as usize]) else {
+        let _ = write_err(err, 160, "display.vnc_password: out of bounds (0..=8)");
+        return EINVAL;
+    };
+    match crate::config_manager::set_display(vnc, port, password, hdmi) {
+        Ok(()) => 0,
+        Err(message) => {
+            let _ = write_err(err, 160, &message);
+            EINVAL
+        }
     }
 }
 

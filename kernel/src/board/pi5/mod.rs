@@ -20,10 +20,24 @@
 //! UART and `sdio1` as the SD card. Ethernet is `rp1_eth` behind `pcie2`,
 //! which this image does not drive.
 
+mod hdmi_task {
+    use core::ptr::{addr_of, addr_of_mut};
+    include!("../hdmi_task.rs");
+}
+mod mbox {
+    include!("../mailbox.rs");
+}
 mod nic;
 mod sdhci;
 mod smp;
 mod uart;
+
+/// Unverified mailbox bases. The first is the Pi 4 child address `0x7E00B880`
+/// plus the bcm2712 ranges offset `0x10_0000_0000`. The second is a legacy
+/// VideoCore window some Pi 5 notes call `0x107C013880`. A status read that
+/// faults is skipped. RP1 HDMI is not programmed, and hotplug stays disconnected,
+/// so neither base is written unless a later change reports a display.
+const MBOX_CANDIDATES: [u64; 2] = [0x10_7E00_B880, 0x107C_013880];
 
 use crate::board::{Board, IrqHit};
 use crate::net::NetworkMode;
@@ -101,6 +115,43 @@ impl Board for Pi5 {
             return IrqHit::Block;
         }
         IrqHit::None
+    }
+
+    fn hdmi_present() -> bool {
+        true
+    }
+
+    fn hdmi_pages() -> u32 {
+        crate::board::HDMI_PAGES
+    }
+
+    /// RP1 hotplug is not wired. The process stays idle.
+    fn hdmi_hpd() -> i64 {
+        0
+    }
+
+    fn hdmi_mailbox(words: &mut [u32]) -> i64 {
+        let mut i = 0;
+        while i < MBOX_CANDIDATES.len() {
+            let rc = mbox::run(MBOX_CANDIDATES[i], words);
+            if rc != -1 {
+                return rc;
+            }
+            i += 1;
+        }
+        -1
+    }
+
+    fn hdmi_image() -> Option<crate::board::HdmiImage> {
+        Some(hdmi_task::image())
+    }
+
+    fn hdmi_code_ptr() -> *mut u8 {
+        hdmi_task::code_ptr()
+    }
+
+    fn hdmi_code_bytes() -> usize {
+        crate::board::HDMI_CODE_BYTES
     }
 }
 

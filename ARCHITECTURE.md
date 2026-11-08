@@ -136,6 +136,16 @@ The SD driver talks to `sdio1` at `0x1000fff000` (cfg block `0x1000fff400`, IRQ 
 
 QEMU cannot boot this image. The integration stage checks the link address and then boots the virt image with `-cpu cortex-a76`. See the README section "Real Raspberry Pi 5" for the address table, the sources, and the hardware risks.
 
+### Display
+
+VNC and HDMI are supervised EL0 processes. They draw one 320×240 console from `display-console`: recent log lines and the supervisor text. The surface is 32-bit little-endian, bytes B, G, R, X, 307200 bytes.
+
+VNC is slot 5, ASID 6, on every board. It is an RFB 3.8 server, raw encoding, optional DES authentication. It is not started unless `display.vnc` is 1. The HTTP form and a `CONFIG.JSN` upload store the flag and leave a command for the poll loop. The syscall holds the FD lock, so it does not take the supervisor lock or enter the new process. Stopping sets a hold flag so the exit is not a crash. The VNC user image is 128 KiB code, 4 KiB data, 384 KiB heap, 16 KiB stack: 133 pages. The framebuffer sits at the heap base `0x1_000A_0000` and is not in the ELF.
+
+HDMI is slot 6. `kernel/build.rs` links `hdmi-el0/pi4` or `hdmi-el0/pi5` only for that board feature, and the user pages live in the board module. Virt does not include the binary. The kernel syscall copies a property buffer through the mailbox or reads the hotplug register. EDID parsing, allocation, and drawing stay in the process. The framebuffer is mapped at `0x1_0030_0000`, at most 1 MiB, non-cacheable. HDMI pages are 41 (128 KiB code, 4 KiB data, 16 KiB heap, 16 KiB stack) plus a 64 KiB kernel stack. Virt still has that kernel stack and a 4 KiB fault stub; it does not reserve the user pages.
+
+Hotplug is polled. Pi 4 reads `0xFEF0071C` and `0xFEF0571C` (HDMI child `0x7ef00700` / `0x7ef05700` plus the bcm2711 range offset), bit 0. That address and bit are not confirmed on hardware. A faulting read returns disconnected-or-absent and the process idles. Pi 5 does not program RP1. Its hotplug call returns disconnected, so the mailbox is not used. The two candidate mailbox bases, `0x107E00B880` and `0x107C013880`, are assumptions. The bus-to-physical translation is `bus & 0x3FFFFFFF`, and addresses below 16 MiB are rejected. None of the HDMI path has been run on a Pi.
+
 ### System Layer
 
 #### Memory Allocator (`kernel/src/memory.rs`)

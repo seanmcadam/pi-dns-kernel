@@ -29,7 +29,31 @@ mod pi5;
 #[cfg(feature = "board-pi5")]
 use pi5::Pi5 as Active;
 
+use core::ptr::addr_of_mut;
+
 use smoltcp::phy::Device;
+
+/// HDMI user image. Only the Pi boards fill one in.
+pub struct HdmiImage {
+    pub code: u64,
+    pub bin_len: usize,
+    pub data: u64,
+    pub heap: u64,
+    pub stack: u64,
+}
+
+/// Code window reserved for the HDMI program. The binary has to fit.
+pub const HDMI_CODE_BYTES: usize = 128 * 1024;
+pub const HDMI_DATA_BYTES: usize = 4096;
+pub const HDMI_HEAP_BYTES: usize = 16 * 1024;
+pub const HDMI_STACK_BYTES: usize = 16 * 1024;
+/// 32 code pages, one data page, four heap pages, four stack pages.
+/// Virt does not call `hdmi_pages`, so this constant is unused in that image.
+#[allow(dead_code)]
+pub const HDMI_PAGES: u32 = 41;
+
+/// Fault-injection stub for a board with no HDMI image.
+static mut HDMI_STUB: [u8; 4096] = [0; 4096];
 
 /// What a device interrupt was. The shared handler counts it and wakes the owner.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,6 +91,35 @@ pub trait Board {
     fn probe_disk() -> bool;
     fn disk() -> Self::Disk;
     fn handle_irq(id: u32) -> IrqHit;
+
+    /// This image has an HDMI process.
+    fn hdmi_present() -> bool {
+        false
+    }
+
+    fn hdmi_pages() -> u32 {
+        0
+    }
+
+    fn hdmi_hpd() -> i64 {
+        -1
+    }
+
+    fn hdmi_mailbox(_words: &mut [u32]) -> i64 {
+        -1
+    }
+
+    fn hdmi_image() -> Option<HdmiImage> {
+        None
+    }
+
+    fn hdmi_code_ptr() -> *mut u8 {
+        addr_of_mut!(HDMI_STUB).cast()
+    }
+
+    fn hdmi_code_bytes() -> usize {
+        4096
+    }
 }
 
 pub const NAME: &str = <Active as Board>::NAME;
@@ -126,4 +179,55 @@ pub fn disk() -> DiskDev {
 
 pub fn handle_irq(id: u32) -> IrqHit {
     <Active as Board>::handle_irq(id)
+}
+
+pub fn hdmi_present() -> bool {
+    <Active as Board>::hdmi_present()
+}
+
+pub fn hdmi_pages() -> u32 {
+    <Active as Board>::hdmi_pages()
+}
+
+pub fn hdmi_hpd() -> i64 {
+    <Active as Board>::hdmi_hpd()
+}
+
+pub fn hdmi_mailbox(words: &mut [u32]) -> i64 {
+    <Active as Board>::hdmi_mailbox(words)
+}
+
+pub fn hdmi_image() -> Option<HdmiImage> {
+    <Active as Board>::hdmi_image()
+}
+
+pub fn hdmi_code_ptr() -> *mut u8 {
+    <Active as Board>::hdmi_code_ptr()
+}
+
+pub fn hdmi_code_bytes() -> usize {
+    <Active as Board>::hdmi_code_bytes()
+}
+
+/// VideoCore bus address to ARM physical address.
+///
+/// The Pi 4 firmware returns an alias in the top bits. `bus & 0x3FFF_FFFF`
+/// is that alias with the cache bits cleared. Addresses below 16 MiB are
+/// rejected so a bad reply cannot remap the firmware or the kernel image.
+/// Pi 5 uses the same translation; it is unverified and unused while hotplug
+/// reports disconnected.
+pub fn fb_bus_to_phys(bus: u64, bytes: u64) -> Option<(u64, u64)> {
+    if bytes == 0 || bytes > 1024 * 1024 {
+        return None;
+    }
+    let phys = bus & 0x3FFF_FFFF;
+    let bytes = (bytes + 4095) & !4095;
+    if bytes == 0 || bytes > 1024 * 1024 || phys < 16 * 1024 * 1024 || phys % 4096 != 0 {
+        return None;
+    }
+    let end = phys.checked_add(bytes)?;
+    if phys < RAM_START || end > RAM_END {
+        return None;
+    }
+    Some((phys, bytes))
 }

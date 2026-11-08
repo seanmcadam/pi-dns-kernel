@@ -7,8 +7,9 @@ echo "=== Running Integration Tests ==="
 DNS_HOST_PORT="${DNS_HOST_PORT:-15353}"
 HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
 TELNET_HOST_PORT="${TELNET_HOST_PORT:-2323}"
-HOSTFWD="hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80,hostfwd=tcp::${TELNET_HOST_PORT}-:23"
-echo "Using host ports DNS ${DNS_HOST_PORT}, HTTP ${HTTP_HOST_PORT}, telnet ${TELNET_HOST_PORT}"
+VNC_HOST_PORT="${VNC_HOST_PORT:-15900}"
+HOSTFWD="hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80,hostfwd=tcp::${TELNET_HOST_PORT}-:23,hostfwd=tcp::${VNC_HOST_PORT}-:5900"
+echo "Using host ports DNS ${DNS_HOST_PORT}, HTTP ${HTTP_HOST_PORT}, telnet ${TELNET_HOST_PORT}, VNC ${VNC_HOST_PORT}"
 
 # Build kernel first
 ./scripts/build.sh
@@ -1147,6 +1148,193 @@ else
     echo "✗ DNS cache stats, validation, or reaper failed"
     TESTS_FAILED=$((TESTS_FAILED + 3))
 fi
+if python3 - "$HTTP_HOST_PORT" "$VNC_HOST_PORT" <<'PY'
+import json, socket, struct, sys, time, urllib.error, urllib.request
+http_port, vnc_port = sys.argv[1], int(sys.argv[2])
+base = "http://127.0.0.1:%s" % http_port
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def req(method, path, data=None, headers=None):
+    body = data.encode() if isinstance(data, str) else data
+    r = urllib.request.Request(base + path, data=body, method=method)
+    for key, value in (headers or {}).items():
+        r.add_header(key, value)
+    try:
+        with opener.open(r, timeout=8) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+
+def recvn(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            fail("short read")
+        buf += chunk
+    return buf
+
+def connect():
+    # QEMU user-net accepts the host handshake before the guest does, then
+    # resets if nothing is listening. The port counts as open only when the
+    # RFB banner is already buffered.
+    sock = socket.socket()
+    sock.settimeout(0.5)
+    try:
+        sock.connect(("127.0.0.1", vnc_port))
+        peek = sock.recv(12, socket.MSG_PEEK)
+    except OSError:
+        sock.close()
+        return None
+    if peek != b"RFB 003.008\n":
+        sock.close()
+        return None
+    return sock
+
+if connect() is not None:
+    fail("vnc port open before enable")
+status, page = req("GET", "/display")
+if status != 200 or b"5900" not in page or b"320" not in page or b"1..=65535" not in page:
+    fail("display page %s %s" % (status, page[:200]))
+status, debug = req("GET", "/debug")
+row = b""
+for line in debug.splitlines():
+    if line.startswith(b"vnc "):
+        row = line
+if status != 200 or not row.startswith(b"vnc off"):
+    fail("vnc not off by default: %s %s" % (status, debug[:400]))
+status, saved = req(
+    "POST",
+    "/display",
+    "vnc=1&vnc_port=5900&vnc_password=&hdmi=0",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200 or b'"status":"applied"' not in saved:
+    fail("enable %s %s" % (status, saved[:200]))
+sock = None
+deadline = time.time() + 8
+while time.time() < deadline:
+    sock = connect()
+    if sock is not None:
+        break
+    time.sleep(0.25)
+if sock is None:
+    fail("vnc did not listen")
+sock.settimeout(15)
+ver = recvn(sock, 12)
+if ver != b"RFB 003.008\n":
+    fail("version %r" % ver)
+sock.sendall(ver)
+count = recvn(sock, 1)[0]
+types = recvn(sock, count)
+if 1 not in types:
+    fail("security %r" % types)
+sock.sendall(bytes([1]))
+if recvn(sock, 4) != b"\x00\x00\x00\x00":
+    fail("security result")
+sock.sendall(bytes([1]))
+init = recvn(sock, 24)
+width, height = struct.unpack(">HH", init[:4])
+if width != 320 or height != 240 or init[4] != 32:
+    fail("server init %s" % init[:24].hex())
+name_len = struct.unpack(">I", init[20:24])[0]
+recvn(sock, name_len)
+sock.sendall(struct.pack(">BBHI", 2, 0, 1, 0))
+sock.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, 320, 240))
+update = recvn(sock, 16)
+if update[0] != 0 or update[12:16] != b"\x00\x00\x00\x00":
+    fail("update %s" % update.hex())
+rect_w, rect_h = struct.unpack(">HH", update[8:12])
+if rect_w != 320 or rect_h != 240:
+    fail("rect %s" % update.hex())
+pixels = recvn(sock, 64)
+if len(pixels) != 64:
+    fail("pixels")
+sock.close()
+status, debug = req("GET", "/debug")
+row = b""
+for line in debug.splitlines():
+    if line.startswith(b"vnc "):
+        row = line
+if not row.startswith(b"vnc running"):
+    fail("vnc not running: %s" % row)
+status, saved = req(
+    "POST",
+    "/display",
+    "vnc=0&vnc_port=5900&vnc_password=&hdmi=0",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200 or b'"status":"applied"' not in saved:
+    fail("disable %s %s" % (status, saved[:160]))
+closed = False
+deadline = time.time() + 8
+while time.time() < deadline:
+    if connect() is None:
+        closed = True
+        break
+    time.sleep(0.25)
+if not closed:
+    fail("port still open")
+status, debug = req("GET", "/debug")
+row = b""
+for line in debug.splitlines():
+    if line.startswith(b"vnc "):
+        row = line
+if not row.startswith(b"vnc off"):
+    fail("vnc still up: %s" % row)
+status, raw = req("GET", "/config/file/config")
+if status != 200 or b'"vnc":0' not in raw:
+    fail("config not disabled %s" % raw[:240])
+kept = raw
+cases = []
+bad = json.loads(raw)
+bad["display"]["vnc_port"] = 0
+cases.append(bad)
+bad = json.loads(raw)
+bad["display"]["vnc_port"] = 70000
+cases.append(bad)
+bad = json.loads(raw)
+bad["display"]["vnc"] = 2
+cases.append(bad)
+bad = json.loads(raw)
+bad["display"]["vnc_password"] = "too-long-pw"
+cases.append(bad)
+bad = json.loads(raw)
+bad["display"]["extra"] = 1
+cases.append(bad)
+for mutated in cases:
+    body = json.dumps(mutated, separators=(",", ":"))
+    status, err = req("POST", "/config/file/config", body, {"Content-Type": "application/json"})
+    if status != 400 or (b"out of bounds" not in err and b"unknown" not in err):
+        fail("reject %s %s" % (status, err[:180]))
+status, now = req("GET", "/config/file/config")
+if now != kept:
+    fail("rejected display upload changed CONFIG.JSN")
+print("vnc ok")
+PY
+then
+    echo "✓ VNC is off until HTTP enables it"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ VNC RFB handshake returns a raw framebuffer"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ Disabling VNC closes the port"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ Display config rejects a bad port, flag, password, and key"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ VNC display test failed"
+    TESTS_FAILED=$((TESTS_FAILED + 4))
+fi
+curl -s -u admin:admin --max-time 5 -X POST \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data "vnc=0&vnc_port=5900&vnc_password=&hdmi=0" \
+    "http://127.0.0.1:${HTTP_HOST_PORT}/display" >/dev/null || true
 kill $JSON_PID 2>/dev/null || true
 wait $JSON_PID 2>/dev/null || true
 sync

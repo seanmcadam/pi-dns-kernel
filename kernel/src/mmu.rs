@@ -27,6 +27,7 @@
 use crate::addr::{phys_to_virt, virt_to_phys};
 
 use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 extern "C" {
     static __text_start: u8;
@@ -66,6 +67,9 @@ pub const USER_HEAP_VA: u64 = 0x1_000A_0000;
 pub const USER_HEAP_BYTES: u64 = 1536 * 1024;
 pub const USER_STACK_VA: u64 = 0x1_0022_0000;
 pub const USER_STACK_BYTES: u64 = 64 * 1024;
+/// Firmware framebuffer, mapped only into the HDMI task. Level-2 index 1.
+pub const USER_FB_VA: u64 = 0x1_0030_0000;
+pub const USER_FB_MAX: u64 = 1024 * 1024;
 const ATTR_NORMAL: u64 = 0 << 2;
 const ATTR_DEVICE: u64 = 1 << 2;
 const ATTR_DMA: u64 = 2 << 2;
@@ -90,7 +94,7 @@ struct Tables {
     user_l1: [Table; USER_SLOTS],
 }
 
-pub const USER_SLOTS: usize = 5;
+pub const USER_SLOTS: usize = 7;
 
 /// Level-2 tables for physical addresses at 4 GiB and above. The BCM2712
 /// device window needs two of these (gigabytes 0x40 and 0x41). Virt and
@@ -133,35 +137,13 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
     ],
-    l2_user: [
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-    ],
-    l3_user: [
-        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
-    ],
-    user_l0: [
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-    ],
-    user_l1: [
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-    ],
+    l2_user: [const { Table { entries: [0; 512] } }; USER_SLOTS],
+    l3_user: [const { [const { Table { entries: [0; 512] } }; 2] }; USER_SLOTS],
+    user_l0: [const { Table { entries: [0; 512] } }; USER_SLOTS],
+    user_l1: [const { Table { entries: [0; 512] } }; USER_SLOTS],
 };
+
+static FB_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static mut NEXT_L3: usize = 0;
 
@@ -249,7 +231,7 @@ fn pan_supported() -> bool {
 
 /// Map one task's EL0 code, data, heap, and stack.
 ///
-/// `slot` is 0 through 4. The arguments are kernel virtual addresses of that
+/// `slot` is 0 through 6. The arguments are kernel virtual addresses of that
 /// task's backing pages. Descriptors store physical addresses. TTBR0 is
 /// pointed at this slot with ASID 0 so the caller can maintain the user
 /// instruction cache. The scheduler later installs the task ASID.
@@ -330,6 +312,64 @@ fn prepare_user_root(slot: usize) {
     }
 }
 
+/// Map a firmware framebuffer into the HDMI task. Pages are non-cacheable
+/// so a store is visible to scanout without a cache clean. `pa` is already
+/// a physical address; it is not run through `virt_to_phys`.
+pub fn map_user_fb(slot: usize, pa: u64, bytes: u64) -> i64 {
+    if slot >= USER_SLOTS || bytes == 0 || bytes > USER_FB_MAX || pa % PAGE != 0 || bytes % PAGE != 0
+    {
+        return -4;
+    }
+    let end = match pa.checked_add(bytes) {
+        Some(end) => end,
+        None => return -4,
+    };
+    let _ = end;
+    let last = USER_FB_VA + bytes - PAGE;
+    if fb_l2(USER_FB_VA).is_none() || fb_l2(last).is_none() {
+        return -4;
+    }
+    unmap_user_fb(slot);
+    let flags = ATTR_DMA | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    map_user_span(slot, USER_FB_VA, pa, bytes, flags);
+    FB_BYTES.store(bytes, Ordering::Release);
+    flush_tlb();
+    USER_FB_VA as i64
+}
+
+pub fn unmap_user_fb(slot: usize) {
+    if slot >= USER_SLOTS {
+        return;
+    }
+    let bytes = FB_BYTES.swap(0, Ordering::AcqRel);
+    if bytes == 0 {
+        return;
+    }
+    let mut off = 0;
+    while off < bytes {
+        let page = USER_FB_VA + off;
+        let Some(l2_index) = fb_l2(page) else {
+            break;
+        };
+        let l3_index = ((page >> 12) & 511) as usize;
+        unsafe {
+            let l3 = addr_of_mut!(TABLES.l3_user[slot][l2_index]);
+            (&mut *l3).entries[l3_index] = 0;
+        }
+        off += PAGE;
+    }
+    flush_tlb();
+}
+
+fn fb_l2(page: u64) -> Option<usize> {
+    let l2_index = ((page >> 21) & 511) as usize;
+    if l2_index >= 2 {
+        None
+    } else {
+        Some(l2_index)
+    }
+}
+
 fn map_user_span(slot: usize, va: u64, pa: u64, bytes: u64, flags: u64) {
     let mut off = 0;
     while off < bytes {
@@ -381,9 +421,10 @@ fn checked_end(ptr: u64, len: u64) -> Option<u64> {
 
 /// ASID lives in TTBR0[63:56] (TCR_EL1.AS is 0, so the ASID is 8 bits).
 /// Kernel translations are global. User translations are non-global, so
-/// ASID 0 does not match them. Slot 0 uses ASID 1, slot 1 uses ASID 2, and
-/// slot 2 uses ASID 3, the log task uses ASID 4, and telnet uses ASID 5. The roots map the same virtual addresses to different
-/// physical pages, and the ASID keeps those translations from aliasing.
+/// ASID 0 does not match them. The preferred ASID is the slot plus one:
+/// dns 1, http 2, spin 3, log 4, telnet 5, vnc 6, hdmi 7. The roots map the
+/// same virtual addresses to different physical pages, and the ASID keeps
+/// those translations from aliasing.
 pub fn set_user_asid(active: bool) {
     use_user_slot(0, if active { 1 } else { 0 });
 }

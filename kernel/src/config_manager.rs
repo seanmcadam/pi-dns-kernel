@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::net::NetworkMode;
 use alloc::string::{String, ToString};
@@ -12,7 +12,16 @@ pub struct Config {
     pub network: NetworkConfig,
     pub dns: DnsConfig,
     pub http: HttpConfig,
+    pub display: DisplayConfig,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DisplayConfig {
+    pub vnc: bool,
+    pub vnc_port: u16,
+    pub vnc_password: String,
+    pub hdmi: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +87,9 @@ static LOG_MAX: AtomicU32 = AtomicU32::new(config::LOG_MIN_BYTES as u32);
 static LOG_ARCHIVES: AtomicU32 = AtomicU32::new(3);
 static LOG_CACHED: Mutex<[u8; 512]> = Mutex::new([0; 512]);
 static LOG_CACHED_LEN: AtomicUsize = AtomicUsize::new(0);
+/// 1 start, 2 stop, 3 stop then start. The poll loop consumes these.
+static VNC_CMD: AtomicU8 = AtomicU8::new(0);
+static HDMI_CMD: AtomicU8 = AtomicU8::new(0);
 
 pub fn load_config() -> Config {
     let config = load_main();
@@ -158,16 +170,16 @@ pub fn store_config_file(which: u8, text: &str) -> Result<bool, String> {
     match which {
         0 => {
             let next = config_from_text(text)?;
-            let restart = {
-                let current = CURRENT.lock();
-                current
-                    .as_ref()
-                    .map(|old| needs_restart(old, &next))
-                    .unwrap_or(false)
-            };
+            let previous = CURRENT.lock().clone();
+            let restart = previous
+                .as_ref()
+                .map(|old| needs_restart(old, &next))
+                .unwrap_or(false);
             crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes())
                 .map_err(|err| alloc::format!("save failed: {err}"))?;
-            *CURRENT.lock() = Some(next);
+            *CURRENT.lock() = Some(next.clone());
+            let old = previous.unwrap_or_else(default_config);
+            queue_display(&old, &next);
             log::info!("Replaced CONFIG.JSN");
             Ok(restart)
         }
@@ -236,6 +248,106 @@ pub fn set_dns_cache(slots: u64, reap_secs: u64) -> Result<bool, String> {
     *CURRENT.lock() = Some(next);
     log::info!("Updated DNS cache settings");
     Ok(restart)
+}
+
+pub fn vnc_port() -> u16 {
+    CURRENT
+        .lock()
+        .as_ref()
+        .map(|config| config.display.vnc_port)
+        .unwrap_or(config::VNC_PORT_DEFAULT as u16)
+}
+
+pub fn vnc_password() -> String {
+    CURRENT
+        .lock()
+        .as_ref()
+        .map(|config| config.display.vnc_password.clone())
+        .unwrap_or_else(String::new)
+}
+
+/// Persist the display object and queue a supervisor start or stop. The
+/// caller may hold an FD lock. This does not take the supervisor lock.
+pub fn set_display(vnc: u64, port: u64, password: &str, hdmi: u64) -> Result<(), String> {
+    if vnc > 1 {
+        return Err(String::from("display.vnc: out of bounds (0..=1)"));
+    }
+    if hdmi > 1 {
+        return Err(String::from("display.hdmi: out of bounds (0..=1)"));
+    }
+    if port < 1 || port > config::PORT_MAX {
+        return Err(String::from("display.vnc_port: out of bounds (1..=65535)"));
+    }
+    if !vnc_password_ok(password) {
+        return Err(alloc::format!(
+            "display.vnc_password: out of bounds (0..={})",
+            config::VNC_PASS_MAX
+        ));
+    }
+    let mut next = CURRENT.lock().clone().unwrap_or_else(default_config);
+    let old = next.clone();
+    next.display = DisplayConfig {
+        vnc: vnc != 0,
+        vnc_port: port as u16,
+        vnc_password: String::from(password),
+        hdmi: hdmi != 0,
+    };
+    let text = serialize_config(&next);
+    match crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes()) {
+        Ok(()) => {}
+        Err(crate::fs::FsError::NotInitialized) => {}
+        Err(err) => return Err(alloc::format!("save failed: {err}")),
+    }
+    *CURRENT.lock() = Some(next.clone());
+    queue_display(&old, &next);
+    log::info!("Updated display settings");
+    Ok(())
+}
+
+pub fn take_display_cmd() -> (u8, u8) {
+    (
+        VNC_CMD.swap(0, Ordering::AcqRel),
+        HDMI_CMD.swap(0, Ordering::AcqRel),
+    )
+}
+
+pub fn restore_display_cmd(vnc: u8, hdmi: u8) {
+    if vnc != 0 {
+        let _ = VNC_CMD.compare_exchange(0, vnc, Ordering::AcqRel, Ordering::Acquire);
+    }
+    if hdmi != 0 {
+        let _ = HDMI_CMD.compare_exchange(0, hdmi, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+fn queue_display(old: &Config, new: &Config) {
+    let vnc_changed = old.display.vnc_port != new.display.vnc_port
+        || old.display.vnc_password != new.display.vnc_password;
+    let vnc = display_cmd(old.display.vnc, new.display.vnc, vnc_changed);
+    let hdmi = display_cmd(old.display.hdmi, new.display.hdmi, false);
+    if vnc != 0 {
+        VNC_CMD.store(vnc, Ordering::Release);
+    }
+    if hdmi != 0 {
+        HDMI_CMD.store(hdmi, Ordering::Release);
+    }
+}
+
+fn display_cmd(was_on: bool, now_on: bool, changed: bool) -> u8 {
+    if was_on == now_on && !(was_on && changed) {
+        return 0;
+    }
+    if !now_on {
+        2
+    } else if was_on {
+        3
+    } else {
+        1
+    }
+}
+
+fn vnc_password_ok(text: &str) -> bool {
+    text.len() <= config::VNC_PASS_MAX && text.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
 
 /// Write `name TYPE value ttl` lines. `None` if `out` is too small.
@@ -429,6 +541,12 @@ fn default_config() -> Config {
             username: String::from("admin"),
             password: String::from("admin"),
         },
+        display: DisplayConfig {
+            vnc: false,
+            vnc_port: config::VNC_PORT_DEFAULT as u16,
+            vnc_password: String::new(),
+            hdmi: false,
+        },
         timeout_ms: 3_000,
     }
 }
@@ -612,6 +730,25 @@ fn config_from_text(text: &str) -> Result<Config, String> {
             });
         }
     }
+    let display = value
+        .get("display")
+        .ok_or_else(|| String::from("display: missing field"))?;
+    let vnc = display.get("vnc").and_then(Value::as_u64).unwrap_or(0) != 0;
+    let hdmi = display.get("hdmi").and_then(Value::as_u64).unwrap_or(0) != 0;
+    let vnc_port = display
+        .get("vnc_port")
+        .and_then(Value::as_u64)
+        .unwrap_or(config::VNC_PORT_DEFAULT) as u16;
+    let vnc_password = display
+        .get("vnc_password")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !vnc_password_ok(vnc_password) {
+        return Err(alloc::format!(
+            "display.vnc_password: out of bounds (0..={})",
+            config::VNC_PASS_MAX
+        ));
+    }
     let network = if mode == "dhcp" {
         NetworkMode::Dhcp {
             fallback_ip: ip,
@@ -635,6 +772,12 @@ fn config_from_text(text: &str) -> Result<Config, String> {
             port,
             username,
             password,
+        },
+        display: DisplayConfig {
+            vnc,
+            vnc_port,
+            vnc_password: vnc_password.to_string(),
+            hdmi,
         },
         timeout_ms,
     })
@@ -853,6 +996,17 @@ fn serialize_config(config: &Config) -> String {
     push_json_str(&mut out, &config.http.username);
     out.push_str(",\"password\":");
     push_json_str(&mut out, &config.http.password);
+    out.push_str("},\"display\":{");
+    out.push_str(&alloc::format!(
+        "\"vnc\":{},\"vnc_port\":{},\"vnc_password\":",
+        u8::from(config.display.vnc),
+        config.display.vnc_port
+    ));
+    push_json_str(&mut out, &config.display.vnc_password);
+    // Append the flag and both closing braces as plain text. A trailing
+    // escaped brace in format! was dropped from the last piece on this target.
+    out.push_str(",\"hdmi\":");
+    out.push(char::from(b'0' + u8::from(config.display.hdmi)));
     out.push_str("}}");
     out
 }

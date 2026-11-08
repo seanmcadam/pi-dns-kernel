@@ -49,6 +49,8 @@ const CONFIG_WRITE: u64 = 47;
 const LOG_FILL: u64 = 48;
 const CONFIG_SET_CACHE: u64 = 49;
 const CACHE_PLANT: u64 = 54;
+const DISPLAY_IO: u64 = 55;
+const DISPLAY_SET: u64 = 56;
 
 const EAGAIN: i64 = -11;
 
@@ -208,6 +210,7 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/logs" => handle_logs(),
         "/log-config" => handle_log_config(request),
         "/dns-config" => handle_dns_config(request),
+        "/display" => handle_display(request),
         "/config/file/config" => handle_config_file(request, 0),
         "/config/file/log" => handle_config_file(request, 1),
         "/debug/log-fill" => handle_log_fill(request),
@@ -325,6 +328,84 @@ fn dns_config_page() -> HttpResponse {
 <button type="submit">Save</button>
 </form>
 <p><a href="/config/file/config">Download CONFIG.JSN</a></p>
+</body></html>"#
+    );
+    html_response(&html)
+}
+
+fn handle_display(request: &HttpRequest) -> HttpResponse {
+    match request.method {
+        HttpMethod::GET => display_page(),
+        HttpMethod::POST => {
+            let body = core::str::from_utf8(&request.body).unwrap_or("");
+            let vnc = form_value(body, "vnc")
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(2u64);
+            let port = form_value(body, "vnc_port")
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(0u64);
+            let password = form_value(body, "vnc_password").unwrap_or("");
+            let hdmi = form_value(body, "hdmi")
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(2u64);
+            let mut raw = [0u8; 8];
+            let n = password.len().min(raw.len());
+            raw[..n].copy_from_slice(&password.as_bytes()[..n]);
+            let pass_len = if password.len() > 8 { 9 } else { password.len() as u64 };
+            let mut err = [0u8; 160];
+            let rc = sys(
+                DISPLAY_SET,
+                vnc,
+                port,
+                raw.as_ptr() as u64,
+                pass_len,
+                hdmi,
+                err.as_mut_ptr() as u64,
+            );
+            if rc < 0 {
+                let end = err.iter().position(|byte| *byte == 0).unwrap_or(err.len());
+                let message = core::str::from_utf8(&err[..end]).unwrap_or("rejected");
+                return bad_json(message);
+            }
+            let present = sys(DISPLAY_IO, 7, 0, 0, 0, 0, 0);
+            let hdmi_state = if present == 1 { "queued" } else { "unavailable" };
+            let body = format!(
+                "{{\"status\":\"applied\",\"vnc\":\"queued\",\"hdmi\":\"{hdmi_state}\"}}\n"
+            );
+            let mut response = HttpResponse::ok(&body);
+            response.add_header("Content-Type", "application/json");
+            response
+        }
+        _ => HttpResponse::new(405, "Method Not Allowed"),
+    }
+}
+
+fn display_page() -> HttpResponse {
+    let current = read_config_file(0).unwrap_or_default();
+    let live = sys(DISPLAY_IO, 6, 0, 0, 0, 0, 0);
+    let present = sys(DISPLAY_IO, 7, 0, 0, 0, 0, 0);
+    let live = if live == 1 { "running" } else { "off" };
+    let hdmi = if present == 1 {
+        "this board has an HDMI process"
+    } else {
+        "this board has no HDMI process"
+    };
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><body>
+<h1>Display</h1>
+<p>VNC is an EL0 RFB 3.8 server. It is off until this form enables it. Default port 5900, bounds 1..=65535. Password 0..=8 printable bytes; empty means no authentication. The console is 320 by 240.</p>
+<p>HDMI is a separate process on Pi 4 and Pi 5. {hdmi}. vnc and hdmi are 0 or 1.</p>
+<p>VNC process: {live}</p>
+<p>Current: {current}</p>
+<form method="POST" action="/display">
+<label>vnc <input name="vnc" required></label>
+<label>vnc_port <input name="vnc_port" required></label>
+<label>vnc_password <input name="vnc_password"></label>
+<label>hdmi <input name="hdmi" required></label>
+<button type="submit">Save</button>
+</form>
+<p><a href="/debug">Supervisor</a></p>
 </body></html>"#
     );
     html_response(&html)
@@ -564,6 +645,7 @@ fn handle_index() -> HttpResponse {
         <li><a href="/records">DNS Records (JSON)</a></li>
         <li><a href="/logs">Log</a></li>
         <li><a href="/log-config">Log configuration</a></li>
+        <li><a href="/display">Display</a></li>
         <li><a href="/dns-config">DNS cache</a></li>
         <li><a href="/config/file/config">Download CONFIG.JSN</a></li>
         <li><a href="/config/file/log">Download LOG.JSN</a></li>
