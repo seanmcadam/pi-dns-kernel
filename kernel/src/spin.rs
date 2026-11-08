@@ -12,6 +12,9 @@
 //! 3. `CONFIG` — config records. Not IRQ-safe. May take `FS` and then `LOGQ`.
 //! 4. `FS` — the FAT volume. Not IRQ-safe. One lock, any core.
 //! 5. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
+//!    The telnet fan-out is not this lock. It is a single-producer ring.
+//!    Publishing a line does not take `LOGQ`. Waking a reader takes `SCHED`
+//!    and nothing else.
 //!
 //! smoltcp and the NIC have no lock. Core 1 owns them after the stack is up
 //! (core 0 until then, and on a one-core boot). Other cores enqueue a

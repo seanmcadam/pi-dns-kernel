@@ -5,8 +5,9 @@
 //! the console directly. Once the task is live, records go into a fixed
 //! queue. A full queue drops the record and counts it. It never waits.
 
+use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use log::{Level, LevelFilter, Metadata, Record};
 use spin::Mutex;
 
@@ -192,6 +193,107 @@ impl log::Log for Logger {
 }
 
 static LOGGER: Logger = Logger;
+
+/// Broadcast ring for telnet readers.
+///
+/// The log task is the only publisher. It stores one line and moves on.
+/// Each reader keeps its own cursor. A reader that falls behind by more
+/// than the ring skips ahead and is told how many lines it missed. Nothing
+/// in this path waits, and it does not take the log queue lock.
+
+const FAN_LINES: usize = 64;
+const FAN_CAP: usize = 96;
+
+struct FanSlot {
+    seq: AtomicU64,
+    len: AtomicUsize,
+    data: UnsafeCell<[u8; FAN_CAP]>,
+}
+
+unsafe impl Sync for FanSlot {}
+
+const fn empty_fan() -> FanSlot {
+    FanSlot {
+        seq: AtomicU64::new(0),
+        len: AtomicUsize::new(0),
+        data: UnsafeCell::new([0; FAN_CAP]),
+    }
+}
+
+static FAN: [FanSlot; FAN_LINES] = [const { empty_fan() }; FAN_LINES];
+static FAN_HEAD: AtomicU64 = AtomicU64::new(0);
+
+pub struct FanLine {
+    pub next: u64,
+    pub dropped: u64,
+    pub len: usize,
+    pub bytes: [u8; FAN_CAP],
+}
+
+pub fn fan_publish(text: &[u8]) {
+    let n = text.len().min(FAN_CAP);
+    let seq = FAN_HEAD.fetch_add(1, Ordering::Relaxed) + 1;
+    let slot = &FAN[(seq as usize - 1) % FAN_LINES];
+    unsafe {
+        let dst = &mut *slot.data.get();
+        dst[..n].copy_from_slice(&text[..n]);
+    }
+    slot.len.store(n, Ordering::Relaxed);
+    slot.seq.store(seq, Ordering::Release);
+}
+
+pub fn fan_read(cursor: u64) -> Option<FanLine> {
+    let head = FAN_HEAD.load(Ordering::Acquire);
+    if cursor >= head {
+        return None;
+    }
+    let mut cur = cursor;
+    let mut dropped = 0u64;
+    let lag = head - cur;
+    if lag > FAN_LINES as u64 {
+        dropped = lag - FAN_LINES as u64;
+        cur = head - FAN_LINES as u64;
+    }
+    let mut tries = 0;
+    while tries < FAN_LINES {
+        tries += 1;
+        let seq = cur + 1;
+        if seq > head {
+            return None;
+        }
+        let slot = &FAN[(seq as usize - 1) % FAN_LINES];
+        let seen = slot.seq.load(Ordering::Acquire);
+        if seen == seq {
+            let n = slot.len.load(Ordering::Relaxed).min(FAN_CAP);
+            let mut bytes = [0u8; FAN_CAP];
+            unsafe {
+                bytes[..n].copy_from_slice(&(*slot.data.get())[..n]);
+            }
+            if slot.seq.load(Ordering::Acquire) != seq {
+                let now = slot.seq.load(Ordering::Acquire);
+                if now > seq {
+                    dropped += now - seq;
+                    cur = now - 1;
+                    continue;
+                }
+                continue;
+            }
+            return Some(FanLine {
+                next: seq,
+                dropped,
+                len: n,
+                bytes,
+            });
+        }
+        if seen > seq {
+            dropped += seen - seq;
+            cur = seen - 1;
+            continue;
+        }
+        return None;
+    }
+    None
+}
 
 pub fn init() {
     log::set_logger(&LOGGER)

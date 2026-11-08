@@ -18,7 +18,8 @@ echo ""
 # Guest DNS stays on 53 and HTTP stays on 80.
 DNS_HOST_PORT="${DNS_HOST_PORT:-15353}"
 HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
-echo "Host DNS port ${DNS_HOST_PORT} -> guest 53, host HTTP port ${HTTP_HOST_PORT} -> guest 80"
+TELNET_HOST_PORT="${TELNET_HOST_PORT:-2323}"
+echo "Host DNS port ${DNS_HOST_PORT} -> guest 53, host HTTP port ${HTTP_HOST_PORT} -> guest 80, host telnet port ${TELNET_HOST_PORT} -> guest 23"
 
 qemu-system-aarch64 \
     -M virt,gic-version=2 \
@@ -29,5 +30,5 @@ qemu-system-aarch64 \
     -serial stdio \
     -nographic \
     -display none \
-    -netdev user,id=net0,hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80 \
+    -netdev user,id=net0,hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80,hostfwd=tcp::${TELNET_HOST_PORT}-:23 \
     -device virtio-net-device,netdev=net0

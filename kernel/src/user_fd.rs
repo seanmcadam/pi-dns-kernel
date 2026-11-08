@@ -12,7 +12,8 @@
 //!   7  udp_send(fd, buf, len, ip, port). ip is the address as a big-endian u32
 //!   8  tcp_listen(port) -> fd
 //!   9  tcp_accept(fd) -> fd
-//!  10  tcp_recv(fd, buf, cap) -> len, or 0 when the peer has closed
+//!  10  tcp_recv(fd, buf, cap, flags) -> len, or 0 when the peer has closed.
+//!      flags 1 returns -11 instead of sleeping when the buffer is empty.
 //!  11  tcp_send(fd, buf, len) -> len
 //!  12  tcp_close(fd)
 //!  13  config_records(buf, cap) -> len
@@ -86,11 +87,11 @@ const EMFILE: i64 = -6;
 const EMSGSIZE: i64 = -7;
 const EAGAIN: i64 = -11;
 
-const MAX_FD: usize = 8;
+const MAX_FD: usize = 24;
 const MAX_PACKET: usize = 4096;
 /// Listeners allocated once. A socket leaves LISTEN on the SYN, and a peer
 /// that stops in FIN-WAIT-2 must not be the only socket on the port.
-const LISTENERS: usize = 4;
+const LISTENERS: usize = service::TCP_LISTENERS;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -102,9 +103,10 @@ enum Kind {
     Closing(SocketHandle),
 }
 
-const TASKS: usize = 4;
+const TASKS: usize = 5;
 
 static mut FDS: [[Kind; MAX_FD]; TASKS] = [
+    [Kind::Empty; MAX_FD],
     [Kind::Empty; MAX_FD],
     [Kind::Empty; MAX_FD],
     [Kind::Empty; MAX_FD],
@@ -113,6 +115,7 @@ static mut FDS: [[Kind; MAX_FD]; TASKS] = [
 static mut TASK_SLOT: [usize; 4] = [0; 4];
 static mut GEN: [[u32; MAX_FD]; TASKS] = [[0; MAX_FD]; TASKS];
 static FD_LOCK: [crate::spin::Spin; TASKS] = [
+    crate::spin::Spin::new(),
     crate::spin::Spin::new(),
     crate::spin::Spin::new(),
     crate::spin::Spin::new(),
@@ -148,7 +151,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         UDP_SEND => udp_send(args[0], args[1], args[2], args[3], args[4]),
         TCP_LISTEN => tcp_listen(args[0]),
         TCP_ACCEPT => tcp_accept(args[0]),
-        TCP_RECV => tcp_recv(args[0], args[1], args[2]),
+        TCP_RECV => tcp_recv(args[0], args[1], args[2], args[3]),
         TCP_SEND => tcp_send(args[0], args[1], args[2]),
         TCP_CLOSE => tcp_close(args[0]),
         CONFIG_RECORDS => config_out(args[0], args[1], crate::config_manager::write_records),
@@ -333,7 +336,7 @@ fn tcp_accept(fd: u64) -> i64 {
     0
 }
 
-fn tcp_recv(fd: u64, buf: u64, cap: u64) -> i64 {
+fn tcp_recv(fd: u64, buf: u64, cap: u64, flags: u64) -> i64 {
     let Some(fd) = fd_index(fd) else {
         return EBADF;
     };
@@ -350,6 +353,7 @@ fn tcp_recv(fd: u64, buf: u64, cap: u64) -> i64 {
         body.handle_raw = service::handle_raw(handle);
         body.cap = cap as u32;
         body.user_ptr = buf;
+        body.port = if flags == 1 { 1 } else { 0 };
     })
     .is_none()
     {
@@ -649,6 +653,7 @@ fn tcp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
     let gen = body.gen;
     let handle = service::handle_of(body.handle_raw);
     let cap = body.cap as usize;
+    let nonblock = body.port != 0;
     if !live(task, fd, gen) {
         return service::Step::Done(EBADF);
     }
@@ -660,7 +665,11 @@ fn tcp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
                 tcp::State::SynSent | tcp::State::SynReceived
             )
         {
-            return service::Step::Pending;
+            return if nonblock {
+                service::Step::Done(EAGAIN)
+            } else {
+                service::Step::Pending
+            };
         }
         return service::Step::Done(0);
     }
@@ -670,7 +679,13 @@ fn tcp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
             service::Step::Done(copied as i64)
         }
         Err(tcp::RecvError::Finished) => service::Step::Done(0),
-        Err(_) => service::Step::Pending,
+        Err(_) => {
+            if nonblock {
+                service::Step::Done(EAGAIN)
+            } else {
+                service::Step::Pending
+            }
+        }
     }
 }
 

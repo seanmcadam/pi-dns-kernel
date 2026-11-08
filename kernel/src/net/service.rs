@@ -18,8 +18,12 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize
 
 use smoltcp::iface::SocketHandle;
 
-const JOBS_N: usize = 32;
-const Q_N: usize = 32;
+const JOBS_N: usize = 64;
+const Q_N: usize = 64;
+
+/// Listening sockets reserved on one TCP port. Sixteen telnet connections
+/// stay open, and a spare listener is still there for the next handshake.
+pub const TCP_LISTENERS: usize = 18;
 const FREE: u8 = 0;
 const QUEUED: u8 = 1;
 const DONE: u8 = 2;
@@ -60,7 +64,7 @@ pub struct Body {
     pub user_ptr: u64,
     pub user_aux: u64,
     pub handle_raw: usize,
-    pub listen: [Option<SocketHandle>; 4],
+    pub listen: [Option<SocketHandle>; TCP_LISTENERS],
     pub addr: [u8; 8],
     pub buf: [u8; 4096],
 }
@@ -122,7 +126,7 @@ const EMPTY_JOB: Job = Job {
         user_ptr: 0,
         user_aux: 0,
         handle_raw: 0,
-        listen: [None, None, None, None],
+        listen: [None; TCP_LISTENERS],
         addr: [0; 8],
         buf: [0; 4096],
     }),
@@ -378,7 +382,7 @@ pub fn submit(op: u8, fill: impl FnOnce(&mut Body)) -> Option<usize> {
         user_ptr: 0,
         user_aux: 0,
         handle_raw: 0,
-        listen: [None, None, None, None],
+        listen: [None; TCP_LISTENERS],
         addr: [0; 8],
         buf: [0; 4096],
     };

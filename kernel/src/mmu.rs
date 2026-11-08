@@ -88,7 +88,7 @@ struct Tables {
     user_l1: [Table; USER_SLOTS],
 }
 
-pub const USER_SLOTS: usize = 4;
+pub const USER_SLOTS: usize = 5;
 
 static mut TABLES: Tables = Tables {
     l0: Table { entries: [0; 512] },
@@ -114,8 +114,10 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
     ],
     l3_user: [
+        [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
         [Table { entries: [0; 512] }, Table { entries: [0; 512] }],
@@ -126,8 +128,10 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
     ],
     user_l1: [
+        Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
@@ -217,7 +221,7 @@ fn pan_supported() -> bool {
 
 /// Map one task's EL0 code, data, heap, and stack.
 ///
-/// `slot` is 0, 1, or 2. The arguments are kernel virtual addresses of that
+/// `slot` is 0 through 4. The arguments are kernel virtual addresses of that
 /// task's backing pages. Descriptors store physical addresses. TTBR0 is
 /// pointed at this slot with ASID 0 so the caller can maintain the user
 /// instruction cache. The scheduler later installs the task ASID.
@@ -245,6 +249,8 @@ pub fn map_user_sized(
     data_len: u64,
     stack_va: u64,
     stack_len: u64,
+    heap_va: u64,
+    heap_len: u64,
 ) {
     if slot >= USER_SLOTS {
         give_up("user slot out of range");
@@ -255,6 +261,9 @@ pub fn map_user_sized(
     map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), code_len, code);
     if data_len > 0 {
         map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), data_len, data);
+    }
+    if heap_len > 0 {
+        map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), heap_len, data);
     }
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), stack_len, data);
     use_user_slot(slot, 0);
@@ -345,7 +354,7 @@ fn checked_end(ptr: u64, len: u64) -> Option<u64> {
 /// ASID lives in TTBR0[63:56] (TCR_EL1.AS is 0, so the ASID is 8 bits).
 /// Kernel translations are global. User translations are non-global, so
 /// ASID 0 does not match them. Slot 0 uses ASID 1, slot 1 uses ASID 2, and
-/// slot 2 uses ASID 3. The roots map the same virtual addresses to different
+/// slot 2 uses ASID 3, the log task uses ASID 4, and telnet uses ASID 5. The roots map the same virtual addresses to different
 /// physical pages, and the ASID keeps those translations from aliasing.
 pub fn set_user_asid(active: bool) {
     use_user_slot(0, if active { 1 } else { 0 });

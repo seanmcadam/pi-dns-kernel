@@ -151,6 +151,10 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         Ok(()) => uart_write("[OK] HTTP socket created\r\n"),
         Err(()) => uart_write("[ERROR] HTTP socket failed\r\n"),
     }
+    match task::start_telnet() {
+        Ok(()) => uart_write("[OK] Telnet log listening on port 23\r\n"),
+        Err(()) => uart_write("[ERROR] Telnet log failed\r\n"),
+    }
 
     uart_write("\r\n=== Kernel Initialized Successfully ===\r\n");
     uart_write("DNS server listening on port 53\r\n");
@@ -164,6 +168,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         task::poll_dns();
         task::poll_http();
         task::poll_log();
+        task::poll_telnet();
         task::poll_spin();
         let _ = task::schedule_one();
         net::poll();

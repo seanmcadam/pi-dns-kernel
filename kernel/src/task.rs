@@ -23,6 +23,10 @@
 //!   36 thread_join(tid) -> exit code
 //!   37 futex_wait(addr, expected) -> 0, or 1 if the word changed
 //!   38 futex_wake(addr, n) -> count
+//!   39 log_publish(ptr, len). Log task only. Never waits.
+//!   40 log_follow(cursor, buf, cap, drops, flags) -> len.
+//!      The caller sleeps when the ring is idle. flags 1 returns 0 instead.
+//!   41 log_wake(). Wakes log followers. Does not publish a line.
 //! Anything else returns -1. A log pointer outside the user window returns -2.
 //! Neither path faults. The boot program proves the round trip on slot 0.
 //! DNS reuses that slot. HTTP uses slot 1.
@@ -36,9 +40,11 @@ const USER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.bin"));
 const DNS_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns.bin"));
 const HTTP_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/http.bin"));
 const LOG_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/log.bin"));
+const TELNET_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/telnet.bin"));
 include!(concat!(env!("OUT_DIR"), "/dns_meta.rs"));
 include!(concat!(env!("OUT_DIR"), "/http_meta.rs"));
 include!(concat!(env!("OUT_DIR"), "/log_meta.rs"));
+include!(concat!(env!("OUT_DIR"), "/telnet_meta.rs"));
 
 const RESUME: u64 = 0;
 const YIELD: u64 = 1;
@@ -47,6 +53,9 @@ const FAULT: u64 = 3;
 const PREEMPT: u64 = 4;
 const BLOCK: u64 = 5;
 
+const LOG_PUBLISH: u64 = 39;
+const LOG_FOLLOW: u64 = 40;
+const LOG_WAKE: u64 = 41;
 const THREAD_CREATE: u64 = 34;
 const THREAD_EXIT: u64 = 35;
 const THREAD_JOIN: u64 = 36;
@@ -169,19 +178,27 @@ static mut DNS_LIVE: bool = false;
 static mut HTTP_LIVE: bool = false;
 static mut SPIN_LIVE: bool = false;
 static mut LOG_LIVE: bool = false;
+static mut TELNET_LIVE: bool = false;
 
 const DNS_SLOT: usize = 0;
 const HTTP_SLOT: usize = 1;
 const SPIN_SLOT: usize = 2;
 const LOG_SLOT: usize = 3;
+const TELNET_SLOT: usize = 4;
+const TASK_SLOTS: usize = 5;
 const DNS_ASID: u64 = 1;
 const HTTP_ASID: u64 = 2;
 const SPIN_ASID: u64 = 3;
 const LOG_ASID: u64 = 4;
+const TELNET_ASID: u64 = 5;
 
 const LOG_CODE_BYTES: usize = 128 * 1024;
 const LOG_DATA_BYTES: usize = 4096;
 const LOG_STACK_BYTES: usize = 16 * 1024;
+const TELNET_CODE_BYTES: usize = 128 * 1024;
+const TELNET_DATA_BYTES: usize = 4096;
+const TELNET_HEAP_BYTES: usize = 256 * 1024;
+const TELNET_STACK_BYTES: usize = 16 * 1024;
 
 /// `b .` — a task that never makes a syscall. Preemption is the only way out.
 const SPIN_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x14];
@@ -397,6 +414,16 @@ fn syscall() -> u64 {
         THREAD_JOIN => thread_join(a0),
         FUTEX_WAIT => futex_wait(a0, a1),
         FUTEX_WAKE => futex_wake(a0, a1),
+        LOG_PUBLISH => {
+            ctx.x[0] = log_publish(a0, a1);
+            RESUME
+        }
+        LOG_FOLLOW => return log_follow(),
+        LOG_WAKE => {
+            wake_log_readers();
+            ctx.x[0] = 0;
+            RESUME
+        }
         4..=33 => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
@@ -540,6 +567,35 @@ static mut LOG_MEM: LogMem = LogMem {
     stack: [0; LOG_STACK_BYTES],
 };
 
+#[repr(C, align(4096))]
+struct TelnetMem {
+    code: [u8; TELNET_CODE_BYTES],
+    data: [u8; TELNET_DATA_BYTES],
+    heap: [u8; TELNET_HEAP_BYTES],
+    stack: [u8; TELNET_STACK_BYTES],
+}
+
+static mut TELNET_MEM: TelnetMem = TelnetMem {
+    code: [0; TELNET_CODE_BYTES],
+    data: [0; TELNET_DATA_BYTES],
+    heap: [0; TELNET_HEAP_BYTES],
+    stack: [0; TELNET_STACK_BYTES],
+};
+
+static mut TELNET_TASK: Task = Task {
+    ctx: TaskContext {
+        x: [0; 31],
+        sp_el0: 0,
+        elr: 0,
+        spsr: 0,
+        fpsr: 0,
+        fpcr: 0,
+        q: [0; 64],
+    },
+    _gap: [0; 4096],
+    kstack: [0; KSTACK_BYTES],
+};
+
 static mut SPIN_MEM: SpinMem = SpinMem {
     code: [0; 4096],
     stack: [0; 4096],
@@ -679,6 +735,8 @@ pub fn start_log() -> Result<(), ()> {
             LOG_DATA_BYTES as u64,
             addr_of!(LOG_MEM.stack) as u64,
             LOG_STACK_BYTES as u64,
+            0,
+            0,
         );
         maintain_code(code, LOG_BIN.len());
         let ctx = addr_of_mut!(LOG_TASK.ctx);
@@ -726,6 +784,91 @@ pub fn poll_log() {
         if !still_scheduled(action) {
             LOG_LIVE = false;
             put("EL0 log stopped\r\n");
+        }
+    }
+}
+
+pub fn start_telnet() -> Result<(), ()> {
+    if TELNET_BIN.len() > TELNET_CODE_BYTES {
+        put("EL0 telnet: program does not fit\r\n");
+        return Err(());
+    }
+    unsafe {
+        let code = addr_of_mut!(TELNET_MEM.code) as *mut u8;
+        core::ptr::write_bytes(code, 0, TELNET_CODE_BYTES);
+        core::ptr::write_bytes(
+            addr_of_mut!(TELNET_MEM.heap) as *mut u8,
+            0,
+            TELNET_HEAP_BYTES,
+        );
+        core::ptr::copy_nonoverlapping(TELNET_BIN.as_ptr(), code, TELNET_BIN.len());
+        if TELNET_DATA_LEN > 0
+            && TELNET_DATA_OFF + TELNET_DATA_LEN <= TELNET_BIN.len()
+            && TELNET_DATA_PLACE + TELNET_DATA_LEN <= TELNET_DATA_BYTES
+        {
+            core::ptr::copy_nonoverlapping(
+                TELNET_BIN.as_ptr().add(TELNET_DATA_OFF),
+                addr_of_mut!(TELNET_MEM.data).cast(),
+                TELNET_DATA_LEN,
+            );
+        }
+        crate::mmu::map_user_sized(
+            TELNET_SLOT,
+            addr_of!(TELNET_MEM.code) as u64,
+            TELNET_CODE_BYTES as u64,
+            addr_of!(TELNET_MEM.data) as u64,
+            TELNET_DATA_BYTES as u64,
+            addr_of!(TELNET_MEM.stack) as u64,
+            TELNET_STACK_BYTES as u64,
+            addr_of!(TELNET_MEM.heap) as u64,
+            TELNET_HEAP_BYTES as u64,
+        );
+        maintain_code(code, TELNET_BIN.len());
+        let ctx = addr_of_mut!(TELNET_TASK.ctx);
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = crate::mmu::USER_CODE_VA;
+        (*ctx).spsr = 0;
+        (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + TELNET_STACK_BYTES as u64;
+        crate::user_fd::set_task(TELNET_SLOT);
+        crate::mmu::use_user_slot(TELNET_SLOT, TELNET_ASID);
+        let ksp = addr_of!(TELNET_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        crate::percpu::set_slot(TELNET_SLOT);
+        crate::percpu::set_thread_index(0);
+        TELNET_LIVE = true;
+        loop {
+            match enter(ctx, ksp) {
+                YIELD | BLOCK => return Ok(()),
+                PREEMPT => continue,
+                _ => {
+                    TELNET_LIVE = false;
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
+pub fn poll_telnet() {
+    if !unsafe { TELNET_LIVE } {
+        return;
+    }
+    if main_blocked(TELNET_SLOT) {
+        return;
+    }
+    crate::user_fd::set_task(TELNET_SLOT);
+    crate::mmu::use_user_slot(TELNET_SLOT, TELNET_ASID);
+    unsafe {
+        crate::percpu::set_slot(TELNET_SLOT);
+        crate::percpu::set_thread_index(0);
+        let ctx = addr_of_mut!(TELNET_TASK.ctx);
+        let ksp = addr_of!(TELNET_TASK.kstack) as u64 + KSTACK_BYTES as u64;
+        let action = enter(ctx, ksp);
+        if action == BLOCK {
+            return;
+        }
+        if !still_scheduled(action) {
+            TELNET_LIVE = false;
+            put("EL0 telnet stopped\r\n");
         }
     }
 }
@@ -871,7 +1014,7 @@ fn maintain_code(kernel_ptr: *mut u8, len: usize) {
     }
 }
 
-const MAX_THREADS: usize = 16;
+const MAX_THREADS: usize = 32;
 const ST_EMPTY: u8 = 0;
 const ST_RUNNABLE: u8 = 1;
 const ST_RUNNING: u8 = 2;
@@ -907,7 +1050,7 @@ pub fn block_current_locked() {
         unsafe {
             MAIN_FUTEX[slot] = 0;
         }
-        if slot < 4 {
+        if slot < TASK_SLOTS {
             MAIN_BLOCKED[slot].store(true, Ordering::Release);
         }
     } else {
@@ -954,7 +1097,7 @@ pub fn wake_locked(slot: usize, thread_index: u64, result: u64) {
         unsafe {
             (*main_ctx(slot)).x[0] = result;
         }
-        if slot < 4 {
+        if slot < TASK_SLOTS {
             MAIN_BLOCKED[slot].store(false, Ordering::Release);
         }
         sev();
@@ -970,13 +1113,9 @@ pub fn wake_locked(slot: usize, thread_index: u64, result: u64) {
         }
     }
 }
-static MAIN_BLOCKED: [core::sync::atomic::AtomicBool; 4] = [
-    core::sync::atomic::AtomicBool::new(false),
-    core::sync::atomic::AtomicBool::new(false),
-    core::sync::atomic::AtomicBool::new(false),
-    core::sync::atomic::AtomicBool::new(false),
-];
-static mut MAIN_FUTEX: [u64; 4] = [0; 4];
+static MAIN_BLOCKED: [core::sync::atomic::AtomicBool; TASK_SLOTS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; TASK_SLOTS];
+static mut MAIN_FUTEX: [u64; TASK_SLOTS] = [0; TASK_SLOTS];
 
 const fn blank_thread() -> PoolThread {
     PoolThread {
@@ -1004,24 +1143,7 @@ const fn blank_thread() -> PoolThread {
     }
 }
 
-static mut THREADS: [PoolThread; MAX_THREADS] = [
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-    blank_thread(),
-];
+static mut THREADS: [PoolThread; MAX_THREADS] = [const { blank_thread() }; MAX_THREADS];
 static mut RUN_Q: [i16; MAX_THREADS] = [-1; MAX_THREADS];
 static mut RUN_HEAD: usize = 0;
 static mut RUN_TAIL: usize = 0;
@@ -1029,7 +1151,7 @@ static mut RUN_LEN: usize = 0;
 static mut FUTEX_HEAD: i16 = WAITER_NONE;
 
 fn main_blocked(slot: usize) -> bool {
-    slot < 4 && MAIN_BLOCKED[slot].load(Ordering::Acquire)
+    slot < TASK_SLOTS && MAIN_BLOCKED[slot].load(Ordering::Acquire)
 }
 
 fn wait_if_blocked(slot: usize, asid: u64) {
@@ -1060,6 +1182,7 @@ fn main_ctx(slot: usize) -> *mut TaskContext {
             HTTP_SLOT => addr_of_mut!(HTTP_TASK.ctx),
             SPIN_SLOT => addr_of_mut!(SPIN_TASK.ctx),
             LOG_SLOT => addr_of_mut!(LOG_TASK.ctx),
+            TELNET_SLOT => addr_of_mut!(TELNET_TASK.ctx),
             _ => addr_of_mut!(TASK.ctx),
         }
     }
@@ -1155,7 +1278,7 @@ fn wake_waiter(index: usize) {
         if waiter == WAITER_MAIN {
             (*main_ctx(slot)).x[0] = code as u64;
             MAIN_FUTEX[slot] = 0;
-            if slot < 4 {
+            if slot < TASK_SLOTS {
                 MAIN_BLOCKED[slot].store(false, Ordering::Release);
             }
             sev();
@@ -1269,6 +1392,151 @@ fn thread_join(tid: u64) -> u64 {
     BLOCK
 }
 
+struct LogWait {
+    slot: u8,
+    index: u8,
+    live: bool,
+}
+
+const LOG_WAIT_N: usize = 32;
+static mut LOG_WAIT: [LogWait; LOG_WAIT_N] =
+    [const { LogWait { slot: 0, index: 0, live: false } }; LOG_WAIT_N];
+
+fn log_publish(ptr: u64, len: u64) -> u64 {
+    if crate::percpu::slot() != LOG_SLOT {
+        return (-4i64) as u64;
+    }
+    if len == 0 || len > 96 {
+        return (-4i64) as u64;
+    }
+    if !crate::mmu::user_slice_ok(ptr, len) {
+        return (-2i64) as u64;
+    }
+    let mut raw = [0u8; 96];
+    let n = len as usize;
+    crate::mmu::set_pan(false);
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), n);
+    }
+    crate::mmu::set_pan(true);
+    crate::logger::fan_publish(&raw[..n]);
+    wake_log_readers();
+    0
+}
+
+fn log_follow() -> u64 {
+    let ctx = unsafe { &mut *crate::percpu::current() };
+    let cursor_ptr = ctx.x[0];
+    let buf = ctx.x[1];
+    let cap = ctx.x[2];
+    let drops_ptr = ctx.x[3];
+    let nonblock = ctx.x[4] == 1;
+    if (cursor_ptr & 7) != 0 || !crate::mmu::user_write_ok(cursor_ptr, 8) {
+        ctx.x[0] = (-2i64) as u64;
+        return RESUME;
+    }
+    if cap == 0 || cap > 96 || !crate::mmu::user_write_ok(buf, cap) {
+        ctx.x[0] = if cap == 0 || cap > 96 {
+            (-4i64) as u64
+        } else {
+            (-2i64) as u64
+        };
+        return RESUME;
+    }
+    if drops_ptr != 0 && ((drops_ptr & 7) != 0 || !crate::mmu::user_write_ok(drops_ptr, 8)) {
+        ctx.x[0] = (-2i64) as u64;
+        return RESUME;
+    }
+    let cursor = read_user_u64(cursor_ptr);
+    if let Some(line) = crate::logger::fan_read(cursor) {
+        return commit_fan(ctx, cursor_ptr, buf, cap, drops_ptr, &line);
+    }
+    if nonblock {
+        ctx.x[0] = 0;
+        return RESUME;
+    }
+    let _guard = SCHED.lock();
+    let cursor = read_user_u64(cursor_ptr);
+    if let Some(line) = crate::logger::fan_read(cursor) {
+        return commit_fan(ctx, cursor_ptr, buf, cap, drops_ptr, &line);
+    }
+    if !enqueue_log_waiter() {
+        ctx.x[0] = (-11i64) as u64;
+        return RESUME;
+    }
+    block_current_locked();
+    BLOCK
+}
+
+fn commit_fan(
+    ctx: &mut TaskContext,
+    cursor_ptr: u64,
+    buf: u64,
+    cap: u64,
+    drops_ptr: u64,
+    line: &crate::logger::FanLine,
+) -> u64 {
+    let n = line.len.min(cap as usize);
+    if n == 0 {
+        ctx.x[0] = 0;
+        return RESUME;
+    }
+    crate::mmu::set_pan(false);
+    unsafe {
+        core::ptr::copy_nonoverlapping(line.bytes.as_ptr(), buf as *mut u8, n);
+        core::ptr::write_volatile(cursor_ptr as *mut u64, line.next);
+        if drops_ptr != 0 {
+            core::ptr::write_volatile(drops_ptr as *mut u64, line.dropped);
+        }
+    }
+    crate::mmu::set_pan(true);
+    ctx.x[0] = n as u64;
+    RESUME
+}
+
+fn enqueue_log_waiter() -> bool {
+    let slot = crate::percpu::slot() as u8;
+    let index = crate::percpu::thread_index() as u8;
+    unsafe {
+        let mut i = 0;
+        while i < LOG_WAIT_N {
+            if !LOG_WAIT[i].live {
+                LOG_WAIT[i] = LogWait {
+                    slot,
+                    index,
+                    live: true,
+                };
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+fn wake_log_readers() {
+    let _guard = SCHED.lock();
+    unsafe {
+        let mut i = 0;
+        while i < LOG_WAIT_N {
+            if LOG_WAIT[i].live {
+                let slot = LOG_WAIT[i].slot as usize;
+                let index = LOG_WAIT[i].index as u64;
+                LOG_WAIT[i].live = false;
+                wake_locked(slot, index, 0);
+            }
+            i += 1;
+        }
+    }
+}
+
+fn read_user_u64(addr: u64) -> u64 {
+    crate::mmu::set_pan(false);
+    let value = unsafe { core::ptr::read_volatile(addr as *const u64) };
+    crate::mmu::set_pan(true);
+    value
+}
+
 fn read_user_u32(addr: u64) -> u32 {
     crate::mmu::set_pan(false);
     let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
@@ -1316,7 +1584,7 @@ fn futex_wake(addr: u64, n: u64) -> u64 {
     let _guard = SCHED.lock();
     unsafe {
         let mut slot = 0;
-        while slot < 4 && woke < limit {
+        while slot < TASK_SLOTS && woke < limit {
             if MAIN_BLOCKED[slot].load(Ordering::Acquire) && MAIN_FUTEX[slot] == addr {
                 MAIN_FUTEX[slot] = 0;
                 (*main_ctx(slot)).x[0] = 0;

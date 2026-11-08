@@ -9,6 +9,7 @@ core::arch::global_asm!(include_str!("start.s"));
 
 const DRAIN: u64 = 29;
 const EMIT: u64 = 30;
+const PUBLISH: u64 = 39;
 const FILE_READ: u64 = 32;
 const FILE_WRITE: u64 = 33;
 const YIELD: u64 = 1;
@@ -47,6 +48,7 @@ fn run() -> ! {
         line[prefix.len()..prefix.len() + take].copy_from_slice(&msg[..take]);
         let end = prefix.len() + take;
         let _ = sys(EMIT, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
+        let _ = sys(PUBLISH, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
         if flags & PERSIST != 0 {
             persist(msg);
         }

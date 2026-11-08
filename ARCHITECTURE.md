@@ -58,8 +58,11 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 | 36 | `thread_join(tid)` |
 | 37 | `futex_wait(addr, expected)` |
 | 38 | `futex_wake(addr, n)` |
+| 39 | `log_publish(ptr, len)` |
+| 40 | `log_follow(cursor, buf, cap, drops)` |
+| 41 | `log_wake()` |
 
-Anything else returns `-1`. `-2` is a bad user pointer. `-4` is a bad argument. `-6` means the thread table is full. `-11` means try again. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned. `futex_wait` and `futex_wake` require a 4-byte-aligned user address. The kernel re-reads the word under the scheduler lock, so a wake that lands before the wait returns a mismatch and the caller retries. The older sections below describe earlier revisions of this tree.
+`log_publish` is the log task only. It copies one line into a kernel ring and returns. It does not wait. `log_follow` copies the next line for that cursor and writes the new cursor and how many lines were skipped. It sleeps until a line is published, unless its fifth argument is `1`, in which case it returns `0`. `tcp_recv` takes a fourth argument: `1` returns `-11` instead of sleeping when the peer has not sent data. Anything else returns `-1`. `-2` is a bad user pointer. `-4` is a bad argument. `-6` means the thread table is full. `-11` means try again. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned. `futex_wait` and `futex_wake` require a 4-byte-aligned user address. The kernel re-reads the word under the scheduler lock, so a wake that lands before the wait returns a mismatch and the caller retries. The older sections below describe earlier revisions of this tree.
 
 QEMU is started with `-smp 4`. Core 0 brings the other three up with PSCI `CPU_ON` (`0xC4000003`) through HVC. This QEMU virt machine's PSCI conduit is HVC; SMC from EL1 is undefined because EL3 is not implemented. When the CPU implements EL2 (`-M virt,virtualization=on`), that HVC is delivered to EL2 instead of the firmware, and the extra cores stay offline. The default virt machine does not implement EL2, so all four cores come up. Each core has its own stack, its own virtual timer, and its own GICv2 CPU interface. `TPIDR_EL1` points at that core's current thread. The Pi 4 build does not use PSCI. It writes the physical entry to the spin-table release addresses `0xE0`, `0xE8`, and `0xF0` (core n at `0xD8 + 8*n`), cleans the line, and sends an event. That path is untested on hardware. If the firmware stub is not parked on those words, the stores hit RAM and the extra cores stay offline.
 
@@ -70,6 +73,8 @@ Lock order, outermost first. A holder may take a later lock and must not take an
 3. `CONFIG` — config records. Not IRQ-safe.
 4. `FS` — the FAT volume. One lock, any core. Not IRQ-safe.
 5. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
+
+The telnet fan-out is not a lock. The log task publishes each line once into a fixed ring. A reader that falls behind skips ahead. Waking a reader takes `SCHED` and no other lock.
 
 smoltcp and the NIC are not behind a lock. Core 1 owns them once the stack is up and only polls; core 0 owns them until that handoff, and on a one-core boot. Other cores push a socket request onto a lock-free ring and sleep. The owner copies the result into the caller's user buffer and wakes the thread. It may take `FD` to publish a new socket, then drop it, then take `SCHED`. `FS` stays one lock because the FAT library is not reentrant and the block device has one command slot. The timer IRQ takes none of these. The UART and the panic path take no locks. The DNS task keeps two threads blocked in the upstream receive, one blocked on TCP port 53, and one that sleeps until a query is forwarded. The HTTP task keeps four connection workers, one per listener. Extra threads share the process page tables and sit on one global run queue.
 

@@ -6,8 +6,9 @@ echo "=== Running Integration Tests ==="
 # 5353 is mDNS and is often already taken. Guest ports stay 53 and 80.
 DNS_HOST_PORT="${DNS_HOST_PORT:-15353}"
 HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
-HOSTFWD="hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80"
-echo "Using host ports DNS ${DNS_HOST_PORT} and HTTP ${HTTP_HOST_PORT}"
+TELNET_HOST_PORT="${TELNET_HOST_PORT:-2323}"
+HOSTFWD="hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80,hostfwd=tcp::${TELNET_HOST_PORT}-:23"
+echo "Using host ports DNS ${DNS_HOST_PORT}, HTTP ${HTTP_HOST_PORT}, telnet ${TELNET_HOST_PORT}"
 
 # Build kernel first
 ./scripts/build.sh
@@ -289,6 +290,192 @@ else
     echo "dig=$SPIN_DIG"
     echo "status=$SPIN_STATUS"
     TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# Test 22: a telnet client sees a live DNS log line.
+echo ""
+echo "Test 22: Telnet client sees a DNS query log line"
+TELNET_NAME="tn$(date +%s).local"
+if python3 - "$TELNET_HOST_PORT" "$DNS_HOST_PORT" "$TELNET_NAME" <<'PY'
+import socket, subprocess, sys, time
+port, dns, name = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+s = socket.create_connection(("127.0.0.1", port), 5)
+s.settimeout(0.3)
+s.sendall(b"\xff\xfb\x03\xff\xfd\x18")
+deadline = time.time() + 3
+buf = b""
+while time.time() < deadline and b"telnet-log" not in buf:
+    try:
+        chunk = s.recv(4096)
+    except socket.timeout:
+        continue
+    if not chunk:
+        break
+    buf += chunk
+if b"telnet-log" not in buf:
+    print("no banner", buf[:200])
+    sys.exit(1)
+subprocess.run(
+    ["dig", "@127.0.0.1", "-p", dns, name, "+short", "+time=3", "+tries=1"],
+    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+deadline = time.time() + 5
+while time.time() < deadline and name.encode() not in buf:
+    try:
+        chunk = s.recv(4096)
+    except socket.timeout:
+        continue
+    if not chunk:
+        break
+    buf += chunk
+s.close()
+if name.encode() not in buf:
+    print("missing log line", buf[-300:])
+    sys.exit(1)
+print("saw", name)
+PY
+then
+    echo "✓ Telnet client saw the DNS query log line"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Telnet client did not see the DNS query log line"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# Test 25: a client that never reads must not stop another client or the console.
+echo ""
+echo "Test 23: Stalled telnet client does not block the others"
+rm -f qemu/telnet-console.txt qemu/telnet-stall-name.txt
+timeout 12 nc 127.0.0.1 4444 > qemu/telnet-console.txt 2>&1 &
+STALL_NC=$!
+STALL_NAME="stall$(date +%s).local"
+echo "$STALL_NAME" > qemu/telnet-stall-name.txt
+if python3 - "$TELNET_HOST_PORT" "$DNS_HOST_PORT" "$STALL_NAME" <<'PY'
+import socket, subprocess, sys, time
+port, dns, name = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+stalled = socket.create_connection(("127.0.0.1", port), 5)
+live = socket.create_connection(("127.0.0.1", port), 5)
+live.settimeout(0.3)
+buf = b""
+deadline = time.time() + 3
+while time.time() < deadline and b"telnet-log" not in buf:
+    try:
+        chunk = live.recv(4096)
+    except socket.timeout:
+        continue
+    if not chunk:
+        break
+    buf += chunk
+subprocess.run(
+    ["dig", "@127.0.0.1", "-p", dns, name, "+short", "+time=3", "+tries=1"],
+    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+deadline = time.time() + 6
+while time.time() < deadline and name.encode() not in buf:
+    try:
+        chunk = live.recv(4096)
+    except socket.timeout:
+        continue
+    if not chunk:
+        break
+    buf += chunk
+live.close()
+stalled.close()
+if name.encode() not in buf:
+    print("live client missed", name, buf[-200:])
+    sys.exit(1)
+print("live client saw", name)
+PY
+then
+    sleep 3
+    kill $STALL_NC 2>/dev/null || true
+    wait $STALL_NC 2>/dev/null || true
+    if grep -q "$STALL_NAME" qemu/telnet-console.txt && grep -q "\[status\]" qemu/telnet-console.txt; then
+        echo "✓ A stalled telnet client did not stop another client or the console"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo "✗ Console stopped while a telnet client was stalled"
+        echo "--- console ---"
+        tail -n 40 qemu/telnet-console.txt || true
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+else
+    kill $STALL_NC 2>/dev/null || true
+    wait $STALL_NC 2>/dev/null || true
+    echo "✗ Stalled telnet client blocked another client"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# Tests 23 and 24: 16 clients, the 17th is refused, and a disconnect frees a slot.
+echo ""
+echo "Test 24: Sixteen telnet clients, the seventeenth is refused"
+echo "Test 25: Disconnecting a telnet client frees its slot"
+if python3 - "$TELNET_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import socket, subprocess, sys, time
+port, dns = int(sys.argv[1]), sys.argv[2]
+
+def read_for(sock, seconds):
+    sock.settimeout(0.2)
+    end = time.time() + seconds
+    data = b""
+    while time.time() < end:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            continue
+        if not chunk:
+            break
+        data += chunk
+        if b"telnet-log" in data or b"busy" in data:
+            break
+    return data
+
+clients = []
+for i in range(16):
+    sock = socket.create_connection(("127.0.0.1", port), 5)
+    banner = read_for(sock, 3)
+    if b"telnet-log" not in banner:
+        print("client", i, "banner", banner[:120])
+        sys.exit(1)
+    clients.append(sock)
+extra = socket.create_connection(("127.0.0.1", port), 5)
+refusal = read_for(extra, 3)
+extra.close()
+if b"busy" not in refusal:
+    print("17th was not refused", refusal[:120])
+    sys.exit(1)
+print("17th refused")
+clients[0].close()
+name = "reuse%d.local" % int(time.time())
+subprocess.run(
+    ["dig", "@127.0.0.1", "-p", dns, name, "+short", "+time=3", "+tries=1"],
+    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+time.sleep(0.4)
+opened = False
+for _ in range(8):
+    sock = socket.create_connection(("127.0.0.1", port), 5)
+    banner = read_for(sock, 2)
+    sock.close()
+    if b"telnet-log" in banner and b"busy" not in banner:
+        opened = True
+        break
+    time.sleep(0.3)
+for sock in clients[1:]:
+    sock.close()
+if not opened:
+    print("slot was not reused")
+    sys.exit(1)
+print("slot reused")
+PY
+then
+    echo "✓ Sixteen telnet clients connected and the seventeenth was refused"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ A disconnected telnet client freed a slot"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Telnet connection limit or slot reuse failed"
+    TESTS_FAILED=$((TESTS_FAILED + 2))
 fi
 
 # Cleanup

@@ -9,6 +9,7 @@
 # Environment overrides:
 #   DNS_HOST_PORT  (default 15353)  host UDP port forwarded to guest DNS port 53
 #   HTTP_HOST_PORT (default 8080)   host TCP port forwarded to guest HTTP port 80
+#   TELNET_HOST_PORT (default 2323) host TCP port forwarded to guest telnet port 23
 #   DISK_IMG       (default qemu/manual-disk.img)
 #
 # Exit QEMU with Ctrl-A then X.
@@ -24,13 +25,14 @@ for arg in "$@"; do
         --no-build)   BUILD=0 ;;
         --fresh-disk) FRESH_DISK=1 ;;
         --no-disk)    USE_DISK=0 ;;
-        -h|--help)    sed -n '2,15p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,16p' "$0"; exit 0 ;;
         *) echo "Unknown option: $arg (try --help)"; exit 1 ;;
     esac
 done
 
 DNS_HOST_PORT="${DNS_HOST_PORT:-15353}"
 HTTP_HOST_PORT="${HTTP_HOST_PORT:-8080}"
+TELNET_HOST_PORT="${TELNET_HOST_PORT:-2323}"
 DISK_IMG="${DISK_IMG:-qemu/manual-disk.img}"
 KERNEL="boot/kernel8.img"
 
@@ -70,6 +72,7 @@ echo ""
 echo "=== pi4-dns-kernel in QEMU ==="
 echo "DNS:  dig @127.0.0.1 -p ${DNS_HOST_PORT} example.com"
 echo "Web:  http://127.0.0.1:${HTTP_HOST_PORT}/"
+echo "Log:  nc 127.0.0.1 ${TELNET_HOST_PORT}"
 if [ "$USE_DISK" -eq 1 ]; then
     echo "Disk: $DISK_IMG (inspect with: mdir -i ${DISK_IMG}@@1048576 ::)"
 else
@@ -86,6 +89,6 @@ exec qemu-system-aarch64 \
     -kernel "$KERNEL" \
     -nographic \
     -serial mon:stdio \
-    -netdev "user,id=net0,hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80" \
+    -netdev "user,id=net0,hostfwd=udp::${DNS_HOST_PORT}-:53,hostfwd=tcp::${HTTP_HOST_PORT}-:80,hostfwd=tcp::${TELNET_HOST_PORT}-:23" \
     -device virtio-net-device,netdev=net0 \
     "${DISK_ARGS[@]}"
