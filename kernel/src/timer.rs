@@ -137,6 +137,10 @@ pub fn get_ticks() -> u64 {
     ticks
 }
 
+pub fn frequency() -> u64 {
+    get_timer_frequency()
+}
+
 fn get_timer_frequency() -> u64 {
     let freq: u64;
     unsafe {

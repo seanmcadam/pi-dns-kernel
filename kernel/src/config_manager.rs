@@ -26,6 +26,7 @@ pub struct DnsConfig {
     pub upstreams: Vec<[u8; 4]>,
     pub blocklist: Vec<String>,
     pub cache_size: usize,
+    pub cache_reap_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -196,7 +197,45 @@ pub fn cache_size() -> usize {
         .lock()
         .as_ref()
         .map(|config| config.dns.cache_size)
-        .unwrap_or(1000)
+        .unwrap_or(config::CACHE_DEFAULT as usize)
+}
+
+pub fn cache_reap_secs() -> u64 {
+    CURRENT
+        .lock()
+        .as_ref()
+        .map(|config| config.dns.cache_reap_secs)
+        .unwrap_or(config::REAP_DEFAULT)
+}
+
+/// Update the two DNS cache fields and rewrite `CONFIG.JSN`. `Ok(true)` means
+/// `cache_size` changed, so the DNS task must restart before the new pool is
+/// reserved. The reap interval is read on each pass and does not need a restart.
+pub fn set_dns_cache(slots: u64, reap_secs: u64) -> Result<bool, String> {
+    if slots < config::CACHE_MIN || slots > config::CACHE_MAX {
+        return Err(alloc::format!(
+            "dns.cache_size: out of bounds ({}..={})",
+            config::CACHE_MIN,
+            config::CACHE_MAX
+        ));
+    }
+    if reap_secs < config::REAP_MIN || reap_secs > config::REAP_MAX {
+        return Err(alloc::format!(
+            "dns.cache_reap_interval_secs: out of bounds ({}..={})",
+            config::REAP_MIN,
+            config::REAP_MAX
+        ));
+    }
+    let mut next = CURRENT.lock().clone().unwrap_or_else(default_config);
+    let restart = next.dns.cache_size != slots as usize;
+    next.dns.cache_size = slots as usize;
+    next.dns.cache_reap_secs = reap_secs;
+    let text = serialize_config(&next);
+    crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes())
+        .map_err(|err| alloc::format!("save failed: {err}"))?;
+    *CURRENT.lock() = Some(next);
+    log::info!("Updated DNS cache settings");
+    Ok(restart)
 }
 
 /// Write `name TYPE value ttl` lines. `None` if `out` is too small.
@@ -382,7 +421,8 @@ fn default_config() -> Config {
             records,
             upstreams: alloc::vec![[8, 8, 8, 8], [1, 1, 1, 1], [10, 0, 2, 3]],
             blocklist: Vec::new(),
-            cache_size: 1000,
+            cache_size: config::CACHE_DEFAULT as usize,
+            cache_reap_secs: config::REAP_DEFAULT,
         },
         http: HttpConfig {
             port: 80,
@@ -524,7 +564,11 @@ fn config_from_text(text: &str) -> Result<Config, String> {
     let cache_size = dns
         .get("cache_size")
         .and_then(Value::as_u64)
-        .unwrap_or(1000) as usize;
+        .unwrap_or(config::CACHE_DEFAULT) as usize;
+    let cache_reap_secs = dns
+        .get("cache_reap_interval_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(config::REAP_DEFAULT);
     let mut upstreams = Vec::new();
     if let Some(items) = dns.get("upstreams").and_then(Value::as_array) {
         for (index, item) in items.iter().enumerate() {
@@ -585,6 +629,7 @@ fn config_from_text(text: &str) -> Result<Config, String> {
             upstreams,
             blocklist,
             cache_size,
+            cache_reap_secs,
         },
         http: HttpConfig {
             port,
@@ -612,7 +657,9 @@ fn require_secret(value: &Value, key: &str) -> Result<String, String> {
 }
 
 fn needs_restart(old: &Config, new: &Config) -> bool {
-    old.http.port != new.http.port || !same_mode(&old.network.mode, &new.network.mode)
+    old.http.port != new.http.port
+        || old.dns.cache_size != new.dns.cache_size
+        || !same_mode(&old.network.mode, &new.network.mode)
 }
 
 fn same_mode(left: &NetworkMode, right: &NetworkMode) -> bool {
@@ -679,7 +726,20 @@ fn parse_legacy(text: &str) -> Option<Config> {
                 config.dns.upstreams.push(parse_ipv4(value)?);
                 saw_upstream = true;
             }
-            "cache" => config.dns.cache_size = value.parse().unwrap_or(1000),
+            "cache" => {
+                config.dns.cache_size = clamp_u64(
+                    value.parse().unwrap_or(config::CACHE_DEFAULT),
+                    config::CACHE_MIN,
+                    config::CACHE_MAX,
+                ) as usize
+            }
+            "cache_reap" => {
+                config.dns.cache_reap_secs = clamp_u64(
+                    value.parse().unwrap_or(config::REAP_DEFAULT),
+                    config::REAP_MIN,
+                    config::REAP_MAX,
+                )
+            }
             "block" => {
                 if valid_label(value) {
                     config.dns.blocklist.push(value.to_string());
@@ -756,7 +816,10 @@ fn serialize_config(config: &Config) -> String {
     push_ip_json(&mut out, "gateway", gateway);
     out.push_str(&alloc::format!(",\"timeout_ms\":{timeout_ms}"));
     out.push_str("},\"dns\":{");
-    out.push_str(&alloc::format!("\"cache_size\":{},\"upstreams\":[", config.dns.cache_size));
+    out.push_str(&alloc::format!(
+        "\"cache_size\":{},\"cache_reap_interval_secs\":{},\"upstreams\":[",
+        config.dns.cache_size, config.dns.cache_reap_secs
+    ));
     for (index, upstream) in config.dns.upstreams.iter().enumerate() {
         if index > 0 {
             out.push(',');
@@ -792,6 +855,16 @@ fn serialize_config(config: &Config) -> String {
     push_json_str(&mut out, &config.http.password);
     out.push_str("}}");
     out
+}
+
+fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
 }
 
 fn push_ip_json(out: &mut String, key: &str, ip: [u8; 4]) {

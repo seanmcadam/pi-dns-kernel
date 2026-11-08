@@ -47,6 +47,8 @@ const LOG_RELOAD: u64 = 45;
 const CONFIG_READ: u64 = 46;
 const CONFIG_WRITE: u64 = 47;
 const LOG_FILL: u64 = 48;
+const CONFIG_SET_CACHE: u64 = 49;
+const CACHE_PLANT: u64 = 54;
 
 const EAGAIN: i64 = -11;
 
@@ -205,9 +207,11 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/records/delete" => handle_record_delete(request),
         "/logs" => handle_logs(),
         "/log-config" => handle_log_config(request),
+        "/dns-config" => handle_dns_config(request),
         "/config/file/config" => handle_config_file(request, 0),
         "/config/file/log" => handle_config_file(request, 1),
         "/debug/log-fill" => handle_log_fill(request),
+        "/debug/cache-plant" => handle_cache_plant(request),
         "/debug" => handle_debug(),
         "/debug/spin" => handle_spin(),
         "/debug/crash/dns" => handle_crash(0, 0),
@@ -263,6 +267,87 @@ fn log_config_page() -> HttpResponse {
 </body></html>"#
     );
     html_response(&html)
+}
+
+fn handle_dns_config(request: &HttpRequest) -> HttpResponse {
+    match request.method {
+        HttpMethod::GET => dns_config_page(),
+        HttpMethod::POST => {
+            let body = core::str::from_utf8(&request.body).unwrap_or("");
+            let slots = form_value(body, "cache_size")
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(0u64);
+            let reap = form_value(body, "cache_reap_interval_secs")
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(0u64);
+            let mut err = [0u8; 240];
+            let rc = sys(
+                CONFIG_SET_CACHE,
+                slots,
+                reap,
+                err.as_mut_ptr() as u64,
+                err.len() as u64,
+                0,
+                0,
+            );
+            if rc < 0 {
+                let end = err.iter().position(|byte| *byte == 0).unwrap_or(err.len());
+                let message = core::str::from_utf8(&err[..end]).unwrap_or("rejected");
+                return bad_json(message);
+            }
+            let body = if rc == 1 {
+                "{\"status\":\"applied\",\"restart\":true}\n"
+            } else {
+                "{\"status\":\"applied\",\"restart\":false}\n"
+            };
+            let mut response = HttpResponse::ok(body);
+            response.add_header("Content-Type", "application/json");
+            response
+        }
+        _ => HttpResponse::new(405, "Method Not Allowed"),
+    }
+}
+
+fn dns_config_page() -> HttpResponse {
+    let current = read_config_file(0).unwrap_or_default();
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><body>
+<h1>DNS cache</h1>
+<p>File <code>CONFIG.JSN</code>, field <code>dns</code>. Schema version 1.</p>
+<p>cache_size 1..=1024. Each slot reserves 800 bytes for a 255-byte name and a 512-byte response. 1024 slots reserve 823296 bytes, which fits the DNS task heap.</p>
+<p>cache_reap_interval_secs 1..=3600. Default 5. The reaper returns expired slots to the free list. Eviction, when the free list is empty, drops the least recently used live entry.</p>
+<p>cache_size is reserved when dns-el0 starts. A change reports restart. The reap interval is read on each pass.</p>
+<p>Current: {current}</p>
+<form method="POST" action="/dns-config">
+<label>cache_size <input name="cache_size" required></label>
+<label>cache_reap_interval_secs <input name="cache_reap_interval_secs" required></label>
+<button type="submit">Save</button>
+</form>
+<p><a href="/config/file/config">Download CONFIG.JSN</a></p>
+</body></html>"#
+    );
+    html_response(&html)
+}
+
+fn handle_cache_plant(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    let ttl = form_value(body, "ttl")
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0u64);
+    if ttl == 0 || ttl > 5 {
+        return bad_json("ttl out of bounds");
+    }
+    let rc = sys(CACHE_PLANT, 0, ttl, 0, 0, 0, 0);
+    if rc < 0 {
+        return bad_json("plant rejected");
+    }
+    let mut response = HttpResponse::ok("planted\n");
+    response.add_header("Content-Type", "text/plain; charset=utf-8");
+    response
 }
 
 fn handle_config_file(request: &HttpRequest, which: u64) -> HttpResponse {
@@ -380,7 +465,7 @@ fn handle_spin() -> HttpResponse {
 }
 
 fn handle_debug() -> HttpResponse {
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 1536];
     let n = sys(
         DEBUG_STATUS,
         buf.as_mut_ptr() as u64,
@@ -479,6 +564,7 @@ fn handle_index() -> HttpResponse {
         <li><a href="/records">DNS Records (JSON)</a></li>
         <li><a href="/logs">Log</a></li>
         <li><a href="/log-config">Log configuration</a></li>
+        <li><a href="/dns-config">DNS cache</a></li>
         <li><a href="/config/file/config">Download CONFIG.JSN</a></li>
         <li><a href="/config/file/log">Download LOG.JSN</a></li>
     </ul>

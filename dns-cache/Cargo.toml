@@ -4,9 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-heapless = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
 std = []
-no_std = ["heapless"]

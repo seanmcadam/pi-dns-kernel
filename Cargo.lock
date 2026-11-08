@@ -82,9 +82,6 @@ dependencies = [
 [[package]]
 name = "dns-cache"
 version = "0.1.0"
-dependencies = [
- "heapless",
-]
 
 [[package]]
 name = "dns-protocol"

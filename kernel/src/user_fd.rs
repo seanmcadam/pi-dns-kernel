@@ -82,6 +82,12 @@ const LOG_RELOAD: u64 = 45;
 const CONFIG_READ: u64 = 46;
 const CONFIG_WRITE: u64 = 47;
 const LOG_FILL: u64 = 48;
+const CONFIG_SET_CACHE: u64 = 49;
+const CONFIG_CACHE_REAP: u64 = 50;
+const TIMER_TICKS: u64 = 51;
+const TIMER_FREQ: u64 = 52;
+const SET_CACHE_STATS: u64 = 53;
+const CACHE_PLANT: u64 = 54;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -186,6 +192,12 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
             crate::config_manager::fill_log(args[0] as u32);
             0
         }
+        CONFIG_SET_CACHE => config_set_cache(args[0], args[1], args[2], args[3]),
+        CONFIG_CACHE_REAP => crate::config_manager::cache_reap_secs() as i64,
+        TIMER_TICKS => crate::timer::get_ticks() as i64,
+        TIMER_FREQ => crate::timer::frequency() as i64,
+        SET_CACHE_STATS => set_cache_stats(args[0]),
+        CACHE_PLANT => cache_plant(args[0], args[1]),
         _ => -1,
     };
     value as u64
@@ -1173,6 +1185,49 @@ fn log_recent(ptr: u64, cap: u64) -> i64 {
         n as i64
     } else {
         EFAULT
+    }
+}
+
+fn config_set_cache(slots: u64, reap: u64, err: u64, err_cap: u64) -> i64 {
+    match crate::config_manager::set_dns_cache(slots, reap) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(message) => {
+            let _ = write_err(err, err_cap, &message);
+            EINVAL
+        }
+    }
+}
+
+fn set_cache_stats(ptr: u64) -> i64 {
+    let mut raw = [0u8; 64];
+    if !copy_user(ptr, &mut raw) {
+        return EFAULT;
+    }
+    let mut words = [0u64; 8];
+    let mut index = 0;
+    while index < 8 {
+        let start = index * 8;
+        let mut chunk = [0u8; 8];
+        chunk.copy_from_slice(&raw[start..start + 8]);
+        words[index] = u64::from_le_bytes(chunk);
+        index += 1;
+    }
+    crate::dns::set_cache_stats(&words);
+    0
+}
+
+fn cache_plant(op: u64, ttl: u64) -> i64 {
+    if op == 0 {
+        if ttl == 0 || ttl > 5 {
+            return EINVAL;
+        }
+        crate::dns::plant_request(ttl as u32);
+        0
+    } else if op == 1 {
+        crate::dns::plant_take() as i64
+    } else {
+        EINVAL
     }
 }
 

@@ -16,7 +16,7 @@ core::arch::global_asm!(include_str!("start.s"));
 const HEAP_VA: usize = 0x1_000A_0000;
 const HEAP_SIZE: usize = 1536 * 1024;
 const STACK_BYTES: usize = 16 * 1024;
-const WORKERS: usize = 4;
+const WORKERS: usize = 5;
 const ALLOC_SIZE: usize = HEAP_SIZE - WORKERS * STACK_BYTES;
 const HEADER: usize = 16;
 

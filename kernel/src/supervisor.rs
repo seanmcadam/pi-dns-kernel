@@ -317,6 +317,11 @@ pub fn status(ptr: u64, cap: u64) -> i64 {
     out.push("\nlimit=");
     out.dec(CRASH_LIMIT as u64);
     out.push("\n");
+    let mut cache = [0u8; 192];
+    let n = crate::dns::write_cache_stats(&mut cache);
+    if let Ok(line) = core::str::from_utf8(&cache[..n]) {
+        out.push(line);
+    }
     let n = out.len.min(cap as usize);
     crate::mmu::set_pan(false);
     unsafe {
@@ -568,14 +573,14 @@ fn say(level: u8, name: &str, what: &str, ec: u64, elr: u64, far: u64) {
 }
 
 struct Text {
-    data: [u8; 800],
+    data: [u8; 1200],
     len: usize,
 }
 
 impl Text {
     const fn new() -> Self {
         Self {
-            data: [0; 800],
+            data: [0; 1200],
             len: 0,
         }
     }

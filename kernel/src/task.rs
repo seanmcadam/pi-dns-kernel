@@ -65,6 +65,12 @@ const LOG_RELOAD: u64 = 45;
 const CONFIG_READ: u64 = 46;
 const CONFIG_WRITE: u64 = 47;
 const LOG_FILL: u64 = 48;
+const CONFIG_SET_CACHE: u64 = 49;
+const CONFIG_CACHE_REAP: u64 = 50;
+const TIMER_TICKS: u64 = 51;
+const TIMER_FREQ: u64 = 52;
+const SET_CACHE_STATS: u64 = 53;
+const CACHE_PLANT: u64 = 54;
 const THREAD_CREATE: u64 = 34;
 const THREAD_EXIT: u64 = 35;
 const THREAD_JOIN: u64 = 36;
@@ -474,7 +480,16 @@ fn syscall() -> u64 {
             ctx.x[0] = 0;
             RESUME
         }
-        LOG_RELOAD | CONFIG_READ | CONFIG_WRITE | LOG_FILL => {
+        LOG_RELOAD
+        | CONFIG_READ
+        | CONFIG_WRITE
+        | LOG_FILL
+        | CONFIG_SET_CACHE
+        | CONFIG_CACHE_REAP
+        | TIMER_TICKS
+        | TIMER_FREQ
+        | SET_CACHE_STATS
+        | CACHE_PLANT => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME

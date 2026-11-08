@@ -25,8 +25,16 @@ pub const LOG_MAX_ARCHIVES: u64 = 16;
 /// smallest FAT image we boot (8 MiB on the raspi4b test card).
 pub const LOG_MAX_TOTAL: u64 = 1_048_576;
 
+/// DNS cache slots. Each slot reserves 800 bytes plus a bucket word, and the
+/// DNS task heap is 1536 KiB with five 16 KiB thread stacks, so 1024 is the
+/// largest pool that still leaves room for packets.
 pub const CACHE_MIN: u64 = 1;
-pub const CACHE_MAX: u64 = 10_000;
+pub const CACHE_MAX: u64 = 1024;
+pub const CACHE_DEFAULT: u64 = 1024;
+/// How often the DNS task returns expired cache slots to the free list.
+pub const REAP_MIN: u64 = 1;
+pub const REAP_MAX: u64 = 3_600;
+pub const REAP_DEFAULT: u64 = 5;
 pub const RECORD_MAX: usize = 64;
 pub const UPSTREAM_MAX: usize = 8;
 pub const BLOCK_MAX: usize = 32;
@@ -252,6 +260,14 @@ const DNS_FIELDS: &[Field] = &[
         kind: FieldKind::U64 {
             min: CACHE_MIN,
             max: CACHE_MAX,
+        },
+    },
+    Field {
+        name: "cache_reap_interval_secs",
+        required: true,
+        kind: FieldKind::U64 {
+            min: REAP_MIN,
+            max: REAP_MAX,
         },
     },
     Field {

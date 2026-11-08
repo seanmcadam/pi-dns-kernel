@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use dns_cache::{CacheEntry, DnsCache};
+use dns_cache::DnsCache;
 use dns_protocol::{DnsPacket, QueryType, RData, RecordClass, RecordType, ResourceRecord};
 
 const LOG: u64 = 0;
@@ -24,8 +24,12 @@ const CONFIG_RECORDS: u64 = 13;
 const CONFIG_UPSTREAMS: u64 = 14;
 const CONFIG_BLOCKLIST: u64 = 15;
 const CONFIG_CACHE_SIZE: u64 = 16;
-const SET_CACHE_ENTRIES: u64 = 17;
 const LOG_POST: u64 = 28;
+const CONFIG_CACHE_REAP: u64 = 50;
+const TIMER_TICKS: u64 = 51;
+const TIMER_FREQ: u64 = 52;
+const SET_CACHE_STATS: u64 = 53;
+const CACHE_PLANT: u64 = 54;
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
@@ -38,6 +42,7 @@ struct PendingQuery {
     client_port: u16,
     name: String,
     qtype: u16,
+    qclass: u16,
     sent_ms: u64,
     upstream_idx: usize,
     original: Vec<u8>,
@@ -58,8 +63,9 @@ pub fn run() -> ! {
         let _ = log_line("dns-el0: bind failed");
         exit(1);
     }
-    let cache_size = sys(CONFIG_CACHE_SIZE, 0, 0, 0, 0, 0, 0).max(1) as usize;
-    let mut cache = DnsCache::new(cache_size);
+    let cache_size = sys(CONFIG_CACHE_SIZE, 0, 0, 0, 0, 0, 0).clamp(1, 1024) as usize;
+    let cache = DnsCache::new(cache_size);
+    publish(&cache);
     let mut pending: Vec<PendingQuery> = Vec::new();
     let mut next_id: u16 = 1;
     let mut tcp_fd: i64 = -1;
@@ -83,7 +89,6 @@ pub fn run() -> ! {
     unsafe {
         SHARED = Box::into_raw(shared);
     }
-    publish_cache(0);
     UPSTREAM_FD.store(upstream, Ordering::Release);
     let mut worker = 0;
     while worker < 2 {
@@ -93,6 +98,7 @@ pub fn run() -> ! {
     }
     let _ = crate::thread::spawn(tcp_worker, thread_stack(2), 0);
     let _ = crate::thread::spawn(retry_worker, thread_stack(3), 0);
+    let _ = crate::thread::spawn(cache_reaper, thread_stack(4), 0);
 
     loop {
         if let Some((packet, ip, port)) = udp_recv(dns) {
@@ -109,7 +115,7 @@ pub fn run() -> ! {
                         &mut shared.pending,
                         &mut shared.next_id,
                     );
-                    publish_cache(shared.cache.len());
+                    publish(&shared.cache);
                 }
             }
             crate::thread::mutex_unlock(&STATE_LOCK);
@@ -154,7 +160,7 @@ extern "C" fn upstream_worker(_index: u64) {
         unsafe {
             if let Some(shared) = SHARED.as_mut() {
                 take_upstream(&packet, shared.dns, &mut shared.cache, &mut shared.pending);
-                publish_cache(shared.cache.len());
+                publish(&shared.cache);
             }
         }
         crate::thread::mutex_unlock(&STATE_LOCK);
@@ -268,6 +274,7 @@ fn take_tcp_query(shared: &mut Shared) -> bool {
         &mut forwards,
         false,
     );
+    publish(&shared.cache);
     for (bytes, ip) in forwards {
         udp_send(shared.upstream, &bytes, ip, 53);
     }
@@ -339,8 +346,7 @@ fn handle_bytes(
     forwards: &mut Vec<(Vec<u8>, [u8; 4])>,
     remember_client: bool,
 ) {
-    let now = time_ms();
-    let seconds = now / 1000;
+    let now_ms = time_ms();
     let query = match DnsPacket::parse(packet) {
         Ok(query) => query,
         Err(_) => return,
@@ -352,6 +358,7 @@ fn handle_bytes(
     let name = normalize_name(&question.name);
     post_query(&name);
     let qtype = question.qtype as u16;
+    let qclass = question.qclass as u16;
 
     if blocked(&name) {
         if let Some(bytes) = error_response(&query, 3) {
@@ -374,7 +381,7 @@ fn handle_bytes(
         return;
     }
 
-    if let Some(mut cached) = cached_response(cache, &name, qtype, seconds) {
+    if let Some(mut cached) = cached_response(cache, &name, qtype, qclass, timer_ticks()) {
         set_id(&mut cached, query.header.id);
         replies.push((cached, ip, port));
         return;
@@ -399,7 +406,8 @@ fn handle_bytes(
         client_port: port,
         name,
         qtype,
-        sent_ms: now,
+        qclass,
+        sent_ms: now_ms,
         upstream_idx: 0,
         original: packet.to_vec(),
     });
@@ -450,7 +458,7 @@ fn take_upstream(packet: &[u8], dns_fd: i64, cache: &mut DnsCache, pending: &mut
     let item = pending.remove(pos);
     let mut packet = packet.to_vec();
     set_id(&mut packet, item.client_id);
-    remember(cache, &item.name, item.qtype, &packet, time_ms() / 1000);
+    remember(cache, &item.name, item.qtype, item.qclass, &packet);
     udp_send(dns_fd, &packet, item.client_ip, item.client_port);
 }
 
@@ -501,12 +509,21 @@ fn parse_rdata(kind: &str, value: &str) -> RData {
     }
 }
 
-fn cached_response(cache: &DnsCache, name: &str, qtype: u16, seconds: u64) -> Option<Vec<u8>> {
-    cache.get(name, qtype, seconds).map(|entry| entry.data.clone())
+fn cached_response(
+    cache: &mut DnsCache,
+    name: &str,
+    qtype: u16,
+    qclass: u16,
+    now: u64,
+) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 512];
+    cache
+        .get(name, qtype, qclass, now, &mut buf)
+        .map(|n| buf[..n].to_vec())
 }
 
-fn remember(cache: &mut DnsCache, name: &str, qtype: u16, packet: &[u8], seconds: u64) {
-    if packet.len() < 12 || packet[2] & 0x02 != 0 {
+fn remember(cache: &mut DnsCache, name: &str, qtype: u16, qclass: u16, packet: &[u8]) {
+    if packet.len() < 12 || packet.len() > 512 || packet[2] & 0x02 != 0 {
         return;
     }
     let rcode = packet[3] & 0x0f;
@@ -524,14 +541,52 @@ fn remember(cache: &mut DnsCache, name: &str, qtype: u16, packet: &[u8], seconds
         Ok(_) => 30,
         Err(_) => 60,
     };
-    cache.insert(CacheEntry {
-        name: name.to_string(),
-        record_type: qtype,
-        data: packet.to_vec(),
-        ttl,
-        timestamp: seconds,
-    });
-    publish_cache(cache.len());
+    let now = timer_ticks();
+    let freq = timer_freq().max(1);
+    let expiry = now.saturating_add((ttl as u64).saturating_mul(freq));
+    let _ = cache.insert(name, qtype, qclass, packet, expiry, now);
+}
+
+extern "C" fn cache_reaper(_arg: u64) {
+    let mut last_reap = 0u64;
+    loop {
+        let planted = sys(CACHE_PLANT, 1, 0, 0, 0, 0, 0);
+        if planted > 0 {
+            let now = timer_ticks();
+            let freq = timer_freq().max(1);
+            let expiry = now.saturating_add((planted as u64).saturating_mul(freq));
+            crate::thread::mutex_lock(&STATE_LOCK);
+            unsafe {
+                if let Some(shared) = SHARED.as_mut() {
+                    let _ = shared.cache.insert(
+                        "reap.invalid",
+                        1,
+                        1,
+                        b"reap-test-record!",
+                        expiry,
+                        now,
+                    );
+                    publish(&shared.cache);
+                }
+            }
+            crate::thread::mutex_unlock(&STATE_LOCK);
+        }
+        let secs = sys(CONFIG_CACHE_REAP, 0, 0, 0, 0, 0, 0).max(1) as u64;
+        let now_ms = time_ms();
+        if last_reap == 0 || now_ms.saturating_sub(last_reap) >= secs.saturating_mul(1000) {
+            let now = timer_ticks();
+            crate::thread::mutex_lock(&STATE_LOCK);
+            unsafe {
+                if let Some(shared) = SHARED.as_mut() {
+                    shared.cache.reap(now);
+                    publish(&shared.cache);
+                }
+            }
+            crate::thread::mutex_unlock(&STATE_LOCK);
+            last_reap = now_ms;
+        }
+        yield_now();
+    }
 }
 
 fn servfail_from_query(original: &[u8]) -> Option<Vec<u8>> {
@@ -652,8 +707,35 @@ fn read_config(num: u64) -> Option<String> {
     core::str::from_utf8(&buf[..n as usize]).ok().map(|text| text.to_string())
 }
 
-fn publish_cache(len: usize) {
-    let _ = sys(SET_CACHE_ENTRIES, len as u64, 0, 0, 0, 0, 0);
+fn publish(cache: &DnsCache) {
+    let stats = cache.stats();
+    let words = [
+        stats.slots,
+        stats.used,
+        stats.free,
+        stats.hits,
+        stats.misses,
+        stats.evictions,
+        stats.reaped,
+        stats.bytes,
+    ];
+    let mut raw = [0u8; 64];
+    let mut index = 0;
+    while index < words.len() {
+        let bytes = words[index].to_le_bytes();
+        let start = index * 8;
+        raw[start..start + 8].copy_from_slice(&bytes);
+        index += 1;
+    }
+    let _ = sys(SET_CACHE_STATS, raw.as_ptr() as u64, 0, 0, 0, 0, 0);
+}
+
+fn timer_ticks() -> u64 {
+    sys(TIMER_TICKS, 0, 0, 0, 0, 0, 0) as u64
+}
+
+fn timer_freq() -> u64 {
+    sys(TIMER_FREQ, 0, 0, 0, 0, 0, 0) as u64
 }
 
 fn udp_bind(port: u16) -> i64 {

@@ -68,6 +68,12 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 | 46 | `config_read(which, buf, cap)` |
 | 47 | `config_write(which, buf, len, err, err_cap)` |
 | 48 | `log_fill(n)` |
+| 49 | `config_set_cache(slots, secs, err, err_cap)` |
+| 50 | `config_cache_reap` |
+| 51 | `timer_ticks` |
+| 52 | `timer_freq` |
+| 53 | `set_cache_stats(ptr)` |
+| 54 | `cache_plant(op, ttl)` |
 
 `log_publish` is the log task only. It copies one line into a kernel ring and returns. It does not wait. `log_follow` copies the next line for that cursor and writes the new cursor and how many lines were skipped. It sleeps until a line is published, unless its fifth argument is `1`, in which case it returns `0`. `tcp_recv` takes a fourth argument: `1` returns `-11` instead of sleeping when the peer has not sent data. Anything else returns `-1`. `-2` is a bad user pointer. `-4` is a bad argument. `-6` means the thread table is full. `-11` means try again. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned. `futex_wait` and `futex_wake` require a 4-byte-aligned user address. The kernel re-reads the word under the scheduler lock, so a wake that lands before the wait returns a mismatch and the caller retries. The older sections below describe earlier revisions of this tree.
 
@@ -230,16 +236,18 @@ These crates are `no_std`-compatible but have `std` feature for testing.
 #### DNS Cache (`dns-cache`)
 
 **Features**:
-- In-memory cache with TTL
-- LRU-style eviction
-- Configurable size limit
+- Fixed slots reserved at startup (default 1024, `cache_size` 1..=1024)
+- Free list, hash chains on a fixed bucket array, LRU eviction
+- Reaper thread, interval `cache_reap_interval_secs` (1..=3600, default 5)
+- Expiry is an absolute `CNTPCT` value
 
 **Implementation**:
-- `Vec` storage (no hash map to minimize dependencies)
-- Linear scan for lookups (acceptable for small caches)
-- Time-based expiration
+- Each slot is 800 bytes: 255-byte name, type, class, 512-byte response, links
+- 1024 slots plus 1024 buckets reserve 823296 bytes
+- No allocation after `DnsCache::new`
+- Replies that do not fit, and names over 255 bytes, are not stored
 
-**Testing**: 3 unit tests covering insert, expiry, eviction
+**Testing**: unit tests for collisions, free-list reuse, expiry, and LRU eviction
 
 ### Application Layer
 

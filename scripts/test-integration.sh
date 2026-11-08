@@ -1028,6 +1028,125 @@ else
     echo "✗ JSON config HTTP checks failed"
     TESTS_FAILED=$((TESTS_FAILED + 3))
 fi
+if python3 - "$HTTP_HOST_PORT" <<'PY'
+import json, sys, time, urllib.error, urllib.request
+http = sys.argv[1]
+base = "http://127.0.0.1:%s" % http
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+
+def req(method, path, body=None, headers=None):
+    data = body.encode() if isinstance(body, str) else body
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if headers:
+        for k, v in headers.items():
+            r.add_header(k, v)
+    try:
+        resp = opener.open(r, timeout=8)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+def cache_fields(page):
+    for line in page.splitlines():
+        if line.startswith(b"cache "):
+            out = {}
+            for part in line.split()[1:]:
+                key, value = part.split(b"=", 1)
+                out[key.decode()] = int(value)
+            return out
+    return None
+
+status, page = req("GET", "/debug")
+fields = cache_fields(page)
+need = ["slots", "used", "free", "hits", "misses", "evictions", "reaped", "bytes"]
+if status != 200 or fields is None or any(key not in fields for key in need):
+    fail("debug cache line %s" % page[:400])
+if fields["slots"] != 1024 or fields["bytes"] != 823296 or fields["free"] != fields["slots"] - fields["used"]:
+    fail("debug stats %s" % fields)
+print("stats", fields)
+
+status, form = req("GET", "/dns-config")
+if status != 200 or b"1..=1024" not in form or b"1..=3600" not in form:
+    fail("dns config page %s" % form[:240])
+
+status, raw = req("GET", "/config/file/config")
+if status != 200:
+    fail("config download %s" % status)
+kept = raw
+doc = json.loads(raw)
+cases = []
+bad = json.loads(raw)
+bad["dns"]["cache_reap_interval_secs"] = 0
+cases.append((bad, b"out of bounds"))
+bad = json.loads(raw)
+bad["dns"]["cache_reap_interval_secs"] = 3601
+cases.append((bad, b"out of bounds"))
+bad = json.loads(raw)
+bad["dns"]["cache_size"] = 2048
+cases.append((bad, b"out of bounds"))
+bad = json.loads(raw)
+del bad["dns"]["cache_reap_interval_secs"]
+cases.append((bad, b"missing"))
+for mutated, needle in cases:
+    body = json.dumps(mutated, separators=(",", ":"))
+    status, err = req("POST", "/config/file/config", body, {"Content-Type": "application/json"})
+    if status != 400 or needle not in err:
+        fail("reject %s -> %s %s" % (needle, status, err[:180]))
+status, now = req("GET", "/config/file/config")
+if now != kept:
+    fail("rejected upload changed CONFIG.JSN")
+print("rejections")
+
+status, saved = req(
+    "POST",
+    "/dns-config",
+    "cache_size=1024&cache_reap_interval_secs=1",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200 or b'"restart":false' not in saved:
+    fail("form %s %s" % (status, saved[:160]))
+status, planted = req(
+    "POST",
+    "/debug/cache-plant",
+    "ttl=1",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200 or b"planted" not in planted:
+    fail("plant %s %s" % (status, planted[:80]))
+before = fields["reaped"]
+deadline = time.time() + 10
+seen = False
+last = b""
+while time.time() < deadline:
+    status, last = req("GET", "/debug")
+    fields = cache_fields(last) or {}
+    if fields.get("reaped", 0) > before and fields.get("used", 1) == 0:
+        seen = True
+        break
+    time.sleep(0.25)
+if not seen:
+    fail("reaper did not clear the planted entry %s" % last[:300])
+print("reaped", fields)
+PY
+then
+    echo "✓ /debug reports cache slots, hits, and reserved bytes"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ Cache config rejects out-of-range size and reap interval"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ Reaper returned an expired slot to the free list"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ DNS cache stats, validation, or reaper failed"
+    TESTS_FAILED=$((TESTS_FAILED + 3))
+fi
 kill $JSON_PID 2>/dev/null || true
 wait $JSON_PID 2>/dev/null || true
 sync
