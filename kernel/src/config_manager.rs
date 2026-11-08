@@ -304,6 +304,28 @@ pub fn set_display(vnc: u64, port: u64, password: &str, hdmi: u64) -> Result<(),
     Ok(())
 }
 
+/// Persist `display.vnc` and always queue start (`1`) or stop (`2`).
+/// A repeated start still queues, so a process that gave up can be asked again.
+/// The poll loop applies the command. This does not take the supervisor lock.
+pub fn request_vnc(on: bool) -> Result<(), String> {
+    let mut next = CURRENT.lock().clone().unwrap_or_else(default_config);
+    next.display.vnc = on;
+    let text = serialize_config(&next);
+    match crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes()) {
+        Ok(()) => {}
+        Err(crate::fs::FsError::NotInitialized) => {}
+        Err(err) => return Err(alloc::format!("save failed: {err}")),
+    }
+    *CURRENT.lock() = Some(next);
+    VNC_CMD.store(if on { 1 } else { 2 }, Ordering::Release);
+    log::info!("Queued VNC");
+    Ok(())
+}
+
+pub fn vnc_pending() -> u8 {
+    VNC_CMD.load(Ordering::Acquire)
+}
+
 pub fn take_display_cmd() -> (u8, u8) {
     (
         VNC_CMD.swap(0, Ordering::AcqRel),

@@ -51,6 +51,8 @@ const CONFIG_SET_CACHE: u64 = 49;
 const CACHE_PLANT: u64 = 54;
 const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
+const POWER: u64 = 58;
+const VNC_CTRL: u64 = 59;
 
 const EAGAIN: i64 = -11;
 
@@ -211,6 +213,8 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/log-config" => handle_log_config(request),
         "/dns-config" => handle_dns_config(request),
         "/display" => handle_display(request),
+        "/vnc" => handle_vnc(request),
+        "/power" => handle_power(request),
         "/config/file/config" => handle_config_file(request, 0),
         "/config/file/log" => handle_config_file(request, 1),
         "/debug/log-fill" => handle_log_fill(request),
@@ -380,11 +384,102 @@ fn handle_display(request: &HttpRequest) -> HttpResponse {
     }
 }
 
+fn handle_vnc(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    let op = match form_value(body, "action") {
+        Some("start") => 1,
+        Some("stop") => 2,
+        _ => return bad_request("action must be start or stop"),
+    };
+    if sys(VNC_CTRL, op, 0, 0, 0, 0, 0) < 0 {
+        return bad_request("VNC request was rejected");
+    }
+    handle_index()
+}
+
+fn handle_power(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    let action = form_value(body, "action").unwrap_or("");
+    let confirm = form_value(body, "confirm").unwrap_or("");
+    let op = if action == "shutdown" && confirm == "shutdown" {
+        1
+    } else if action == "reboot" && confirm == "reboot" {
+        2
+    } else {
+        return bad_request("Confirmation required");
+    };
+    let rc = sys(POWER, op, 0, 0, 0, 0, 0);
+    if rc < 0 {
+        return bad_request("Power request was rejected");
+    }
+    if rc == 1 {
+        return html_ok("A power change is already requested.");
+    }
+    let word = if op == 1 { "Shutdown" } else { "Reboot" };
+    html_ok(&format!("{word} requested."))
+}
+
+fn bad_request(message: &str) -> HttpResponse {
+    let mut response = HttpResponse::new(400, "Bad Request");
+    response.set_body(message.as_bytes());
+    response
+}
+
+fn vnc_block() -> String {
+    let state = sys(VNC_CTRL, 0, 0, 0, 0, 0, 0);
+    let (word, button) = match state {
+        1 => (
+            "running",
+            "<form method=\"POST\" action=\"/vnc\"><button type=\"submit\" name=\"action\" value=\"stop\">Stop</button></form>",
+        ),
+        2 => ("starting", "<button type=\"button\" disabled>Starting</button>"),
+        3 => ("stopping", "<button type=\"button\" disabled>Stopping</button>"),
+        4 => (
+            "failed",
+            "<form method=\"POST\" action=\"/vnc\"><p>The VNC process failed.</p><button type=\"submit\" name=\"action\" value=\"start\">Start</button></form>",
+        ),
+        _ => (
+            "off",
+            "<form method=\"POST\" action=\"/vnc\"><button type=\"submit\" name=\"action\" value=\"start\">Start</button></form>",
+        ),
+    };
+    format!("<h2>VNC</h2><p>VNC process: {word}</p>{button}")
+}
+
+fn power_block() -> String {
+    let state = sys(POWER, 0, 0, 0, 0, 0, 0);
+    let banner = match state {
+        1 => "<p>Shutdown requested.</p>",
+        2 => "<p>Reboot requested.</p>",
+        3 => "<p>Shutdown failed on this board. The machine is still running.</p>",
+        4 => "<p>Reboot failed on this board. The machine is still running.</p>",
+        _ => "",
+    };
+    let forms = if state == 1 || state == 2 {
+        ""
+    } else {
+        "<form method=\"POST\" action=\"/power\" onsubmit=\"return confirm('Shut down this DNS server?');\">\
+<label><input type=\"checkbox\" name=\"confirm\" value=\"shutdown\" required> Confirm shutdown</label>\
+<button type=\"submit\" name=\"action\" value=\"shutdown\">Shutdown</button></form>\
+<form method=\"POST\" action=\"/power\" onsubmit=\"return confirm('Reboot this DNS server?');\">\
+<label><input type=\"checkbox\" name=\"confirm\" value=\"reboot\" required> Confirm reboot</label>\
+<button type=\"submit\" name=\"action\" value=\"reboot\">Reboot</button></form>"
+    };
+    format!(
+        "<h2>Power</h2><p>Shutdown and reboot act on this machine. They do not affect the computer showing this page.</p>{banner}{forms}"
+    )
+}
+
 fn display_page() -> HttpResponse {
     let current = read_config_file(0).unwrap_or_default();
-    let live = sys(DISPLAY_IO, 6, 0, 0, 0, 0, 0);
     let present = sys(DISPLAY_IO, 7, 0, 0, 0, 0, 0);
-    let live = if live == 1 { "running" } else { "off" };
+    let vnc_block = vnc_block();
     let hdmi = if present == 1 {
         "this board has an HDMI process"
     } else {
@@ -396,7 +491,7 @@ fn display_page() -> HttpResponse {
 <h1>Display</h1>
 <p>VNC is an EL0 RFB 3.8 server. It is off until this form enables it. Default port 5900, bounds 1..=65535. Password 0..=8 printable bytes; empty means no authentication. The console is 640 by 480.</p>
 <p>HDMI is a separate process on Pi 4 and Pi 5. {hdmi}. vnc and hdmi are 0 or 1.</p>
-<p>VNC process: {live}</p>
+{vnc_block}
 <p>Current: {current}</p>
 <form method="POST" action="/display">
 <label>vnc <input name="vnc" required></label>
@@ -605,6 +700,8 @@ fn handle_index() -> HttpResponse {
             record.name, record.kind, record.value, record.ttl, record.name
         ));
     }
+    let vnc_block = vnc_block();
+    let power_block = power_block();
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -638,6 +735,8 @@ fn handle_index() -> HttpResponse {
         <input name="ttl" value="300">
         <button type="submit">Add record</button>
     </form>
+    {vnc_block}
+    {power_block}
     <h2>Management</h2>
     <ul>
         <li><a href="/status">System Status (JSON)</a></li>

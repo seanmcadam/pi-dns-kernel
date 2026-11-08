@@ -138,6 +138,36 @@ pub fn phase(slot: usize) -> u8 {
     unsafe { (*svc(slot)).phase }
 }
 
+/// `0` off or stopped, `1` running, `2` draining, `3` backoff, `4` gave up.
+pub fn runtime(slot: usize) -> u8 {
+    match phase(slot) {
+        RUNNING => 1,
+        DRAINING => 2,
+        BACKOFF => 3,
+        GAVEUP => 4,
+        _ => 0,
+    }
+}
+
+/// An explicit start may run a service that already gave up.
+pub fn revive(slot: usize) {
+    let _hold = guard();
+    if slot >= SLOTS {
+        return;
+    }
+    unsafe {
+        let row = &mut *svc(slot);
+        if row.phase != GAVEUP {
+            return;
+        }
+        row.phase = STOPPED;
+        row.hold = false;
+        row.pending_restart = false;
+        row.crash_n = 0;
+        row.backoff_ms = BACKOFF_START_MS;
+    }
+}
+
 pub fn is_live(slot: usize) -> bool {
     matches!(phase(slot), RUNNING | DRAINING)
 }

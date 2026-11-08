@@ -1926,6 +1926,289 @@ if [ "$PI5_OK" -ne 1 ]; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
+# VNC button, reboot, and shutdown use their own guests and their own host
+# ports. They never signal a QEMU this script did not start.
+echo ""
+echo "Test 31: VNC Start/Stop button, guest reboot, and guest shutdown"
+POWER_HTTP_PORT="${POWER_HTTP_PORT:-18080}"
+POWER_DNS_PORT="${POWER_DNS_PORT:-25353}"
+POWER_VNC_PORT="${POWER_VNC_PORT:-25900}"
+POWER_TELNET_PORT="${POWER_TELNET_PORT:-3323}"
+POWER_FWD="hostfwd=udp::${POWER_DNS_PORT}-:53,hostfwd=tcp::${POWER_HTTP_PORT}-:80,hostfwd=tcp::${POWER_TELNET_PORT}-:23,hostfwd=tcp::${POWER_VNC_PORT}-:5900"
+FOREIGN_QEMU=$(ps -eo pid=,args= | awk 'index($0, "qemu-system-aarch64") && index($0, "awk") == 0 {print $1}')
+start_power_guest() {
+    local serial="$1"
+    rm -f "$serial"
+    timeout 70 qemu-system-aarch64 \
+        -M virt,gic-version=2 \
+        -cpu cortex-a72 \
+        -smp 4 \
+        -m 512M \
+        -kernel boot/kernel8.img \
+        -serial file:"$serial" \
+        -display none -monitor none -nographic \
+        -netdev user,id=net0,${POWER_FWD} \
+        -device virtio-net-device,netdev=net0 \
+        >/tmp/qemu-power.txt 2>&1 &
+    POWER_PID=$!
+}
+wait_power_http() {
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        if curl -sf -u admin:admin --max-time 2 "http://127.0.0.1:${POWER_HTTP_PORT}/" >/dev/null; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+start_power_guest qemu/power-reboot.txt
+echo "Power guest PID: $POWER_PID"
+VNC_BUTTON_OK=0
+REBOOT_OK=0
+if wait_power_http; then
+    if python3 - "$POWER_HTTP_PORT" "$POWER_VNC_PORT" <<'PY'
+import json, socket, sys, time, urllib.error, urllib.request
+http_port, vnc_port = sys.argv[1], int(sys.argv[2])
+base = "http://127.0.0.1:%s" % http_port
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def req(method, path, data=None, headers=None, auth=True):
+    body = data.encode() if isinstance(data, str) else data
+    r = urllib.request.Request(base + path, data=body, method=method)
+    for key, value in (headers or {}).items():
+        r.add_header(key, value)
+    handler = opener if auth else urllib.request.build_opener()
+    try:
+        with handler.open(r, timeout=8) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+
+def connect():
+    sock = socket.socket()
+    sock.settimeout(0.5)
+    try:
+        sock.connect(("127.0.0.1", vnc_port))
+        peek = sock.recv(12, socket.MSG_PEEK)
+    except OSError:
+        sock.close()
+        return None
+    if peek != b"RFB 003.008\n":
+        sock.close()
+        return None
+    sock.close()
+    return True
+
+def uptime():
+    status, page = req("GET", "/status")
+    if status != 200:
+        fail("status %s" % status)
+    return json.loads(page)["uptime"]
+
+status, page = req("GET", "/")
+if status != 200 or b'value="start">Start</button>' not in page or b'value="stop">Stop</button>' in page:
+    fail("home label %s %s" % (status, page[:400]))
+if b">Shutdown</button>" not in page or b">Reboot</button>" not in page:
+    fail("power buttons missing")
+if b"confirm('Shut down this DNS server?')" not in page or b"confirm('Reboot this DNS server?')" not in page:
+    fail("confirmation dialog missing")
+status, _ = req("GET", "/vnc")
+if status != 405 or connect() is not None:
+    fail("GET /vnc changed the server %s" % status)
+status, _ = req("GET", "/power")
+if status != 405:
+    fail("GET /power %s" % status)
+status, _ = req("POST", "/vnc", "action=start", {"Content-Type": "application/x-www-form-urlencoded"}, auth=False)
+if status != 401:
+    fail("unauthenticated start %s" % status)
+before = uptime()
+status, body = req(
+    "POST",
+    "/power",
+    "action=shutdown",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 400 or b"Confirmation required" not in body:
+    fail("unconfirmed shutdown %s %s" % (status, body[:160]))
+if uptime() < before:
+    fail("unconfirmed shutdown rebooted the guest")
+status, page = req(
+    "POST",
+    "/vnc",
+    "action=start",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200:
+    fail("start %s %s" % (status, page[:200]))
+deadline = time.time() + 8
+while time.time() < deadline:
+    status, page = req("GET", "/")
+    if status == 200 and b'value="stop">Stop</button>' in page and b"VNC process: running" in page and connect() is not None:
+        break
+    time.sleep(0.25)
+else:
+    fail("button did not become Stop")
+status, page = req(
+    "POST",
+    "/vnc",
+    "action=stop",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200:
+    fail("stop %s" % status)
+deadline = time.time() + 8
+while time.time() < deadline:
+    status, page = req("GET", "/")
+    if status == 200 and b'value="start">Start</button>' in page and b'value="stop">Stop</button>' not in page and b"VNC process: off" in page and connect() is None:
+        break
+    time.sleep(0.25)
+else:
+    fail("button did not return to Start")
+print("vnc button ok")
+PY
+    then
+        VNC_BUTTON_OK=1
+    fi
+    if [ "$VNC_BUTTON_OK" = 1 ] && python3 - "$POWER_HTTP_PORT" <<'PY'
+import json, sys, time, urllib.error, urllib.request
+http_port = sys.argv[1]
+base = "http://127.0.0.1:%s" % http_port
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def req(method, path, data=None):
+    body = data.encode() if isinstance(data, str) else data
+    r = urllib.request.Request(base + path, data=body, method=method)
+    if data is not None:
+        r.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with opener.open(r, timeout=8) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+
+before = 0
+deadline = time.time() + 8
+while time.time() < deadline and before < 4:
+    status, page = req("GET", "/status")
+    before = json.loads(page)["uptime"]
+    time.sleep(0.3)
+if before < 4:
+    fail("uptime never reached 4 (%s)" % before)
+status, body = req("POST", "/power", "action=reboot&confirm=reboot")
+if status != 200 or b"Reboot requested." not in body:
+    fail("reboot response %s %s" % (status, body[:200]))
+deadline = time.time() + 20
+while time.time() < deadline:
+    try:
+        status, page = req("GET", "/status")
+        now = json.loads(page)["uptime"]
+    except Exception:
+        time.sleep(0.4)
+        continue
+    if status == 200 and now <= 2:
+        status, home = req("GET", "/")
+        if b'value="start">Start</button>' not in home or b">Shutdown</button>" not in home:
+            fail("home after reboot %s" % home[:240])
+        print("reboot", before, now)
+        break
+    time.sleep(0.4)
+else:
+    fail("guest uptime did not drop")
+PY
+    then
+        REBOOT_OK=1
+    fi
+else
+    echo "✗ Power guest did not answer HTTP"
+fi
+if kill -0 "$POWER_PID" 2>/dev/null; then
+    kill "$POWER_PID" 2>/dev/null || true
+    wait "$POWER_PID" 2>/dev/null || true
+fi
+if [ "$VNC_BUTTON_OK" = 1 ]; then
+    echo "✓ VNC button follows the live process"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ VNC Start/Stop button failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+if [ "$REBOOT_OK" = 1 ]; then
+    echo "✓ Guest reboot came back with a lower uptime"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Guest reboot failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+start_power_guest qemu/power-off.txt
+OFF_PID=$POWER_PID
+echo "Shutdown guest PID: $OFF_PID"
+SHUTDOWN_OK=0
+if wait_power_http && python3 - "$POWER_HTTP_PORT" <<'PY'
+import sys, urllib.error, urllib.request
+http_port = sys.argv[1]
+base = "http://127.0.0.1:%s" % http_port
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+body = "action=shutdown&confirm=shutdown".encode()
+r = urllib.request.Request(base + "/power", data=body, method="POST")
+r.add_header("Content-Type", "application/x-www-form-urlencoded")
+try:
+    with opener.open(r, timeout=8) as resp:
+        status, page = resp.status, resp.read()
+except urllib.error.HTTPError as err:
+    status, page = err.code, err.read()
+if status != 200 or b"Shutdown requested." not in page:
+    print("shutdown response %s %s" % (status, page[:200]), file=sys.stderr)
+    sys.exit(1)
+print("shutdown accepted")
+PY
+then
+    deadline=$((SECONDS + 12))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if ! kill -0 "$OFF_PID" 2>/dev/null; then
+            SHUTDOWN_OK=1
+            break
+        fi
+        sleep 0.3
+    done
+fi
+if [ "$SHUTDOWN_OK" = 1 ] && grep -q "power: shutdown" qemu/power-off.txt; then
+    echo "✓ Guest shutdown exited that QEMU"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Guest shutdown did not exit its QEMU"
+    if kill -0 "$OFF_PID" 2>/dev/null; then
+        kill "$OFF_PID" 2>/dev/null || true
+        wait "$OFF_PID" 2>/dev/null || true
+    fi
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+LEFT=""
+for pid in $FOREIGN_QEMU; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        LEFT="$LEFT $pid"
+    fi
+done
+if [ -n "$LEFT" ]; then
+    echo "✗ Unrelated QEMU exited:$LEFT"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Summary
 echo ""
 echo "=== Test Summary ==="

@@ -20,6 +20,7 @@ mod memory;
 mod net;
 mod panic;
 mod percpu;
+mod power;
 mod smp;
 mod spin;
 mod supervisor;
@@ -200,6 +201,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         task::poll_display();
         let _ = task::schedule_one();
         net::poll();
+        power::poll();
         supervisor::tick();
 
         let now = timer::millis();

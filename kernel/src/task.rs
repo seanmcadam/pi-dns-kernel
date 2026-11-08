@@ -76,6 +76,8 @@ const CACHE_PLANT: u64 = 54;
 const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
 const SET_DNS_TOP: u64 = 57;
+const POWER: u64 = 58;
+const VNC_CTRL: u64 = 59;
 const THREAD_CREATE: u64 = 34;
 const THREAD_EXIT: u64 = 35;
 const THREAD_JOIN: u64 = 36;
@@ -508,6 +510,14 @@ fn syscall() -> u64 {
         | SET_DNS_TOP => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
+            RESUME
+        }
+        POWER => {
+            ctx.x[0] = crate::power::request(a0 as u8) as u64;
+            RESUME
+        }
+        VNC_CTRL => {
+            ctx.x[0] = vnc_ctrl(a0) as u64;
             RESUME
         }
         4..=33 => {
@@ -1095,6 +1105,42 @@ pub fn vnc_is_live() -> bool {
     unsafe { VNC_LIVE }
 }
 
+/// `0` query, `1` start, `2` stop. The query reads the supervisor phase and
+/// the queued command. Start and stop only publish that command.
+fn vnc_ctrl(op: u64) -> i64 {
+    if crate::percpu::slot() != HTTP_SLOT {
+        return -3;
+    }
+    match op {
+        0 => vnc_state() as i64,
+        1 => match crate::config_manager::request_vnc(true) {
+            Ok(()) => 0,
+            Err(_) => -4,
+        },
+        2 => match crate::config_manager::request_vnc(false) {
+            Ok(()) => 0,
+            Err(_) => -4,
+        },
+        _ => -4,
+    }
+}
+
+fn vnc_state() -> u8 {
+    let pending = crate::config_manager::vnc_pending();
+    let runtime = crate::supervisor::runtime(VNC_SLOT);
+    if runtime == 2 || pending == 2 {
+        3
+    } else if pending == 1 || pending == 3 || runtime == 3 {
+        2
+    } else if runtime == 4 {
+        4
+    } else if runtime == 1 {
+        1
+    } else {
+        0
+    }
+}
+
 pub fn poll_display() {
     let (vnc, hdmi) = crate::config_manager::take_display_cmd();
     let vnc_left = apply_display(VNC_SLOT, vnc);
@@ -1113,6 +1159,10 @@ pub fn poll_display() {
 fn apply_display(slot: usize, cmd: u8) -> u8 {
     match cmd {
         1 => {
+            if crate::supervisor::runtime(slot) == 2 {
+                return 1;
+            }
+            crate::supervisor::revive(slot);
             let _ = crate::supervisor::launch(slot);
             0
         }

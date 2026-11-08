@@ -9,6 +9,8 @@
 //! parks the primary and secondaries are never started.
 
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
 pub fn start_secondary(cpu: usize, entry: u64, _entry_el: u64) {
     if cpu == 0 || cpu > 3 {
@@ -23,6 +25,19 @@ pub fn start_secondary(cpu: usize, entry: u64, _entry_el: u64) {
         hex_out(ret);
         crate::console::write_str("\r\n");
     }
+}
+
+/// PSCI `SYSTEM_OFF` or `SYSTEM_RESET` through SMC. The Pi 5 firmware claims
+/// `arm,psci`. This has not been run on a Pi 5. A return means the firmware
+/// refused the call and the board is still up.
+pub fn system_power(reset: bool) -> bool {
+    let fid = if reset {
+        PSCI_SYSTEM_RESET
+    } else {
+        PSCI_SYSTEM_OFF
+    };
+    let _ret = psci_smc(fid, 0, 0, 0);
+    true
 }
 
 fn psci_smc(fid: u64, a1: u64, a2: u64, a3: u64) -> u64 {

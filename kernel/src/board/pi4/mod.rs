@@ -138,6 +138,48 @@ impl Board for Pi4 {
     fn hdmi_code_bytes() -> usize {
         crate::board::HDMI_CODE_BYTES
     }
+
+    fn power(reset: bool) -> bool {
+        watchdog_power(reset)
+    }
+}
+
+/// BCM2711 power management at `0xFE100000` (bus `0x7E100000`).
+/// The same watchdog the Linux Pi driver uses: partition bits `0x555` ask the
+/// firmware to halt, and a full reset without those bits reboots.
+/// This has not been run on a Pi 4. A missing register is left alone.
+fn watchdog_power(reset: bool) -> bool {
+    const PM_BASE: u64 = 0xFE10_0000;
+    const PM_RSTC: u64 = PM_BASE + 0x1c;
+    const PM_RSTS: u64 = PM_BASE + 0x20;
+    const PM_WDOG: u64 = PM_BASE + 0x24;
+    const PM_PASSWORD: u32 = 0x5a00_0000;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x20;
+    const PM_RSTS_HALT: u32 = 0x555;
+    let Some(rsts) = crate::exception::read_u32_catching(PM_RSTS as *const u32) else {
+        return true;
+    };
+    let Some(rstc) = crate::exception::read_u32_catching(PM_RSTC as *const u32) else {
+        return true;
+    };
+    let rsts = if reset {
+        rsts & !PM_RSTS_HALT
+    } else {
+        (rsts & !PM_RSTS_HALT) | PM_RSTS_HALT
+    };
+    unsafe {
+        core::ptr::write_volatile(PM_RSTS as *mut u32, PM_PASSWORD | rsts);
+        core::ptr::write_volatile(PM_WDOG as *mut u32, PM_PASSWORD | 10);
+        let rstc = (rstc & PM_RSTC_WRCFG_CLR) | PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET;
+        core::ptr::write_volatile(PM_RSTC as *mut u32, rstc);
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+    let deadline = crate::timer::millis().saturating_add(50);
+    while crate::timer::millis() < deadline {
+        core::hint::spin_loop();
+    }
+    true
 }
 
 fn read_hotplug() -> i64 {

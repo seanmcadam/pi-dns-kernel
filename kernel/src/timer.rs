@@ -14,9 +14,13 @@ pub const TICK_HZ: u64 = 100;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
+/// `CNTVCT` at boot. QEMU does not clear that counter on reset, so uptime is
+/// the difference, not the raw value.
+static BOOT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     let freq = get_timer_frequency();
+    BOOT_COUNT.store(virtual_count(), Ordering::Release);
     log::info!("generic timer frequency {freq} Hz, virtual timer {TICK_HZ} Hz");
 }
 
@@ -73,7 +77,9 @@ pub fn uptime_secs() -> u64 {
     if freq == 0 {
         return 0;
     }
-    virtual_count() / freq
+    let now = virtual_count();
+    let boot = BOOT_COUNT.load(Ordering::Acquire);
+    now.saturating_sub(boot) / freq
 }
 
 fn virtual_count() -> u64 {

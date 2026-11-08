@@ -123,6 +123,14 @@ pub trait Board {
     fn hdmi_code_bytes() -> usize {
         4096
     }
+
+    /// Shut down or reboot this guest. `reset` selects reboot.
+    /// A successful call does not return. `true` means the platform refused
+    /// and this guest is still running.
+    fn power(reset: bool) -> bool {
+        let _ = reset;
+        true
+    }
 }
 
 pub const NAME: &str = <Active as Board>::NAME;
@@ -214,6 +222,10 @@ pub fn hdmi_code_ptr() -> *mut u8 {
 
 pub fn hdmi_code_bytes() -> usize {
     <Active as Board>::hdmi_code_bytes()
+}
+
+pub fn power(reset: bool) -> bool {
+    <Active as Board>::power(reset)
 }
 
 /// VideoCore bus address to ARM physical address.

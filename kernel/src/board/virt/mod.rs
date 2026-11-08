@@ -81,6 +81,10 @@ impl Board for Virt {
         }
         IrqHit::None
     }
+
+    fn power(reset: bool) -> bool {
+        smp::system_power(reset)
+    }
 }
 
 fn default_network() -> NetworkMode {

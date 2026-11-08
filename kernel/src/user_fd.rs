@@ -40,6 +40,8 @@
 //!  55  display_io(op, a, b, c). HDMI mailbox and framebuffer, plus VNC settings.
 //!  56  display_set(vnc, port, pass, pass_len, hdmi, err). Queues start or stop.
 //!  57  set_dns_top(ptr, len). DNS task publishes the fixed top-N blob.
+//!  58  power(action). HTTP task. 0 queries, 1 queues shutdown, 2 queues reboot.
+//!  59  vnc_ctrl(op). HTTP task. 0 queries the live process, 1 queues start, 2 queues stop.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 

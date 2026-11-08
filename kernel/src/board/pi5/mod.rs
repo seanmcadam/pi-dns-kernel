@@ -117,6 +117,10 @@ impl Board for Pi5 {
         IrqHit::None
     }
 
+    fn power(reset: bool) -> bool {
+        smp::system_power(reset)
+    }
+
     fn hdmi_present() -> bool {
         true
     }
