@@ -249,6 +249,12 @@ pub extern "C" fn secondary_main(cpu: u64) -> ! {
     crate::percpu::mark_online(id);
     crate::interrupts::init_secondary();
     loop {
+        if id == 1 && crate::net::service::try_become_owner() {
+            loop {
+                crate::net::service::drive();
+                core::hint::spin_loop();
+            }
+        }
         if !crate::task::schedule_one() {
             unsafe {
                 core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));

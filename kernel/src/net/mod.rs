@@ -1,20 +1,19 @@
 mod device;
 #[cfg(feature = "pi4")]
 mod genet;
+pub mod service;
 mod stack;
 #[cfg(not(feature = "pi4"))]
 mod virtio;
 
-use alloc::boxed::Box;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
-use spin::Mutex;
 
 pub use device::{DeviceType, EthernetDevice};
 pub use stack::NetworkStack;
 
-struct NetworkState {
+pub(crate) struct NetworkState {
     stack: NetworkStack,
     device: EthernetDevice,
     dhcp: Option<DhcpClient>,
@@ -29,8 +28,6 @@ struct DhcpClient {
     fallback_gateway: [u8; 4],
     finished: bool,
 }
-
-static NETWORK: Mutex<Option<Box<NetworkState>>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy)]
 pub enum NetworkMode {
@@ -95,7 +92,7 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
         } => {
             log::info!("Starting DHCP");
             let handle = stack.sockets_mut().add(dhcpv4::Socket::new());
-            *NETWORK.lock() = Some(Box::new(NetworkState {
+            service::install(NetworkState {
                 stack,
                 device,
                 dhcp: Some(DhcpClient {
@@ -107,30 +104,33 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
                     fallback_gateway,
                     finished: false,
                 }),
-            }));
+            });
             return Ok(());
         }
     }
 
-    *NETWORK.lock() = Some(Box::new(NetworkState {
+    service::install(NetworkState {
         stack,
         device,
         dhcp: None,
-    }));
+    });
 
     Ok(())
 }
 
-/// Drive the NIC and the socket stack.
+/// Drive the NIC. The network owner is the only caller that reaches the device.
 ///
-/// Called only from the kernel poll loop. A timer IRQ never calls this.
-/// `NETWORK` is a spin lock, so a poll from that IRQ would deadlock if a
-/// syscall already held it, and would reenter smoltcp if it did not.
+/// A timer IRQ never calls this. Socket syscalls do not take a device lock;
+/// they enqueue a request and sleep.
 pub fn poll() {
-    let mut net = NETWORK.lock();
-    let Some(state) = net.as_mut() else {
-        return;
-    };
+    service::drive();
+}
+
+pub fn polling_here() -> bool {
+    service::polling_here()
+}
+
+pub(crate) fn poll_device(state: &mut NetworkState) {
     let timestamp = Instant::from_millis(crate::timer::millis() as i64);
     state.stack.poll(timestamp, &mut state.device);
 
@@ -222,10 +222,3 @@ pub fn packet_counts() -> (u32, u32) {
     }
 }
 
-pub fn with_stack<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut NetworkStack, &mut EthernetDevice) -> R,
-{
-    let mut net = NETWORK.lock();
-    net.as_mut().map(|state| f(&mut state.stack, &mut state.device))
-}

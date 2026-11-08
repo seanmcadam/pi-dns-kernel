@@ -45,7 +45,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
-use crate::net::with_stack;
+use crate::net::service;
 
 const TIME_MS: u64 = 4;
 const UDP_BIND: u64 = 5;
@@ -95,6 +95,7 @@ const LISTENERS: usize = 4;
 #[derive(Clone, Copy)]
 enum Kind {
     Empty,
+    Reserved,
     Udp(SocketHandle),
     TcpListen([Option<SocketHandle>; LISTENERS], u16),
     TcpConn(SocketHandle),
@@ -110,6 +111,7 @@ static mut FDS: [[Kind; MAX_FD]; TASKS] = [
     [Kind::Empty; MAX_FD],
 ];
 static mut TASK_SLOT: [usize; 4] = [0; 4];
+static mut GEN: [[u32; MAX_FD]; TASKS] = [[0; MAX_FD]; TASKS];
 static FD_LOCK: [crate::spin::Spin; TASKS] = [
     crate::spin::Spin::new(),
     crate::spin::Spin::new(),
@@ -200,36 +202,23 @@ fn udp_bind(port: u64) -> i64 {
     let Some(port) = port_ok(port) else {
         return EINVAL;
     };
-    let result = with_stack(|stack, _| {
-        reap(stack);
-        if find_free().is_none() {
-            return EMFILE;
-        }
-        let rx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
-        let tx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
-        let handle = stack.sockets_mut().add(udp::Socket::new(rx, tx));
-        let bound = stack
-            .sockets_mut()
-            .get_mut::<udp::Socket>(handle)
-            .bind(port)
-            .is_ok();
-        if !bound {
-            stack.sockets_mut().remove(handle);
-            return EIO;
-        }
-        let fd = find_free().unwrap();
-        set_kind(fd, Kind::Udp(handle));
-        fd as i64
-    });
-    let fd = result.unwrap_or(EIO);
-    if fd >= 0 {
-        if port == 53 {
-            log::info!("DNS socket bound to port 53");
-        } else if port == 53535 {
-            log::info!("DNS upstream socket bound to port 53535");
-        }
+    let Some(fd) = find_free() else {
+        return EMFILE;
+    };
+    let task = slot();
+    set_kind(fd, Kind::Reserved);
+    bump_gen(task, fd);
+    if service::submit(service::OP_UDP_BIND, |body| {
+        body.fd = fd as u8;
+        body.port = port;
+        body.gen = gen_at(task, fd);
+    })
+    .is_none()
+    {
+        set_kind(fd, Kind::Empty);
+        return EAGAIN;
     }
-    fd
+    0
 }
 
 fn udp_recv(fd: u64, buf: u64, cap: u64, addr: u64) -> i64 {
@@ -242,46 +231,23 @@ fn udp_recv(fd: u64, buf: u64, cap: u64, addr: u64) -> i64 {
     if !crate::mmu::user_write_ok(addr, 8) {
         return EFAULT;
     }
-    let outcome = with_stack(|stack, _| {
-        reap(stack);
-        let Kind::Udp(handle) = kind_at(fd) else {
-            return Err(EBADF);
-        };
-        let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
-        if !socket.can_recv() {
-            return Err(EAGAIN);
-        }
-        match socket.recv() {
-            Ok((data, meta)) => {
-                let n = data.len().min(cap as usize);
-                unsafe {
-                    packet()[..n].copy_from_slice(&data[..n]);
-                }
-                let ip = match meta.endpoint.addr {
-                    IpAddress::Ipv4(ip) => {
-                        let bytes = ip.as_bytes();
-                        [bytes[0], bytes[1], bytes[2], bytes[3]]
-                    }
-                    _ => [0, 0, 0, 0],
-                };
-                let port = meta.endpoint.port.to_be_bytes();
-                Ok((n, [ip[0], ip[1], ip[2], ip[3], port[0], port[1], 0, 0]))
-            }
-            Err(_) => Err(EAGAIN),
-        }
-    });
-    match outcome {
-        Some(Ok((n, addr_bytes))) => {
-            let copied = unsafe { write_user(buf, &packet()[..n]) };
-            if copied && write_user(addr, &addr_bytes) {
-                n as i64
-            } else {
-                EFAULT
-            }
-        }
-        Some(Err(err)) => err,
-        None => EIO,
+    let Kind::Udp(handle) = kind_at(fd) else {
+        return EBADF;
+    };
+    let task = slot();
+    if service::submit(service::OP_UDP_RECV, |body| {
+        body.fd = fd as u8;
+        body.gen = gen_at(task, fd);
+        body.handle_raw = service::handle_raw(handle);
+        body.cap = cap as u32;
+        body.user_ptr = buf;
+        body.user_aux = addr;
+    })
+    .is_none()
+    {
+        return EAGAIN;
     }
+    0
 }
 
 fn udp_send(fd: u64, buf: u64, len: u64, ip: u64, port: u64) -> i64 {
@@ -294,89 +260,77 @@ fn udp_send(fd: u64, buf: u64, len: u64, ip: u64, port: u64) -> i64 {
     if len == 0 || len > MAX_PACKET as u64 || !crate::mmu::user_slice_ok(buf, len) {
         return EFAULT;
     }
-    if !read_user(buf, len as usize) {
-        return EFAULT;
-    }
-    let ip_bytes = (ip as u32).to_be_bytes();
-    let sent = with_stack(|stack, _| {
-        reap(stack);
-        let Kind::Udp(handle) = kind_at(fd) else {
-            return Err(EBADF);
-        };
-        let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
-        let endpoint = IpEndpoint::new(
-            Ipv4Address::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]).into(),
-            port,
-        );
-        let packet = unsafe { &packet()[..len as usize] };
-        socket
-            .send_slice(packet, endpoint)
-            .map(|_| 0)
-            .map_err(|_| EIO)
+    let Kind::Udp(handle) = kind_at(fd) else {
+        return EBADF;
+    };
+    let task = slot();
+    let posted = service::submit(service::OP_UDP_SEND, |body| {
+        body.fd = fd as u8;
+        body.gen = gen_at(task, fd);
+        body.handle_raw = service::handle_raw(handle);
+        body.ip = ip as u32;
+        body.port = port;
+        body.len = len as u32;
+        let n = len as usize;
+        crate::mmu::set_pan(false);
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf as *const u8, body.buf.as_mut_ptr(), n);
+        }
+        crate::mmu::set_pan(true);
     });
-    sent.unwrap_or(Err(EIO)).unwrap_or_else(|err| err)
+    if posted.is_none() {
+        return EAGAIN;
+    }
+    0
 }
 
 fn tcp_listen(port: u64) -> i64 {
     let Some(port) = port_ok(port) else {
         return EINVAL;
     };
-    let result = with_stack(|stack, _| {
-        recycle(stack);
-        let Some(fd) = find_free() else {
-            return EMFILE;
-        };
-        let mut slots = [None; LISTENERS];
-        for slot in slots.iter_mut() {
-            *slot = add_listener(stack, port);
-        }
-        if slots.iter().all(|slot| slot.is_none()) {
-            return EIO;
-        }
-        set_kind(fd, Kind::TcpListen(slots, port));
-        fd as i64
-    });
-    let fd = result.unwrap_or(EIO);
-    if fd >= 0 && port == 80 {
-        log::info!("HTTP socket listening on port 80");
+    let Some(fd) = find_free() else {
+        return EMFILE;
+    };
+    let task = slot();
+    set_kind(fd, Kind::Reserved);
+    bump_gen(task, fd);
+    if service::submit(service::OP_TCP_LISTEN, |body| {
+        body.fd = fd as u8;
+        body.port = port;
+        body.gen = gen_at(task, fd);
+    })
+    .is_none()
+    {
+        set_kind(fd, Kind::Empty);
+        return EAGAIN;
     }
-    fd
+    0
 }
 
 fn tcp_accept(fd: u64) -> i64 {
     let Some(fd) = fd_index(fd) else {
         return EBADF;
     };
-    let result = with_stack(|stack, _| {
-        recycle(stack);
-        let Kind::TcpListen(mut slots, port) = kind_at(fd) else {
-            return EBADF;
-        };
-        let ready = slots.iter().position(|slot| {
-            let Some(handle) = slot else {
-                return false;
-            };
-            let socket = stack.sockets_mut().get::<tcp::Socket>(*handle);
-            // SYN-RECEIVED is active but may_recv is false. Handing it out
-            // makes the first recv look like EOF and aborts the handshake.
-            socket.may_recv()
-        });
-        let Some(index) = ready else {
-            return EAGAIN;
-        };
-        let Some(handle) = slots[index].take() else {
-            return EAGAIN;
-        };
-        let Some(conn) = find_free() else {
-            slots[index] = Some(handle);
-            set_kind(fd, Kind::TcpListen(slots, port));
-            return EMFILE;
-        };
-        set_kind(fd, Kind::TcpListen(slots, port));
-        set_kind(conn, Kind::TcpConn(handle));
-        conn as i64
-    });
-    result.unwrap_or(EIO)
+    let Kind::TcpListen(_, _) = kind_at(fd) else {
+        return EBADF;
+    };
+    let Some(conn) = find_free() else {
+        return EMFILE;
+    };
+    let task = slot();
+    set_kind(conn, Kind::Reserved);
+    bump_gen(task, conn);
+    if service::submit(service::OP_TCP_ACCEPT, |body| {
+        body.fd = fd as u8;
+        body.conn_fd = conn as u8;
+        body.gen = gen_at(task, fd);
+    })
+    .is_none()
+    {
+        set_kind(conn, Kind::Empty);
+        return EAGAIN;
+    }
+    0
 }
 
 fn tcp_recv(fd: u64, buf: u64, cap: u64) -> i64 {
@@ -386,42 +340,22 @@ fn tcp_recv(fd: u64, buf: u64, cap: u64) -> i64 {
     if cap == 0 || cap > MAX_PACKET as u64 || !crate::mmu::user_write_ok(buf, cap) {
         return EFAULT;
     }
-    let outcome = with_stack(|stack, _| {
-        reap(stack);
-        let Kind::TcpConn(handle) = kind_at(fd) else {
-            return Err(EBADF);
-        };
-        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-        if !socket.can_recv() {
-            if socket.may_recv()
-                || matches!(
-                    socket.state(),
-                    tcp::State::SynSent | tcp::State::SynReceived
-                )
-            {
-                return Err(EAGAIN);
-            }
-            return Ok(0);
-        }
-        let n = cap as usize;
-        match socket.recv_slice(unsafe { &mut packet()[..n] }) {
-            Ok(copied) => Ok(copied),
-            Err(tcp::RecvError::Finished) => Ok(0),
-            Err(_) => Err(EAGAIN),
-        }
-    });
-    match outcome {
-        Some(Ok(0)) => 0,
-        Some(Ok(n)) => {
-            if unsafe { write_user(buf, &packet()[..n]) } {
-                n as i64
-            } else {
-                EFAULT
-            }
-        }
-        Some(Err(err)) => err,
-        None => EIO,
+    let Kind::TcpConn(handle) = kind_at(fd) else {
+        return EBADF;
+    };
+    let task = slot();
+    if service::submit(service::OP_TCP_RECV, |body| {
+        body.fd = fd as u8;
+        body.gen = gen_at(task, fd);
+        body.handle_raw = service::handle_raw(handle);
+        body.cap = cap as u32;
+        body.user_ptr = buf;
+    })
+    .is_none()
+    {
+        return EAGAIN;
     }
+    0
 }
 
 fn tcp_send(fd: u64, buf: u64, len: u64) -> i64 {
@@ -431,52 +365,424 @@ fn tcp_send(fd: u64, buf: u64, len: u64) -> i64 {
     if len == 0 || len > MAX_PACKET as u64 || !crate::mmu::user_slice_ok(buf, len) {
         return EFAULT;
     }
-    if !read_user(buf, len as usize) {
-        return EFAULT;
-    }
-    let sent = with_stack(|stack, _| {
-        recycle(stack);
-        let Kind::TcpConn(handle) = kind_at(fd) else {
-            return Err(EBADF);
-        };
-        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-        if !socket.can_send() {
-            return Err(EAGAIN);
+    let Kind::TcpConn(handle) = kind_at(fd) else {
+        return EBADF;
+    };
+    let task = slot();
+    let posted = service::submit(service::OP_TCP_SEND, |body| {
+        body.fd = fd as u8;
+        body.gen = gen_at(task, fd);
+        body.handle_raw = service::handle_raw(handle);
+        body.len = len as u32;
+        let n = len as usize;
+        crate::mmu::set_pan(false);
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf as *const u8, body.buf.as_mut_ptr(), n);
         }
-        let packet = unsafe { &packet()[..len as usize] };
-        socket
-            .send_slice(packet)
-            .map(|n| n as i64)
-            .map_err(|_| EIO)
+        crate::mmu::set_pan(true);
     });
-    sent.unwrap_or(Err(EIO)).unwrap_or_else(|err| err)
+    if posted.is_none() {
+        return EAGAIN;
+    }
+    0
 }
 
 fn tcp_close(fd: u64) -> i64 {
     let Some(fd) = fd_index(fd) else {
         return EBADF;
     };
-    let result = with_stack(|stack, _| {
-        match kind_at(fd) {
-            Kind::TcpConn(handle) => {
-                stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
-                set_kind(fd, Kind::Closing(handle));
-            }
-            Kind::TcpListen(slots, _) => {
-                for handle in slots.into_iter().flatten() {
-                    stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
+    let task = slot();
+    let kind = kind_at(fd);
+    set_kind(fd, Kind::Reserved);
+    bump_gen(task, fd);
+    let posted = match kind {
+        Kind::TcpConn(handle) => service::submit(service::OP_TCP_CLOSE, |body| {
+            body.fd = fd as u8;
+            body.cap = 1;
+            body.handle_raw = service::handle_raw(handle);
+        }),
+        Kind::TcpListen(slots, _) => service::submit(service::OP_TCP_CLOSE, |body| {
+            body.fd = fd as u8;
+            body.cap = 2;
+            body.listen = slots;
+        }),
+        Kind::Udp(handle) => service::submit(service::OP_TCP_CLOSE, |body| {
+            body.fd = fd as u8;
+            body.cap = 3;
+            body.handle_raw = service::handle_raw(handle);
+        }),
+        Kind::Closing(handle) => service::submit(service::OP_TCP_CLOSE, |body| {
+            body.fd = fd as u8;
+            body.cap = 4;
+            body.handle_raw = service::handle_raw(handle);
+        }),
+        _ => None,
+    };
+    if posted.is_none() {
+        set_kind(fd, kind);
+        return if matches!(kind, Kind::Empty | Kind::Reserved) {
+            EBADF
+        } else {
+            EAGAIN
+        };
+    }
+    0
+}
+
+fn gen_at(task: usize, fd: usize) -> u32 {
+    unsafe { GEN[task][fd] }
+}
+
+fn bump_gen(task: usize, fd: usize) {
+    unsafe {
+        GEN[task][fd] = GEN[task][fd].wrapping_add(1);
+    }
+}
+
+fn table_of(task: usize) -> &'static mut [Kind; MAX_FD] {
+    unsafe { &mut FDS[task] }
+}
+
+fn live(task: usize, fd: usize, gen: u32) -> bool {
+    let _lock = FD_LOCK[task].lock();
+    unsafe { GEN[task][fd] == gen }
+}
+
+pub fn perform(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let op = service::body(id).op;
+    if op == service::OP_CANCEL {
+        release_conn(id);
+        return service::Step::Done(EBADF);
+    }
+    match op {
+        service::OP_UDP_BIND => udp_bind_job(id, stack),
+        service::OP_UDP_RECV => udp_recv_job(id, stack),
+        service::OP_UDP_SEND => udp_send_job(id, stack),
+        service::OP_TCP_LISTEN => tcp_listen_job(id, stack),
+        service::OP_TCP_ACCEPT => tcp_accept_job(id, stack),
+        service::OP_TCP_RECV => tcp_recv_job(id, stack),
+        service::OP_TCP_SEND => tcp_send_job(id, stack),
+        service::OP_TCP_CLOSE => tcp_close_job(id, stack),
+        _ => service::Step::Done(EBADF),
+    }
+}
+
+fn release_conn(id: usize) {
+    let body = service::body(id);
+    if body.conn_fd == 0xff {
+        return;
+    }
+    let task = body.task as usize;
+    let conn = body.conn_fd as usize;
+    let _lock = FD_LOCK[task].lock();
+    if matches!(table_of(task)[conn], Kind::Reserved) {
+        table_of(task)[conn] = Kind::Empty;
+    }
+}
+
+fn udp_bind_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let port = body.port;
+    let rx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
+    let tx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
+    let handle = stack.sockets_mut().add(udp::Socket::new(rx, tx));
+    let bound = stack
+        .sockets_mut()
+        .get_mut::<udp::Socket>(handle)
+        .bind(port)
+        .is_ok();
+    if !bound {
+        stack.sockets_mut().remove(handle);
+        let _lock = FD_LOCK[task].lock();
+        table_of(task)[fd] = Kind::Empty;
+        return service::Step::Done(EIO);
+    }
+    {
+        let _lock = FD_LOCK[task].lock();
+        table_of(task)[fd] = Kind::Udp(handle);
+    }
+    if port == 53 {
+        log::info!("DNS socket bound to port 53");
+    } else if port == 53535 {
+        log::info!("DNS upstream socket bound to port 53535");
+    }
+    service::Step::Done(fd as i64)
+}
+
+fn udp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let gen = body.gen;
+    let handle = service::handle_of(body.handle_raw);
+    if !live(task, fd, gen) {
+        return service::Step::Done(EBADF);
+    }
+    let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
+    if !socket.can_recv() {
+        return service::Step::Pending;
+    }
+    match socket.recv() {
+        Ok((data, meta)) => {
+            let cap = service::body(id).cap as usize;
+            let n = data.len().min(cap);
+            service::body(id).buf[..n].copy_from_slice(&data[..n]);
+            service::body(id).copy_len = n as u32;
+            let ip = match meta.endpoint.addr {
+                IpAddress::Ipv4(ip) => {
+                    let bytes = ip.as_bytes();
+                    [bytes[0], bytes[1], bytes[2], bytes[3]]
                 }
-                set_kind(fd, Kind::Empty);
-            }
-            Kind::Udp(handle) => {
-                stack.sockets_mut().remove(handle);
-                set_kind(fd, Kind::Empty);
-            }
-            _ => return EBADF,
+                _ => [0, 0, 0, 0],
+            };
+            let port = meta.endpoint.port.to_be_bytes();
+            service::body(id).addr = [ip[0], ip[1], ip[2], ip[3], port[0], port[1], 0, 0];
+            service::body(id).aux_len = 8;
+            service::Step::Done(n as i64)
         }
-        0
+        Err(_) => service::Step::Pending,
+    }
+}
+
+fn udp_send_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let gen = body.gen;
+    let handle = service::handle_of(body.handle_raw);
+    let port = body.port;
+    let ip = body.ip;
+    let len = body.len as usize;
+    if !live(task, fd, gen) {
+        return service::Step::Done(EBADF);
+    }
+    let bytes = (ip as u32).to_be_bytes();
+    let endpoint = IpEndpoint::new(
+        Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]).into(),
+        port,
+    );
+    let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
+    match socket.send_slice(&service::body(id).buf[..len], endpoint) {
+        Ok(_) => service::Step::Done(0),
+        Err(_) => service::Step::Pending,
+    }
+}
+
+fn tcp_listen_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let port = body.port;
+    let mut slots = [None; LISTENERS];
+    for slot in slots.iter_mut() {
+        *slot = add_listener(stack, port);
+    }
+    if slots.iter().all(|slot| slot.is_none()) {
+        let _lock = FD_LOCK[task].lock();
+        table_of(task)[fd] = Kind::Empty;
+        return service::Step::Done(EIO);
+    }
+    {
+        let _lock = FD_LOCK[task].lock();
+        table_of(task)[fd] = Kind::TcpListen(slots, port);
+    }
+    if port == 80 {
+        log::info!("HTTP socket listening on port 80");
+    }
+    service::Step::Done(fd as i64)
+}
+
+fn tcp_accept_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let conn = body.conn_fd as usize;
+    let gen = body.gen;
+    if !live(task, fd, gen) {
+        release_conn(id);
+        return service::Step::Done(EBADF);
+    }
+    let slots = {
+        let _lock = FD_LOCK[task].lock();
+        match table_of(task)[fd] {
+            Kind::TcpListen(slots, _) => slots,
+            _ => {
+                drop(_lock);
+                release_conn(id);
+                return service::Step::Done(EBADF);
+            }
+        }
+    };
+    let ready = slots.iter().position(|slot| {
+        let Some(handle) = slot else {
+            return false;
+        };
+        stack.sockets_mut().get::<tcp::Socket>(*handle).may_recv()
     });
-    result.unwrap_or(EIO)
+    let Some(index) = ready else {
+        return service::Step::Pending;
+    };
+    let Some(handle) = slots[index] else {
+        return service::Step::Pending;
+    };
+    let _lock = FD_LOCK[task].lock();
+    let Kind::TcpListen(mut live_slots, port) = table_of(task)[fd] else {
+        drop(_lock);
+        release_conn(id);
+        return service::Step::Done(EBADF);
+    };
+    if live_slots[index] != Some(handle) {
+        return service::Step::Pending;
+    }
+    live_slots[index] = None;
+    table_of(task)[fd] = Kind::TcpListen(live_slots, port);
+    table_of(task)[conn] = Kind::TcpConn(handle);
+    service::Step::Done(conn as i64)
+}
+
+fn tcp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let gen = body.gen;
+    let handle = service::handle_of(body.handle_raw);
+    let cap = body.cap as usize;
+    if !live(task, fd, gen) {
+        return service::Step::Done(EBADF);
+    }
+    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+    if !socket.can_recv() {
+        if socket.may_recv()
+            || matches!(
+                socket.state(),
+                tcp::State::SynSent | tcp::State::SynReceived
+            )
+        {
+            return service::Step::Pending;
+        }
+        return service::Step::Done(0);
+    }
+    match socket.recv_slice(&mut service::body(id).buf[..cap]) {
+        Ok(copied) => {
+            service::body(id).copy_len = copied as u32;
+            service::Step::Done(copied as i64)
+        }
+        Err(tcp::RecvError::Finished) => service::Step::Done(0),
+        Err(_) => service::Step::Pending,
+    }
+}
+
+fn tcp_send_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let gen = body.gen;
+    let handle = service::handle_of(body.handle_raw);
+    let len = body.len as usize;
+    if !live(task, fd, gen) {
+        return service::Step::Done(EBADF);
+    }
+    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+    if !socket.can_send() {
+        if matches!(
+            socket.state(),
+            tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived | tcp::State::SynSent
+        ) {
+            return service::Step::Pending;
+        }
+        return service::Step::Done(EIO);
+    }
+    match socket.send_slice(&service::body(id).buf[..len]) {
+        Ok(n) => service::Step::Done(n as i64),
+        Err(_) => service::Step::Pending,
+    }
+}
+
+fn tcp_close_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let mode = body.cap;
+    let handle = service::handle_of(body.handle_raw);
+    let slots = body.listen;
+    service::cancel_fd(task, fd, id);
+    match mode {
+        1 => {
+            stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Closing(handle);
+        }
+        2 => {
+            for handle in slots.into_iter().flatten() {
+                stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
+            }
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Empty;
+        }
+        3 => {
+            stack.sockets_mut().remove(handle);
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Empty;
+        }
+        _ => {
+            stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Empty;
+        }
+    }
+    service::Step::Done(0)
+}
+
+pub fn recycle_all(stack: &mut crate::net::NetworkStack) {
+    for task in 0..TASKS {
+        let _lock = FD_LOCK[task].lock();
+        recycle_task(task, stack);
+    }
+}
+
+fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
+    let table = table_of(task);
+    let Some(listen_fd) = (0..MAX_FD).find(|index| matches!(table[*index], Kind::TcpListen(_, _)))
+    else {
+        return;
+    };
+    let Kind::TcpListen(mut slots, port) = table[listen_fd] else {
+        return;
+    };
+    for index in 0..MAX_FD {
+        let Kind::Closing(handle) = table[index] else {
+            continue;
+        };
+        if slots.iter().all(|slot| slot.is_some()) {
+            break;
+        }
+        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+        if socket.send_queue() > 0 {
+            continue;
+        }
+        if matches!(
+            socket.state(),
+            tcp::State::Established
+                | tcp::State::CloseWait
+                | tcp::State::SynReceived
+                | tcp::State::SynSent
+        ) {
+            continue;
+        }
+        if socket.is_open() {
+            socket.abort();
+        }
+        if socket.listen(port).is_err() {
+            continue;
+        }
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(handle);
+            table[index] = Kind::Empty;
+        }
+    }
+    table[listen_fd] = Kind::TcpListen(slots, port);
 }
 
 fn add_listener(stack: &mut crate::net::NetworkStack, port: u16) -> Option<SocketHandle> {
@@ -493,49 +799,6 @@ fn add_listener(stack: &mut crate::net::NetworkStack, port: u16) -> Option<Socke
         return None;
     }
     Some(handle)
-}
-
-fn recycle(stack: &mut crate::net::NetworkStack) {
-    let Some(listen_fd) = (0..MAX_FD).find(|index| matches!(kind_at(*index), Kind::TcpListen(_, _)))
-    else {
-        return;
-    };
-    let Kind::TcpListen(mut slots, port) = kind_at(listen_fd) else {
-        return;
-    };
-    for index in 0..MAX_FD {
-        let Kind::Closing(handle) = kind_at(index) else {
-            continue;
-        };
-        if slots.iter().all(|slot| slot.is_some()) {
-            break;
-        }
-        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-        if socket.send_queue() > 0 {
-            continue;
-        }
-        if matches!(
-            socket.state(),
-            tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived | tcp::State::SynSent
-        ) {
-            continue;
-        }
-        if socket.is_open() {
-            socket.abort();
-        }
-        if socket.listen(port).is_err() {
-            continue;
-        }
-        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(handle);
-            set_kind(index, Kind::Empty);
-        }
-    }
-    set_kind(listen_fd, Kind::TcpListen(slots, port));
-}
-
-fn reap(stack: &mut crate::net::NetworkStack) {
-    recycle(stack);
 }
 
 fn meta(n: usize) -> Vec<udp::PacketMetadata> {

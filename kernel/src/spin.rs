@@ -3,21 +3,23 @@
 //! Lock order, outermost first. A holder may take a later lock. It must not
 //! take an earlier one.
 //!
-//! 1. `SCHED` — run queue, thread state, futex waiters, join waiters.
+//! 1. `SCHED` — run queue, thread state, futex waiters, join waiters, and
+//!    socket sleepers.
 //!    IRQ-safe (the holder masks IRQ). The timer IRQ does not take it: it
 //!    only counts the tick and, at EL0, returns to the scheduler.
 //! 2. `FD` — that process's file-descriptor table. One lock per EL0 task.
-//!    Not IRQ-safe. Socket syscalls take it and then `NET`.
+//!    Not IRQ-safe. A socket syscall drops it before sleeping.
 //! 3. `CONFIG` — config records. Not IRQ-safe. May take `FS` and then `LOGQ`.
 //! 4. `FS` — the FAT volume. Not IRQ-safe. One lock, any core.
-//! 5. `NET` — smoltcp and the NIC. Not IRQ-safe. One lock, any core.
-//! 6. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
+//! 5. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
 //!
-//! `NET` and `FS` stay one lock each because neither library is reentrant
-//! and the block device has a single command slot. Pinning them to core 0
-//! would need a second queue for every send, recv, and file syscall. Any
-//! core may take the lock. The timer IRQ never does, so a core that is
-//! interrupted while holding one cannot deadlock on it.
+//! smoltcp and the NIC have no lock. Core 1 owns them after the stack is up
+//! (core 0 until then, and on a one-core boot). Other cores enqueue a
+//! request and sleep on `SCHED`. The owner may take `FD` to publish a
+//! bind or accept, drop it, then take `SCHED` to wake the caller. It never
+//! holds `FD` and `SCHED` together. `FS` stays one lock because the FAT
+//! library is not reentrant and the block device has one command slot.
+//! The timer IRQ takes none of these.
 //!
 //! The UART and the panic path take no locks.
 

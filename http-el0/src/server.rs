@@ -15,6 +15,12 @@ static JOB: [AtomicU32; HTTP_WORKERS] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
 ];
+static WAITING: [AtomicU32; HTTP_WORKERS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 
 const YIELD: u64 = 1;
 const EXIT: u64 = 3;
@@ -64,29 +70,37 @@ pub fn run() -> ! {
 }
 
 extern "C" fn conn_worker(index: u64) {
-    let job = &JOB[index as usize];
+    let slot = index as usize;
+    let job = &JOB[slot];
+    let waiting = &WAITING[slot];
     loop {
+        waiting.store(1, Ordering::Release);
         let value = job.load(Ordering::Acquire);
         if value == 0 {
             let _ = crate::thread::futex_wait(job, 0);
             continue;
         }
-        job.store(0, Ordering::Release);
-        let conn = (value - 1) as i64;
-        serve(conn);
-        let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+        waiting.store(0, Ordering::Release);
+        if job
+            .compare_exchange(value, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        serve((value - 1) as i64);
+        let _ = sys(TCP_CLOSE, (value - 1) as u64, 0, 0, 0, 0, 0);
     }
 }
 
 fn handoff(conn: u32) -> bool {
     let mut index = 0;
     while index < HTTP_WORKERS {
-        let job = &JOB[index];
-        if job
-            .compare_exchange(0, conn + 1, Ordering::AcqRel, Ordering::Relaxed)
+        if WAITING[index]
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            let _ = crate::thread::futex_wake(job, 1);
+            JOB[index].store(conn + 1, Ordering::Release);
+            let _ = crate::thread::futex_wake(&JOB[index], 1);
             return true;
         }
         index += 1;

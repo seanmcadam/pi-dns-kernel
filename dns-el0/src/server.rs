@@ -1,6 +1,7 @@
 //! Resolver and DNS server. Same answers as the old kernel loop: local
 //! records, cache, upstream retry, and a blocklist that the kernel stores.
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -63,183 +64,220 @@ pub fn run() -> ! {
     let mut next_id: u16 = 1;
     let mut tcp_fd: i64 = -1;
     let mut tcp_buf: Vec<u8> = Vec::new();
-    publish_cache(cache.len());
+    // Socket calls now sleep until the NIC has data, so this thread cannot
+    // poll the client socket, the upstream mailbox, and TCP in one loop.
+    // Each wait lives on its own thread and they share the cache under one
+    // futex mutex. Sends happen while that mutex is held; a send completes
+    // in the network owner without waiting for a peer, so the lock is not
+    // held across a packet round trip.
+    let shared = Box::new(Shared {
+        cache,
+        pending,
+        next_id,
+        dns,
+        upstream,
+        tcp,
+        tcp_fd,
+        tcp_buf,
+    });
+    unsafe {
+        SHARED = Box::into_raw(shared);
+    }
+    publish_cache(0);
     UPSTREAM_FD.store(upstream, Ordering::Release);
     let mut worker = 0;
     while worker < 2 {
-        let top = 0x1_000A_0000u64 + (1536 * 1024) - (worker as u64 + 1) * (16 * 1024);
+        let top = thread_stack(worker);
         let _ = crate::thread::spawn(upstream_worker, top, worker as u64);
         worker += 1;
     }
+    let _ = crate::thread::spawn(tcp_worker, thread_stack(2), 0);
+    let _ = crate::thread::spawn(retry_worker, thread_stack(3), 0);
 
     loop {
-        while let Some((packet, ip, port)) = udp_recv(dns) {
-            handle_client(
-                &packet,
-                ip,
-                port,
-                dns,
-                upstream,
-                &mut cache,
-                &mut pending,
-                &mut next_id,
-            );
+        if let Some((packet, ip, port)) = udp_recv(dns) {
+            crate::thread::mutex_lock(&STATE_LOCK);
+            unsafe {
+                if let Some(shared) = SHARED.as_mut() {
+                    handle_client(
+                        &packet,
+                        ip,
+                        port,
+                        shared.dns,
+                        shared.upstream,
+                        &mut shared.cache,
+                        &mut shared.pending,
+                        &mut shared.next_id,
+                    );
+                    publish_cache(shared.cache.len());
+                }
+            }
+            crate::thread::mutex_unlock(&STATE_LOCK);
+        } else {
+            yield_now();
         }
-        drain_upstream(dns, &mut cache, &mut pending);
-        service_tcp(tcp, &mut tcp_fd, &mut tcp_buf, &mut cache, &mut pending, &mut next_id, upstream, dns);
-        retry_expired(upstream, dns, &mut pending, &mut next_id);
-        KICK.fetch_add(1, Ordering::Release);
-        let _ = crate::thread::futex_wake(&KICK, 2);
-        yield_now();
     }
 }
 
-static UPSTREAM_FD: AtomicI64 = AtomicI64::new(0);
-static KICK: AtomicU32 = AtomicU32::new(0);
-static MAIL_LOCK: AtomicU32 = AtomicU32::new(0);
-
-struct Mail {
-    used: bool,
-    len: u16,
-    ip: [u8; 4],
-    port: u16,
-    data: [u8; 512],
+struct Shared {
+    cache: DnsCache,
+    pending: Vec<PendingQuery>,
+    next_id: u16,
+    dns: i64,
+    upstream: i64,
+    tcp: i64,
+    tcp_fd: i64,
+    tcp_buf: Vec<u8>,
 }
 
-static mut MAIL: [Mail; 8] = [
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
-];
+static mut SHARED: *mut Shared = core::ptr::null_mut();
+static UPSTREAM_FD: AtomicI64 = AtomicI64::new(0);
+static STATE_LOCK: AtomicU32 = AtomicU32::new(0);
+static RETRY_KICK: AtomicU32 = AtomicU32::new(0);
+
+fn thread_stack(index: u64) -> u64 {
+    0x1_000A_0000u64 + (1536 * 1024) - (index + 1) * (16 * 1024)
+}
 
 extern "C" fn upstream_worker(_index: u64) {
     loop {
         let fd = UPSTREAM_FD.load(Ordering::Acquire);
         if fd <= 0 {
-            let seen = KICK.load(Ordering::Acquire);
-            let _ = crate::thread::futex_wait(&KICK, seen);
+            yield_now();
             continue;
         }
-        if let Some((packet, ip, port)) = udp_recv(fd) {
-            deposit(&packet, ip, port);
+        let Some((packet, _ip, _port)) = udp_recv(fd) else {
+            yield_now();
             continue;
-        }
-        let seen = KICK.load(Ordering::Acquire);
-        let _ = crate::thread::futex_wait(&KICK, seen);
-    }
-}
-
-fn deposit(packet: &[u8], ip: [u8; 4], port: u16) {
-    let copy = packet.len().min(512);
-    loop {
-        crate::thread::mutex_lock(&MAIL_LOCK);
-        let stored = unsafe {
-            let mut index = 0;
-            while index < MAIL.len() {
-                if !MAIL[index].used {
-                    MAIL[index].used = true;
-                    MAIL[index].len = copy as u16;
-                    MAIL[index].ip = ip;
-                    MAIL[index].port = port;
-                    MAIL[index].data[..copy].copy_from_slice(&packet[..copy]);
-                    break;
-                }
-                index += 1;
-            }
-            index < MAIL.len()
         };
-        crate::thread::mutex_unlock(&MAIL_LOCK);
-        if stored {
-            return;
-        }
-        yield_now();
-    }
-}
-
-fn drain_upstream(dns: i64, cache: &mut DnsCache, pending: &mut Vec<PendingQuery>) {
-    loop {
-        let mut packet = [0u8; 512];
-        let mut len = 0usize;
-        crate::thread::mutex_lock(&MAIL_LOCK);
+        crate::thread::mutex_lock(&STATE_LOCK);
         unsafe {
-            let mut index = 0;
-            while index < MAIL.len() {
-                if MAIL[index].used {
-                    len = MAIL[index].len as usize;
-                    packet[..len].copy_from_slice(&MAIL[index].data[..len]);
-                    MAIL[index].used = false;
-                    break;
-                }
-                index += 1;
+            if let Some(shared) = SHARED.as_mut() {
+                take_upstream(&packet, shared.dns, &mut shared.cache, &mut shared.pending);
+                publish_cache(shared.cache.len());
             }
         }
-        crate::thread::mutex_unlock(&MAIL_LOCK);
-        if len == 0 {
-            return;
-        }
-        take_upstream(&packet[..len], dns, cache, pending);
+        crate::thread::mutex_unlock(&STATE_LOCK);
     }
 }
 
-fn service_tcp(
-    listen: i64,
-    conn: &mut i64,
-    buf: &mut Vec<u8>,
-    cache: &mut DnsCache,
-    pending: &mut Vec<PendingQuery>,
-    next_id: &mut u16,
-    upstream: i64,
-    dns: i64,
-) {
-    if listen < 0 {
-        return;
-    }
-    if *conn < 0 {
-        let accepted = sys(TCP_ACCEPT, listen as u64, 0, 0, 0, 0, 0);
-        if accepted >= 0 {
-            *conn = accepted;
-            buf.clear();
+extern "C" fn retry_worker(_index: u64) {
+    loop {
+        crate::thread::mutex_lock(&STATE_LOCK);
+        let mut busy = false;
+        unsafe {
+            if let Some(shared) = SHARED.as_mut() {
+                if !shared.pending.is_empty() {
+                    retry_expired(
+                        shared.upstream,
+                        shared.dns,
+                        &mut shared.pending,
+                        &mut shared.next_id,
+                    );
+                    busy = !shared.pending.is_empty();
+                }
+            }
         }
-        return;
+        let seen = RETRY_KICK.load(Ordering::Acquire);
+        crate::thread::mutex_unlock(&STATE_LOCK);
+        if busy {
+            yield_now();
+        } else {
+            let _ = crate::thread::futex_wait(&RETRY_KICK, seen);
+        }
     }
-    let mut tmp = [0u8; 512];
-    let n = sys(TCP_RECV, *conn as u64, tmp.as_mut_ptr() as u64, tmp.len() as u64, 0, 0, 0);
-    if n == 0 {
-        let _ = sys(TCP_CLOSE, *conn as u64, 0, 0, 0, 0, 0);
-        *conn = -1;
-        buf.clear();
-        return;
+}
+
+fn poke_retry() {
+    RETRY_KICK.fetch_add(1, Ordering::Release);
+    let _ = crate::thread::futex_wake(&RETRY_KICK, 1);
+}
+
+extern "C" fn tcp_worker(_index: u64) {
+    loop {
+        let listen = unsafe { SHARED.as_ref().map(|shared| shared.tcp).unwrap_or(-1) };
+        if listen < 0 {
+            yield_now();
+            continue;
+        }
+        let accepted = sys(TCP_ACCEPT, listen as u64, 0, 0, 0, 0, 0);
+        if accepted < 0 {
+            yield_now();
+            continue;
+        }
+        crate::thread::mutex_lock(&STATE_LOCK);
+        unsafe {
+            if let Some(shared) = SHARED.as_mut() {
+                shared.tcp_fd = accepted;
+                shared.tcp_buf.clear();
+            }
+        }
+        crate::thread::mutex_unlock(&STATE_LOCK);
+        loop {
+            let mut tmp = [0u8; 512];
+            let n = sys(
+                TCP_RECV,
+                accepted as u64,
+                tmp.as_mut_ptr() as u64,
+                tmp.len() as u64,
+                0,
+                0,
+                0,
+            );
+            if n <= 0 {
+                let _ = sys(TCP_CLOSE, accepted as u64, 0, 0, 0, 0, 0);
+                break;
+            }
+            let mut done = false;
+            crate::thread::mutex_lock(&STATE_LOCK);
+            unsafe {
+                if let Some(shared) = SHARED.as_mut() {
+                    shared.tcp_buf.extend_from_slice(&tmp[..n as usize]);
+                    done = take_tcp_query(shared);
+                }
+            }
+            crate::thread::mutex_unlock(&STATE_LOCK);
+            if done {
+                break;
+            }
+        }
     }
-    if n < 0 {
-        return;
+}
+
+fn take_tcp_query(shared: &mut Shared) -> bool {
+    if shared.tcp_buf.len() < 2 {
+        return false;
     }
-    buf.extend_from_slice(&tmp[..n as usize]);
-    if buf.len() < 2 {
-        return;
+    let need = u16::from_be_bytes([shared.tcp_buf[0], shared.tcp_buf[1]]) as usize;
+    if need == 0 || shared.tcp_buf.len() < 2 + need {
+        return false;
     }
-    let need = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-    if buf.len() < 2 + need || need == 0 {
-        return;
-    }
-    let query = buf[2..2 + need].to_vec();
-    buf.drain(..2 + need);
+    let query = shared.tcp_buf[2..2 + need].to_vec();
+    shared.tcp_buf.drain(..2 + need);
+    let conn = shared.tcp_fd;
     let mut replies = Vec::new();
     let mut forwards = Vec::new();
-    handle_bytes(&query, [0, 0, 0, 0], 0, cache, pending, next_id, &mut replies, &mut forwards, false);
-    for (bytes, _ip, _port) in replies {
-        send_tcp(*conn, &bytes);
-        *conn = -1;
-        break;
-    }
+    handle_bytes(
+        &query,
+        [0, 0, 0, 0],
+        0,
+        &mut shared.cache,
+        &mut shared.pending,
+        &mut shared.next_id,
+        &mut replies,
+        &mut forwards,
+        false,
+    );
     for (bytes, ip) in forwards {
-        udp_send(upstream, &bytes, ip, 53);
+        udp_send(shared.upstream, &bytes, ip, 53);
     }
-    let _ = dns;
+    for (bytes, _ip, _port) in replies {
+        send_tcp(conn, &bytes);
+        let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+        shared.tcp_fd = -1;
+        return true;
+    }
+    false
 }
 
 fn send_tcp(fd: i64, payload: &[u8]) {
@@ -366,6 +404,7 @@ fn handle_bytes(
         original: packet.to_vec(),
     });
     forwards.push((forwarded, dest));
+    poke_retry();
 }
 
 fn retry_expired(upstream_fd: i64, dns_fd: i64, pending: &mut Vec<PendingQuery>, next_id: &mut u16) {

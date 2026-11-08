@@ -65,14 +65,13 @@ QEMU is started with `-smp 4`. Core 0 brings the other three up with PSCI `CPU_O
 
 Lock order, outermost first. A holder may take a later lock and must not take an earlier one.
 
-1. `SCHED` — run queue, thread state, futex waiters, and join waiters. IRQ-safe. The timer IRQ does not take it.
-2. `FD` — one lock per EL0 task, for that task's file descriptors. Not IRQ-safe. A socket syscall then takes `NET`.
+1. `SCHED` — run queue, thread state, futex waiters, join waiters, and socket sleepers. IRQ-safe. The timer IRQ does not take it.
+2. `FD` — one lock per EL0 task, for that task's file descriptors. Not IRQ-safe. A socket syscall drops it before sleeping.
 3. `CONFIG` — config records. Not IRQ-safe.
 4. `FS` — the FAT volume. One lock, any core. Not IRQ-safe.
-5. `NET` — smoltcp and the NIC. One lock, any core. Not IRQ-safe.
-6. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
+5. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
 
-`NET` and `FS` stay one lock each. smoltcp and the FAT library are not reentrant, and the block device has a single command slot. Pinning the lock to core 0 would need a cross-core queue on every send, recv, and file syscall. Any core may take the lock. The timer IRQ never takes `SCHED`, `FD`, `CONFIG`, `FS`, `NET`, or `LOGQ`, so a core interrupted while holding one cannot deadlock. The UART and the panic path take no locks. The DNS task keeps two threads blocked in the upstream receive. The HTTP task keeps four connection workers, one per listener. Extra threads share the process page tables and sit on one global run queue.
+smoltcp and the NIC are not behind a lock. Core 1 owns them once the stack is up and only polls; core 0 owns them until that handoff, and on a one-core boot. Other cores push a socket request onto a lock-free ring and sleep. The owner copies the result into the caller's user buffer and wakes the thread. It may take `FD` to publish a new socket, then drop it, then take `SCHED`. `FS` stays one lock because the FAT library is not reentrant and the block device has one command slot. The timer IRQ takes none of these. The UART and the panic path take no locks. The DNS task keeps two threads blocked in the upstream receive, one blocked on TCP port 53, and one that sleeps until a query is forwarded. The HTTP task keeps four connection workers, one per listener. Extra threads share the process page tables and sit on one global run queue.
 
 ## Overview
 

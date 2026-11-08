@@ -400,6 +400,15 @@ fn syscall() -> u64 {
         4..=33 => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
+            if let Some(id) = crate::net::service::take_posted() {
+                return match crate::net::service::wait(id) {
+                    crate::net::service::Wait::Ready(result) => {
+                        ctx.x[0] = result;
+                        RESUME
+                    }
+                    crate::net::service::Wait::Sleep => BLOCK,
+                };
+            }
             RESUME
         }
         _ => {
@@ -581,12 +590,8 @@ pub fn start_dns() -> Result<(), ()> {
         DNS_LIVE = true;
         loop {
             match enter(ctx, ksp) {
-                YIELD => return Ok(()),
+                YIELD | BLOCK => return Ok(()),
                 PREEMPT => continue,
-                BLOCK => {
-                    wait_if_blocked(DNS_SLOT, DNS_ASID);
-                    continue;
-                }
                 _ => {
                     DNS_LIVE = false;
                     return Err(());
@@ -628,12 +633,8 @@ pub fn start_http() -> Result<(), ()> {
         HTTP_LIVE = true;
         loop {
             match enter(ctx, ksp) {
-                YIELD => return Ok(()),
+                YIELD | BLOCK => return Ok(()),
                 PREEMPT => continue,
-                BLOCK => {
-                    wait_if_blocked(HTTP_SLOT, HTTP_ASID);
-                    continue;
-                }
                 _ => {
                     HTTP_LIVE = false;
                     return Err(());
@@ -693,12 +694,8 @@ pub fn start_log() -> Result<(), ()> {
         LOG_LIVE = true;
         loop {
             match enter(ctx, ksp) {
-                YIELD => return Ok(()),
+                YIELD | BLOCK => return Ok(()),
                 PREEMPT => continue,
-                BLOCK => {
-                    wait_if_blocked(LOG_SLOT, LOG_ASID);
-                    continue;
-                }
                 _ => {
                     LOG_LIVE = false;
                     return Err(());
@@ -896,6 +893,83 @@ struct PoolThread {
 }
 
 static SCHED: crate::spin::IrqSpin = crate::spin::IrqSpin::new();
+
+pub fn with_sched<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = SCHED.lock();
+    f()
+}
+
+/// Caller holds `SCHED`.
+pub fn block_current_locked() {
+    let slot = crate::percpu::slot();
+    let index = crate::percpu::thread_index();
+    if index == 0 {
+        unsafe {
+            MAIN_FUTEX[slot] = 0;
+        }
+        if slot < 4 {
+            MAIN_BLOCKED[slot].store(true, Ordering::Release);
+        }
+    } else {
+        let mine = (index - 1) as usize;
+        unsafe {
+            if mine < MAX_THREADS {
+                // A pool thread can block on a socket after it was waiting on
+                // a futex. Clear that address or the next futex_wake will
+                // resume the socket syscall with a zero result and abandon
+                // the bytes already queued in the socket.
+                unlink_futex(mine);
+                THREADS[mine].futex_addr = 0;
+                THREADS[mine].state = ST_BLOCKED;
+            }
+        }
+    }
+}
+
+fn unlink_futex(mine: usize) {
+    unsafe {
+        let mut prev = WAITER_NONE;
+        let mut cur = FUTEX_HEAD;
+        while cur >= 0 {
+            let index = cur as usize;
+            let next = THREADS[index].futex_next;
+            if index == mine {
+                if prev < 0 {
+                    FUTEX_HEAD = next;
+                } else {
+                    THREADS[prev as usize].futex_next = next;
+                }
+                THREADS[mine].futex_next = WAITER_NONE;
+                return;
+            }
+            prev = cur;
+            cur = next;
+        }
+    }
+}
+
+/// Caller holds `SCHED`.
+pub fn wake_locked(slot: usize, thread_index: u64, result: u64) {
+    if thread_index == 0 {
+        unsafe {
+            (*main_ctx(slot)).x[0] = result;
+        }
+        if slot < 4 {
+            MAIN_BLOCKED[slot].store(false, Ordering::Release);
+        }
+        sev();
+        return;
+    }
+    let mine = (thread_index - 1) as usize;
+    unsafe {
+        if mine < MAX_THREADS && THREADS[mine].state == ST_BLOCKED {
+            THREADS[mine].task.ctx.x[0] = result;
+            THREADS[mine].state = ST_RUNNABLE;
+            queue_push(mine as i16);
+            sev();
+        }
+    }
+}
 static MAIN_BLOCKED: [core::sync::atomic::AtomicBool; 4] = [
     core::sync::atomic::AtomicBool::new(false),
     core::sync::atomic::AtomicBool::new(false),
@@ -960,9 +1034,17 @@ fn main_blocked(slot: usize) -> bool {
 
 fn wait_if_blocked(slot: usize, asid: u64) {
     while main_blocked(slot) {
+        crate::net::poll();
+        if !main_blocked(slot) {
+            break;
+        }
         if !schedule_one() {
-            unsafe {
-                core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+            if crate::net::polling_here() {
+                core::hint::spin_loop();
+            } else {
+                unsafe {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
             }
         }
     }
