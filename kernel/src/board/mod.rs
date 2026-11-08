@@ -1,17 +1,18 @@
 //! One board per kernel image.
 //!
-//! Cargo enables `board-virt` by default or `board-pi4` for the Pi 4 image.
-//! `board-pi5` is reserved and refuses to build; a Pi 5 board is a later change.
-//! Shared code calls the functions below. It does not name a board feature.
+//! Cargo enables `board-virt` by default, `board-pi4` for the Pi 4 image, or
+//! `board-pi5` for the Pi 5 image. Shared code calls the functions below. It
+//! does not name a board feature.
 
-#[cfg(feature = "board-pi5")]
-compile_error!("board-pi5 is reserved; a Pi 5 board is a later change");
+#[cfg(any(
+    all(feature = "board-virt", feature = "board-pi4"),
+    all(feature = "board-virt", feature = "board-pi5"),
+    all(feature = "board-pi4", feature = "board-pi5"),
+))]
+compile_error!("enable only one of board-virt, board-pi4, and board-pi5");
 
-#[cfg(all(feature = "board-virt", feature = "board-pi4"))]
-compile_error!("enable only one of board-virt and board-pi4");
-
-#[cfg(not(any(feature = "board-virt", feature = "board-pi4")))]
-compile_error!("select board-virt or board-pi4");
+#[cfg(not(any(feature = "board-virt", feature = "board-pi4", feature = "board-pi5")))]
+compile_error!("select board-virt, board-pi4, or board-pi5");
 
 #[cfg(feature = "board-virt")]
 mod virt;
@@ -23,12 +24,20 @@ mod pi4;
 #[cfg(feature = "board-pi4")]
 use pi4::Pi4 as Active;
 
+#[cfg(feature = "board-pi5")]
+mod pi5;
+#[cfg(feature = "board-pi5")]
+use pi5::Pi5 as Active;
+
 use smoltcp::phy::Device;
 
 /// What a device interrupt was. The shared handler counts it and wakes the owner.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IrqHit {
     None,
+    /// The Pi 5 image has no NIC, so this variant is constructed only on
+    /// boards that drive one.
+    #[allow(dead_code)]
     Net,
     Block,
 }

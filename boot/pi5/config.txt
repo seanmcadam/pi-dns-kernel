@@ -1,0 +1,8 @@
+# Raspberry Pi 5 boot file for this kernel.
+# The ELF is linked at 0xFFFF000000200000 (TTBR1). The firmware loads the
+# raw kernel_2712.img at physical 0x200000. kernel_address asks for that
+# load address explicitly. This image has not been tested on hardware.
+# QEMU has no Pi 5 machine. RP1 Ethernet is not driven.
+arm_64bit=1
+kernel=kernel_2712.img
+kernel_address=0x200000

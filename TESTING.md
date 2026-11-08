@@ -80,6 +80,17 @@ The integration test script verifies basic boot functionality:
 - SD card support limited
 - Cannot test DNS or HTTP functionality yet
 
+#### Pi 5 stage
+
+QEMU has no Pi 5 machine. The integration script still:
+
+- builds `board-pi5` and checks that `_start` is `0xffff000000200000`, that `boot/pi5/kernel_2712.img` exists, and that `config.txt` names that image and `kernel_address=0x200000`
+- boots `boot/kernel8.img` (the virt image, not the Pi 5 image) with `-M virt,gic-version=2 -cpu cortex-a76 -smp 4` and expects the MMU line, EL1, four cores, and `DNS Server ready`
+
+That A76 boot runs shared code only. It does not run `kernel/src/board/pi5`. A pass does not change the 26 virt pass count. A failure fails the suite. The raspi4b stage is unchanged and still skips when the QEMU binary has no `raspi4b` machine.
+
+Not covered by any test: Pi 5 UART, GIC-400, SDHCI, PSCI over SMC, DRAM above 4 GiB, and RP1/PCIe. Those need hardware.
+
 #### Planned Integration Tests
 
 **Phase 1: Network Stack** (requires virtio-net setup)

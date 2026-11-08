@@ -962,6 +962,70 @@ EOF
     fi
 fi
 
+# Pi 5 has no QEMU machine. This stage builds the image and checks the
+# link address, then boots the virt image on cortex-a76. That second step
+# runs the shared kernel on the Pi 5 CPU. It does not execute the Pi 5
+# UART, GIC, SDHCI, or PSCI code. A failure here fails the suite. A pass
+# does not change the 26 virt results.
+echo ""
+echo "Test 28: Pi 5 image build, and shared code on cortex-a76"
+PI5_OK=1
+if ! ./scripts/build-pi5.sh >/tmp/build-pi5.txt; then
+    echo "✗ Pi 5 build failed"
+    cat /tmp/build-pi5.txt || true
+    PI5_OK=0
+else
+    PI5_START=$(aarch64-linux-gnu-nm target/aarch64-unknown-none/release/kernel8 | awk '/ _start$/ {print $1}')
+    if [ -f boot/pi5/kernel_2712.img ] && [ -f boot/pi5/config.txt ] \
+        && echo "$PI5_START" | grep -Eq '^0*ffff000000200000$' \
+        && grep -q 'kernel=kernel_2712.img' boot/pi5/config.txt \
+        && grep -q 'kernel_address=0x200000' boot/pi5/config.txt; then
+        echo "✓ Pi 5 kernel_2712.img linked at 0x${PI5_START}"
+        echo "  Not booted. QEMU has no Pi 5 machine. Not run on hardware."
+    else
+        echo "✗ Pi 5 image is incomplete (_start=${PI5_START})"
+        PI5_OK=0
+    fi
+fi
+rm -f qemu/a76.txt
+timeout 20 qemu-system-aarch64 \
+    -M virt,gic-version=2 \
+    -cpu cortex-a76 \
+    -smp 4 \
+    -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/a76.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    >/tmp/qemu-a76.txt 2>&1 || true
+A76_OK=1
+for need in \
+    "MMU and caches enabled" \
+    "Running at EL1" \
+    "cores online 4" \
+    "DNS Server ready"
+do
+    if ! grep -q "$need" qemu/a76.txt; then
+        echo "✗ cortex-a76 virt boot missing: $need"
+        A76_OK=0
+    fi
+done
+if [ "$A76_OK" -eq 1 ]; then
+    echo "✓ virt image booted on -cpu cortex-a76 (shared code only)"
+    echo "  Pi 5 peripherals, PSCI, SD, and RP1 were not executed."
+else
+    echo "✗ cortex-a76 virt boot failed"
+    echo "--- serial ---"
+    cat qemu/a76.txt 2>/dev/null || true
+    echo "--- qemu ---"
+    cat /tmp/qemu-a76.txt 2>/dev/null || true
+    PI5_OK=0
+fi
+if [ "$PI5_OK" -ne 1 ]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Summary
 echo ""
 echo "=== Test Summary ==="

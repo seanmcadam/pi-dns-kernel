@@ -2,7 +2,7 @@
 
 A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the Raspberry Pi 4 (BCM2711, AArch64) that implements a complete DNS server appliance.
 
-**Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. The DNS resolver runs at EL0. The kernel is linked in the upper half. Board code lives in `kernel/src/board/{virt,pi4}` and is selected with a Cargo feature (`board-virt` is the default, `board-pi4` is the Pi 4 image). `board-pi5` is reserved and does not build. A separate Pi 4 image is linked at `0xFFFF000000080000` and the firmware still loads that raw file at physical `0x80000`. That image has not been tested on hardware. QEMU 9.0 or newer can boot it on `-M raspi4b` (UART, MMU, four cores, SD). That machine has no GENET.
+**Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. The DNS resolver runs at EL0. The kernel is linked in the upper half. Board code lives in `kernel/src/board/{virt,pi4,pi5}` and is selected with a Cargo feature (`board-virt` is the default). A separate Pi 4 image is linked at `0xFFFF000000080000` and the firmware still loads that raw file at physical `0x80000`. That image has not been tested on hardware. QEMU 9.0 or newer can boot it on `-M raspi4b` (UART, MMU, four cores, SD). That machine has no GENET. A Pi 5 image is linked at `0xFFFF000000200000` and named `kernel_2712.img`. QEMU has no Pi 5 machine, and that image has not been run on hardware. Its RP1 Ethernet is not driven.
 
 ## Quick Status
 
@@ -15,8 +15,9 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 | DHCP | Working | User-net lease, static fallback on timeout |
 | FAT32 config | Working | virtio-blk, records survive reboot, rotating logs |
 | Pi 4 image | QEMU raspi4b smoke, untested on hardware | High link `0xFFFF000000080000`, load `0x80000`, PL011, EMMC, GENET. raspi4b needs QEMU 9.0+ and has no GENET |
+| Pi 5 image | Builds. Not booted | High link `0xFFFF000000200000`, load `0x200000`, `kernel_2712.img`. No QEMU machine. RP1 Ethernet is not driven |
 | EL1 exceptions | Working on QEMU | VBAR_EL1, fault report, then halt |
-| MMU | Working on QEMU | Kernel in TTBR1, user window in TTBR0, W^X. Pi 4 map untested |
+| MMU | Working on QEMU | Kernel in TTBR1, user window in TTBR0, W^X. Pi 4 and Pi 5 maps untested |
 
 ---
 
@@ -260,6 +261,7 @@ All tests run with `std` feature for host-side validation.
 - adding a record in the web UI, rebooting the same FAT disk, and resolving that name
 - the Pi 4 image links at `0xFFFF000000080000` and `boot/pi4/config.txt` names `kernel8.img`
 - when `qemu-system-aarch64 -machine help` lists `raspi4b` (QEMU 9.0 or newer), the Pi 4 image boots on that machine: UART, upper-half MMU, four cores, FAT `CONFIG.TXT`, and the EL0 log task. The stage skips with a message on an older QEMU. raspi4b does not emulate GENET, so DNS, HTTP, and telnet are not part of that stage
+- the Pi 5 image links at `0xFFFF000000200000` and `boot/pi5/config.txt` names `kernel_2712.img`. QEMU has no Pi 5 machine, so that image is not booted. The same stage boots the virt image with `-cpu cortex-a76` to run the shared code on the Pi 5 CPU. A pass of that stage does not change the 26 virt results
 
 ## Boards
 
@@ -269,9 +271,9 @@ Shared kernel code (scheduler, syscalls, the network owner, the filesystem, the 
 |---------|--------|-------------|-----|------|-----------------|
 | `board-virt` (default) | QEMU `virt` | `kernel/src/board/virt/link.ld` | virtio-net | virtio-blk | PSCI `CPU_ON` via HVC |
 | `board-pi4` | Raspberry Pi 4 | `kernel/src/board/pi4/link.ld` | GENET | EMMC2, then the legacy SDHCI | spin table at `0xE0` / `0xE8` / `0xF0` |
-| `board-pi5` | reserved | does not compile | | | |
+| `board-pi5` | Raspberry Pi 5 | `kernel/src/board/pi5/link.ld` | none (RP1 is not driven) | BCM2712 SDHCI at `0x1000fff000` | PSCI `CPU_ON` via SMC |
 
-`board-pi4` replaces the default feature. `./scripts/build.sh pi4` and `./scripts/build-pi4.sh` pass `--no-default-features --features board-pi4`. `./scripts/build.sh` and `./scripts/build.sh --features dhcp-default` still build the virt image.
+`board-pi4` and `board-pi5` each replace the default feature. `./scripts/build.sh pi4` and `./scripts/build-pi4.sh` pass `--no-default-features --features board-pi4`. `./scripts/build.sh pi5` and `./scripts/build-pi5.sh` pass `--no-default-features --features board-pi5`. `./scripts/build.sh` and `./scripts/build.sh --features dhcp-default` still build the virt image.
 
 ## Deployment
 
@@ -315,6 +317,90 @@ The virt machine is what the integration suite uses for DNS, HTTP, and telnet. `
 
 4. Insert the card, connect Ethernet, and power on. Until this image is run on a board, treat boot, DHCP, and SD writes as unverified. The QEMU image remains the tested one.
 
+### Real Raspberry Pi 5
+
+**This image has not been tested on hardware.** QEMU has no Pi 5 machine, so the integration suite does not boot `kernel_2712.img`. Do not copy `boot/kernel8.img` or `boot/pi4/kernel8.img` to the card.
+
+1. Build the SD card files:
+
+   ```bash
+   ./scripts/build-pi5.sh
+   ```
+
+   That writes:
+
+   - `boot/pi5/kernel_2712.img` — raw kernel. The ELF entry is `0xFFFF000000200000`. The firmware loads the file at physical `0x200000`.
+   - `boot/pi5/config.txt` — `arm_64bit=1`, `kernel=kernel_2712.img`, `kernel_address=0x200000`
+
+   The Pi 5 firmware files (`start4.elf` is not the 2712 loader; use the Pi 5 EEPROM boot plus the matching `bootcode`/`start` files from the Raspberry Pi firmware) are not produced by this build.
+
+2. Serial console, 115200 8N1, on the dedicated 3-pin JST-SH connector labeled UART. That is the BCM2712 debug UART at `0x107d001000`, not GPIO 14/15.
+
+#### Addresses
+
+The SoC bus in `bcm2712.dtsi` has `ranges = <0x00000000 0x10 0x00000000 0x80000000>`, so a child address plus `0x10_0000_0000` is the physical address. Sources are listed at the end of this section.
+
+| Device | Physical address | Notes |
+|--------|------------------|--------|
+| Debug UART (`uart10`) | `0x107d001000` | PL011, 3-pin connector. `clk_uart` is 9.216 MHz, so 115200 is IBRD 5, FBRD 0 |
+| GIC-400 distributor | `0x107fff9000` | Device tree `reg` is the distributor, not the GIC-400 block base |
+| GIC-400 CPU interface | `0x107fffa000` | Second `reg` entry |
+| SDHCI host (`sdio1`) | `0x1000fff000` | Standard SDHCI. IRQ SPI 273 (INTID 305) |
+| SDHCI cfg | `0x1000fff400` | Pin-mode register at offset `0x44` |
+| RAM mapped by this kernel | `0` .. `0x1_0000_0000` | First 4 GiB. ATF is reserved at `0` .. `0x80000` |
+| PCIe 2 registers | `0x1000120000` | x4 link used for RP1. Not programmed |
+| RP1 outbound window | `0x1f_00000000` | Not mapped |
+
+CPU affinity values from the device tree are `0x000`, `0x100`, `0x200`, `0x300`. PSCI is SMC (`arm,psci-1.0`). The virtual timer is PPI 11, INTID 27, the same line the other boards use. The generic timer is the only timer this image arms.
+
+#### RP1 and PCIe (not implemented)
+
+The Pi 5 Ethernet port is not a SoC MMIO block. `bcm2712-rpi-5-b.dts` enables `pcie2` and `rp1_eth`. The MAC is a Cadence GEM on the RP1, behind that PCIe link, with the PHY reset on RP1 GPIO 32. This kernel stubs the NIC: `probe_nic` returns none, the boot log says `No NIC`, and the log task still starts. The same thing happens on raspi4b, which has no GENET.
+
+Left to do before the port can pass a packet:
+
+- Release the PCIe rescal reset and bridge reset 44, then train the `pcie2` link.
+- Program the outbound non-prefetchable window at `0x1f_00000000` and map it. The kernel currently maps only `0x10_0000_0000` .. `0x10_8000_0000`.
+- Enumerate ECAM, enable the RP1 BAR, and turn on the RP1 clocks.
+- Drive the Cadence MACB/GEM. MSI is delivered through the MIP at `0x1000130000` (SPI 128 and up).
+
+#### What is verified, and what is not
+
+Verified on QEMU, without executing any Pi 5 board file:
+
+- `./scripts/build-pi5.sh` is warning-clean and `_start` is `0xffff000000200000`.
+- The virt image, which shares `boot.s`, the MMU, the GIC driver, and the scheduler, still passes the 26 virt tests on Cortex-A72.
+- That same virt image boots on `-cpu cortex-a76` far enough to enable the MMU, reach EL1, bring up four cores, and print `DNS Server ready`. Cortex-A76 enforces PAN. The user loads and stores stay between the PAN clear and the PAN set. QEMU's Cortex-A72 does not enforce PAN, so this ordering is what the A76 boot checks.
+
+Not verified:
+
+- Boot on a Pi 5, including the `0x200000` load and the EL2-to-EL1 drop.
+- The debug UART at the device-tree clock.
+- GIC-400 at `0x107fff9000`, including whether `GICC_CTLR = 0x7` matches the non-secure view.
+- PSCI `CPU_ON` over SMC, and the Aff1 fallback if x0 arrives as zero.
+- The SDHCI driver, card power (`gio_aon` GPIO 4), and card detect (`gio_aon` GPIO 5).
+- DRAM above 4 GiB on 8 GiB and 16 GiB boards.
+- RP1, PCIe, and Ethernet.
+
+#### Hardware bring-up risks
+
+- The early TCR now allows 40-bit physical addresses on every board. Virt and Pi 4 addresses still fit. A Pi 5 access above 4 GiB faults if firmware entered with a narrower IPS and the boot path did not run.
+- The device tree UART clock is 9.216 MHz. If the firmware left a different clock, the console is garbage.
+- Shared console writes do not wait for the TX FIFO. A long early banner can drop characters on a real PL011.
+- SD card power and the pin mux are left as the firmware set them. A card that the firmware did not use may be unpowered, and identification then times out on `cntpct`.
+- The GIC CPU-interface enable value is the virt value (`0x7`). A secure-only GIC-400 can ignore that write.
+- If the firmware enters at EL3, `boot.s` parks. The 2712 stub is expected to enter at EL2, which the boot path drops to EL1. That drop is untested on this SoC.
+- Mapping 8 GiB or 16 GiB needs more level-2 tables than the kernel allocates. Only the first 4 GiB is mapped.
+- The PCIe outbound windows are not mapped. A probe of RP1 that ignored that would take an external abort. The NIC stub does not touch those addresses.
+
+Sources:
+
+- Raspberry Pi downstream tree, `arch/arm64/boot/dts/broadcom/bcm2712.dtsi` and `bcm2712-rpi-5-b.dts` on `rpi-6.12.y`: SoC `ranges`, `uart10`, `gicv2`, `sdio1`, `psci`, CPU `reg` values, `pcie2`, and the comments that `uart10` is the 3-pin debug UART and `sdio1` drives the SD card. https://github.com/raspberrypi/linux/blob/rpi-6.12.y/arch/arm64/boot/dts/broadcom/bcm2712.dtsi
+- `sdhci-brcmstb.c` in that tree: cfg pin-select at offset `0x44`, SD mode is bit 1.
+- Raspberry Pi forum thread on `kernel_2712.img` loading at `0x200000`: https://forums.raspberrypi.com/viewtopic.php?t=393990
+- Raspberry Pi forum thread on the GIC-400: the device tree address `0x107fff9000` is the distributor; the block base is `0x1000` below that. https://forums.raspberrypi.com/viewtopic.php?t=371974
+- BCM2712 is the Pi 5 SoC (Cortex-A76): https://www.raspberrypi.com/documentation/computers/processors.html#bcm2712
+
 ## Configuration
 
 The default QEMU image uses a static address so the integration tests can reach it immediately:
@@ -342,7 +428,8 @@ upstream=10.0.2.3
 │   │   ├── board/
 │   │   │   ├── mod.rs          # The only place a board feature is selected
 │   │   │   ├── virt/           # PSCI, virtio-net, virtio-blk, link.ld
-│   │   │   └── pi4/            # Spin table, GENET, EMMC, PL011, link.ld
+│   │   │   ├── pi4/            # Spin table, GENET, EMMC, PL011, link.ld
+│   │   │   └── pi5/            # PSCI SMC, SDHCI, UART, RP1 stub, link.ld
 │   │   ├── net/                # smoltcp owner, sockets, DHCP
 │   │   ├── dns/                # DNS service
 │   │   ├── http/               # HTTP service
@@ -352,8 +439,8 @@ upstream=10.0.2.3
 ├── http-server/                # HTTP handler (with std tests)
 ├── dns-cache/                  # DNS cache (with std tests)
 ├── config/                     # Config parser (with std tests)
-├── boot/                       # virt kernel8.img, and boot/pi4/ for the Pi
-└── scripts/                    # build.sh virt|pi4, build-pi4.sh, tests
+├── boot/                       # virt kernel8.img, boot/pi4/, and boot/pi5/
+└── scripts/                    # build.sh virt|pi4|pi5, build-pi4.sh, build-pi5.sh, tests
 
 ```
 

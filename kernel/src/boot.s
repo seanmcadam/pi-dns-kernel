@@ -19,6 +19,9 @@
 //   - Raspberry Pi 4 (board/pi4/link.ld): linked at 0xFFFF000000080000
 //                                     firmware loads the raw image at
 //                                     physical 0x80000. Untested on hardware.
+//   - Raspberry Pi 5 (board/pi5/link.ld): linked at 0xFFFF000000200000
+//                                     firmware loads kernel_2712.img at
+//                                     physical 0x200000. Untested on hardware.
 //
 // The upper 16 bits are the only difference between the link address and the
 // physical load address. While the MMU is off the PC is the physical address.
@@ -30,7 +33,8 @@
 // -------------------------
 //   - AArch64. QEMU virt with -kernel starts at EL1. QEMU virt with
 //     virtualization=on starts at EL2. A real Pi 4 with arm_64bit=1 normally
-//     hands over at EL2. The EL2 path below is untested on Pi 4 hardware.
+//     hands over at EL2. The Pi 5 stub normally does the same. The EL2 path
+//     below is untested on Pi hardware. An EL3 entry parks.
 //   - The MMU and caches are off, so every address is a physical address.
 //   - There is no stack yet, so we cannot call any Rust code until we set
 //     one up.
@@ -293,6 +297,42 @@ _start:
     mov     x5, x14
     bl      build_early
 
+    // BCM2712 peripherals sit above 4 GiB. Two extra 1 GiB device blocks
+    // cover the SDHCI at 0x1000fff000 and the debug UART plus GIC-400 at
+    // 0x107d001000 and 0x107fff9000. Virt and Pi 4 have no RAM there, and
+    // nothing in those images loads from these indices. Same attribute bits
+    // as the other device block: valid, AttrIdx 1, AF, outer shareable,
+    // PXN and UXN.
+    movz    x13, #0x10, lsl #32
+    orr     x13, x13, #1
+    orr     x13, x13, #4
+    orr     x13, x13, #0x200
+    orr     x13, x13, #0x400
+    movz    x12, #0x0060, lsl #48
+    orr     x13, x13, x12
+    mov     x14, #0x40
+    adrp    x1, early_l1_id
+    add     x1, x1, :lo12:early_l1_id
+    str     x13, [x1, x14, lsl #3]
+    adrp    x1, early_l1_hi
+    add     x1, x1, :lo12:early_l1_hi
+    str     x13, [x1, x14, lsl #3]
+    movz    x13, #0x10, lsl #32
+    movk    x13, #0x4000, lsl #16
+    orr     x13, x13, #1
+    orr     x13, x13, #4
+    orr     x13, x13, #0x200
+    orr     x13, x13, #0x400
+    movz    x12, #0x0060, lsl #48
+    orr     x13, x13, x12
+    mov     x14, #0x41
+    adrp    x1, early_l1_id
+    add     x1, x1, :lo12:early_l1_id
+    str     x13, [x1, x14, lsl #3]
+    adrp    x1, early_l1_hi
+    add     x1, x1, :lo12:early_l1_hi
+    str     x13, [x1, x14, lsl #3]
+
     // Push the tables to the point of coherency before the walker reads them.
     // Four pages, 64-byte lines. clean_page clobbers x0 and x2.
     adrp    x0, early_l0_id
@@ -319,10 +359,13 @@ _start:
     msr     mair_el1, x0
 
     // TCR: 48-bit VA on both halves, 4 KiB granules, inner write-back,
-    // inner shareable, 32-bit physical addresses. 0xB5103510 is that value.
-    // TG1's 4 KiB encoding is 0b10.
+    // inner shareable. The low 32 bits are 0xB5103510. TG1's 4 KiB
+    // encoding is 0b10. IPS is bits 34:32. 0b010 is a 40-bit physical
+    // address, which is bit 33. Virt and Pi 4 addresses still fit.
+    // BCM2712 peripherals sit above 4 GiB and need the wider size.
     movz    x0, #0x3510
     movk    x0, #0xB510, lsl #16
+    movk    x0, #2, lsl #32
     msr     tcr_el1, x0
 
     adrp    x0, early_l0_id
@@ -415,9 +458,11 @@ clean_page:
 
 // Secondary cores arrive here with the MMU off. x0 is the PSCI context
 // id. QEMU virt passes the cpu id there, so that path is unchanged.
-// The Pi spin-table stub, including QEMU raspi4b, zeroes x0-x3 and then
-// branches. A zero x0 means take the MPIDR affinity instead. Core 0
-// never enters here. The hardware spin table is still untested.
+// The Pi 4 spin-table stub, including QEMU raspi4b, zeroes x0-x3 and then
+// branches. A zero x0 means take the MPIDR affinity instead. Aff0 is the
+// cpu id on the Pi 4. On the BCM2712 every core has Aff0 0 and the cpu
+// number lives in Aff1, so a zero Aff0 uses Aff1. Core 0 never enters
+// here. The Pi 4 spin table and the Pi 5 PSCI path are untested on hardware.
 .section .text
 .global secondary_entry
 .type secondary_entry, %function
@@ -425,7 +470,13 @@ secondary_entry:
     mov     x21, x0
     cbnz    x21, 18f
     mrs     x21, mpidr_el1
+    and     x22, x21, #0xff
+    cbnz    x22, 19f
+    lsr     x21, x21, #8
     and     x21, x21, #0xff
+    b       18f
+19:
+    mov     x21, x22
 18:
     cmp     x21, #3
     b.hi    29f

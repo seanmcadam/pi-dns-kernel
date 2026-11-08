@@ -19,8 +19,10 @@
 //! physical address; the CPU uses the high alias. Other RAM is Normal
 //! write-back. MMIO is Device-nGnRE.
 //!
-//! boot.s drops EL2 to EL1 before this runs. The Pi 4 ranges below are
-//! untested on hardware.
+//! boot.s drops EL2 to EL1 before this runs. The Pi 4 and Pi 5 ranges are
+//! untested on hardware. Addresses below 4 GiB use the four level-2 tables.
+//! A small extra pool covers the BCM2712 device window above 4 GiB. Virt
+//! and Pi 4 never allocate from that pool.
 
 use crate::addr::{phys_to_virt, virt_to_phys};
 
@@ -89,6 +91,28 @@ struct Tables {
 }
 
 pub const USER_SLOTS: usize = 5;
+
+/// Level-2 tables for physical addresses at 4 GiB and above. The BCM2712
+/// device window needs two of these (gigabytes 0x40 and 0x41). Virt and
+/// Pi 4 stay inside the four low tables.
+const HIGH_L2: usize = 4;
+
+struct HighL2 {
+    tables: [Table; HIGH_L2],
+    gb: [u16; HIGH_L2],
+    used: usize,
+}
+
+static mut HIGH: HighL2 = HighL2 {
+    tables: [
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+        Table { entries: [0; 512] },
+    ],
+    gb: [0xffff; HIGH_L2],
+    used: 0,
+};
 
 static mut TABLES: Tables = Tables {
     l0: Table { entries: [0; 512] },
@@ -199,10 +223,14 @@ pub fn set_pan(on: bool) {
         return;
     }
     unsafe {
+        // Not `nomem`. LLVM may otherwise sink the user load or store past
+        // both the clear and the set, and Cortex-A76 then takes a permission
+        // fault. QEMU's Cortex-A72 does not enforce PAN, so that reorder
+        // stays invisible there.
         if on {
-            core::arch::asm!(".inst 0xd500419f", options(nomem, nostack));
+            core::arch::asm!(".inst 0xd500419f", options(nostack));
         } else {
-            core::arch::asm!(".inst 0xd500409f", options(nomem, nostack));
+            core::arch::asm!(".inst 0xd500409f", options(nostack));
         }
     }
 }
@@ -506,13 +534,36 @@ fn map_page(pa: u64, flags: u64) {
 unsafe fn l2_for(pa: u64) -> *mut Table {
     let gb = ((pa >> 30) & 511) as usize;
     if gb >= 4 {
-        give_up("physical address outside the 4 GiB table budget");
+        return l2_high(gb);
     }
     let l1 = addr_of_mut!(TABLES.l1);
     let l2 = addr_of_mut!(TABLES.l2[gb]);
     if (&mut *l1).entries[gb] & VALID == 0 {
         (&mut *l1).entries[gb] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
     }
+    l2
+}
+
+unsafe fn l2_high(gb: usize) -> *mut Table {
+    let high = addr_of_mut!(HIGH);
+    let used = core::ptr::read(addr_of!((*high).used));
+    let tags = addr_of_mut!((*high).gb) as *mut u16;
+    let tables = addr_of_mut!((*high).tables) as *mut Table;
+    let mut i = 0;
+    while i < used {
+        if core::ptr::read(tags.add(i)) as usize == gb {
+            return tables.add(i);
+        }
+        i += 1;
+    }
+    if used >= HIGH_L2 {
+        give_up("ran out of level-2 page tables");
+    }
+    core::ptr::write(tags.add(used), gb as u16);
+    core::ptr::write(addr_of_mut!((*high).used), used + 1);
+    let l2 = tables.add(used);
+    let l1 = addr_of_mut!(TABLES.l1);
+    (&mut *l1).entries[gb] = virt_to_phys(l2 as u64) | VALID | TABLE_OR_PAGE;
     l2
 }
 

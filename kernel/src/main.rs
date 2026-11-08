@@ -121,9 +121,9 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("[OK] Config loaded\r\n");
 
     uart_write("[6] Initializing network...\r\n");
-    // A missing NIC is fatal on the virt image because every service there
-    // needs the stack. The Pi 4 image can boot on QEMU raspi4b, which has
-    // no GENET, so that case continues with the log task only.
+    // A missing NIC skips DNS, HTTP, and telnet. The log task still starts.
+    // QEMU virt has a NIC. raspi4b has no GENET, and the Pi 5 image does
+    // not drive RP1 Ethernet.
     let net_up = match net::init(&config.network) {
         Ok(()) => {
             uart_write("[OK] Network initialized\r\n");

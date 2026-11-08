@@ -14,7 +14,9 @@ board-virt = []
 # Build with --no-default-features --features board-pi4. Enabling it on
 # top of the default features selects two boards and does not compile.
 board-pi4 = []
-# Reserved. Selecting it does not compile. A Pi 5 board is a later change.
+# Raspberry Pi 5: link at 0xFFFF000000200000, image name kernel_2712.img.
+# Build with --no-default-features --features board-pi5. Enabling it on
+# top of another board feature does not compile. RP1 Ethernet is not driven.
 board-pi5 = []
 
 [dependencies]

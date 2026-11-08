@@ -103,15 +103,25 @@ This is a bare-metal operating system kernel written in Rust for the Raspberry P
 **Location**: `kernel/src/boot.s`, `kernel/src/main.rs`
 
 The boot process:
-1. The loader copies the raw image to a physical address: `0x40080000` on QEMU virt, `0x80000` on the Pi 4
+1. The loader copies the raw image to a physical address: `0x40080000` on QEMU virt, `0x80000` on the Pi 4, `0x200000` on the Pi 5
 2. Assembly code (`_start`) runs on core 0. Cores that enter `_start` instead of the secondary entry park. QEMU starts the other cores later, at `secondary_entry`, through PSCI
 3. Sets the stack at that physical address, drops EL2 to EL1 when needed, and zeroes BSS
 4. Turns the MMU on and jumps to the upper-half link address
 5. Calls Rust `kernel_main()`
 
-The stack grows down from the load address. The QEMU link script is `kernel/src/board/virt/link.ld`. The Pi 4 link script is `kernel/src/board/pi4/link.ld`. `kernel/build.rs` copies the one selected by the Cargo feature into the link search path.
+The stack grows down from the load address. The QEMU link script is `kernel/src/board/virt/link.ld`. The Pi 4 link script is `kernel/src/board/pi4/link.ld`. The Pi 5 link script is `kernel/src/board/pi5/link.ld` (`0xFFFF000000200000`). `kernel/build.rs` copies the one selected by the Cargo feature into the link search path.
 
-Board-specific code is `kernel/src/board`. `board-virt` is the default feature. `board-pi4` is selected with `--no-default-features --features board-pi4` (`./scripts/build.sh pi4` or `./scripts/build-pi4.sh`). `board-pi5` is reserved and refuses to compile. The scheduler, syscalls, network owner, filesystem, logger, and EL0 services call `crate::board` and do not name a feature. The board supplies the memory map, UART base, GIC bases and the timer INTID, the NIC, the block device, secondary-core startup, the link script, and the default network config.
+Board-specific code is `kernel/src/board`. `board-virt` is the default feature. `board-pi4` is selected with `--no-default-features --features board-pi4` (`./scripts/build.sh pi4` or `./scripts/build-pi4.sh`). `board-pi5` is selected with `--no-default-features --features board-pi5` (`./scripts/build.sh pi5` or `./scripts/build-pi5.sh`). The scheduler, syscalls, network owner, filesystem, logger, and EL0 services call `crate::board` and do not name a feature. The board supplies the memory map, UART base, GIC bases and the timer INTID, the NIC, the block device, secondary-core startup, the link script, and the default network config.
+
+### Pi 5 (BCM2712)
+
+The Pi 5 board is Cortex-A76, GICv2 (GIC-400), and the generic timer at PPI 11. `boot.s` widens `TCR_EL1.IPS` to 40-bit physical addresses so the early map can cover the SoC window at `0x10_0000_0000`. That window is two 1 GiB device blocks in the early tables and 2 MiB blocks in the strict map. The extra level-2 tables used for addresses above 4 GiB are not used by virt or Pi 4. RAM above 4 GiB is not mapped.
+
+`probe_nic` returns none. RP1 Ethernet is a Cadence GEM behind PCIe controller 2 (`pcie2` at `0x1000120000`, outbound window `0x1f_00000000`). Bringing that up means link training, an ECAM scan, the RP1 BAR, and a MACB driver. None of that is in this image. The missing NIC is non-fatal: DNS, HTTP, and telnet stay down, and the log task still starts.
+
+The SD driver talks to `sdio1` at `0x1000fff000` (cfg block `0x1000fff400`, IRQ 305). The first read is `read_u32_catching`, so an external abort on a missing window fails the probe. Card power and card detect are `gio_aon` GPIOs and are not programmed. Secondary cores use PSCI `CPU_ON` with SMC and affinity `cpu << 8`. `el2_blocks_secondaries` is false because SMC is not delivered to EL2.
+
+QEMU cannot boot this image. The integration stage checks the link address and then boots the virt image with `-cpu cortex-a76`. See the README section "Real Raspberry Pi 5" for the address table, the sources, and the hardware risks.
 
 ### System Layer
 

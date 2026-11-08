@@ -6,6 +6,7 @@ qemu/*.txt
 qemu/*.img
 qemu/*.pcap
 boot/pi4/*.img
+boot/pi5/*.img
 
 # IDE
 .vscode/
