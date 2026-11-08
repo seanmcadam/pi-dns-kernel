@@ -364,6 +364,10 @@ pub fn status(ptr: u64, cap: u64) -> i64 {
             0
         };
         out.dec(up);
+        out.push(" ticks=");
+        out.dec(crate::cpu_stat::slot_ticks(i));
+        out.push(" pages=");
+        out.dec(pages(i) as u64);
         out.push("\n");
         i += 1;
     }
@@ -376,9 +380,48 @@ pub fn status(ptr: u64, cap: u64) -> i64 {
     out.push("\nlimit=");
     out.dec(CRASH_LIMIT as u64);
     out.push("\n");
+    out.push("up=");
+    out.dec(crate::timer::uptime_secs());
+    out.push("\n");
+    let mut cpu = 0;
+    while cpu < crate::cpu_stat::CPUS {
+        let (user, kern, idle) = crate::cpu_stat::cpu(cpu);
+        out.push("cpu ");
+        out.dec(cpu as u64);
+        out.push(" user=");
+        out.dec(user);
+        out.push(" kern=");
+        out.dec(kern);
+        out.push(" idle=");
+        out.dec(idle);
+        out.push("\n");
+        cpu += 1;
+    }
+    let (used, size) = crate::memory::ALLOCATOR.usage();
+    out.push("heap used=");
+    out.dec(used as u64);
+    out.push(" size=");
+    out.dec(size as u64);
+    out.push("\n");
+    let (rx, tx) = crate::net::packet_counts();
+    let (rx_b, tx_b) = crate::board::packet_bytes();
+    out.push("net rx=");
+    out.dec(rx as u64);
+    out.push("/");
+    out.dec(rx_b);
+    out.push(" tx=");
+    out.dec(tx as u64);
+    out.push("/");
+    out.dec(tx_b);
+    out.push("\n");
     let mut cache = [0u8; 192];
     let n = crate::dns::write_cache_stats(&mut cache);
     if let Ok(line) = core::str::from_utf8(&cache[..n]) {
+        out.push(line);
+    }
+    let mut top = [0u8; 768];
+    let n = crate::dns::write_top(&mut top);
+    if let Ok(line) = core::str::from_utf8(&top[..n]) {
         out.push(line);
     }
     let n = out.len.min(cap as usize);
@@ -588,7 +631,7 @@ fn pages(slot: usize) -> u32 {
         2 => 2,
         3 => 37,
         4 => 101,
-        5 => 133,
+        5 => 357,
         6 => crate::board::hdmi_pages(),
         _ => 0,
     }
@@ -644,14 +687,14 @@ fn say(level: u8, name: &str, what: &str, ec: u64, elr: u64, far: u64) {
 }
 
 struct Text {
-    data: [u8; 1200],
+    data: [u8; 2048],
     len: usize,
 }
 
 impl Text {
     const fn new() -> Self {
         Self {
-            data: [0; 1200],
+            data: [0; 2048],
             len: 0,
         }
     }

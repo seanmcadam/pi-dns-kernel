@@ -6,7 +6,7 @@
 /// and stay put for the life of the kernel.
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
@@ -61,6 +61,8 @@ const MAGIC: u32 = 0x7472_6976;
 
 static RX_COUNT: AtomicU32 = AtomicU32::new(0);
 static TX_COUNT: AtomicU32 = AtomicU32::new(0);
+static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 static MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
 static IRQ_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -107,6 +109,13 @@ pub struct VirtioNetDevice {
     tx_seen: u16,
     tx_busy: [bool; QSIZE],
     pending: [Option<(u16, u16)>; QSIZE],
+}
+
+pub fn packet_bytes() -> (u64, u64) {
+    (
+        RX_BYTES.load(Ordering::Relaxed),
+        TX_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 pub fn packet_counts() -> (u32, u32) {
@@ -242,6 +251,7 @@ impl VirtioNetDevice {
                 if let Some(slot) = self.pending.iter_mut().find(|s| s.is_none()) {
                     *slot = Some((id as u16, frame_len));
                     RX_COUNT.fetch_add(1, Ordering::Relaxed);
+                    RX_BYTES.fetch_add(frame_len as u64, Ordering::Relaxed);
                 } else if (id as usize) < QSIZE {
                     self.post_rx(id as u16);
                 }
@@ -291,6 +301,8 @@ impl VirtioNetDevice {
         self.tx_busy[idx] = true;
         self.kick(1);
         TX_COUNT.fetch_add(1, Ordering::Relaxed);
+        let payload = (total_len as u64).saturating_sub(HDR_LEN as u64);
+        TX_BYTES.fetch_add(payload, Ordering::Relaxed);
     }
 }
 

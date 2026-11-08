@@ -11,8 +11,8 @@ mod des;
 pub use des::{encrypt_block, vnc_block};
 
 pub const VERSION: &[u8; 12] = b"RFB 003.008\n";
-pub const WIDTH: u16 = 320;
-pub const HEIGHT: u16 = 240;
+pub const WIDTH: u16 = 640;
+pub const HEIGHT: u16 = 480;
 pub const RAW: i32 = 0;
 
 /// Security types. An empty password offers None (1). A password offers VNC
@@ -182,8 +182,9 @@ mod tests {
         assert_eq!(security_result(true), [0, 0, 0, 0]);
         assert_eq!(security_result(false), [0, 0, 0, 1]);
         let mut header = [0u8; 24];
-        assert_eq!(server_init_header(320, 240, 10, &mut header), 24);
-        assert_eq!(&header[..4], &[0x01, 0x40, 0x00, 0xF0]);
+        assert_eq!(server_init_header(WIDTH, HEIGHT, 10, &mut header), 24);
+        assert_eq!(u16::from_be_bytes([header[0], header[1]]), WIDTH);
+        assert_eq!(u16::from_be_bytes([header[2], header[3]]), HEIGHT);
         assert_eq!(header[4], 32);
         assert_eq!(header[6], 0);
         assert_eq!(header[7], 1);
@@ -192,11 +193,11 @@ mod tests {
         assert_eq!(header[16], 0);
         assert_eq!(&header[20..], &10u32.to_be_bytes());
         let mut update = [0u8; 16];
-        assert_eq!(raw_update_header(0, 0, 320, 240, &mut update), 16);
+        assert_eq!(raw_update_header(0, 0, WIDTH, HEIGHT, &mut update), 16);
         assert_eq!(update[0], 0);
         assert_eq!(&update[2..4], &1u16.to_be_bytes());
-        assert_eq!(&update[8..10], &320u16.to_be_bytes());
-        assert_eq!(&update[10..12], &240u16.to_be_bytes());
+        assert_eq!(&update[8..10], &WIDTH.to_be_bytes());
+        assert_eq!(&update[10..12], &HEIGHT.to_be_bytes());
         assert_eq!(&update[12..], &0u32.to_be_bytes());
     }
 

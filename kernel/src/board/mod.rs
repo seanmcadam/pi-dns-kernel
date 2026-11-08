@@ -87,6 +87,9 @@ pub trait Board {
     fn probe_nic() -> Option<Self::Nic>;
     fn nic_name() -> &'static str;
     fn packet_counts() -> (u32, u32);
+    fn packet_bytes() -> (u64, u64) {
+        (0, 0)
+    }
     fn retarget_nic(cpu: usize);
     fn probe_disk() -> bool;
     fn disk() -> Self::Disk;
@@ -165,6 +168,10 @@ pub fn packet_counts() -> (u32, u32) {
     <Active as Board>::packet_counts()
 }
 
+pub fn packet_bytes() -> (u64, u64) {
+    <Active as Board>::packet_bytes()
+}
+
 pub fn retarget_nic(cpu: usize) {
     <Active as Board>::retarget_nic(cpu);
 }
@@ -217,12 +224,12 @@ pub fn hdmi_code_bytes() -> usize {
 /// Pi 5 uses the same translation; it is unverified and unused while hotplug
 /// reports disconnected.
 pub fn fb_bus_to_phys(bus: u64, bytes: u64) -> Option<(u64, u64)> {
-    if bytes == 0 || bytes > 1024 * 1024 {
+    if bytes == 0 || bytes > crate::mmu::USER_FB_MAX {
         return None;
     }
     let phys = bus & 0x3FFF_FFFF;
     let bytes = (bytes + 4095) & !4095;
-    if bytes == 0 || bytes > 1024 * 1024 || phys < 16 * 1024 * 1024 || phys % 4096 != 0 {
+    if bytes == 0 || bytes > crate::mmu::USER_FB_MAX || phys < 16 * 1024 * 1024 || phys % 4096 != 0 {
         return None;
     }
     let end = phys.checked_add(bytes)?;

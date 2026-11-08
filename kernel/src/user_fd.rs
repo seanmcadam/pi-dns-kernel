@@ -39,6 +39,7 @@
 //!  33  file_write(name, name_len, buf, len, flags). flags 1 appends.
 //!  55  display_io(op, a, b, c). HDMI mailbox and framebuffer, plus VNC settings.
 //!  56  display_set(vnc, port, pass, pass_len, hdmi, err). Queues start or stop.
+//!  57  set_dns_top(ptr, len). DNS task publishes the fixed top-N blob.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -92,6 +93,7 @@ const SET_CACHE_STATS: u64 = 53;
 const CACHE_PLANT: u64 = 54;
 const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
+const SET_DNS_TOP: u64 = 57;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -192,6 +194,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         CACHE_PLANT => cache_plant(args[0], args[1]),
         DISPLAY_IO => display_io(args[0], args[1], args[2], args[3]),
         DISPLAY_SET => display_set(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SET_DNS_TOP => set_dns_top(args[0], args[1]),
         _ => -1,
     };
     value as u64
@@ -1191,6 +1194,19 @@ fn config_set_cache(slots: u64, reap: u64, err: u64, err_cap: u64) -> i64 {
             EINVAL
         }
     }
+}
+
+fn set_dns_top(ptr: u64, len: u64) -> i64 {
+    if slot() != crate::task::DNS_SLOT || len < 21 || len > 576 {
+        return EINVAL;
+    }
+    let mut raw = [0u8; 576];
+    let n = len as usize;
+    if !copy_user(ptr, &mut raw[..n]) {
+        return EFAULT;
+    }
+    crate::dns::set_top(&raw[..n]);
+    0
 }
 
 fn set_cache_stats(ptr: u64) -> i64 {

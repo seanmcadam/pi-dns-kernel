@@ -122,6 +122,7 @@ The user program puts the number in `x8`, arguments in `x0`–`x5`, and reads th
 | 54 | `cache_plant(op, ttl)` | `op` 0 stores a one-shot insert of `ttl` seconds (1..=5). `op` 1 returns that ttl and clears it, or `0` |
 | 55 | `display_io(op, a, b, c)` | `op` 0 hotplug (1 connected, 0 not, -1 no controller), 1 mailbox property buffer, 2 map a firmware framebuffer, 3 unmap it. Ops 0–3 are the HDMI task only. `op` 4 returns the VNC port, 5 copies the VNC password, 6 is 1 when the VNC process is running, 7 is 1 when this board has HDMI |
 | 56 | `display_set(vnc, port, pass, pass_len, hdmi, err)` | `0` applied, `-4` out of bounds. Writes `display` in `CONFIG.JSN` and queues the supervisor. It does not start the process itself |
+| 57 | `set_dns_top(ptr, len)` | DNS task only. Publishes the fixed top-N blob (queries, rate, names, types, sources) |
 | other | | `-1` |
 
 Errors: `-1` unknown number, `-2` bad pointer, `-3` bad fd, `-4` bad argument, `-5` I/O, `-6` too many fds or threads, `-7` the config text does not fit, `-11` try again. Packet and config buffers are at most 4096 bytes. Each task has 24 fds. `tcp_recv`'s fourth argument is `1` to return `-11` instead of sleeping. Telnet listens on guest port 23. `run-local.sh` forwards host port 2323 (`TELNET_HOST_PORT`).

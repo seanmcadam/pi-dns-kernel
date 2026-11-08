@@ -15,7 +15,7 @@
 //! instead of spinning. None of this has been run on a Pi 4.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
@@ -94,6 +94,8 @@ const DESC_ADDRESS_HI: usize = 0x08;
 
 static RX_COUNT: AtomicU32 = AtomicU32::new(0);
 static TX_COUNT: AtomicU32 = AtomicU32::new(0);
+static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static mut RX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
 static mut TX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
@@ -104,6 +106,13 @@ static RX_CONS: AtomicU32 = AtomicU32::new(0);
 pub struct GenetDevice {
     mac: [u8; 6],
     tx_index: u16,
+}
+
+pub fn packet_bytes() -> (u64, u64) {
+    (
+        RX_BYTES.load(Ordering::Relaxed),
+        TX_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 pub fn packet_counts() -> (u32, u32) {
@@ -159,9 +168,9 @@ impl GenetDevice {
 
     fn transmit_frame(&mut self, frame: &[u8]) {
         let index = self.tx_index as usize % DESC_COUNT;
+        let n = frame.len().min(BUF_LEN);
         unsafe {
             let buf = &mut TX_BUFS[index];
-            let n = frame.len().min(BUF_LEN);
             buf[..n].copy_from_slice(&frame[..n]);
             let addr = crate::addr::virt_to_phys(buf.as_ptr() as u64);
             let desc = GENET_TX_OFF + index * DMA_DESC_SIZE;
@@ -180,6 +189,7 @@ impl GenetDevice {
         barrier();
         write(TDMA_RING + DMA_PROD_INDEX, prod);
         TX_COUNT.fetch_add(1, Ordering::Relaxed);
+        TX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
 
@@ -456,6 +466,7 @@ fn poll_rx() -> Option<(u16, u16)> {
         reclaim_rx_static(index as u16);
         return None;
     }
+    RX_BYTES.fetch_add((length - RX_ALIGN) as u64, Ordering::Relaxed);
     Some((index as u16, (length - RX_ALIGN) as u16))
 }
 

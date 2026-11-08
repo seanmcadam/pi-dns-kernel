@@ -4,7 +4,7 @@
 //! thread's kernel stack, the kernel resume block, and the preemption slice.
 
 use crate::task::TaskContext;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 pub const NCPU: usize = 4;
 
@@ -49,6 +49,20 @@ const EMPTY: PerCpu = PerCpu {
 };
 
 static BOOTED: AtomicU32 = AtomicU32::new(0);
+static ASLEEP: [AtomicU8; NCPU] = [const { AtomicU8::new(0) }; NCPU];
+
+/// The timer IRQ reads this. Set it around `wfi` / `wfe` on this core only.
+pub fn set_asleep(on: bool) {
+    let cpu = id();
+    if cpu < NCPU {
+        ASLEEP[cpu].store(u8::from(on), Ordering::Relaxed);
+    }
+}
+
+pub fn asleep() -> bool {
+    let cpu = id();
+    cpu < NCPU && ASLEEP[cpu].load(Ordering::Relaxed) != 0
+}
 
 fn this() -> *mut PerCpu {
     let ptr: u64;

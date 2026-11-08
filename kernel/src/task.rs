@@ -75,6 +75,7 @@ const SET_CACHE_STATS: u64 = 53;
 const CACHE_PLANT: u64 = 54;
 const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
+const SET_DNS_TOP: u64 = 57;
 const THREAD_CREATE: u64 = 34;
 const THREAD_EXIT: u64 = 35;
 const THREAD_JOIN: u64 = 36;
@@ -220,7 +221,7 @@ const TELNET_HEAP_BYTES: usize = 256 * 1024;
 const TELNET_STACK_BYTES: usize = 16 * 1024;
 const VNC_CODE_BYTES: usize = 128 * 1024;
 const VNC_DATA_BYTES: usize = 4096;
-const VNC_HEAP_BYTES: usize = 384 * 1024;
+const VNC_HEAP_BYTES: usize = 1280 * 1024;
 const VNC_STACK_BYTES: usize = 16 * 1024;
 
 /// `b .` — a task that never makes a syscall. Preemption is the only way out.
@@ -503,7 +504,8 @@ fn syscall() -> u64 {
         | SET_CACHE_STATS
         | CACHE_PLANT
         | DISPLAY_IO
-        | DISPLAY_SET => {
+        | DISPLAY_SET
+        | SET_DNS_TOP => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
@@ -1779,9 +1781,11 @@ fn wait_if_blocked(slot: usize, asid: u64) {
             if crate::net::polling_here() {
                 crate::net::service::owner_idle();
             } else {
+                crate::percpu::set_asleep(true);
                 unsafe {
                     core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
                 }
+                crate::percpu::set_asleep(false);
             }
         }
     }

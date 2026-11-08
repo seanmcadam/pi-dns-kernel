@@ -7,6 +7,7 @@ mod addr;
 mod board;
 mod config_manager;
 mod console;
+mod cpu_stat;
 mod dns;
 mod exception;
 mod fs;

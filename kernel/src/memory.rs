@@ -58,6 +58,15 @@ impl LockedAllocator {
     pub unsafe fn init(&self) {
         self.0.lock().init();
     }
+
+    /// `(used, size)` in bytes. The bump allocator never frees, so `used` only grows.
+    pub fn usage(&self) -> (usize, usize) {
+        let bump = self.0.lock();
+        (
+            bump.next.saturating_sub(bump.heap_start),
+            bump.heap_end.saturating_sub(bump.heap_start),
+        )
+    }
 }
 
 unsafe impl GlobalAlloc for LockedAllocator {

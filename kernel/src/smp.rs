@@ -140,6 +140,7 @@ pub extern "C" fn secondary_main(cpu: u64) -> ! {
             }
         }
         if !crate::task::schedule_one() {
+            crate::percpu::set_asleep(true);
             unsafe {
                 if id == 1 {
                     // WFI, not WFE, so the timer wakes this core to notice
@@ -149,6 +150,7 @@ pub extern "C" fn secondary_main(cpu: u64) -> ! {
                     core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
                 }
             }
+            crate::percpu::set_asleep(false);
         }
     }
 }

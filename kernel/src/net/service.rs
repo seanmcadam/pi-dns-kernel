@@ -307,9 +307,11 @@ pub fn owner_idle() {
     crate::interrupts::mask();
     if !work_pending() {
         let t0 = crate::timer::get_ticks();
+        crate::percpu::set_asleep(true);
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
         }
+        crate::percpu::set_asleep(false);
         IDLE_TICKS.fetch_add(crate::timer::get_ticks().wrapping_sub(t0), Ordering::Relaxed);
     }
     crate::interrupts::unmask();

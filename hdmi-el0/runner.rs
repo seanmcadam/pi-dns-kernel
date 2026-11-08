@@ -43,7 +43,7 @@ fn run() -> ! {
         if let Some(fb) = live.as_ref() {
             paint(fb);
         }
-        pause(500);
+        pause(1000);
     }
 }
 
@@ -103,7 +103,7 @@ fn release(bus: u32) {
 
 fn paint(fb: &Fb) {
     let mut log_buf = [0u8; 1024];
-    let mut debug_buf = [0u8; 1200];
+    let mut debug_buf = [0u8; 2048];
     let log_n = sys(LOG_RECENT, log_buf.as_mut_ptr() as u64, log_buf.len() as u64, 0, 0, 0, 0);
     let debug_n = sys(
         DEBUG_STATUS,
@@ -125,8 +125,8 @@ fn paint(fb: &Fb) {
             buf,
             fb.pitch as usize,
             BOARD,
-            text_of(&log_buf, log_n),
             text_of(&debug_buf, debug_n),
+            text_of(&log_buf, log_n),
         );
     }
 }

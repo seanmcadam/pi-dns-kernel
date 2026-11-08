@@ -1148,6 +1148,62 @@ else
     echo "✗ DNS cache stats, validation, or reaper failed"
     TESTS_FAILED=$((TESTS_FAILED + 3))
 fi
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import subprocess, sys, time, urllib.request
+http, dns = sys.argv[1], sys.argv[2]
+base = "http://127.0.0.1:%s" % http
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def query(name):
+    subprocess.run(
+        ["dig", "@127.0.0.1", "-p", dns, name, "A", "+time=1", "+tries=1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+for _ in range(3):
+    query("alpha.console.local")
+query("beta.console.local")
+deadline = time.time() + 4
+page = b""
+while time.time() < deadline:
+    try:
+        with opener.open(base + "/debug", timeout=4) as resp:
+            page = resp.read()
+    except Exception as err:
+        page = str(err).encode()
+    names = b""
+    types = b""
+    srcs = b""
+    for line in page.splitlines():
+        if line.startswith(b"top-name"):
+            names = line
+        elif line.startswith(b"top-type"):
+            types = line
+        elif line.startswith(b"top-src"):
+            srcs = line
+    if (b"alpha.console.local=3" in names and b"beta.console.local=1" in names
+            and b"A=" in types and b"10.0.2.2=" in srcs):
+        print("top", names.decode(), types.decode(), srcs.decode())
+        break
+    time.sleep(0.25)
+else:
+    fail("top counters %s" % page[:500])
+PY
+then
+    echo "✓ /debug lists top domains, types, and sources"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ DNS top counters missing from /debug"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
 if python3 - "$HTTP_HOST_PORT" "$VNC_HOST_PORT" <<'PY'
 import json, socket, struct, sys, time, urllib.error, urllib.request
 http_port, vnc_port = sys.argv[1], int(sys.argv[2])
@@ -1200,7 +1256,7 @@ def connect():
 if connect() is not None:
     fail("vnc port open before enable")
 status, page = req("GET", "/display")
-if status != 200 or b"5900" not in page or b"320" not in page or b"1..=65535" not in page:
+if status != 200 or b"5900" not in page or b"640" not in page or b"480" not in page or b"1..=65535" not in page:
     fail("display page %s %s" % (status, page[:200]))
 status, debug = req("GET", "/debug")
 row = b""
@@ -1241,17 +1297,17 @@ if recvn(sock, 4) != b"\x00\x00\x00\x00":
 sock.sendall(bytes([1]))
 init = recvn(sock, 24)
 width, height = struct.unpack(">HH", init[:4])
-if width != 320 or height != 240 or init[4] != 32:
+if width != 640 or height != 480 or init[4] != 32:
     fail("server init %s" % init[:24].hex())
 name_len = struct.unpack(">I", init[20:24])[0]
 recvn(sock, name_len)
 sock.sendall(struct.pack(">BBHI", 2, 0, 1, 0))
-sock.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, 320, 240))
+sock.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, 640, 480))
 update = recvn(sock, 16)
 if update[0] != 0 or update[12:16] != b"\x00\x00\x00\x00":
     fail("update %s" % update.hex())
 rect_w, rect_h = struct.unpack(">HH", update[8:12])
-if rect_w != 320 or rect_h != 240:
+if rect_w != 640 or rect_h != 480:
     fail("rect %s" % update.hex())
 pixels = recvn(sock, 64)
 if len(pixels) != 64:

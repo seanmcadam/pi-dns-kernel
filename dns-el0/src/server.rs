@@ -30,6 +30,7 @@ const TIMER_TICKS: u64 = 51;
 const TIMER_FREQ: u64 = 52;
 const SET_CACHE_STATS: u64 = 53;
 const CACHE_PLANT: u64 = 54;
+const SET_DNS_TOP: u64 = 57;
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
@@ -85,6 +86,7 @@ pub fn run() -> ! {
         tcp,
         tcp_fd,
         tcp_buf,
+        traffic: dns_cache::top::Traffic::new(),
     });
     unsafe {
         SHARED = Box::into_raw(shared);
@@ -114,6 +116,7 @@ pub fn run() -> ! {
                         &mut shared.cache,
                         &mut shared.pending,
                         &mut shared.next_id,
+                        &mut shared.traffic,
                     );
                     publish(&shared.cache);
                 }
@@ -134,6 +137,7 @@ struct Shared {
     tcp: i64,
     tcp_fd: i64,
     tcp_buf: Vec<u8>,
+    traffic: dns_cache::top::Traffic,
 }
 
 static mut SHARED: *mut Shared = core::ptr::null_mut();
@@ -273,6 +277,7 @@ fn take_tcp_query(shared: &mut Shared) -> bool {
         &mut replies,
         &mut forwards,
         false,
+        &mut shared.traffic,
     );
     publish(&shared.cache);
     for (bytes, ip) in forwards {
@@ -323,10 +328,22 @@ fn handle_client(
     cache: &mut DnsCache,
     pending: &mut Vec<PendingQuery>,
     next_id: &mut u16,
+    traffic: &mut dns_cache::top::Traffic,
 ) {
     let mut replies = Vec::new();
     let mut forwards = Vec::new();
-    handle_bytes(packet, ip, port, cache, pending, next_id, &mut replies, &mut forwards, true);
+    handle_bytes(
+        packet,
+        ip,
+        port,
+        cache,
+        pending,
+        next_id,
+        &mut replies,
+        &mut forwards,
+        true,
+        traffic,
+    );
     for (bytes, to_ip, to_port) in replies {
         udp_send(dns, &bytes, to_ip, to_port);
     }
@@ -345,6 +362,7 @@ fn handle_bytes(
     replies: &mut Vec<(Vec<u8>, [u8; 4], u16)>,
     forwards: &mut Vec<(Vec<u8>, [u8; 4])>,
     remember_client: bool,
+    traffic: &mut dns_cache::top::Traffic,
 ) {
     let now_ms = time_ms();
     let query = match DnsPacket::parse(packet) {
@@ -358,6 +376,7 @@ fn handle_bytes(
     let name = normalize_name(&question.name);
     post_query(&name);
     let qtype = question.qtype as u16;
+    traffic.note(name.as_bytes(), qtype, &ip);
     let qclass = question.qclass as u16;
 
     if blocked(&name) {
@@ -549,7 +568,24 @@ fn remember(cache: &mut DnsCache, name: &str, qtype: u16, qclass: u16, packet: &
 
 extern "C" fn cache_reaper(_arg: u64) {
     let mut last_reap = 0u64;
+    let mut last_top = 0u64;
     loop {
+        let now_ms = time_ms();
+        if last_top == 0 || now_ms.saturating_sub(last_top) >= 200 {
+            let mut raw = [0u8; 576];
+            let mut n = 0;
+            crate::thread::mutex_lock(&STATE_LOCK);
+            unsafe {
+                if let Some(shared) = SHARED.as_mut() {
+                    n = shared.traffic.write(now_ms, &mut raw);
+                }
+            }
+            crate::thread::mutex_unlock(&STATE_LOCK);
+            if n > 0 {
+                let _ = sys(SET_DNS_TOP, raw.as_ptr() as u64, n as u64, 0, 0, 0, 0);
+            }
+            last_top = now_ms;
+        }
         let planted = sys(CACHE_PLANT, 1, 0, 0, 0, 0, 0);
         if planted > 0 {
             let now = timer_ticks();

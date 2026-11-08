@@ -83,6 +83,10 @@ impl Board for Pi4 {
         genet::packet_counts()
     }
 
+    fn packet_bytes() -> (u64, u64) {
+        genet::packet_bytes()
+    }
+
     fn retarget_nic(_cpu: usize) {}
 
     fn probe_disk() -> bool {

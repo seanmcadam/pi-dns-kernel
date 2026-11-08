@@ -22,6 +22,8 @@
 
 extern crate alloc;
 
+pub mod top;
+
 use alloc::vec::Vec;
 
 /// Name bytes stored in a slot, not counting a trailing dot.

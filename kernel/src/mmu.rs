@@ -67,9 +67,11 @@ pub const USER_HEAP_VA: u64 = 0x1_000A_0000;
 pub const USER_HEAP_BYTES: u64 = 1536 * 1024;
 pub const USER_STACK_VA: u64 = 0x1_0022_0000;
 pub const USER_STACK_BYTES: u64 = 64 * 1024;
-/// Firmware framebuffer, mapped only into the HDMI task. Level-2 index 1.
-pub const USER_FB_VA: u64 = 0x1_0030_0000;
-pub const USER_FB_MAX: u64 = 1024 * 1024;
+/// Firmware framebuffer, mapped only into the HDMI task. It sits in the gap
+/// after the user stack so a 640x480 surface still fits in the two level-3
+/// tables. Level-2 index 1.
+pub const USER_FB_VA: u64 = 0x1_0024_0000;
+pub const USER_FB_MAX: u64 = 1280 * 1024;
 const ATTR_NORMAL: u64 = 0 << 2;
 const ATTR_DEVICE: u64 = 1 << 2;
 const ATTR_DMA: u64 = 2 << 2;

@@ -5,13 +5,27 @@
 //! user program publishes the cache size through a syscall so `/status` can
 //! keep reporting it.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::config_manager::DnsConfig;
 
 static CACHE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 static CACHE_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static PLANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+const TOP_CAP: usize = 576;
+static TOP_GEN: AtomicU32 = AtomicU32::new(0);
+static TOP_LEN: AtomicU32 = AtomicU32::new(0);
+static TOP_BUF: TopBuf = TopBuf {
+    bytes: UnsafeCell::new([0; TOP_CAP]),
+};
+
+struct TopBuf {
+    bytes: UnsafeCell<[u8; TOP_CAP]>,
+}
+
+unsafe impl Sync for TopBuf {}
 
 pub fn init(config: &DnsConfig) {
     log::info!("DNS server initialized");
@@ -69,6 +83,217 @@ pub fn write_cache_stats(out: &mut [u8]) -> usize {
     cursor = push(out, cursor, b" bytes=");
     cursor = push_dec(out, cursor, CACHE_STATS[7].load(Ordering::Relaxed));
     cursor = push(out, cursor, b"\n");
+    cursor
+}
+
+/// Store the version-1 top-N blob from dns-el0. The writer is the DNS task.
+/// Readers retry if a publish is in progress. No lock, so this stays off the
+/// scheduler and the FD lock order.
+pub fn set_top(bytes: &[u8]) {
+    let n = if bytes.len() < TOP_CAP { bytes.len() } else { TOP_CAP };
+    let gen = TOP_GEN.load(Ordering::Relaxed) & !1;
+    TOP_GEN.store(gen.wrapping_add(1), Ordering::Release);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), TOP_BUF.bytes.get().cast::<u8>(), n);
+    }
+    TOP_LEN.store(n as u32, Ordering::Release);
+    TOP_GEN.store(gen.wrapping_add(2), Ordering::Release);
+}
+
+/// `queries`, `hitrate`, and the three `top-` lines. Empty until the first publish.
+pub fn write_top(out: &mut [u8]) -> usize {
+    let mut raw = [0u8; TOP_CAP];
+    let n = copy_top(&mut raw);
+    let Some(view) = parse_top(&raw[..n]) else {
+        return push(out, 0, b"queries=0 rate=0\nhitrate=0\n");
+    };
+    let hits = CACHE_STATS[3].load(Ordering::Relaxed);
+    let misses = CACHE_STATS[4].load(Ordering::Relaxed);
+    let hitrate = if hits + misses == 0 {
+        0
+    } else {
+        hits.saturating_mul(100) / (hits + misses)
+    };
+    let mut cursor = 0;
+    cursor = push(out, cursor, b"queries=");
+    cursor = push_dec(out, cursor, view.queries);
+    cursor = push(out, cursor, b" rate=");
+    cursor = push_dec(out, cursor, view.rate);
+    cursor = push(out, cursor, b"\nhitrate=");
+    cursor = push_dec(out, cursor, hitrate);
+    cursor = push(out, cursor, b"\ntop-name");
+    let mut i = 0;
+    while i < view.name_n {
+        cursor = push(out, cursor, b" ");
+        cursor = push(out, cursor, &view.names[i].0[..view.names[i].1]);
+        cursor = push(out, cursor, b"=");
+        cursor = push_dec(out, cursor, view.names[i].2 as u64);
+        i += 1;
+    }
+    cursor = push(out, cursor, b"\ntop-type");
+    i = 0;
+    while i < view.type_n {
+        cursor = push(out, cursor, b" ");
+        cursor = push_type(out, cursor, view.types[i].0);
+        cursor = push(out, cursor, b"=");
+        cursor = push_dec(out, cursor, view.types[i].1 as u64);
+        i += 1;
+    }
+    cursor = push(out, cursor, b"\ntop-src");
+    i = 0;
+    while i < view.src_n {
+        cursor = push(out, cursor, b" ");
+        cursor = push_ip(out, cursor, view.srcs[i].0);
+        cursor = push(out, cursor, b"=");
+        cursor = push_dec(out, cursor, view.srcs[i].1 as u64);
+        i += 1;
+    }
+    push(out, cursor, b"\n")
+}
+
+fn copy_top(out: &mut [u8]) -> usize {
+    let mut spins = 0;
+    loop {
+        let gen = TOP_GEN.load(Ordering::Acquire);
+        if gen & 1 != 0 {
+            spins += 1;
+            if spins > 8 {
+                return 0;
+            }
+            core::hint::spin_loop();
+            continue;
+        }
+        let n = TOP_LEN.load(Ordering::Acquire) as usize;
+        let n = if n < out.len() { n } else { out.len() };
+        let n = if n < TOP_CAP { n } else { TOP_CAP };
+        unsafe {
+            core::ptr::copy_nonoverlapping(TOP_BUF.bytes.get().cast::<u8>(), out.as_mut_ptr(), n);
+        }
+        if TOP_GEN.load(Ordering::Acquire) == gen {
+            return n;
+        }
+    }
+}
+
+struct TopView {
+    queries: u64,
+    rate: u64,
+    names: [([u8; 48], usize, u32); 8],
+    name_n: usize,
+    types: [(u16, u32); 8],
+    type_n: usize,
+    srcs: [([u8; 4], u32); 8],
+    src_n: usize,
+}
+
+fn parse_top(raw: &[u8]) -> Option<TopView> {
+    if raw.len() < 21 || u32::from_le_bytes(raw[0..4].try_into().ok()?) != 1 {
+        return None;
+    }
+    let mut view = TopView {
+        queries: u64::from_le_bytes(raw[4..12].try_into().ok()?),
+        rate: u64::from_le_bytes(raw[12..20].try_into().ok()?),
+        names: [([0; 48], 0, 0); 8],
+        name_n: 0,
+        types: [(0, 0); 8],
+        type_n: 0,
+        srcs: [([0; 4], 0); 8],
+        src_n: 0,
+    };
+    let mut cursor = 20;
+    let name_n = *raw.get(cursor)? as usize;
+    cursor += 1;
+    if name_n > 8 {
+        return None;
+    }
+    let mut i = 0;
+    while i < name_n {
+        let len = *raw.get(cursor)? as usize;
+        cursor += 1;
+        if len == 0 || len > 48 || cursor + len + 4 > raw.len() {
+            return None;
+        }
+        let mut name = [0u8; 48];
+        name[..len].copy_from_slice(&raw[cursor..cursor + len]);
+        if name[..len].iter().any(|byte| *byte <= 0x20 || *byte >= 0x7f || *byte == b'=') {
+            return None;
+        }
+        cursor += len;
+        let count = u32::from_le_bytes(raw[cursor..cursor + 4].try_into().ok()?);
+        cursor += 4;
+        view.names[i] = (name, len, count);
+        i += 1;
+    }
+    view.name_n = name_n;
+    let type_n = *raw.get(cursor)? as usize;
+    cursor += 1;
+    if type_n > 8 {
+        return None;
+    }
+    i = 0;
+    while i < type_n {
+        if cursor + 6 > raw.len() {
+            return None;
+        }
+        let qtype = u16::from_le_bytes(raw[cursor..cursor + 2].try_into().ok()?);
+        cursor += 2;
+        let count = u32::from_le_bytes(raw[cursor..cursor + 4].try_into().ok()?);
+        cursor += 4;
+        view.types[i] = (qtype, count);
+        i += 1;
+    }
+    view.type_n = type_n;
+    let src_n = *raw.get(cursor)? as usize;
+    cursor += 1;
+    if src_n > 8 {
+        return None;
+    }
+    i = 0;
+    while i < src_n {
+        if cursor + 8 > raw.len() {
+            return None;
+        }
+        let mut ip = [0u8; 4];
+        ip.copy_from_slice(&raw[cursor..cursor + 4]);
+        cursor += 4;
+        let count = u32::from_le_bytes(raw[cursor..cursor + 4].try_into().ok()?);
+        cursor += 4;
+        view.srcs[i] = (ip, count);
+        i += 1;
+    }
+    view.src_n = src_n;
+    let _ = cursor;
+    Some(view)
+}
+
+fn push_type(out: &mut [u8], cursor: usize, qtype: u16) -> usize {
+    let name = match qtype {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        _ => "",
+    };
+    if !name.is_empty() {
+        push(out, cursor, name.as_bytes())
+    } else {
+        push_dec(out, cursor, qtype as u64)
+    }
+}
+
+fn push_ip(out: &mut [u8], mut cursor: usize, ip: [u8; 4]) -> usize {
+    let mut i = 0;
+    while i < 4 {
+        if i > 0 {
+            cursor = push(out, cursor, b".");
+        }
+        cursor = push_dec(out, cursor, ip[i] as u64);
+        i += 1;
+    }
     cursor
 }
 

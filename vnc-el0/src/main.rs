@@ -15,6 +15,7 @@ const TCP_CLOSE: u64 = 12;
 const LOG_RECENT: u64 = 31;
 const DEBUG_STATUS: u64 = 42;
 const TIMER_TICKS: u64 = 51;
+const TIMER_FREQ: u64 = 52;
 const YIELD: u64 = 1;
 const EXIT: u64 = 3;
 const DISPLAY_IO: u64 = 55;
@@ -91,9 +92,24 @@ fn session(fd: u64, password: &[u8]) {
     if n == 0 || !send_all(fd, header.as_ptr(), n) || !send_all(fd, NAME.as_ptr(), NAME.len()) {
         return;
     }
+    let freq = sys(TIMER_FREQ, 0, 0, 0, 0, 0, 0) as u64;
+    let mut follow = false;
+    let mut next = 0u64;
     loop {
         let mut kind = [0u8; 1];
-        if !recv_exact(fd, &mut kind) {
+        let n = sys(TCP_RECV, fd, kind.as_mut_ptr() as u64, 1, 1, 0, 0);
+        if n == -11 {
+            let now = sys(TIMER_TICKS, 0, 0, 0, 0, 0, 0) as u64;
+            if follow && freq > 0 && now >= next {
+                if !send_frame(fd) {
+                    return;
+                }
+                next = now.saturating_add(freq);
+            }
+            yield_now();
+            continue;
+        }
+        if n <= 0 {
             return;
         }
         match kind[0] {
@@ -114,6 +130,8 @@ fn session(fd: u64, password: &[u8]) {
                 if !send_frame(fd) {
                     return;
                 }
+                follow = true;
+                next = sys(TIMER_TICKS, 0, 0, 0, 0, 0, 0) as u64 + freq;
             }
             4 => {
                 if !skip(fd, 7) {
@@ -152,7 +170,7 @@ fn check_password(fd: u64, password: &[u8]) -> bool {
 
 fn send_frame(fd: u64) -> bool {
     let mut log_buf = [0u8; 1024];
-    let mut debug_buf = [0u8; 1200];
+    let mut debug_buf = [0u8; 2048];
     let log_n = sys(LOG_RECENT, log_buf.as_mut_ptr() as u64, log_buf.len() as u64, 0, 0, 0, 0);
     let debug_n = sys(
         DEBUG_STATUS,
@@ -167,7 +185,7 @@ fn send_frame(fd: u64) -> bool {
     let debug = text_of(&debug_buf, debug_n);
     unsafe {
         let fb = slice::from_raw_parts_mut(FB as *mut u8, display_console::BYTES);
-        display_console::draw(fb, display_console::STRIDE, "console", log, debug);
+        display_console::draw(fb, display_console::STRIDE, "console", debug, log);
     }
     let mut header = [0u8; 16];
     let n = rfb::raw_update_header(0, 0, rfb::WIDTH, rfb::HEIGHT, &mut header);

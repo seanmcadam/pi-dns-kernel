@@ -56,6 +56,10 @@ impl Board for Virt {
         virtio_net::packet_counts()
     }
 
+    fn packet_bytes() -> (u64, u64) {
+        virtio_net::packet_bytes()
+    }
+
     fn retarget_nic(cpu: usize) {
         virtio_net::retarget(cpu);
     }

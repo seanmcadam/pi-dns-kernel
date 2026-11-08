@@ -394,7 +394,7 @@ fn display_page() -> HttpResponse {
         r#"<!DOCTYPE html>
 <html><body>
 <h1>Display</h1>
-<p>VNC is an EL0 RFB 3.8 server. It is off until this form enables it. Default port 5900, bounds 1..=65535. Password 0..=8 printable bytes; empty means no authentication. The console is 320 by 240.</p>
+<p>VNC is an EL0 RFB 3.8 server. It is off until this form enables it. Default port 5900, bounds 1..=65535. Password 0..=8 printable bytes; empty means no authentication. The console is 640 by 480.</p>
 <p>HDMI is a separate process on Pi 4 and Pi 5. {hdmi}. vnc and hdmi are 0 or 1.</p>
 <p>VNC process: {live}</p>
 <p>Current: {current}</p>
@@ -546,7 +546,7 @@ fn handle_spin() -> HttpResponse {
 }
 
 fn handle_debug() -> HttpResponse {
-    let mut buf = [0u8; 1536];
+    let mut buf = [0u8; 2048];
     let n = sys(
         DEBUG_STATUS,
         buf.as_mut_ptr() as u64,
