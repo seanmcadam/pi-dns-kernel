@@ -41,6 +41,8 @@ const HTTP_INFO: u64 = 25;
 const TICK_HZ: u64 = 26;
 const DEBUG_SPIN: u64 = 27;
 const LOG_RECENT: u64 = 31;
+const DEBUG_STATUS: u64 = 42;
+const DEBUG_CRASH: u64 = 43;
 
 const EAGAIN: i64 = -11;
 
@@ -186,7 +188,14 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/records" => handle_records(request),
         "/records/delete" => handle_record_delete(request),
         "/logs" => handle_logs(),
+        "/debug" => handle_debug(),
         "/debug/spin" => handle_spin(),
+        "/debug/crash/dns" => handle_crash(0, 0),
+        "/debug/crash/http" => handle_crash(1, 0),
+        "/debug/crash/spin" => handle_crash(2, 0),
+        "/debug/crash/log" => handle_crash(3, 0),
+        "/debug/crash/telnet" => handle_crash(4, 0),
+        "/debug/crash/telnet-worker" => handle_crash(4, 1),
         "/debug/fault/guard" => {
             let _ = sys(FAULT_GUARD, 0, 0, 0, 0, 0, 0);
             loop {}
@@ -223,6 +232,37 @@ fn handle_logs() -> HttpResponse {
 fn handle_spin() -> HttpResponse {
     let _ = sys(DEBUG_SPIN, 0, 0, 0, 0, 0, 0);
     HttpResponse::ok("spinning\n")
+}
+
+fn handle_debug() -> HttpResponse {
+    let mut buf = [0u8; 1024];
+    let n = sys(
+        DEBUG_STATUS,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    let text = if n > 0 {
+        core::str::from_utf8(&buf[..n as usize]).unwrap_or("")
+    } else {
+        ""
+    };
+    let mut response = HttpResponse::ok(text);
+    response.add_header("Content-Type", "text/plain; charset=utf-8");
+    response
+}
+
+fn handle_crash(slot: u64, worker: u64) -> HttpResponse {
+    let rc = sys(DEBUG_CRASH, slot, worker, 0, 0, 0, 0);
+    if rc < 0 {
+        return HttpResponse::internal_error();
+    }
+    let mut response = HttpResponse::ok("armed\n");
+    response.add_header("Content-Type", "text/plain; charset=utf-8");
+    response
 }
 
 fn check_auth(request: &HttpRequest) -> bool {

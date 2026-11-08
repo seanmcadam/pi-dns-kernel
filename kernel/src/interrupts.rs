@@ -91,6 +91,9 @@ fn classify(id: u32) -> u64 {
         crate::net::service::note_kick();
         return CLASS_NET;
     }
+    if id == crate::gic::SGI_KILL {
+        return CLASS_OTHER;
+    }
     match crate::board::handle_irq(id) {
         crate::board::IrqHit::Net => {
             NIC_IRQS.fetch_add(1, Ordering::Relaxed);

@@ -507,7 +507,7 @@ pub fn submit(op: u8, fill: impl FnOnce(&mut Body)) -> Option<usize> {
         aux_len: 0,
         ip: 0,
         gen: 0,
-        asid: crate::percpu::slot() as u64 + 1,
+        asid: crate::supervisor::asid(crate::percpu::slot()),
         user_ptr: 0,
         user_aux: 0,
         handle_raw: 0,
@@ -575,6 +575,40 @@ pub fn handle_of(raw: usize) -> SocketHandle {
 
 pub fn handle_raw(handle: SocketHandle) -> usize {
     unsafe { core::mem::transmute(handle) }
+}
+
+/// Mark queued work for this process cancelled. Close jobs stay, so a
+/// teardown that already submitted them still runs.
+pub fn cancel_task(task: usize) {
+    let mut id = 0;
+    while id < JOBS_N {
+        if JOBS[id].state.load(Ordering::Acquire) == QUEUED {
+            unsafe {
+                let body = &mut *JOBS[id].body.get();
+                if body.task as usize == task
+                    && body.op != OP_TCP_CLOSE
+                    && body.op != OP_CANCEL
+                {
+                    body.op = OP_CANCEL;
+                }
+            }
+        }
+        id += 1;
+    }
+}
+
+pub fn task_queued(task: usize) -> bool {
+    let mut id = 0;
+    while id < JOBS_N {
+        if JOBS[id].state.load(Ordering::Acquire) == QUEUED {
+            let queued = unsafe { (*JOBS[id].body.get()).task as usize == task };
+            if queued {
+                return true;
+            }
+        }
+        id += 1;
+    }
+    false
 }
 
 pub fn cancel_fd(task: usize, fd: usize, except: usize) {

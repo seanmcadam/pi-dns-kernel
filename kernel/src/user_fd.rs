@@ -483,16 +483,14 @@ fn udp_bind_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
     let task = body.task as usize;
     let fd = body.fd as usize;
     let port = body.port;
-    let rx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
-    let tx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
-    let handle = stack.sockets_mut().add(udp::Socket::new(rx, tx));
+    let handle = take_udp(stack);
     let bound = stack
         .sockets_mut()
         .get_mut::<udp::Socket>(handle)
         .bind(port)
         .is_ok();
     if !bound {
-        stack.sockets_mut().remove(handle);
+        give_udp(stack, handle);
         let _lock = FD_LOCK[task].lock();
         table_of(task)[fd] = Kind::Empty;
         return service::Step::Done(EIO);
@@ -731,7 +729,19 @@ fn tcp_close_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::St
             table_of(task)[fd] = Kind::Empty;
         }
         3 => {
-            stack.sockets_mut().remove(handle);
+            give_udp(stack, handle);
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Empty;
+        }
+        5 => {
+            give_tcp(stack, handle);
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Empty;
+        }
+        6 => {
+            for handle in slots.into_iter().flatten() {
+                give_tcp(stack, handle);
+            }
             let _lock = FD_LOCK[task].lock();
             table_of(task)[fd] = Kind::Empty;
         }
@@ -742,6 +752,89 @@ fn tcp_close_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::St
         }
     }
     service::Step::Done(0)
+}
+
+/// Close every fd of a dead process. Returns when the table is empty and no
+/// job for it is still queued. A full job ring leaves the fd in place so the
+/// caller can try again. Does not drive the stack and does not take `SCHED`.
+pub fn release_fds(task: usize) -> bool {
+    if task >= TASKS {
+        return true;
+    }
+    service::cancel_task(task);
+    close_all(task);
+    idle(task)
+}
+
+pub fn idle(task: usize) -> bool {
+    if task >= TASKS {
+        return true;
+    }
+    if service::task_queued(task) {
+        return false;
+    }
+    let _lock = FD_LOCK[task].lock();
+    table_of(task).iter().all(|kind| matches!(kind, Kind::Empty))
+}
+
+pub fn open_fds() -> u32 {
+    let mut n = 0u32;
+    let mut task = 0;
+    while task < TASKS {
+        let _lock = FD_LOCK[task].lock();
+        for kind in table_of(task).iter() {
+            if !matches!(kind, Kind::Empty) {
+                n += 1;
+            }
+        }
+        task += 1;
+    }
+    n
+}
+
+fn close_all(task: usize) {
+    let _lock = FD_LOCK[task].lock();
+    let mut fd = 0;
+    while fd < MAX_FD {
+        let kind = table_of(task)[fd];
+        let posted = match kind {
+            Kind::Empty | Kind::Reserved => None,
+            Kind::TcpConn(handle) | Kind::Closing(handle) => {
+                table_of(task)[fd] = Kind::Reserved;
+                bump_gen(task, fd);
+                service::submit(service::OP_TCP_CLOSE, |body| {
+                    body.task = task as u8;
+                    body.fd = fd as u8;
+                    body.cap = 5;
+                    body.handle_raw = service::handle_raw(handle);
+                })
+            }
+            Kind::TcpListen(slots, _) => {
+                table_of(task)[fd] = Kind::Reserved;
+                bump_gen(task, fd);
+                service::submit(service::OP_TCP_CLOSE, |body| {
+                    body.task = task as u8;
+                    body.fd = fd as u8;
+                    body.cap = 6;
+                    body.listen = slots;
+                })
+            }
+            Kind::Udp(handle) => {
+                table_of(task)[fd] = Kind::Reserved;
+                bump_gen(task, fd);
+                service::submit(service::OP_TCP_CLOSE, |body| {
+                    body.task = task as u8;
+                    body.fd = fd as u8;
+                    body.cap = 3;
+                    body.handle_raw = service::handle_raw(handle);
+                })
+            }
+        };
+        if posted.is_none() && !matches!(kind, Kind::Empty | Kind::Reserved) {
+            table_of(task)[fd] = kind;
+        }
+        fd += 1;
+    }
 }
 
 pub fn recycle_all(stack: &mut crate::net::NetworkStack) {
@@ -794,17 +887,85 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
     table[listen_fd] = Kind::TcpListen(slots, port);
 }
 
-fn add_listener(stack: &mut crate::net::NetworkStack, port: u16) -> Option<SocketHandle> {
+/// The kernel heap never frees. Socket buffers are parked here on teardown
+/// and taken again the next time a port is bound, so a restart does not
+/// allocate another set. Touched only from the network owner.
+const TCP_POOL: usize = 64;
+const UDP_POOL: usize = 16;
+static mut TCP_POOL_H: [Option<SocketHandle>; TCP_POOL] = [None; TCP_POOL];
+static mut TCP_POOL_N: usize = 0;
+static mut UDP_POOL_H: [Option<SocketHandle>; UDP_POOL] = [None; UDP_POOL];
+static mut UDP_POOL_N: usize = 0;
+
+fn take_tcp(stack: &mut crate::net::NetworkStack) -> SocketHandle {
+    unsafe {
+        if TCP_POOL_N > 0 {
+            TCP_POOL_N -= 1;
+            if let Some(handle) = TCP_POOL_H[TCP_POOL_N].take() {
+                let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+                if socket.is_open() {
+                    socket.abort();
+                }
+                return handle;
+            }
+        }
+    }
     let rx = tcp::SocketBuffer::new(vec![0u8; 8192]);
     let tx = tcp::SocketBuffer::new(vec![0u8; 8192]);
-    let handle = stack.sockets_mut().add(tcp::Socket::new(rx, tx));
+    stack.sockets_mut().add(tcp::Socket::new(rx, tx))
+}
+
+fn give_tcp(stack: &mut crate::net::NetworkStack, handle: SocketHandle) {
+    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+    if socket.is_open() {
+        socket.abort();
+    }
+    unsafe {
+        if TCP_POOL_N < TCP_POOL {
+            TCP_POOL_H[TCP_POOL_N] = Some(handle);
+            TCP_POOL_N += 1;
+            return;
+        }
+    }
+    stack.sockets_mut().remove(handle);
+}
+
+fn take_udp(stack: &mut crate::net::NetworkStack) -> SocketHandle {
+    unsafe {
+        if UDP_POOL_N > 0 {
+            UDP_POOL_N -= 1;
+            if let Some(handle) = UDP_POOL_H[UDP_POOL_N].take() {
+                stack.sockets_mut().get_mut::<udp::Socket>(handle).close();
+                return handle;
+            }
+        }
+    }
+    let rx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
+    let tx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
+    stack.sockets_mut().add(udp::Socket::new(rx, tx))
+}
+
+fn give_udp(stack: &mut crate::net::NetworkStack, handle: SocketHandle) {
+    stack.sockets_mut().get_mut::<udp::Socket>(handle).close();
+    unsafe {
+        if UDP_POOL_N < UDP_POOL {
+            UDP_POOL_H[UDP_POOL_N] = Some(handle);
+            UDP_POOL_N += 1;
+            return;
+        }
+    }
+    stack.sockets_mut().remove(handle);
+}
+
+fn add_listener(stack: &mut crate::net::NetworkStack, port: u16) -> Option<SocketHandle> {
+    let handle = take_tcp(stack);
     let listening = stack
         .sockets_mut()
         .get_mut::<tcp::Socket>(handle)
         .listen(port)
         .is_ok();
     if !listening {
-        stack.sockets_mut().remove(handle);
+        give_tcp(stack, handle);
         return None;
     }
     Some(handle)

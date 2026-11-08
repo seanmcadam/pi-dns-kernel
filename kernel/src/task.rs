@@ -27,12 +27,15 @@
 //!   40 log_follow(cursor, buf, cap, drops, flags) -> len.
 //!      The caller sleeps when the ring is idle. flags 1 returns 0 instead.
 //!   41 log_wake(). Wakes log followers. Does not publish a line.
+//!   42 debug_status(buf, cap) -> length of the supervisor page
+//!   43 debug_crash(slot, worker) -> 0. worker 1 faults one pool thread
+//!   44 thread_try_join(tid) -> exit code, -11 if it is still running, -4 if empty
 //! Anything else returns -1. A log pointer outside the user window returns -2.
 //! Neither path faults. The boot program proves the round trip on slot 0.
 //! DNS reuses that slot. HTTP uses slot 1.
 
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 core::arch::global_asm!(include_str!("task.s"));
 
@@ -56,9 +59,12 @@ const BLOCK: u64 = 5;
 const LOG_PUBLISH: u64 = 39;
 const LOG_FOLLOW: u64 = 40;
 const LOG_WAKE: u64 = 41;
+const DEBUG_STATUS: u64 = 42;
+const DEBUG_CRASH: u64 = 43;
 const THREAD_CREATE: u64 = 34;
 const THREAD_EXIT: u64 = 35;
 const THREAD_JOIN: u64 = 36;
+const THREAD_TRY_JOIN: u64 = 44;
 const FUTEX_WAIT: u64 = 37;
 const FUTEX_WAKE: u64 = 38;
 
@@ -180,17 +186,12 @@ static mut SPIN_LIVE: bool = false;
 static mut LOG_LIVE: bool = false;
 static mut TELNET_LIVE: bool = false;
 
-const DNS_SLOT: usize = 0;
-const HTTP_SLOT: usize = 1;
-const SPIN_SLOT: usize = 2;
-const LOG_SLOT: usize = 3;
-const TELNET_SLOT: usize = 4;
+pub const DNS_SLOT: usize = 0;
+pub const HTTP_SLOT: usize = 1;
+pub const SPIN_SLOT: usize = 2;
+pub const LOG_SLOT: usize = 3;
+pub const TELNET_SLOT: usize = 4;
 const TASK_SLOTS: usize = 5;
-const DNS_ASID: u64 = 1;
-const HTTP_ASID: u64 = 2;
-const SPIN_ASID: u64 = 3;
-const LOG_ASID: u64 = 4;
-const TELNET_ASID: u64 = 5;
 
 const LOG_CODE_BYTES: usize = 128 * 1024;
 const LOG_DATA_BYTES: usize = 4096;
@@ -210,6 +211,7 @@ extern "C" {
 
 fn enter(ctx: *mut TaskContext, ksp: u64) -> u64 {
     crate::percpu::set_slice(0);
+    redirect_ctx(ctx);
     unsafe { enter_user(ctx, ksp) }
 }
 
@@ -360,6 +362,12 @@ pub extern "C" fn el0_dispatch(kind: u64) -> u64 {
     if kind == 1 {
         EL0_IRQS.fetch_add(1, Ordering::Relaxed);
         let class = crate::interrupts::irq_handler();
+        if stop_user() {
+            return FAULT;
+        }
+        if redirect_current() {
+            return RESUME;
+        }
         // Only the timer advances the slice. A NIC IRQ must not look like
         // the boot test's timer preemption, and it must not burn the quantum.
         if class == crate::interrupts::CLASS_TIMER && crate::percpu::bump_slice(QUANTUM_TICKS) {
@@ -376,10 +384,20 @@ pub extern "C" fn el0_dispatch(kind: u64) -> u64 {
         }
         return RESUME;
     }
+    if stop_user() {
+        return FAULT;
+    }
+    if redirect_current() {
+        return RESUME;
+    }
     let esr = reg("esr_el1");
     let ec = (esr >> 26) & 0x3f;
     if ec == 0x15 {
-        return after_syscall(syscall());
+        let action = after_syscall(syscall());
+        if stop_user() {
+            return FAULT;
+        }
+        return action;
     }
     kill(ec);
     FAULT
@@ -431,6 +449,15 @@ fn syscall() -> u64 {
         THREAD_CREATE => thread_create(a0, a1, ctx.x[2]),
         THREAD_EXIT => thread_exit(a0 as i64),
         THREAD_JOIN => thread_join(a0),
+        THREAD_TRY_JOIN => thread_try_join(a0),
+        DEBUG_STATUS => {
+            ctx.x[0] = crate::supervisor::status(a0, a1) as u64;
+            RESUME
+        }
+        DEBUG_CRASH => {
+            ctx.x[0] = crate::supervisor::arm(a0 as usize, a1 != 0) as u64;
+            RESUME
+        }
         FUTEX_WAIT => futex_wait(a0, a1),
         FUTEX_WAKE => futex_wake(a0, a1),
         LOG_PUBLISH => {
@@ -516,6 +543,13 @@ fn kill(ec: u64) {
             5 => EXEC_KILLED = true,
             _ => {}
         }
+    }
+    let slot = crate::percpu::slot();
+    crate::supervisor::note(slot, ec, elr, far);
+    let index = crate::percpu::thread_index();
+    if index != 0 {
+        clear_log_wait(slot, Some(index as u8));
+        crate::supervisor::worker_fault(slot, ec, elr, far);
     }
 }
 
@@ -658,26 +692,16 @@ pub fn start_dns() -> Result<(), ()> {
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::mmu::USER_STACK_BYTES;
         crate::user_fd::set_task(DNS_SLOT);
-        crate::mmu::use_user_slot(DNS_SLOT, DNS_ASID);
         let ksp = addr_of!(TASK.kstack) as u64 + KSTACK_BYTES as u64;
         crate::percpu::set_slot(DNS_SLOT);
         crate::percpu::set_thread_index(0);
         DNS_LIVE = true;
-        loop {
-            match enter(ctx, ksp) {
-                YIELD | BLOCK => return Ok(()),
-                PREEMPT => continue,
-                _ => {
-                    DNS_LIVE = false;
-                    return Err(());
-                }
-            }
-        }
+        run_until_yield(DNS_SLOT, ctx, ksp)
     }
 }
 
 pub fn poll_dns() {
-    resume(DNS_SLOT, DNS_ASID, addr_of_mut!(TASK), true);
+    resume(DNS_SLOT, addr_of_mut!(TASK), true);
 }
 
 pub fn start_http() -> Result<(), ()> {
@@ -701,26 +725,16 @@ pub fn start_http() -> Result<(), ()> {
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + crate::mmu::USER_STACK_BYTES;
         crate::user_fd::set_task(HTTP_SLOT);
-        crate::mmu::use_user_slot(HTTP_SLOT, HTTP_ASID);
         let ksp = addr_of!(HTTP_TASK.kstack) as u64 + KSTACK_BYTES as u64;
         crate::percpu::set_slot(HTTP_SLOT);
         crate::percpu::set_thread_index(0);
         HTTP_LIVE = true;
-        loop {
-            match enter(ctx, ksp) {
-                YIELD | BLOCK => return Ok(()),
-                PREEMPT => continue,
-                _ => {
-                    HTTP_LIVE = false;
-                    return Err(());
-                }
-            }
-        }
+        run_until_yield(HTTP_SLOT, ctx, ksp)
     }
 }
 
 pub fn poll_http() {
-    resume(HTTP_SLOT, HTTP_ASID, addr_of_mut!(HTTP_TASK), false);
+    resume(HTTP_SLOT, addr_of_mut!(HTTP_TASK), false);
 }
 
 pub fn log_live() -> bool {
@@ -764,21 +778,11 @@ pub fn start_log() -> Result<(), ()> {
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + LOG_STACK_BYTES as u64;
         crate::user_fd::set_task(LOG_SLOT);
-        crate::mmu::use_user_slot(LOG_SLOT, LOG_ASID);
         let ksp = addr_of!(LOG_TASK.kstack) as u64 + KSTACK_BYTES as u64;
         crate::percpu::set_slot(LOG_SLOT);
         crate::percpu::set_thread_index(0);
         LOG_LIVE = true;
-        loop {
-            match enter(ctx, ksp) {
-                YIELD | BLOCK => return Ok(()),
-                PREEMPT => continue,
-                _ => {
-                    LOG_LIVE = false;
-                    return Err(());
-                }
-            }
-        }
+        run_until_yield(LOG_SLOT, ctx, ksp)
     }
 }
 
@@ -790,20 +794,17 @@ pub fn poll_log() {
         return;
     }
     crate::user_fd::set_task(LOG_SLOT);
-    crate::mmu::use_user_slot(LOG_SLOT, LOG_ASID);
+    crate::mmu::use_user_slot(LOG_SLOT, crate::supervisor::asid(LOG_SLOT));
     unsafe {
         crate::percpu::set_slot(LOG_SLOT);
         crate::percpu::set_thread_index(0);
         let ctx = addr_of_mut!(LOG_TASK.ctx);
         let ksp = addr_of!(LOG_TASK.kstack) as u64 + KSTACK_BYTES as u64;
         let action = enter(ctx, ksp);
-        if action == BLOCK {
+        if action == BLOCK || still_scheduled(action) {
             return;
         }
-        if !still_scheduled(action) {
-            LOG_LIVE = false;
-            put("EL0 log stopped\r\n");
-        }
+        crate::supervisor::died(LOG_SLOT);
     }
 }
 
@@ -849,21 +850,11 @@ pub fn start_telnet() -> Result<(), ()> {
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + TELNET_STACK_BYTES as u64;
         crate::user_fd::set_task(TELNET_SLOT);
-        crate::mmu::use_user_slot(TELNET_SLOT, TELNET_ASID);
         let ksp = addr_of!(TELNET_TASK.kstack) as u64 + KSTACK_BYTES as u64;
         crate::percpu::set_slot(TELNET_SLOT);
         crate::percpu::set_thread_index(0);
         TELNET_LIVE = true;
-        loop {
-            match enter(ctx, ksp) {
-                YIELD | BLOCK => return Ok(()),
-                PREEMPT => continue,
-                _ => {
-                    TELNET_LIVE = false;
-                    return Err(());
-                }
-            }
-        }
+        run_until_yield(TELNET_SLOT, ctx, ksp)
     }
 }
 
@@ -875,20 +866,17 @@ pub fn poll_telnet() {
         return;
     }
     crate::user_fd::set_task(TELNET_SLOT);
-    crate::mmu::use_user_slot(TELNET_SLOT, TELNET_ASID);
+    crate::mmu::use_user_slot(TELNET_SLOT, crate::supervisor::asid(TELNET_SLOT));
     unsafe {
         crate::percpu::set_slot(TELNET_SLOT);
         crate::percpu::set_thread_index(0);
         let ctx = addr_of_mut!(TELNET_TASK.ctx);
         let ksp = addr_of!(TELNET_TASK.kstack) as u64 + KSTACK_BYTES as u64;
         let action = enter(ctx, ksp);
-        if action == BLOCK {
+        if action == BLOCK || still_scheduled(action) {
             return;
         }
-        if !still_scheduled(action) {
-            TELNET_LIVE = false;
-            put("EL0 telnet stopped\r\n");
-        }
+        crate::supervisor::died(TELNET_SLOT);
     }
 }
 
@@ -897,25 +885,40 @@ pub fn poll_spin() {
         return;
     }
     crate::user_fd::set_task(SPIN_SLOT);
-    crate::mmu::use_user_slot(SPIN_SLOT, SPIN_ASID);
+    crate::mmu::use_user_slot(SPIN_SLOT, crate::supervisor::asid(SPIN_SLOT));
     unsafe {
         crate::percpu::set_slot(SPIN_SLOT);
         crate::percpu::set_thread_index(0);
         let ctx = addr_of_mut!(SPIN_TASK.ctx);
         let ksp = addr_of!(SPIN_TASK.kstack) as u64 + KSTACK_BYTES as u64;
-        if !still_scheduled(enter(ctx, ksp)) {
-            SPIN_LIVE = false;
-            put("EL0 spin stopped\r\n");
+        let action = enter(ctx, ksp);
+        if action == BLOCK || still_scheduled(action) {
+            return;
         }
+        crate::supervisor::died(SPIN_SLOT);
     }
 }
 
 /// Arm the EL0 program that branches to itself. The caller is in a syscall,
 /// so this only publishes the task. The poll loop runs it.
 pub fn arm_spinner() -> i64 {
+    if unsafe { SPIN_LIVE } {
+        return 0;
+    }
+    if start_spin().is_err() {
+        return -1;
+    }
+    let slot = crate::percpu::slot();
+    crate::user_fd::set_task(slot);
+    crate::mmu::use_user_slot(slot, crate::supervisor::asid(slot));
+    put("EL0 spin task armed\r\n");
+    0
+}
+
+pub fn start_spin() -> Result<(), ()> {
     unsafe {
         if SPIN_LIVE {
-            return 0;
+            return Ok(());
         }
         let code = addr_of_mut!(SPIN_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, 4096);
@@ -932,35 +935,42 @@ pub fn arm_spinner() -> i64 {
         (*ctx).spsr = 0;
         (*ctx).sp_el0 = crate::mmu::USER_STACK_VA + 4096;
         SPIN_LIVE = true;
-        let slot = crate::percpu::slot();
-        crate::mmu::use_user_slot(slot, slot as u64 + 1);
-        put("EL0 spin task armed\r\n");
-        0
+        crate::supervisor::begin(SPIN_SLOT);
+        Ok(())
     }
 }
 
-fn resume(slot: usize, asid: u64, task: *mut Task, dns: bool) {
+fn resume(slot: usize, task: *mut Task, dns: bool) {
     let live = unsafe { if dns { DNS_LIVE } else { HTTP_LIVE } };
     if !live || main_blocked(slot) {
         return;
     }
     crate::user_fd::set_task(slot);
-    crate::mmu::use_user_slot(slot, asid);
+    crate::mmu::use_user_slot(slot, crate::supervisor::asid(slot));
     unsafe {
         crate::percpu::set_slot(slot);
         crate::percpu::set_thread_index(0);
-        let ctx = &mut (*task).ctx as *mut TaskContext;
+        let ctx = addr_of_mut!((*task).ctx);
         let ksp = addr_of!((*task).kstack) as u64 + KSTACK_BYTES as u64;
         let action = enter(ctx, ksp);
         if action == BLOCK || still_scheduled(action) {
             return;
         }
-        if dns {
-            DNS_LIVE = false;
-            put("EL0 dns stopped\r\n");
-        } else {
-            HTTP_LIVE = false;
-            put("EL0 http stopped\r\n");
+        crate::supervisor::died(slot);
+    }
+}
+
+fn run_until_yield(slot: usize, ctx: *mut TaskContext, ksp: u64) -> Result<(), ()> {
+    crate::supervisor::begin(slot);
+    crate::mmu::use_user_slot(slot, crate::supervisor::asid(slot));
+    loop {
+        match enter(ctx, ksp) {
+            YIELD | BLOCK => return Ok(()),
+            PREEMPT => continue,
+            _ => {
+                crate::supervisor::died(slot);
+                return Err(());
+            }
         }
     }
 }
@@ -1039,6 +1049,7 @@ const ST_RUNNABLE: u8 = 1;
 const ST_RUNNING: u8 = 2;
 const ST_BLOCKED: u8 = 3;
 const ST_EXITED: u8 = 4;
+const ST_DYING: u8 = 5;
 const WAITER_NONE: i16 = -1;
 const WAITER_MAIN: i16 = -2;
 
@@ -1055,16 +1066,343 @@ struct PoolThread {
 }
 
 static SCHED: crate::spin::IrqSpin = crate::spin::IrqSpin::new();
+static DOOMED: AtomicU32 = AtomicU32::new(0);
+static MAIN_INJECT: [AtomicU64; TASK_SLOTS] = [const { AtomicU64::new(0) }; TASK_SLOTS];
+static THREAD_INJECT: [AtomicBool; MAX_THREADS] = [const { AtomicBool::new(false) }; MAX_THREADS];
 
 pub fn with_sched<R>(f: impl FnOnce() -> R) -> R {
     let _guard = SCHED.lock();
     f()
 }
 
+pub fn clear_live(slot: usize) {
+    unsafe {
+        match slot {
+            DNS_SLOT => DNS_LIVE = false,
+            HTTP_SLOT => HTTP_LIVE = false,
+            SPIN_SLOT => SPIN_LIVE = false,
+            LOG_SLOT => LOG_LIVE = false,
+            TELNET_SLOT => TELNET_LIVE = false,
+            _ => {}
+        }
+    }
+}
+
+pub fn poke_others() {
+    let me = crate::percpu::id();
+    let n = crate::smp::online() as usize;
+    let mut cpu = 0;
+    while cpu < n && cpu < 8 {
+        if cpu != me {
+            crate::gic::send_sgi(crate::gic::SGI_KILL, cpu);
+        }
+        cpu += 1;
+    }
+}
+
+pub fn kill_slot(slot: usize) {
+    {
+        let _guard = SCHED.lock();
+        unsafe {
+            let mut prev = WAITER_NONE;
+            let mut cur = FUTEX_HEAD;
+            while cur >= 0 {
+                let index = cur as usize;
+                let next = THREADS[index].futex_next;
+                if THREADS[index].slot as usize == slot {
+                    if prev < 0 {
+                        FUTEX_HEAD = next;
+                    } else {
+                        THREADS[prev as usize].futex_next = next;
+                    }
+                    THREADS[index].futex_next = WAITER_NONE;
+                    THREADS[index].futex_addr = 0;
+                } else {
+                    prev = cur;
+                }
+                cur = next;
+            }
+            let mut i = 0;
+            while i < MAX_THREADS {
+                if THREADS[i].slot as usize == slot && THREADS[i].state != ST_EMPTY {
+                    let waiter = THREADS[i].waiter;
+                    let waiter_slot = THREADS[i].waiter_slot as usize;
+                    THREADS[i].waiter = WAITER_NONE;
+                    if waiter == WAITER_MAIN && waiter_slot != slot && waiter_slot < TASK_SLOTS {
+                        MAIN_BLOCKED[waiter_slot].store(false, Ordering::Release);
+                        sev();
+                    } else if waiter >= 0 {
+                        let other = waiter as usize;
+                        if other < MAX_THREADS
+                            && THREADS[other].slot as usize != slot
+                            && THREADS[other].state == ST_BLOCKED
+                        {
+                            THREADS[other].task.ctx.x[0] = (-1i64) as u64;
+                            THREADS[other].state = ST_RUNNABLE;
+                            queue_push(waiter);
+                            sev();
+                        }
+                    }
+                    THREAD_INJECT[i].store(false, Ordering::Release);
+                    if THREADS[i].state == ST_RUNNING {
+                        DOOMED.fetch_or(1u32 << i, Ordering::Release);
+                    } else if THREADS[i].state == ST_RUNNABLE {
+                        THREADS[i].state = ST_DYING;
+                    } else {
+                        THREADS[i].state = ST_EMPTY;
+                        DOOMED.fetch_and(!(1u32 << i), Ordering::Release);
+                    }
+                }
+                i += 1;
+            }
+            clear_log_wait_locked(slot, None);
+            if slot < TASK_SLOTS {
+                MAIN_BLOCKED[slot].store(false, Ordering::Release);
+                MAIN_FUTEX[slot] = 0;
+                MAIN_INJECT[slot].store(0, Ordering::Release);
+            }
+        }
+    }
+    poke_others();
+}
+
+pub fn slot_busy(slot: usize) -> bool {
+    let _guard = SCHED.lock();
+    unsafe {
+        let mut busy = false;
+        let mut i = 0;
+        while i < MAX_THREADS {
+            if THREADS[i].slot as usize == slot {
+                match THREADS[i].state {
+                    ST_RUNNING | ST_DYING | ST_RUNNABLE => busy = true,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        busy
+    }
+}
+
+pub fn inject_main(slot: usize, delay_ms: u64) -> i64 {
+    if slot >= TASK_SLOTS {
+        return -4;
+    }
+    plant_fault(slot);
+    let due = crate::timer::millis().saturating_add(delay_ms).max(1);
+    MAIN_INJECT[slot].store(due, Ordering::Release);
+    if delay_ms == 0 {
+        nudge_slot(slot);
+    }
+    0
+}
+
+pub fn inject_worker(slot: usize) -> i64 {
+    plant_fault(slot);
+    let _guard = SCHED.lock();
+    unsafe {
+        let mut chosen = None;
+        let mut i = 0;
+        while i < MAX_THREADS {
+            if THREADS[i].slot as usize == slot {
+                match THREADS[i].state {
+                    ST_RUNNABLE | ST_RUNNING | ST_BLOCKED => chosen = Some(i),
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let Some(index) = chosen else {
+            return -1;
+        };
+        THREAD_INJECT[index].store(true, Ordering::Release);
+        clear_log_wait_locked(slot, Some((index as u8).saturating_add(1)));
+        if THREADS[index].state == ST_BLOCKED {
+            unlink_futex(index);
+            THREADS[index].futex_addr = 0;
+            THREADS[index].state = ST_RUNNABLE;
+            queue_push(index as i16);
+            sev();
+        }
+    }
+    0
+}
+
+pub fn nudge_injected(now: u64) {
+    let mut slot = 0;
+    while slot < TASK_SLOTS {
+        let due = MAIN_INJECT[slot].load(Ordering::Acquire);
+        if due != 0 && now >= due {
+            nudge_slot(slot);
+        }
+        slot += 1;
+    }
+}
+
+fn nudge_slot(slot: usize) {
+    if slot >= TASK_SLOTS {
+        return;
+    }
+    let _guard = SCHED.lock();
+    unsafe {
+        MAIN_BLOCKED[slot].store(false, Ordering::Release);
+        MAIN_FUTEX[slot] = 0;
+    }
+    sev();
+}
+
+fn stop_user() -> bool {
+    let slot = crate::percpu::slot();
+    if crate::supervisor::dead(slot) {
+        return true;
+    }
+    let index = crate::percpu::thread_index();
+    if index == 0 {
+        return false;
+    }
+    let mine = (index - 1) as usize;
+    if mine >= MAX_THREADS {
+        return false;
+    }
+    DOOMED.load(Ordering::Acquire) & (1u32 << mine) != 0
+}
+
+fn redirect_current() -> bool {
+    redirect_ctx(crate::percpu::current())
+}
+
+fn redirect_ctx(ctx: *mut TaskContext) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    let slot = crate::percpu::slot();
+    if slot >= TASK_SLOTS {
+        return false;
+    }
+    let index = crate::percpu::thread_index();
+    let now = crate::timer::millis();
+    if index == 0 {
+        let due = MAIN_INJECT[slot].load(Ordering::Acquire);
+        if due == 0 || now < due {
+            return false;
+        }
+        if MAIN_INJECT[slot]
+            .compare_exchange(due, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+    } else {
+        let mine = (index - 1) as usize;
+        if mine >= MAX_THREADS || !THREAD_INJECT[mine].swap(false, Ordering::AcqRel) {
+            return false;
+        }
+    }
+    plant_fault(slot);
+    unsafe {
+        (*ctx).elr = fault_va(slot);
+    }
+    true
+}
+
+fn plant_fault(slot: usize) {
+    let len = code_bytes(slot);
+    if len < 8 {
+        return;
+    }
+    let ptr = code_ptr(slot);
+    if ptr.is_null() {
+        return;
+    }
+    // Unsigned-offset LDR treats x31 as SP, so `ldr w0, [xzr]` is not
+    // encodable that way. Clear x0, then load through it. The load is the
+    // instruction that data-aborts with FAR 0.
+    unsafe {
+        let at = ptr.add(len - 8) as *mut u32;
+        core::ptr::write_volatile(at, 0xAA1F_03E0);
+        core::ptr::write_volatile(at.add(1), 0xB940_0000);
+        let kva = at as u64;
+        let uva = crate::mmu::USER_CODE_VA + len as u64 - 8;
+        core::arch::asm!(
+            "dc cvau, {kva}",
+            "ic ivau, {kva}",
+            "ic ivau, {uva}",
+            "add {kva}, {kva}, #4",
+            "add {uva}, {uva}, #4",
+            "dc cvau, {kva}",
+            "ic ivau, {kva}",
+            "ic ivau, {uva}",
+            kva = inout(reg) kva => _,
+            uva = inout(reg) uva => _,
+            options(nostack),
+        );
+        core::arch::asm!("dsb ish", "isb", options(nostack));
+    }
+}
+
+fn fault_va(slot: usize) -> u64 {
+    crate::mmu::USER_CODE_VA + code_bytes(slot) as u64 - 8
+}
+
+fn code_bytes(slot: usize) -> usize {
+    match slot {
+        LOG_SLOT => LOG_CODE_BYTES,
+        TELNET_SLOT => TELNET_CODE_BYTES,
+        SPIN_SLOT => 4096,
+        _ => crate::mmu::USER_CODE_BYTES as usize,
+    }
+}
+
+fn code_ptr(slot: usize) -> *mut u8 {
+    unsafe {
+        match slot {
+            HTTP_SLOT => addr_of_mut!(HTTP_MEM.code).cast(),
+            SPIN_SLOT => addr_of_mut!(SPIN_MEM.code).cast(),
+            LOG_SLOT => addr_of_mut!(LOG_MEM.code).cast(),
+            TELNET_SLOT => addr_of_mut!(TELNET_MEM.code).cast(),
+            _ => addr_of_mut!(USER_MEM.code).cast(),
+        }
+    }
+}
+
+fn clear_log_wait(slot: usize, index: Option<u8>) {
+    let _guard = SCHED.lock();
+    clear_log_wait_locked(slot, index);
+}
+
+fn clear_log_wait_locked(slot: usize, index: Option<u8>) {
+    unsafe {
+        let mut i = 0;
+        while i < LOG_WAIT_N {
+            if LOG_WAIT[i].live && LOG_WAIT[i].slot as usize == slot {
+                let drop_it = match index {
+                    Some(thread) => LOG_WAIT[i].index == thread,
+                    None => true,
+                };
+                if drop_it {
+                    LOG_WAIT[i].live = false;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Caller holds `SCHED`.
 pub fn block_current_locked() {
     let slot = crate::percpu::slot();
     let index = crate::percpu::thread_index();
+    if index != 0 {
+        let mine = (index - 1) as usize;
+        if mine < MAX_THREADS
+            && (DOOMED.load(Ordering::Relaxed) & (1u32 << mine) != 0
+                || crate::supervisor::dead(slot))
+        {
+            return;
+        }
+    } else if crate::supervisor::dead(slot) {
+        return;
+    }
     if index == 0 {
         unsafe {
             MAIN_FUTEX[slot] = 0;
@@ -1246,7 +1584,17 @@ pub fn schedule_one() -> bool {
         let Some(index) = queue_pop() else {
             return false;
         };
-        unsafe { THREADS[index].state = ST_RUNNING; }
+        unsafe {
+            let slot = THREADS[index].slot as usize;
+            let doomed = DOOMED.load(Ordering::Relaxed) & (1u32 << index) != 0;
+            if THREADS[index].state == ST_DYING || doomed || crate::supervisor::dead(slot) {
+                THREADS[index].state = ST_EMPTY;
+                DOOMED.fetch_and(!(1u32 << index), Ordering::Release);
+                THREAD_INJECT[index].store(false, Ordering::Release);
+                return true;
+            }
+            THREADS[index].state = ST_RUNNING;
+        }
         index
     };
     let (ctx, ksp, slot, asid) = unsafe {
@@ -1266,6 +1614,16 @@ pub fn schedule_one() -> bool {
     crate::percpu::set_thread_index(0);
     let _guard = SCHED.lock();
     unsafe {
+        let slot = THREADS[index].slot as usize;
+        let doomed = DOOMED.load(Ordering::Relaxed) & (1u32 << index) != 0;
+        if doomed || THREADS[index].state == ST_DYING || crate::supervisor::dead(slot) {
+            unlink_futex(index);
+            THREADS[index].state = ST_EMPTY;
+            THREADS[index].waiter = WAITER_NONE;
+            DOOMED.fetch_and(!(1u32 << index), Ordering::Release);
+            THREAD_INJECT[index].store(false, Ordering::Release);
+            return true;
+        }
         let thread = &mut THREADS[index];
         match action {
             YIELD | PREEMPT => {
@@ -1325,7 +1683,7 @@ fn thread_create(entry: u64, stack: u64, arg: u64) -> u64 {
         return RESUME;
     }
     let slot = crate::percpu::slot();
-    let asid = slot as u64 + 1;
+    let asid = crate::supervisor::asid(slot);
     let _guard = SCHED.lock();
     unsafe {
         let mut chosen = None;
@@ -1409,6 +1767,29 @@ fn thread_join(tid: u64) -> u64 {
         }
     }
     BLOCK
+}
+
+fn thread_try_join(tid: u64) -> u64 {
+    let ctx = unsafe { &mut *crate::percpu::current() };
+    if tid == 0 || tid as usize > MAX_THREADS {
+        ctx.x[0] = (-4i64) as u64;
+        return RESUME;
+    }
+    let index = tid as usize - 1;
+    let _guard = SCHED.lock();
+    unsafe {
+        if THREADS[index].state == ST_EMPTY || THREADS[index].state == ST_DYING {
+            ctx.x[0] = (-4i64) as u64;
+            return RESUME;
+        }
+        if THREADS[index].state == ST_EXITED {
+            ctx.x[0] = THREADS[index].exit_code as u64;
+            THREADS[index].state = ST_EMPTY;
+            return RESUME;
+        }
+    }
+    ctx.x[0] = (-11i64) as u64;
+    RESUME
 }
 
 struct LogWait {

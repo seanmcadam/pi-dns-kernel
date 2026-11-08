@@ -25,6 +25,8 @@ pub const SPURIOUS_IRQ: u32 = 1023;
 
 /// Socket-queue kick. Each CPU enables this banked SGI in `init_cpu`.
 pub const SGI_NET: u32 = 1;
+/// Ask every other core to leave EL0. The handler does not take a lock.
+pub const SGI_KILL: u32 = 2;
 
 const GICD_CTLR: usize = 0x000;
 const GICD_TYPER: usize = 0x004;
@@ -107,6 +109,9 @@ pub fn init_cpu() {
     set_priority(SGI_NET, 0x80);
     set_group1(SGI_NET);
     enable_id(SGI_NET);
+    set_priority(SGI_KILL, 0x80);
+    set_group1(SGI_KILL);
+    enable_id(SGI_KILL);
 
     // QEMU's GICv2 treats this CPU as Secure. A Secure ack of a Group 1
     // interrupt returns 1022 unless GICC_CTLR.AckCtl is set, so the timer

@@ -57,6 +57,7 @@ A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the 
 - Strict TTBR1 map: `.text` is read-only and executable, `.rodata` is read-only and not executable, and data, bss, heap, and stack are read-write and not executable. One guard page sits under the stack. Devices are programmed with physical addresses. The CPU uses the high alias, including for `.dma`.
 - Virtio rings and packet buffers are in `.dma` and mapped Normal non-cacheable so DMA stays coherent with the data cache on. Other RAM is write-back cacheable. UART, virtio-mmio, and the GIC are Device-nGnRE.
 - `GET /debug/fault/guard` and `GET /debug/fault/text` (HTTP basic auth) deliberately fault.
+- Authenticated `GET /debug` shows each service's state, restart count, last fault (`ec`, `elr`, `far`, time), and uptime, plus free user pages, held ASIDs, and open fds. `GET /debug/crash/dns` (and `http`, `log`, `telnet`, `telnet-worker`) arms a real data abort. A dead main thread takes its process with it: threads on every core are stopped, futex waiters and log followers of that process are dropped, fds and smoltcp sockets are closed by the network owner, the user root is released, and the ASID is invalidated and recycled. The supervisor then restarts dns, http, log, telnet, and a spinner that had been armed. The delay starts at 100 ms and doubles up to 10 seconds, and it resets after 60 healthy seconds. Five deaths in 60 seconds leave that service down (`CRASH_LIMIT`). Config is not touched. DNS, HTTP, and telnet bind their ports again.
 - `boot.s` drops EL2 to EL1h when `CurrentEL` is EL2 (QEMU `-M virt,virtualization=on`, and a Pi 4 firmware handover). QEMU `-kernel` without that option is already at EL1 and skips the drop. The boot log prints `Entered at EL` and `Running at EL`. The Pi 4 drop is untested on hardware.
 
 ### EL0 syscall ABI
@@ -106,6 +107,9 @@ The user program puts the number in `x8`, arguments in `x0`–`x5`, and reads th
 | 39 | `log_publish(ptr, len)` | `0`. Log task only. One line into the fan-out. Never waits |
 | 40 | `log_follow(cursor, buf, cap, drops, flags)` | length of the next line. The caller sleeps if the ring is idle, unless `flags` is `1`, which returns `0`. `drops` receives how many lines this reader skipped |
 | 41 | `log_wake()` | `0`. Wakes every `log_follow` sleeper. Does not publish a line |
+| 42 | `debug_status(buf, cap)` | length of the supervisor text page |
+| 43 | `debug_crash(slot, worker)` | `0` if a fault was armed. `worker` 1 faults one pool thread of that process; `0` faults the main thread. Slots are dns 0, http 1, spin 2, log 3, telnet 4 |
+| 44 | `thread_try_join(tid)` | exit code, `-11` if the thread is still running, `-4` if the id is empty |
 | other | | `-1` |
 
 Errors: `-1` unknown number, `-2` bad pointer, `-3` bad fd, `-4` bad argument, `-5` I/O, `-6` too many fds or threads, `-7` the config text does not fit, `-11` try again. Packet and config buffers are at most 4096 bytes. Each task has 24 fds. `tcp_recv`'s fourth argument is `1` to return `-11` instead of sleeping. Telnet listens on guest port 23. `run-local.sh` forwards host port 2323 (`TELNET_HOST_PORT`).

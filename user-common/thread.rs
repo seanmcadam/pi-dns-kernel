@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const THREAD_CREATE: u64 = 34;
 pub const THREAD_EXIT: u64 = 35;
 pub const THREAD_JOIN: u64 = 36;
+pub const THREAD_TRY_JOIN: u64 = 44;
 pub const FUTEX_WAIT: u64 = 37;
 pub const FUTEX_WAKE: u64 = 38;
 
@@ -36,6 +37,10 @@ pub fn exit(code: u64) -> ! {
 
 pub fn join(tid: i64) -> i64 {
     sys(THREAD_JOIN, tid as u64, 0, 0, 0, 0, 0)
+}
+
+pub fn try_join(tid: i64) -> i64 {
+    sys(THREAD_TRY_JOIN, tid as u64, 0, 0, 0, 0, 0)
 }
 
 pub fn futex_wait(word: &AtomicU32, expected: u32) -> i64 {

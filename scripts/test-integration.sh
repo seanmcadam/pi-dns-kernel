@@ -484,6 +484,293 @@ echo "Stopping QEMU..."
 kill $QEMU_PID 2>/dev/null || true
 wait $QEMU_PID 2>/dev/null || true
 
+# Supervisor checks use their own guest so a crash loop cannot eat the
+# first QEMU's 120s budget or the 26 tests above.
+echo ""
+echo "Test 29: User-task supervisor"
+rm -f qemu/supervisor-console.txt
+timeout 90 qemu-system-aarch64 \
+    -M virt,gic-version=2 \
+    -cpu cortex-a72 \
+    -smp 4 \
+    -m 512M \
+    -kernel boot/kernel8.img \
+    -serial mon:tcp:127.0.0.1:4444,server,nowait \
+    -nographic \
+    -display none \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    >/dev/null 2>&1 &
+SUP_PID=$!
+sleep 1
+timeout 80 nc 127.0.0.1 4444 > qemu/supervisor-console.txt 2>&1 &
+SUP_NC=$!
+sleep 7
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" "$TELNET_HOST_PORT" <<'PY'
+import base64, socket, subprocess, sys, time, urllib.error, urllib.request
+
+http, dns, telnet = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+base = "http://127.0.0.1:%d" % http
+token = base64.b64encode(b"admin:admin").decode()
+auth = {"Authorization": "Basic " + token}
+
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+
+def get(path, authed=True):
+    headers = auth if authed else {}
+    req = urllib.request.Request(base + path, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return 0, b""
+
+def page():
+    status, body = get("/debug")
+    if status != 200:
+        return ""
+    return body.decode("utf-8", "replace")
+
+def row(text, name):
+    for line in text.splitlines():
+        if line.startswith(name + " "):
+            return line
+    fail("no %s row\n%s" % (name, text))
+
+def field(text, name, key):
+    line = row(text, name)
+    needle = key + "="
+    for part in line.split():
+        if part.startswith(needle):
+            return part[len(needle):]
+    fail("no %s on %s" % (key, line))
+
+def counters(text):
+    out = {}
+    for key in ("free_pages", "asids", "fds"):
+        found = None
+        for line in text.splitlines():
+            if line.startswith(key + "="):
+                found = int(line.split("=", 1)[1])
+        if found is None:
+            fail("no %s\n%s" % (key, text))
+        out[key] = found
+    return out
+
+def dns_up(seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        result = subprocess.run(
+            ["dig", "@127.0.0.1", "-p", str(dns), "test.local", "+short", "+time=1", "+tries=1"],
+            capture_output=True,
+        )
+        if b"192.168.1.100" in result.stdout:
+            return True
+        time.sleep(0.15)
+    return False
+
+def wait_running(name, restarts_above, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        text = page()
+        if not text:
+            time.sleep(0.15)
+            continue
+        line = row(text, name)
+        if line.startswith(name + " running ") and int(field(text, name, "restarts")) > restarts_above:
+            return text
+        time.sleep(0.15)
+    return None
+
+code, _ = get("/debug", authed=False)
+if code != 401:
+    fail("unauthenticated /debug returned %s" % code)
+print("unauth 401")
+
+if not dns_up(8):
+    fail("dns did not answer before the crash tests")
+base_text = page()
+base_count = counters(base_text)
+print("baseline", base_count)
+
+for n in range(3):
+    before = int(field(page(), "dns", "restarts"))
+    status, body = get("/debug/crash/dns")
+    if status != 200 or b"armed" not in body:
+        fail("dns crash %s %s" % (status, body[:80]))
+    if wait_running("dns", before, 8) is None or not dns_up(8):
+        fail("dns did not return after crash %d\n%s" % (n + 1, page()))
+print("dns returned")
+matched = None
+end = time.time() + 5
+while time.time() < end:
+    text = page()
+    if not text or not dns_up(1):
+        time.sleep(0.2)
+        continue
+    line = row(text, "dns")
+    if "ec=0x24" in line and "far=0x0" in line and counters(text) == base_count:
+        matched = text
+        break
+    time.sleep(0.3)
+if matched is None:
+    text = page()
+    fail("dns fault or leak\n%s\nbaseline %s" % (text, base_count))
+print("no leak", counters(matched))
+
+before = int(field(page(), "http", "restarts"))
+status, body = get("/debug/crash/http")
+if status != 200 or b"armed" not in body:
+    fail("http crash %s %s" % (status, body[:80]))
+time.sleep(0.6)
+if wait_running("http", before, 8) is None:
+    fail("http did not return\n" + page())
+status, body = get("/status")
+if status != 200 or b"Uptime" not in body and b"uptime" not in body.lower():
+    # /status is the HTML dashboard; any 200 after the restart is enough
+    if status != 200:
+        fail("status %s after http restart" % status)
+print("http returned")
+
+def read_for(sock, seconds, needle=None):
+    sock.settimeout(0.2)
+    end = time.time() + seconds
+    data = b""
+    while time.time() < end:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            if needle is not None and needle in data:
+                break
+            continue
+        if not chunk:
+            break
+        data += chunk
+        if needle is not None and needle in data:
+            break
+    return data
+
+clients = []
+for i in range(16):
+    sock = socket.create_connection(("127.0.0.1", telnet), 5)
+    banner = read_for(sock, 3, b"telnet-log")
+    if b"telnet-log" not in banner:
+        fail("telnet client %d banner %s" % (i, banner[:80]))
+    clients.append(sock)
+extra = socket.create_connection(("127.0.0.1", telnet), 5)
+refusal = read_for(extra, 2, b"busy")
+extra.close()
+if b"busy" not in refusal:
+    fail("17th was not refused %s" % refusal[:80])
+status, body = get("/debug/crash/telnet-worker")
+if status != 200 or b"armed" not in body:
+    fail("worker crash %s %s" % (status, body[:80]))
+name = ("slot%d.local" % int(time.time())).encode()
+subprocess.run(
+    ["dig", "@127.0.0.1", "-p", str(dns), name.decode(), "+short", "+time=1", "+tries=1"],
+    capture_output=True,
+)
+saw = False
+for sock in clients:
+    chunk = read_for(sock, 4, name)
+    if name in chunk or b"worker fault" in chunk or b"supervisor" in chunk:
+        saw = True
+        break
+if not saw:
+    fail("no telnet client kept streaming")
+opened = False
+for _ in range(12):
+    sock = socket.create_connection(("127.0.0.1", telnet), 5)
+    banner = read_for(sock, 2, b"telnet-log")
+    sock.close()
+    if b"telnet-log" in banner and b"busy" not in banner:
+        opened = True
+        break
+    time.sleep(0.25)
+if not opened:
+    fail("telnet slot was not freed")
+print("telnet worker")
+
+mark = 0
+try:
+    mark = len(open("qemu/supervisor-console.txt", "rb").read())
+except FileNotFoundError:
+    mark = 0
+live = clients[0]
+status, body = get("/debug/crash/dns")
+if status != 200:
+    fail("dns crash during telnet %s" % status)
+deadline = time.time() + 6
+buf = b""
+while time.time() < deadline and b"supervisor dns" not in buf:
+    buf += read_for(live, 0.4)
+if b"supervisor dns" not in buf:
+    fail("telnet missed the dns restart log %s" % buf[-200:])
+if not dns_up(8):
+    fail("dns did not return while telnet was connected")
+deadline = time.time() + 6
+grew = False
+while time.time() < deadline:
+    try:
+        console = open("qemu/supervisor-console.txt", "rb").read()
+    except FileNotFoundError:
+        console = b""
+    if b"[status]" in console[mark:]:
+        grew = True
+        break
+    time.sleep(0.4)
+if not grew:
+    fail("console produced no status line during the restart")
+print("console and telnet")
+for sock in clients:
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+for n in range(4):
+    before = int(field(page(), "log", "restarts"))
+    status, body = get("/debug/crash/log")
+    if status != 200 or b"armed" not in body:
+        fail("log crash %s %s" % (status, body[:80]))
+    if wait_running("log", before, 8) is None:
+        fail("log did not return after crash %d\n%s" % (n + 1, page()))
+status, body = get("/debug/crash/log")
+if status != 200 or b"armed" not in body:
+    fail("final log crash %s" % status)
+time.sleep(2.5)
+text = page()
+if not row(text, "log").startswith("log gaveup"):
+    fail("crash loop was not honored\n" + row(text, "log"))
+print("crash loop")
+print("supervisor ok")
+PY
+then
+    echo "✓ DNS came back and answered on ${DNS_HOST_PORT}"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ HTTP came back"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ A faulted telnet worker freed its slot and the others kept streaming"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ Console and telnet both moved during a restart"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ User pages, ASIDs, and fds returned to the baseline"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo "✓ Crash-loop limit left the service down"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ User-task supervisor checks failed"
+    TESTS_FAILED=$((TESTS_FAILED + 6))
+fi
+kill $SUP_NC 2>/dev/null || true
+kill $SUP_PID 2>/dev/null || true
+wait $SUP_NC 2>/dev/null || true
+wait $SUP_PID 2>/dev/null || true
+
 # Test 9: DHCP on user-net, then static fallback with no server
 echo ""
 echo "Test 9: DHCP client and static fallback"

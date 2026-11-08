@@ -416,6 +416,34 @@ pub fn flush_tlb() {
     }
 }
 
+/// Drop this task's user root. The next map rebuilds it. Call `tlbi_asid`
+/// as well so other cores drop translations tagged with the old ASID.
+pub fn release_user_root(slot: usize) {
+    if slot >= USER_SLOTS {
+        return;
+    }
+    unsafe {
+        let l0 = addr_of_mut!(TABLES.user_l0[slot]);
+        (&mut *l0).entries[0] = 0;
+    }
+}
+
+/// Invalidate EL0/EL1 stage-1 entries for one ASID on every core.
+/// TCR_EL1.AS is 0, so the ASID lives in the same bits as TTBR0[63:56].
+pub fn tlbi_asid(asid: u64) {
+    let arg = (asid & 0xff) << 56;
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "tlbi aside1is, {arg}",
+            "dsb ish",
+            "isb",
+            arg = in(reg) arg,
+            options(nostack),
+        );
+    }
+}
+
 fn layout() -> Layout {
     let text = phys_range(addr_of!(__text_start), addr_of!(__text_end));
     let rodata = phys_range(addr_of!(__rodata_start), addr_of!(__rodata_end));

@@ -21,6 +21,7 @@ mod panic;
 mod percpu;
 mod smp;
 mod spin;
+mod supervisor;
 mod task;
 mod user_fd;
 mod timer;
@@ -148,20 +149,20 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     }
 
     uart_write("[9] Creating sockets...\r\n");
-    match task::start_log() {
+    match supervisor::launch(task::LOG_SLOT) {
         Ok(()) => uart_write("[OK] Log task running\r\n"),
         Err(()) => uart_write("[ERROR] Log task failed\r\n"),
     }
     if net_up {
-        match task::start_dns() {
+        match supervisor::launch(task::DNS_SLOT) {
             Ok(()) => uart_write("[OK] DNS user program running\r\n"),
             Err(()) => uart_write("[ERROR] DNS user program failed\r\n"),
         }
-        match task::start_http() {
+        match supervisor::launch(task::HTTP_SLOT) {
             Ok(()) => uart_write("[OK] HTTP socket created\r\n"),
             Err(()) => uart_write("[ERROR] HTTP socket failed\r\n"),
         }
-        match task::start_telnet() {
+        match supervisor::launch(task::TELNET_SLOT) {
             Ok(()) => uart_write("[OK] Telnet log listening on port 23\r\n"),
             Err(()) => uart_write("[ERROR] Telnet log failed\r\n"),
         }
@@ -185,6 +186,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         task::poll_spin();
         let _ = task::schedule_one();
         net::poll();
+        supervisor::tick();
 
         let now = timer::millis();
         if now >= next_status {

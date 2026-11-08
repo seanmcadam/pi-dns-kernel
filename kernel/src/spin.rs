@@ -28,6 +28,9 @@
 //! an atomic. The timer IRQ takes none of these.
 //!
 //! The UART and the panic path take no locks.
+//!
+//! The supervisor lock is not in this list. It is taken alone and dropped
+//! before any lock above, including `SCHED` and `LOGQ`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

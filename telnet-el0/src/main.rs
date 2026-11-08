@@ -92,14 +92,20 @@ fn free_slot() -> Option<usize> {
 fn reap() {
     let mut index = 0;
     while index < MAX_CLIENTS {
-        if USED[index].load(Ordering::Acquire) == 1 && DONE[index].load(Ordering::Acquire) == 1 {
+        if USED[index].load(Ordering::Acquire) == 1 {
             let tid = TID[index].load(Ordering::Acquire);
             if tid > 0 {
-                let _ = thread::join(tid);
+                let code = thread::try_join(tid);
+                if code != -11 {
+                    if FD_LIVE[index].swap(0, Ordering::AcqRel) == 1 {
+                        let fd = FD_NUM[index].load(Ordering::Acquire);
+                        let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
+                    }
+                    TID[index].store(0, Ordering::Release);
+                    DONE[index].store(0, Ordering::Release);
+                    USED[index].store(0, Ordering::Release);
+                }
             }
-            TID[index].store(0, Ordering::Release);
-            DONE[index].store(0, Ordering::Release);
-            USED[index].store(0, Ordering::Release);
         }
         index += 1;
     }
@@ -115,6 +121,7 @@ extern "C" fn reaper(_arg: u64) {
     let mut drops = 0u64;
     let mut line = [0u8; 96];
     loop {
+        reap();
         let mut live = false;
         let mut index = 0;
         while index < MAX_CLIENTS {

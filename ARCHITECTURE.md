@@ -61,6 +61,9 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 | 39 | `log_publish(ptr, len)` |
 | 40 | `log_follow(cursor, buf, cap, drops)` |
 | 41 | `log_wake()` |
+| 42 | `debug_status(buf, cap)` |
+| 43 | `debug_crash(slot, worker)` |
+| 44 | `thread_try_join(tid)` |
 
 `log_publish` is the log task only. It copies one line into a kernel ring and returns. It does not wait. `log_follow` copies the next line for that cursor and writes the new cursor and how many lines were skipped. It sleeps until a line is published, unless its fifth argument is `1`, in which case it returns `0`. `tcp_recv` takes a fourth argument: `1` returns `-11` instead of sleeping when the peer has not sent data. Anything else returns `-1`. `-2` is a bad user pointer. `-4` is a bad argument. `-6` means the thread table is full. `-11` means try again. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned. `futex_wait` and `futex_wake` require a 4-byte-aligned user address. The kernel re-reads the word under the scheduler lock, so a wake that lands before the wait returns a mismatch and the caller retries. The older sections below describe earlier revisions of this tree.
 
@@ -74,7 +77,7 @@ Lock order, outermost first. A holder may take a later lock and must not take an
 4. `FS` — the FAT volume. One lock, any core. Not IRQ-safe.
 5. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
 
-The telnet fan-out is not a lock. The log task publishes each line once into a fixed ring. A reader that falls behind skips ahead. Waking a reader takes `SCHED` and no other lock.
+The telnet fan-out is not a lock. The log task publishes each line once into a fixed ring. A reader that falls behind skips ahead. Waking a reader takes `SCHED` and no other lock. The supervisor lock is taken alone and dropped before any lock in this list. When the log task is down, a crash line is written to the UART and the fan directly so a telnet reader is not left waiting on that task.
 
 smoltcp and the NIC are not behind a lock. Core 1 owns them once the stack is up. It sleeps in `wfi` until the virtio used-ring IRQ, an SGI from a core that queued a socket job, or the timer, which is also how smoltcp `poll_delay` is serviced. If none of those are pending it runs one user thread, so network work stays ahead of user work and the core is not busy-polling. Core 0 owns the NIC until that handoff, and on a one-core boot, and drives on the same conditions from its loop. Other cores push a socket request onto a lock-free ring, send SGI 1 to the owner, and sleep. The owner copies the result into the caller's user buffer and wakes the thread. It may take `FD` to publish a new socket, then drop it, then take `SCHED`. `FS` stays one lock because the FAT library is not reentrant and the block device has one command slot. The virtio-blk waiter holds the disk mutex and sleeps on `wfe`; the IRQ handler does not take that mutex or any lock above. It acknowledges the device and the GIC and stores an atomic. A kick that arrives after the idle check is not lost: the owner rechecks with IRQs masked, and `wfi` returns while the interrupt is still pending. The timer IRQ takes none of these locks. The UART and the panic path take no locks.
 

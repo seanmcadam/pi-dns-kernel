@@ -230,6 +230,13 @@ pub struct FanLine {
     pub bytes: [u8; FAN_CAP],
 }
 
+/// UART, the recent buffer, and the telnet ring. Used when the log task
+/// itself is down, so a crash line is not stuck behind that task.
+pub fn announce(text: &str) {
+    emit_line(text);
+    fan_publish(text.as_bytes());
+}
+
 pub fn fan_publish(text: &[u8]) {
     let n = text.len().min(FAN_CAP);
     let seq = FAN_HEAD.fetch_add(1, Ordering::Relaxed) + 1;
