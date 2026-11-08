@@ -177,12 +177,22 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         if now >= next_status {
             next_status = now + 2000;
             let (rx, tx) = net::packet_counts();
+            let (nic, blk) = interrupts::irq_counts();
+            let (busy, idle) = net::service::owner_time();
             uart_write("[status] rx=");
             uart_dec(rx as u64);
             uart_write(" tx=");
             uart_dec(tx as u64);
             uart_write(" ms=");
             uart_dec(now);
+            uart_write(" nic=");
+            uart_dec(nic);
+            uart_write(" blk=");
+            uart_dec(blk);
+            uart_write(" busy=");
+            uart_dec(busy);
+            uart_write(" idle=");
+            uart_dec(idle);
             uart_write("\r\n");
             // Repeat the lines the integration test greps for, in case the
             // serial client connects after the boot banner has already gone by.

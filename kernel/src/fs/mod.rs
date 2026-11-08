@@ -13,7 +13,7 @@ use spin::Mutex;
 #[cfg(feature = "pi4")]
 mod emmc;
 #[cfg(not(feature = "pi4"))]
-mod virtio_blk;
+pub(crate) mod virtio_blk;
 
 #[cfg(feature = "pi4")]
 use emmc::DiskDev;

@@ -359,8 +359,10 @@ pub extern "C" fn el0_no_task() -> ! {
 pub extern "C" fn el0_dispatch(kind: u64) -> u64 {
     if kind == 1 {
         EL0_IRQS.fetch_add(1, Ordering::Relaxed);
-        crate::interrupts::irq_handler();
-        if crate::percpu::bump_slice(QUANTUM_TICKS) {
+        let class = crate::interrupts::irq_handler();
+        // Only the timer advances the slice. A NIC IRQ must not look like
+        // the boot test's timer preemption, and it must not burn the quantum.
+        if class == crate::interrupts::CLASS_TIMER && crate::percpu::bump_slice(QUANTUM_TICKS) {
             unsafe {
                 if SCENARIO == 0 {
                     PREEMPT_OK = true;
@@ -368,15 +370,32 @@ pub extern "C" fn el0_dispatch(kind: u64) -> u64 {
             }
             return PREEMPT;
         }
+        // Network work outranks the user thread on the owner core.
+        if class == crate::interrupts::CLASS_NET && crate::net::service::polling_here() {
+            return PREEMPT;
+        }
         return RESUME;
     }
     let esr = reg("esr_el1");
     let ec = (esr >> 26) & 0x3f;
     if ec == 0x15 {
-        return syscall();
+        return after_syscall(syscall());
     }
     kill(ec);
     FAULT
+}
+
+/// A syscall that finished while a NIC kick was pending returns to the
+/// owner loop with the result already stored in the user context. The
+/// syscall itself is not aborted.
+fn after_syscall(action: u64) -> u64 {
+    if action == RESUME
+        && crate::net::service::polling_here()
+        && crate::net::service::kick_pending()
+    {
+        return PREEMPT;
+    }
+    action
 }
 
 fn syscall() -> u64 {
@@ -1162,7 +1181,7 @@ fn wait_if_blocked(slot: usize, asid: u64) {
         }
         if !schedule_one() {
             if crate::net::polling_here() {
-                core::hint::spin_loop();
+                crate::net::service::owner_idle();
             } else {
                 unsafe {
                     core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));

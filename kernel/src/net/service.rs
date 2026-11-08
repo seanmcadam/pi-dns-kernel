@@ -5,13 +5,24 @@
 //! into per-socket interfaces would make those stacks fight over one MAC
 //! and one address. Virtio multiqueue is not what the GENET driver speaks.
 //!
-//! One core owns the device. Core 1 takes that role once the stack is up
-//! and then only polls. Until then, and when EL2 leaves the machine with
-//! one core, core 0 owns it and polls from the kernel loop. Every other
-//! core enqueues a socket request on a lock-free multi-producer ring and
-//! sleeps. The owner runs the request, copies the result into the caller's
-//! user buffer, and wakes the thread. A request that has to wait for the
-//! wire stays queued; the thread stays asleep until the next poll finishes it.
+//! One core owns the device. Core 1 takes that role once the stack is up.
+//! It sleeps in `wfi` until a virtio used-ring IRQ, an SGI from a core that
+//! queued a socket job, or the timer (which is also how `poll_delay` is
+//! serviced). When none of those are pending it runs one user thread, so
+//! the NIC stays the highest priority and the core is not a dedicated poll
+//! loop. Until the handoff, and when EL2 leaves the machine with one core,
+//! core 0 owns it and drives from the kernel loop on the same kick and
+//! deadline. Every other core enqueues a socket request on a lock-free
+//! multi-producer ring and sleeps. The owner runs the request, copies the
+//! result into the caller's user buffer, and wakes the thread. A request
+//! that has to wait for the wire stays queued; the thread stays asleep
+//! until the next drive finishes it.
+//!
+//! The IRQ handler only sets `KICK` (and acknowledges the device). It does
+//! not take `SCHED` or any other lock. The owner rechecks `KICK`, the job
+//! ring, and the deadline with IRQs masked before `wfi`, so a kick that
+//! arrives after the check and is EOI'd before the sleep cannot be lost:
+//! with DAIF.I set the interrupt stays pending and `wfi` returns.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -101,6 +112,10 @@ static POSTED: [AtomicUsize; 4] = [
 static IN_STACK: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 static TURN: AtomicUsize = AtomicUsize::new(0);
+static KICK: AtomicBool = AtomicBool::new(false);
+static DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+static BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
+static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 static mut STATE: Option<super::NetworkState> = None;
 static mut PENDING: [usize; JOBS_N] = [0; JOBS_N];
 static mut PENDING_LEN: usize = 0;
@@ -191,6 +206,12 @@ impl Queue {
         self.head.store(pos.wrapping_add(1), Ordering::Relaxed);
         Some(value)
     }
+
+    fn pending(&self) -> bool {
+        let pos = self.head.load(Ordering::Relaxed);
+        let cell = &self.cells[pos % Q_N];
+        cell.seq.load(Ordering::Acquire) == pos.wrapping_add(1)
+    }
 }
 
 pub fn install(state: super::NetworkState) {
@@ -205,6 +226,9 @@ pub fn install(state: super::NetworkState) {
     }
     READY.store(true, Ordering::Release);
     IN_STACK.store(false, Ordering::Release);
+    // Core 1 waits in WFI. An SGI wakes that; `sev` covers a WFE.
+    sev();
+    crate::gic::send_sgi(crate::gic::SGI_NET, 1);
 }
 
 pub fn try_become_owner() -> bool {
@@ -219,6 +243,10 @@ pub fn try_become_owner() -> bool {
     }
     TURN.store(1, Ordering::Release);
     IN_STACK.store(false, Ordering::Release);
+    #[cfg(not(feature = "pi4"))]
+    crate::net::virtio::retarget(1);
+    // Drive once on the new owner even if the last deadline was far away.
+    note_kick();
     true
 }
 
@@ -228,6 +256,72 @@ fn owner_is_me() -> bool {
 
 pub fn polling_here() -> bool {
     READY.load(Ordering::Acquire) && owner_is_me()
+}
+
+/// Device IRQ or socket-queue IPI. Atomic only. Safe from the IRQ handler.
+pub fn note_kick() {
+    KICK.store(true, Ordering::Release);
+}
+
+pub fn kick_pending() -> bool {
+    KICK.load(Ordering::Acquire)
+}
+
+/// `cntpct` spent inside `drive` and inside `wfi` on the owner.
+pub fn owner_time() -> (u64, u64) {
+    (
+        BUSY_TICKS.load(Ordering::Relaxed),
+        IDLE_TICKS.load(Ordering::Relaxed),
+    )
+}
+
+fn work_pending() -> bool {
+    KICK.load(Ordering::Acquire)
+        || crate::timer::millis() >= DEADLINE_MS.load(Ordering::Acquire)
+        || QUEUE.pending()
+}
+
+/// Drive if this core owns the NIC and a kick, a job, or `poll_delay` is due.
+pub fn pump() {
+    if !polling_here() || !work_pending() {
+        return;
+    }
+    drive();
+}
+
+/// NIC first. Then one user thread. Then sleep until an interrupt.
+///
+/// The masked recheck closes the lost-wakeup window: an IRQ that is taken
+/// and EOI'd after the first check is visible in `KICK` or stays pending
+/// across `wfi` because IRQs are masked.
+pub fn owner_idle() {
+    if !polling_here() {
+        return;
+    }
+    if work_pending() {
+        drive();
+        return;
+    }
+    if crate::task::schedule_one() {
+        return;
+    }
+    crate::interrupts::mask();
+    if !work_pending() {
+        let t0 = crate::timer::get_ticks();
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
+        IDLE_TICKS.fetch_add(crate::timer::get_ticks().wrapping_sub(t0), Ordering::Relaxed);
+    }
+    crate::interrupts::unmask();
+}
+
+fn notify_owner() {
+    note_kick();
+    let owner = TURN.load(Ordering::Acquire);
+    if owner != crate::percpu::id() {
+        crate::gic::send_sgi(crate::gic::SGI_NET, owner);
+    }
 }
 
 pub fn drive() {
@@ -244,6 +338,10 @@ pub fn drive() {
         IN_STACK.store(false, Ordering::Release);
         return;
     }
+    // Drop a kick that was already visible. One that arrives during the
+    // poll is stored again and the owner loop drives once more.
+    KICK.store(false, Ordering::Release);
+    let t0 = crate::timer::get_ticks();
     unsafe {
         if let Some(state) = STATE.as_mut() {
             super::poll_device(state);
@@ -252,9 +350,40 @@ pub fn drive() {
             run_pending(&mut state.stack);
             pull();
             run_pending(&mut state.stack);
+            arm_deadline(state);
         }
     }
+    BUSY_TICKS.fetch_add(crate::timer::get_ticks().wrapping_sub(t0), Ordering::Relaxed);
     IN_STACK.store(false, Ordering::Release);
+}
+
+fn arm_deadline(state: &mut super::NetworkState) {
+    let now = crate::timer::millis();
+    let timestamp = smoltcp::time::Instant::from_millis(now as i64);
+    let mut deadline = match state.stack.poll_delay(timestamp) {
+        Some(delay) => {
+            let ms = delay.total_millis();
+            // A zero delay means the stack wants another look. Doing that
+            // immediately is correct; `owner_idle` loops while work is due.
+            if ms == 0 {
+                now
+            } else {
+                now.saturating_add(ms)
+            }
+        }
+        None => u64::MAX,
+    };
+    // The DHCP fallback is a kernel deadline, not a smoltcp timer. Without
+    // this cap the owner sleeps through `timeout_ms` and never applies it.
+    if let Some(dhcp) = state.dhcp.as_ref() {
+        if !dhcp.finished {
+            let at = dhcp.started_ms.saturating_add(dhcp.timeout_ms);
+            if at < deadline {
+                deadline = at;
+            }
+        }
+    }
+    DEADLINE_MS.store(deadline, Ordering::Release);
 }
 
 fn pull() {
@@ -397,6 +526,7 @@ pub fn submit(op: u8, fill: impl FnOnce(&mut Body)) -> Option<usize> {
     if cpu < POSTED.len() {
         POSTED[cpu].store(id + 1, Ordering::Release);
     }
+    notify_owner();
     sev();
     Some(id)
 }

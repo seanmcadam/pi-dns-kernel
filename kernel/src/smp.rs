@@ -251,13 +251,18 @@ pub extern "C" fn secondary_main(cpu: u64) -> ! {
     loop {
         if id == 1 && crate::net::service::try_become_owner() {
             loop {
-                crate::net::service::drive();
-                core::hint::spin_loop();
+                crate::net::service::owner_idle();
             }
         }
         if !crate::task::schedule_one() {
             unsafe {
-                core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                if id == 1 {
+                    // WFI, not WFE, so the timer wakes this core to notice
+                    // that the stack is ready. A `sev` from install does too.
+                    core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+                } else {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
             }
         }
     }

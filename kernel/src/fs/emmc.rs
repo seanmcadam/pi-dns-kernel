@@ -7,6 +7,11 @@
 //! read or written one 512-byte sector at a time.
 //!
 //! This driver is compiled into the Pi 4 image and has not been run on hardware.
+//!
+//! The GIC-400 line is SPI 126 (INTID 158). `wait_interrupt` enables it and
+//! sleeps in `wfe` until the handler masks the line, or until half a second
+//! of `cntpct`. The device status register is still what decides success.
+//! That path has not been run on a Pi 4.
 
 use core::ptr::{read_volatile, write_volatile};
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
@@ -202,6 +207,15 @@ fn reset_host() -> Result<(), &'static str> {
             write(IRPT_EN, 0xffff_ffff);
             write(IRPT_MASK, 0xffff_ffff);
             write(INTERRUPT, 0xffff_ffff);
+            // Level IRQ. The handler masks the GIC line; each wait unmasks it.
+            // Untested on hardware. A stuck line cannot spin because the
+            // handler disables it before EOI.
+            crate::gic::arm_spi(
+                crate::gic::PI4_EMMC_IRQ,
+                0x80,
+                crate::gic::online_cpu_mask(),
+            );
+            crate::gic::disable_id(crate::gic::PI4_EMMC_IRQ);
             return Ok(());
         }
         spin(100);
@@ -248,15 +262,38 @@ fn command(index: u32, arg: u32, resp: u32, data: bool, read_data: bool) -> Resu
 }
 
 fn wait_interrupt(bit: u32) -> Result<u32, &'static str> {
-    for _ in 0..200_000 {
+    crate::gic::enable_id(crate::gic::PI4_EMMC_IRQ);
+    let start = crate::timer::get_ticks();
+    let freq = cntfrq();
+    let budget = freq / 2;
+    let mut spins = 0u32;
+    loop {
         let status = read(INTERRUPT);
         if status & (bit | INT_ERR | INT_CMD_TIMEOUT) != 0 {
             write(INTERRUPT, status);
             return Ok(status);
         }
-        spin(50);
+        let timed_out = if budget == 0 {
+            spins > 50_000_000
+        } else {
+            crate::timer::get_ticks().wrapping_sub(start) >= budget
+        };
+        if timed_out {
+            return Err("emmc timeout");
+        }
+        spins = spins.wrapping_add(1);
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
     }
-    Err("emmc timeout")
+}
+
+fn cntfrq() -> u64 {
+    let freq: u64;
+    unsafe {
+        core::arch::asm!("mrs {freq}, cntfrq_el0", freq = out(reg) freq);
+    }
+    freq
 }
 
 fn read(offset: usize) -> u32 {

@@ -5,6 +5,14 @@
 //! RX offset matches the controller's IP-header alignment.
 //!
 //! This driver is compiled into the Pi 4 image and has not been run on hardware.
+//!
+//! BCM2711 GENET uses GIC-400 SPI 157 and SPI 158 (INTID 189 and 190). The
+//! IRQ handler recognizes those ids, counts them, and masks the line so a
+//! stuck level cannot spin a core. The lines are left disabled: the device
+//! INTRL2 mask is not programmed here, and that register block has not been
+//! tested on hardware. Packet completion is therefore still observed when the
+//! owner wakes for `poll_delay` or a socket-queue SGI. The owner does sleep
+//! instead of spinning. None of this has been run on a Pi 4.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};

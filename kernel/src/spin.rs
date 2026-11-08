@@ -22,7 +22,10 @@
 //! bind or accept, drop it, then take `SCHED` to wake the caller. It never
 //! holds `FD` and `SCHED` together. `FS` stays one lock because the FAT
 //! library is not reentrant and the block device has one command slot.
-//! The timer IRQ takes none of these.
+//! The block waiter holds that device mutex with IRQs enabled and sleeps
+//! on `wfe`. The IRQ handler must not take it, or any lock in this list:
+//! it acknowledges the GIC and the virtio-mmio status register and stores
+//! an atomic. The timer IRQ takes none of these.
 //!
 //! The UART and the panic path take no locks.
 

@@ -826,6 +826,85 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
+echo ""
+echo "Test 26: NIC and block IRQs, idle network core"
+rm -f qemu/irq-serial.txt
+# disk.img is the FAT volume from test 10. Recreate a blank one if that test
+# did not leave it behind; the block driver still completes a sector read.
+if [ ! -f qemu/disk.img ]; then
+    dd if=/dev/zero of=qemu/disk.img bs=1M count=8 status=none
+fi
+timeout 30 qemu-system-aarch64 \
+    -M virt,gic-version=2 \
+    -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/irq-serial.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-irq.txt 2>&1 &
+IRQ_PID=$!
+sleep 6
+timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short +time=3 +tries=1 >/tmp/irq-dig.txt 2>&1 || true
+# Quiet window. The status line is every 2s; wait until a later sample exists.
+IRQ_RC=0
+python3 - <<'PY' || IRQ_RC=$?
+import re, sys, time
+path = "qemu/irq-serial.txt"
+pat = re.compile(r"\[status\] rx=\d+ tx=\d+ ms=(\d+) nic=(\d+) blk=(\d+) busy=(\d+) idle=(\d+)")
+def rows():
+    text = open(path, errors="replace").read()
+    return [tuple(int(x) for x in m) for m in pat.findall(text)]
+base = rows()
+deadline = time.time() + 8
+while time.time() < deadline:
+    time.sleep(0.5)
+    cur = rows()
+    if base and cur and cur[-1][0] >= base[-1][0] + 1500:
+        break
+    if not base and cur:
+        base = cur
+cur = rows()
+open("/tmp/irq-samples.txt", "w").write(repr(cur) + "\n")
+if not cur:
+    print("no status samples")
+    sys.exit(1)
+ms, nic, blk, busy, idle = cur[-1]
+if nic <= 0 or blk <= 0:
+    print(f"counts nic={nic} blk={blk}")
+    sys.exit(1)
+# Compare the last sample with one at least 1.5s earlier.
+prev = None
+for row in cur:
+    if ms >= row[0] + 1500:
+        prev = row
+if prev is None:
+    print("no quiet window")
+    sys.exit(1)
+idle_d = idle - prev[4]
+busy_d = busy - prev[3]
+print(f"nic={nic} blk={blk} idle_d={idle_d} busy_d={busy_d}")
+# Idle cntpct over the quiet window should dwarf drive() time.
+if idle_d <= 0 or idle_d <= busy_d * 4:
+    sys.exit(1)
+sys.exit(0)
+PY
+kill $IRQ_PID 2>/dev/null || true
+wait $IRQ_PID 2>/dev/null || true
+if [ "$IRQ_RC" -eq 0 ] && grep -q "192.168.1.100" /tmp/irq-dig.txt; then
+    echo "✓ NIC and block IRQ counts are nonzero and the network core idled"
+    cat /tmp/irq-samples.txt
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ IRQ idle test failed"
+    cat /tmp/irq-samples.txt 2>/dev/null || true
+    grep "irq" qemu/irq-serial.txt || true
+    grep "status" qemu/irq-serial.txt | tail -5 || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Summary
 echo ""
 echo "=== Test Summary ==="

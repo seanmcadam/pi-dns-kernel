@@ -7,13 +7,16 @@
 //! before the descriptor is published.
 //!
 //! QEMU 8.2 defaults virtio-mmio `ioeventfd` on, so a queue notify returns
-//! before the request finishes and another thread completes it. The wait is
-//! therefore a fraction of a second of `cntpct`, not a short spin. A timeout
-//! resets the device before the next request: leaving the old one in flight
-//! and reusing its descriptors makes every later status read look like
-//! `blk io error`.
+//! before the request finishes and another thread completes it. The waiter
+//! sleeps with `wfe` until the used-ring IRQ (or another core's `sev`) and
+//! still gives up after half a second of `cntpct`. A timeout resets the
+//! device before the next request: leaving the old one in flight and reusing
+//! its descriptors makes every later status read look like `blk io error`.
+//! The IRQ handler only acknowledges the MMIO status and sends an event. It
+//! does not take the disk mutex.
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
 use spin::Mutex;
 
@@ -36,6 +39,8 @@ const REG_QUEUE_ALIGN: usize = 0x03c;
 const REG_QUEUE_PFN: usize = 0x040;
 const REG_QUEUE_READY: usize = 0x044;
 const REG_QUEUE_NOTIFY: usize = 0x050;
+const REG_INTERRUPT_STATUS: usize = 0x060;
+const REG_INTERRUPT_ACK: usize = 0x064;
 const REG_STATUS: usize = 0x070;
 const REG_QUEUE_DESC_LOW: usize = 0x080;
 const REG_QUEUE_DESC_HIGH: usize = 0x084;
@@ -61,6 +66,9 @@ const QUEUE_BYTES: usize = 8192;
 const AVAIL_OFF: usize = 16 * QSIZE;
 const USED_OFF: usize = 4096;
 const MAGIC: u32 = 0x7472_6976;
+
+static BLK_BASE: AtomicUsize = AtomicUsize::new(0);
+static BLK_IRQ: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[repr(C, align(4096))]
 struct QueueArea {
@@ -223,6 +231,7 @@ impl VirtioBlk {
         write_reg(base, REG_STATUS, status);
         dsb();
         self.seen = 0;
+        register_irq(base);
         Ok(())
     }
 
@@ -365,9 +374,47 @@ impl VirtioBlk {
             if timed_out {
                 return Err("blk timeout");
             }
-            core::hint::spin_loop();
+            // IRQs stay enabled. The handler `sev`s, which latches the event
+            // register, so a completion that lands between this check and
+            // `wfe` does not sleep. The 100 Hz timer also wakes `wfe`, which
+            // is what makes the `cntpct` deadline run if the event was lost.
+            unsafe {
+                core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+            }
         }
     }
+}
+
+fn mmio_intid(base: usize) -> u32 {
+    let phys = crate::addr::virt_to_phys(base as u64) as usize;
+    let slot = phys.saturating_sub(0x0a00_0000) / 0x200;
+    48 + slot as u32
+}
+
+fn register_irq(base: usize) {
+    let intid = mmio_intid(base);
+    BLK_BASE.store(base, Ordering::Release);
+    BLK_IRQ.store(intid, Ordering::Release);
+    // Any core can be inside `wait_complete`. The distributor delivers the
+    // SPI to one targeted CPU; that handler `sev`s so the waiter wakes
+    // wherever it is. Target every online CPU.
+    crate::gic::arm_spi(intid, 0x80, crate::gic::online_cpu_mask());
+    log::info!("virtio-blk irq {intid} spi {}", intid.saturating_sub(32));
+}
+
+/// Acknowledge this device's virtio-mmio interrupt. No locks.
+pub fn take_irq(id: u32) -> bool {
+    if id != BLK_IRQ.load(Ordering::Acquire) {
+        return false;
+    }
+    let base = BLK_BASE.load(Ordering::Acquire);
+    if base != 0 {
+        let status = read_reg(base, REG_INTERRUPT_STATUS);
+        if status != 0 {
+            write_reg(base, REG_INTERRUPT_ACK, status);
+        }
+    }
+    true
 }
 
 fn find_blk_device() -> Option<usize> {

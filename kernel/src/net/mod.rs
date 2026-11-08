@@ -4,7 +4,7 @@ mod genet;
 pub mod service;
 mod stack;
 #[cfg(not(feature = "pi4"))]
-mod virtio;
+pub(crate) mod virtio;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::dhcpv4;
@@ -123,7 +123,7 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
 /// A timer IRQ never calls this. Socket syscalls do not take a device lock;
 /// they enqueue a request and sleep.
 pub fn poll() {
-    service::drive();
+    service::pump();
 }
 
 pub fn polling_here() -> bool {

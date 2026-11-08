@@ -76,7 +76,13 @@ Lock order, outermost first. A holder may take a later lock and must not take an
 
 The telnet fan-out is not a lock. The log task publishes each line once into a fixed ring. A reader that falls behind skips ahead. Waking a reader takes `SCHED` and no other lock.
 
-smoltcp and the NIC are not behind a lock. Core 1 owns them once the stack is up and only polls; core 0 owns them until that handoff, and on a one-core boot. Other cores push a socket request onto a lock-free ring and sleep. The owner copies the result into the caller's user buffer and wakes the thread. It may take `FD` to publish a new socket, then drop it, then take `SCHED`. `FS` stays one lock because the FAT library is not reentrant and the block device has one command slot. The timer IRQ takes none of these. The UART and the panic path take no locks. The DNS task keeps two threads blocked in the upstream receive, one blocked on TCP port 53, and one that sleeps until a query is forwarded. The HTTP task keeps four connection workers, one per listener. Extra threads share the process page tables and sit on one global run queue.
+smoltcp and the NIC are not behind a lock. Core 1 owns them once the stack is up. It sleeps in `wfi` until the virtio used-ring IRQ, an SGI from a core that queued a socket job, or the timer, which is also how smoltcp `poll_delay` is serviced. If none of those are pending it runs one user thread, so network work stays ahead of user work and the core is not busy-polling. Core 0 owns the NIC until that handoff, and on a one-core boot, and drives on the same conditions from its loop. Other cores push a socket request onto a lock-free ring, send SGI 1 to the owner, and sleep. The owner copies the result into the caller's user buffer and wakes the thread. It may take `FD` to publish a new socket, then drop it, then take `SCHED`. `FS` stays one lock because the FAT library is not reentrant and the block device has one command slot. The virtio-blk waiter holds the disk mutex and sleeps on `wfe`; the IRQ handler does not take that mutex or any lock above. It acknowledges the device and the GIC and stores an atomic. A kick that arrives after the idle check is not lost: the owner rechecks with IRQs masked, and `wfi` returns while the interrupt is still pending. The timer IRQ takes none of these locks. The UART and the panic path take no locks.
+
+QEMU virt (GICv2) maps virtio-mmio slot `n` to SPI `16 + n`, INTID `48 + n`. QEMU 8.2 plugs `-device virtio-*-device` into the high slots, so with a NIC and a block device the measured lines are INTID 79 (SPI 47) and INTID 78 (SPI 46). Both are level-triggered; the handler writes the virtio-mmio interrupt-ack register before EOI. The NIC line is routed at the owner and moved to core 1 when that core claims the stack. The block line targets every online CPU, and the handler sends an event so the waiter wakes on whichever core holds the disk mutex. The `cntpct` timeout remains the fallback.
+
+On the Pi 4 the GIC-400 lines are GENET SPI 157 and 158 (INTID 189 and 190) and EMMC2 SPI 126 (INTID 158). EMMC waits sleep on `wfe` with the same half-second `cntpct` cap, and the handler masks the line so a stuck level cannot spin. GENET's lines are recognized and, if they fire, masked after one count. They are left disabled because the device INTRL2 mask is not programmed and has not been tested. GENET packet completion is observed on the timer or socket-queue wake. None of the Pi 4 IRQ path has been run on hardware.
+
+The DNS task keeps two threads blocked in the upstream receive, one blocked on TCP port 53, and one that sleeps until a query is forwarded. The HTTP task keeps four connection workers, one per listener. Extra threads share the process page tables and sit on one global run queue.
 
 ## Overview
 
@@ -88,7 +94,7 @@ This is a bare-metal operating system kernel written in Rust for the Raspberry P
 2. **Layered Architecture**: Clear separation between hardware, network, and application
 3. **Testability**: Protocol layers testable on host with `std`
 4. **Type Safety**: Leverage Rust's type system for memory and concurrency safety
-5. **Minimal Complexity**: Simple allocator, polling-based I/O
+5. **Minimal Complexity**: Simple allocator, interrupt-driven device I/O
 
 ## Component Architecture
 

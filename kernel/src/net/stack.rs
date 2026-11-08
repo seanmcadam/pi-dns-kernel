@@ -44,6 +44,10 @@ impl NetworkStack {
         self.iface.poll(timestamp, device, &mut self.sockets);
     }
 
+    pub fn poll_delay(&mut self, timestamp: Instant) -> Option<smoltcp::time::Duration> {
+        self.iface.poll_delay(timestamp, &self.sockets)
+    }
+
     pub fn sockets_mut(&mut self) -> &mut SocketSet<'static> {
         &mut self.sockets
     }

@@ -29,6 +29,8 @@ const REG_QUEUE_ALIGN: usize = 0x03c;
 const REG_QUEUE_PFN: usize = 0x040;
 const REG_QUEUE_READY: usize = 0x044;
 const REG_QUEUE_NOTIFY: usize = 0x050;
+const REG_INTERRUPT_STATUS: usize = 0x060;
+const REG_INTERRUPT_ACK: usize = 0x064;
 const REG_STATUS: usize = 0x070;
 const REG_QUEUE_DESC_LOW: usize = 0x080;
 const REG_QUEUE_DESC_HIGH: usize = 0x084;
@@ -59,6 +61,8 @@ const MAGIC: u32 = 0x7472_6976;
 
 static RX_COUNT: AtomicU32 = AtomicU32::new(0);
 static TX_COUNT: AtomicU32 = AtomicU32::new(0);
+static MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+static IRQ_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[repr(C, align(4096))]
 struct QueueArea {
@@ -183,6 +187,7 @@ impl VirtioNetDevice {
         write_reg(base, REG_STATUS, status);
         // Kick again now that the device is allowed to use the queues.
         dev.kick(0);
+        register_irq(base);
 
         uart_log("VirtIO net ready\r\n");
         Some(dev)
@@ -465,7 +470,52 @@ fn install_queue(base: usize, index: u32, q: *mut QueueArea, legacy: bool) -> bo
 fn init_queue(q: *mut QueueArea) {
     unsafe {
         core::ptr::write_bytes(q as *mut u8, 0, QUEUE_BYTES);
+        // Avail flags are the first u16 of the avail ring. Zero leaves
+        // used-ring interrupts on. VIRTQ_AVAIL_F_NO_INTERRUPT would be 1.
+        write_volatile((q as *mut u8).add(AVAIL_OFF) as *mut u16, 0);
     }
+}
+
+/// QEMU virt: virtio-mmio slot `n` is SPI `16 + n`, GIC INTID `48 + n`.
+fn mmio_intid(base: usize) -> u32 {
+    let phys = crate::addr::virt_to_phys(base as u64) as usize;
+    let slot = phys.saturating_sub(0x0a00_0000) / 0x200;
+    48 + slot as u32
+}
+
+fn register_irq(base: usize) {
+    let intid = mmio_intid(base);
+    MMIO_BASE.store(base, Ordering::Release);
+    IRQ_ID.store(intid, Ordering::Release);
+    // Core 0 owns the NIC until core 1 claims it.
+    crate::gic::arm_spi(intid, 0x80, 1);
+    log::info!("virtio-net irq {intid} spi {}", intid.saturating_sub(32));
+}
+
+/// Point the NIC SPI at the network owner. Called when ownership moves.
+pub fn retarget(cpu: usize) {
+    let intid = IRQ_ID.load(Ordering::Acquire);
+    if intid == u32::MAX {
+        return;
+    }
+    let mask = 1u8 << (cpu & 7);
+    crate::gic::route_spi(intid, mask);
+}
+
+/// Acknowledge the virtio-mmio interrupt status if `id` is this device.
+/// The handler calls this before GIC EOI. No locks, no queue walk.
+pub fn take_irq(id: u32) -> bool {
+    if id != IRQ_ID.load(Ordering::Acquire) {
+        return false;
+    }
+    let base = MMIO_BASE.load(Ordering::Acquire);
+    if base != 0 {
+        let status = read_reg(base, REG_INTERRUPT_STATUS);
+        if status != 0 {
+            write_reg(base, REG_INTERRUPT_ACK, status);
+        }
+    }
+    true
 }
 
 fn desc_ptr(q: *mut QueueArea, index: usize) -> *mut Desc {
