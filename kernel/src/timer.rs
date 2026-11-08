@@ -56,7 +56,11 @@ pub fn on_tick() {
         next = now.wrapping_add(interval);
     }
     write_cval(next);
-    TICKS.fetch_add(steps, Ordering::Relaxed);
+    // One published 100 Hz counter. Every core has its own compare register
+    // and uses it for preemption. Adding all four would report 400 Hz.
+    if crate::percpu::id() == 0 {
+        TICKS.fetch_add(steps, Ordering::Relaxed);
+    }
 }
 
 pub fn irq_ticks() -> u64 {

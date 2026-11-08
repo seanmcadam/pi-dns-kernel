@@ -18,6 +18,13 @@ pub fn init() {
     enable();
 }
 
+/// GIC CPU interface and virtual timer for a core that is not core 0.
+pub fn init_secondary() {
+    crate::gic::init_cpu();
+    crate::timer::arm();
+    enable();
+}
+
 pub fn enable() {
     unsafe {
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack));

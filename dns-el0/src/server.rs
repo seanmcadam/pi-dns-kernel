@@ -3,6 +3,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use dns_cache::{CacheEntry, DnsCache};
 use dns_protocol::{DnsPacket, QueryType, RData, RecordClass, RecordType, ResourceRecord};
 
@@ -63,6 +64,13 @@ pub fn run() -> ! {
     let mut tcp_fd: i64 = -1;
     let mut tcp_buf: Vec<u8> = Vec::new();
     publish_cache(cache.len());
+    UPSTREAM_FD.store(upstream, Ordering::Release);
+    let mut worker = 0;
+    while worker < 2 {
+        let top = 0x1_000A_0000u64 + (1536 * 1024) - (worker as u64 + 1) * (16 * 1024);
+        let _ = crate::thread::spawn(upstream_worker, top, worker as u64);
+        worker += 1;
+    }
 
     loop {
         while let Some((packet, ip, port)) = udp_recv(dns) {
@@ -77,12 +85,104 @@ pub fn run() -> ! {
                 &mut next_id,
             );
         }
-        while let Some((packet, _ip, _port)) = udp_recv(upstream) {
-            take_upstream(&packet, dns, &mut cache, &mut pending);
-        }
+        drain_upstream(dns, &mut cache, &mut pending);
         service_tcp(tcp, &mut tcp_fd, &mut tcp_buf, &mut cache, &mut pending, &mut next_id, upstream, dns);
         retry_expired(upstream, dns, &mut pending, &mut next_id);
+        KICK.fetch_add(1, Ordering::Release);
+        let _ = crate::thread::futex_wake(&KICK, 2);
         yield_now();
+    }
+}
+
+static UPSTREAM_FD: AtomicI64 = AtomicI64::new(0);
+static KICK: AtomicU32 = AtomicU32::new(0);
+static MAIL_LOCK: AtomicU32 = AtomicU32::new(0);
+
+struct Mail {
+    used: bool,
+    len: u16,
+    ip: [u8; 4],
+    port: u16,
+    data: [u8; 512],
+}
+
+static mut MAIL: [Mail; 8] = [
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+    Mail { used: false, len: 0, ip: [0; 4], port: 0, data: [0; 512] },
+];
+
+extern "C" fn upstream_worker(_index: u64) {
+    loop {
+        let fd = UPSTREAM_FD.load(Ordering::Acquire);
+        if fd <= 0 {
+            let seen = KICK.load(Ordering::Acquire);
+            let _ = crate::thread::futex_wait(&KICK, seen);
+            continue;
+        }
+        if let Some((packet, ip, port)) = udp_recv(fd) {
+            deposit(&packet, ip, port);
+            continue;
+        }
+        let seen = KICK.load(Ordering::Acquire);
+        let _ = crate::thread::futex_wait(&KICK, seen);
+    }
+}
+
+fn deposit(packet: &[u8], ip: [u8; 4], port: u16) {
+    let copy = packet.len().min(512);
+    loop {
+        crate::thread::mutex_lock(&MAIL_LOCK);
+        let stored = unsafe {
+            let mut index = 0;
+            while index < MAIL.len() {
+                if !MAIL[index].used {
+                    MAIL[index].used = true;
+                    MAIL[index].len = copy as u16;
+                    MAIL[index].ip = ip;
+                    MAIL[index].port = port;
+                    MAIL[index].data[..copy].copy_from_slice(&packet[..copy]);
+                    break;
+                }
+                index += 1;
+            }
+            index < MAIL.len()
+        };
+        crate::thread::mutex_unlock(&MAIL_LOCK);
+        if stored {
+            return;
+        }
+        yield_now();
+    }
+}
+
+fn drain_upstream(dns: i64, cache: &mut DnsCache, pending: &mut Vec<PendingQuery>) {
+    loop {
+        let mut packet = [0u8; 512];
+        let mut len = 0usize;
+        crate::thread::mutex_lock(&MAIL_LOCK);
+        unsafe {
+            let mut index = 0;
+            while index < MAIL.len() {
+                if MAIL[index].used {
+                    len = MAIL[index].len as usize;
+                    packet[..len].copy_from_slice(&MAIL[index].data[..len]);
+                    MAIL[index].used = false;
+                    break;
+                }
+                index += 1;
+            }
+        }
+        crate::thread::mutex_unlock(&MAIL_LOCK);
+        if len == 0 {
+            return;
+        }
+        take_upstream(&packet[..len], dns, cache, pending);
     }
 }
 

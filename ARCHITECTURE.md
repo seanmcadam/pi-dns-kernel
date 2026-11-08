@@ -13,7 +13,7 @@ TTBR0 holds only the EL0 window, in its own page tables:
 - heap `0x1_000A_0000`, 1536 KiB
 - stack `0x1_0022_0000`, 64 KiB
 
-User pages are non-global. The boot test and the DNS task use ASID 1. The HTTP task uses ASID 2. The spinner uses ASID 3. The log task uses ASID 4. EL0 cannot walk TTBR1, so a user access to kernel memory faults and kills that task. The DNS resolver, the HTTP dashboard, and the log task each run in this window, in separate page tables. The kernel keeps the NIC, the smoltcp sockets, storage, and the config file. A task yields when a socket would block. A timer IRQ at EL0 also returns to the poll loop after two 10 ms ticks, and that loop polls the NIC before running the next task.
+User pages are non-global. The boot test and the DNS task use ASID 1. The HTTP task uses ASID 2. The spinner uses ASID 3. The log task uses ASID 4. Threads of one process share that process's TTBR0 root and ASID. A switch between those threads does not flush the TLB. A map change uses `tlbi vmalle1is` and `dsb ish`, so the maintenance is inner-shareable and reaches every core. EL0 cannot walk TTBR1, so a user access to kernel memory faults and kills that task. The DNS resolver, the HTTP dashboard, and the log task each run in this window, in separate page tables. The kernel keeps the NIC, the smoltcp sockets, storage, and the config file. A task yields when a socket would block. A timer IRQ at EL0 also returns to the poll loop after two 10 ms ticks, and that loop polls the NIC before running the next task. The published tick count is core 0's 100 Hz counter. The other cores arm their own virtual timers and preempt, and they do not add to that counter.
 
 Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 
@@ -53,8 +53,26 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 | 31 | `log_recent(buf, cap)` |
 | 32 | `file_read(name, name_len, buf, cap)` |
 | 33 | `file_write(name, name_len, buf, len, flags)` |
+| 34 | `thread_create(entry, stack, arg)` |
+| 35 | `thread_exit(code)` |
+| 36 | `thread_join(tid)` |
+| 37 | `futex_wait(addr, expected)` |
+| 38 | `futex_wake(addr, n)` |
 
-Anything else returns `-1`. `-2` is a bad user pointer. `-11` means try again. The older sections below describe earlier revisions of this tree.
+Anything else returns `-1`. `-2` is a bad user pointer. `-4` is a bad argument. `-6` means the thread table is full. `-11` means try again. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned. `futex_wait` and `futex_wake` require a 4-byte-aligned user address. The kernel re-reads the word under the scheduler lock, so a wake that lands before the wait returns a mismatch and the caller retries. The older sections below describe earlier revisions of this tree.
+
+QEMU is started with `-smp 4`. Core 0 brings the other three up with PSCI `CPU_ON` (`0xC4000003`) through HVC. This QEMU virt machine's PSCI conduit is HVC; SMC from EL1 is undefined because EL3 is not implemented. When the CPU implements EL2 (`-M virt,virtualization=on`), that HVC is delivered to EL2 instead of the firmware, and the extra cores stay offline. The default virt machine does not implement EL2, so all four cores come up. Each core has its own stack, its own virtual timer, and its own GICv2 CPU interface. `TPIDR_EL1` points at that core's current thread. The Pi 4 build does not use PSCI. It writes the physical entry to the spin-table release addresses `0xE0`, `0xE8`, and `0xF0` (core n at `0xD8 + 8*n`), cleans the line, and sends an event. That path is untested on hardware. If the firmware stub is not parked on those words, the stores hit RAM and the extra cores stay offline.
+
+Lock order, outermost first. A holder may take a later lock and must not take an earlier one.
+
+1. `SCHED` — run queue, thread state, futex waiters, and join waiters. IRQ-safe. The timer IRQ does not take it.
+2. `FD` — one lock per EL0 task, for that task's file descriptors. Not IRQ-safe. A socket syscall then takes `NET`.
+3. `CONFIG` — config records. Not IRQ-safe.
+4. `FS` — the FAT volume. One lock, any core. Not IRQ-safe.
+5. `NET` — smoltcp and the NIC. One lock, any core. Not IRQ-safe.
+6. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
+
+`NET` and `FS` stay one lock each. smoltcp and the FAT library are not reentrant, and the block device has a single command slot. Pinning the lock to core 0 would need a cross-core queue on every send, recv, and file syscall. Any core may take the lock. The timer IRQ never takes `SCHED`, `FD`, `CONFIG`, `FS`, `NET`, or `LOGQ`, so a core interrupted while holding one cannot deadlock. The UART and the panic path take no locks. The DNS task keeps two threads blocked in the upstream receive. The HTTP task keeps four connection workers, one per listener. Extra threads share the process page tables and sit on one global run queue.
 
 ## Overview
 
@@ -76,7 +94,7 @@ This is a bare-metal operating system kernel written in Rust for the Raspberry P
 
 The boot process:
 1. The loader copies the raw image to a physical address: `0x40080000` on QEMU virt, `0x80000` on the Pi 4
-2. Assembly code (`_start`) runs on core 0 and parks the other cores
+2. Assembly code (`_start`) runs on core 0. Cores that enter `_start` instead of the secondary entry park. QEMU starts the other cores later, at `secondary_entry`, through PSCI
 3. Sets the stack at that physical address, drops EL2 to EL1 when needed, and zeroes BSS
 4. Turns the MMU on and jumps to the upper-half link address
 5. Calls Rust `kernel_main()`

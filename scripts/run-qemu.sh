@@ -23,6 +23,7 @@ echo "Host DNS port ${DNS_HOST_PORT} -> guest 53, host HTTP port ${HTTP_HOST_POR
 qemu-system-aarch64 \
     -M virt,gic-version=2 \
     -cpu cortex-a72 \
+    -smp 4 \
     -m 512M \
     -kernel "$KERNEL" \
     -serial stdio \

@@ -109,21 +109,36 @@ static mut FDS: [[Kind; MAX_FD]; TASKS] = [
     [Kind::Empty; MAX_FD],
     [Kind::Empty; MAX_FD],
 ];
-static mut TASK_SLOT: usize = 0;
+static mut TASK_SLOT: [usize; 4] = [0; 4];
+static FD_LOCK: [crate::spin::Spin; TASKS] = [
+    crate::spin::Spin::new(),
+    crate::spin::Spin::new(),
+    crate::spin::Spin::new(),
+    crate::spin::Spin::new(),
+];
 
 pub fn set_task(slot: usize) {
     if slot < TASKS {
-        unsafe { TASK_SLOT = slot };
+        unsafe { TASK_SLOT[crate::percpu::id()] = slot };
     }
 }
 
-fn table() -> &'static mut [Kind; MAX_FD] {
-    unsafe { &mut FDS[TASK_SLOT] }
+fn slot() -> usize {
+    unsafe { TASK_SLOT[crate::percpu::id()] }
 }
 
-static mut PACKET: [u8; MAX_PACKET] = [0; MAX_PACKET];
+fn table() -> &'static mut [Kind; MAX_FD] {
+    unsafe { &mut FDS[slot()] }
+}
+
+static mut PACKET: [[u8; MAX_PACKET]; 4] = [[0; MAX_PACKET]; 4];
+
+fn packet() -> &'static mut [u8] {
+    unsafe { &mut PACKET[crate::percpu::id()] }
+}
 
 pub fn call(num: u64, args: [u64; 6]) -> u64 {
+    let _fd = FD_LOCK[slot()].lock();
     let value = match num {
         TIME_MS => crate::timer::millis() as i64,
         UDP_BIND => udp_bind(args[0]),
@@ -240,7 +255,7 @@ fn udp_recv(fd: u64, buf: u64, cap: u64, addr: u64) -> i64 {
             Ok((data, meta)) => {
                 let n = data.len().min(cap as usize);
                 unsafe {
-                    PACKET[..n].copy_from_slice(&data[..n]);
+                    packet()[..n].copy_from_slice(&data[..n]);
                 }
                 let ip = match meta.endpoint.addr {
                     IpAddress::Ipv4(ip) => {
@@ -257,7 +272,7 @@ fn udp_recv(fd: u64, buf: u64, cap: u64, addr: u64) -> i64 {
     });
     match outcome {
         Some(Ok((n, addr_bytes))) => {
-            let copied = unsafe { write_user(buf, &PACKET[..n]) };
+            let copied = unsafe { write_user(buf, &packet()[..n]) };
             if copied && write_user(addr, &addr_bytes) {
                 n as i64
             } else {
@@ -293,7 +308,7 @@ fn udp_send(fd: u64, buf: u64, len: u64, ip: u64, port: u64) -> i64 {
             Ipv4Address::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]).into(),
             port,
         );
-        let packet = unsafe { &PACKET[..len as usize] };
+        let packet = unsafe { &packet()[..len as usize] };
         socket
             .send_slice(packet, endpoint)
             .map(|_| 0)
@@ -389,7 +404,7 @@ fn tcp_recv(fd: u64, buf: u64, cap: u64) -> i64 {
             return Ok(0);
         }
         let n = cap as usize;
-        match socket.recv_slice(unsafe { &mut PACKET[..n] }) {
+        match socket.recv_slice(unsafe { &mut packet()[..n] }) {
             Ok(copied) => Ok(copied),
             Err(tcp::RecvError::Finished) => Ok(0),
             Err(_) => Err(EAGAIN),
@@ -398,7 +413,7 @@ fn tcp_recv(fd: u64, buf: u64, cap: u64) -> i64 {
     match outcome {
         Some(Ok(0)) => 0,
         Some(Ok(n)) => {
-            if unsafe { write_user(buf, &PACKET[..n]) } {
+            if unsafe { write_user(buf, &packet()[..n]) } {
                 n as i64
             } else {
                 EFAULT
@@ -428,7 +443,7 @@ fn tcp_send(fd: u64, buf: u64, len: u64) -> i64 {
         if !socket.can_send() {
             return Err(EAGAIN);
         }
-        let packet = unsafe { &PACKET[..len as usize] };
+        let packet = unsafe { &packet()[..len as usize] };
         socket
             .send_slice(packet)
             .map(|n| n as i64)
@@ -644,7 +659,7 @@ fn read_user(ptr: u64, len: usize) -> bool {
     }
     crate::mmu::set_pan(false);
     unsafe {
-        core::ptr::copy_nonoverlapping(ptr as *const u8, core::ptr::addr_of_mut!(PACKET).cast(), len);
+        core::ptr::copy_nonoverlapping(ptr as *const u8, packet().as_mut_ptr(), len);
     }
     crate::mmu::set_pan(true);
     true
@@ -662,7 +677,11 @@ fn write_user(ptr: u64, src: &[u8]) -> bool {
     true
 }
 
-static mut IOBUF: [u8; 1024] = [0; 1024];
+static mut IOBUF: [[u8; 1024]; 4] = [[0; 1024]; 4];
+
+fn iobuf() -> &'static mut [u8] {
+    unsafe { &mut IOBUF[crate::percpu::id()] }
+}
 
 fn log_post(ptr: u64, len: u64) -> i64 {
     if len == 0 || len > 80 || !crate::mmu::user_slice_ok(ptr, len) {
@@ -750,11 +769,11 @@ fn file_read(name: u64, name_len: u64, buf: u64, cap: u64) -> i64 {
     let Ok(text) = core::str::from_utf8(&raw[..name_len as usize]) else {
         return EINVAL;
     };
-    let n = unsafe { crate::fs::read_named(text, &mut IOBUF[..cap as usize]) };
+    let n = unsafe { crate::fs::read_named(text, &mut iobuf()[..cap as usize]) };
     match n {
         Ok(0) => 0,
         Ok(copied) => {
-            if unsafe { write_user(buf, &IOBUF[..copied]) } {
+            if unsafe { write_user(buf, &iobuf()[..copied]) } {
                 copied as i64
             } else {
                 EFAULT
@@ -782,7 +801,7 @@ fn file_write(name: u64, name_len: u64, buf: u64, len: u64, flags: u64) -> i64 {
     if len > 0 && !read_user_io(buf, len as usize) {
         return EFAULT;
     }
-    let data = unsafe { &IOBUF[..len as usize] };
+    let data = unsafe { &iobuf()[..len as usize] };
     match crate::fs::write_named(text, data, (flags & 1) == 1) {
         Ok(()) => 0,
         Err(_) => EIO,
@@ -795,7 +814,7 @@ fn read_user_io(ptr: u64, len: usize) -> bool {
     }
     crate::mmu::set_pan(false);
     unsafe {
-        core::ptr::copy_nonoverlapping(ptr as *const u8, core::ptr::addr_of_mut!(IOBUF).cast(), len);
+        core::ptr::copy_nonoverlapping(ptr as *const u8, iobuf().as_mut_ptr(), len);
     }
     crate::mmu::set_pan(true);
     true

@@ -9,6 +9,7 @@
 //   3  load from x1, which is kernel text. This must not return.
 //   4  mrs currentel. A privileged read must not return.
 //   5  branch to the user stack. That page is not executable.
+//   6  four threads add under a futex mutex. The total must be exact.
 //
 // Syscalls: x8 is the number, x0-x5 the arguments, x0 the return.
 //   0 log(ptr, len)   1 yield   2 uptime_ticks   3 exit(code)
@@ -32,6 +33,8 @@ _start:
     b.eq    5f
     cmp     x19, #5
     b.eq    6f
+    cmp     x19, #6
+    b.eq    7f
     mov     x0, #9
     mov     x8, #3
     svc     #0
@@ -117,6 +120,10 @@ _start:
 6:
     sub     x2, sp, #16
     br      x2
+
+7:
+    bl      futex_test
+    b       .
 
 msg_hello:
     .ascii "hello from el0"

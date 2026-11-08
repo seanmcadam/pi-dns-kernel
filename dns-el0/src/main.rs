@@ -15,7 +15,16 @@ core::arch::global_asm!(include_str!("start.s"));
 
 const HEAP_VA: usize = 0x1_000A_0000;
 const HEAP_SIZE: usize = 1536 * 1024;
+const STACK_BYTES: usize = 16 * 1024;
+const WORKERS: usize = 2;
+const ALLOC_SIZE: usize = HEAP_SIZE - WORKERS * STACK_BYTES;
 const HEADER: usize = 16;
+
+mod thread {
+    include!("../../user-common/thread.rs");
+}
+
+static HEAP_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[repr(C)]
 struct Node {
@@ -29,12 +38,17 @@ struct Heap;
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        thread::mutex_lock(&HEAP_LOCK);
         init_heap();
-        alloc_block(layout)
+        let ptr = alloc_block(layout);
+        thread::mutex_unlock(&HEAP_LOCK);
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        thread::mutex_lock(&HEAP_LOCK);
         free_block(ptr, alloc_size(layout));
+        thread::mutex_unlock(&HEAP_LOCK);
     }
 }
 
@@ -55,7 +69,7 @@ unsafe fn init_heap() {
         return;
     }
     let node = HEAP_VA as *mut Node;
-    (*node).size = HEAP_SIZE;
+    (*node).size = ALLOC_SIZE;
     (*node).next = core::ptr::null_mut();
     FREE = node;
 }

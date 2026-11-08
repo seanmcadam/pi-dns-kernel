@@ -90,9 +90,9 @@ _start:
                                 // event or interrupt wakes the core.
     b       1b                  // woke up anyway? go back to sleep.
                                 // "1b" means "the previous label 1, going back".
-                                // To support multiple cores later, this is
-                                // where a secondary core would instead pick up
-                                // its own stack and jump into Rust.
+// QEMU keeps these cores off until PSCI CPU_ON. A Pi 4
+    // firmware stub parks them on the spin table instead.
+    // secondary_entry is that later entry, for both.
 
 2:
     // -------------------------------------------------------------------------
@@ -135,9 +135,8 @@ _start:
     mrs     x0, mpidr_el1
     msr     vmpidr_el2, x0
 
-    // CPTR_EL2.TFP traps EL1 floating-point to EL2, and this file does not
-    // install an EL2 vector table (a trap there would hang). 0x33ff clears
-    // the trap bits and sets the RES1 bits in CPTR_EL2.
+    // CPTR_EL2.TFP traps EL1 floating-point to EL2. 0x33ff clears the trap
+    // bits and sets the RES1 bits in CPTR_EL2.
     movz    x0, #0x33ff
     msr     cptr_el2, x0
 
@@ -413,6 +412,102 @@ clean_page:
     subs    x2, x2, #1
     b.ne    12b
     ret
+
+// Secondary cores arrive here with the MMU off. x0 is the PSCI context
+// id, or whatever the Pi 4 stub left in x0 (this image writes the cpu id
+// only for PSCI). The Pi 4 spin-table path is untested on hardware.
+.section .text
+.global secondary_entry
+.type secondary_entry, %function
+secondary_entry:
+    mov     x21, x0
+    cmp     x21, #3
+    b.hi    29f
+    mrs     x20, currentel
+    lsr     x20, x20, #2
+    cmp     x20, #1
+    b.eq    20f
+    cmp     x20, #2
+    b.ne    29f
+    movz    x0, #0x8000, lsl #16
+    msr     hcr_el2, x0
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr
+    mrs     x0, midr_el1
+    msr     vpidr_el2, x0
+    mrs     x0, mpidr_el1
+    msr     vmpidr_el2, x0
+    movz    x0, #0x33ff
+    msr     cptr_el2, x0
+    movz    x0, #0x0800
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+    movz    x0, #0x3c5
+    msr     spsr_el2, x0
+    adr     x0, 20f
+    msr     elr_el2, x0
+    isb
+    eret
+20:
+    mrs     x0, cpacr_el1
+    orr     x0, x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+    adrp    x1, SEC_SP
+    add     x1, x1, :lo12:SEC_SP
+    ldr     x1, [x1, x21, lsl #3]
+    mov     sp, x1
+    movz    x0, #0x0800
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+    adrp    x1, SEC_MAIR
+    add     x1, x1, :lo12:SEC_MAIR
+    ldr     x1, [x1]
+    msr     mair_el1, x1
+    adrp    x1, SEC_TCR
+    add     x1, x1, :lo12:SEC_TCR
+    ldr     x1, [x1]
+    msr     tcr_el1, x1
+    adrp    x1, early_l0_id
+    add     x1, x1, :lo12:early_l0_id
+    msr     ttbr0_el1, x1
+    adrp    x1, SEC_TTBR1
+    add     x1, x1, :lo12:SEC_TTBR1
+    ldr     x1, [x1]
+    msr     ttbr1_el1, x1
+    dsb     sy
+    isb
+    ic      iallu
+    dsb     sy
+    isb
+    mrs     x0, sctlr_el1
+    orr     x0, x0, #1
+    orr     x0, x0, #4
+    orr     x0, x0, #0x1000
+    msr     sctlr_el1, x0
+    isb
+    adr     x0, 21f
+    movz    x1, #0xFFFF, lsl #48
+    add     x0, x0, x1
+    add     sp, sp, x1
+    br      x0
+21:
+    msr     ttbr0_el1, xzr
+    dsb     nsh
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    adrp    x0, exception_vectors
+    add     x0, x0, :lo12:exception_vectors
+    msr     vbar_el1, x0
+    isb
+    mov     x0, x21
+    bl      secondary_main
+29:
+    wfe
+    b       29b
 
 // Early translation tables. Zeroed with the rest of .bss, then filled above.
 // They stay in the image's RAM, so the high map covers them after the jump.

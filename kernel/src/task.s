@@ -1,8 +1,16 @@
 // EL0 enter and return. global_asm! treats curly braces as format
 // placeholders, so this file has none.
 //
-// TaskContext, written by task.rs, is:
-//   0    x0-x30, 31 registers
+// TPIDR_EL1 points at PerCpu:
+//   0    current TaskContext
+//   8    kernel stack top
+//   16   x19-x30
+//   112  kernel sp
+//   120  DAIF
+//   128  action returned to Rust
+//
+// TaskContext is:
+//   0    x0-x30
 //   248  sp_el0
 //   256  elr_el1
 //   264  spsr_el1
@@ -10,13 +18,10 @@
 //   280  fpcr
 //   288  q0-q31
 //
-// KERNEL_RESUME is x19-x30, the kernel sp, then DAIF. Returning to the
-// kernel restores DAIF. Exception entry masks IRQ, and a bare ret would
-// leave the poll loop with the timer masked.
-// A lower-EL exception arrives on the task kernel stack. The vector saves
-// the user registers into CURRENT_CTX and calls el0_dispatch. Zero means
-// eret back to EL0. Anything else restores the kernel and returns from
-// enter_user.
+// A lower-EL exception arrives on the thread kernel stack. The vector
+// saves the user registers into the current context and calls el0_dispatch.
+// Zero means eret back to EL0. Anything else restores this core's kernel
+// and returns from enter_user.
 
 .section .text
 .global el0_sync_entry
@@ -53,11 +58,11 @@ el0_irq_entry:
     el0_prologue 1
 
 el0_saved:
-    adrp    x9, CURRENT_CTX
-    add     x9, x9, :lo12:CURRENT_CTX
-    ldr     x9, [x9]
+    mrs     x9, tpidr_el1
     cbz     x9, el0_no_ctx
-    mov     x0, x9
+    ldr     x10, [x9]
+    cbz     x10, el0_no_ctx
+    mov     x0, x10
     mov     x1, sp
     add     x1, x1, #16
     mov     x2, #31
@@ -67,49 +72,47 @@ el0_saved:
     subs    x2, x2, #1
     b.ne    1b
     mrs     x2, sp_el0
-    str     x2, [x9, #248]
+    str     x2, [x10, #248]
     mrs     x2, elr_el1
     mrs     x3, spsr_el1
-    stp     x2, x3, [x9, #256]
+    stp     x2, x3, [x10, #256]
     mrs     x2, fpsr
     mrs     x3, fpcr
-    stp     x2, x3, [x9, #272]
-    str     q0, [x9, #288]
-    str     q1, [x9, #304]
-    str     q2, [x9, #320]
-    str     q3, [x9, #336]
-    str     q4, [x9, #352]
-    str     q5, [x9, #368]
-    str     q6, [x9, #384]
-    str     q7, [x9, #400]
-    str     q8, [x9, #416]
-    str     q9, [x9, #432]
-    str     q10, [x9, #448]
-    str     q11, [x9, #464]
-    str     q12, [x9, #480]
-    str     q13, [x9, #496]
-    str     q14, [x9, #512]
-    str     q15, [x9, #528]
-    str     q16, [x9, #544]
-    str     q17, [x9, #560]
-    str     q18, [x9, #576]
-    str     q19, [x9, #592]
-    str     q20, [x9, #608]
-    str     q21, [x9, #624]
-    str     q22, [x9, #640]
-    str     q23, [x9, #656]
-    str     q24, [x9, #672]
-    str     q25, [x9, #688]
-    str     q26, [x9, #704]
-    str     q27, [x9, #720]
-    str     q28, [x9, #736]
-    str     q29, [x9, #752]
-    str     q30, [x9, #768]
-    str     q31, [x9, #784]
+    stp     x2, x3, [x10, #272]
+    str     q0, [x10, #288]
+    str     q1, [x10, #304]
+    str     q2, [x10, #320]
+    str     q3, [x10, #336]
+    str     q4, [x10, #352]
+    str     q5, [x10, #368]
+    str     q6, [x10, #384]
+    str     q7, [x10, #400]
+    str     q8, [x10, #416]
+    str     q9, [x10, #432]
+    str     q10, [x10, #448]
+    str     q11, [x10, #464]
+    str     q12, [x10, #480]
+    str     q13, [x10, #496]
+    str     q14, [x10, #512]
+    str     q15, [x10, #528]
+    str     q16, [x10, #544]
+    str     q17, [x10, #560]
+    str     q18, [x10, #576]
+    str     q19, [x10, #592]
+    str     q20, [x10, #608]
+    str     q21, [x10, #624]
+    str     q22, [x10, #640]
+    str     q23, [x10, #656]
+    str     q24, [x10, #672]
+    str     q25, [x10, #688]
+    str     q26, [x10, #704]
+    str     q27, [x10, #720]
+    str     q28, [x10, #736]
+    str     q29, [x10, #752]
+    str     q30, [x10, #768]
+    str     q31, [x10, #784]
     ldr     x19, [sp]
-    adrp    x1, TASK_KSP
-    add     x1, x1, :lo12:TASK_KSP
-    ldr     x1, [x1]
+    ldr     x1, [x9, #8]
     mov     sp, x1
     mov     x0, x19
     bl      el0_dispatch
@@ -117,8 +120,8 @@ el0_saved:
     b       return_to_kernel
 
 el0_resume:
-    adrp    x0, CURRENT_CTX
-    add     x0, x0, :lo12:CURRENT_CTX
+    mrs     x0, tpidr_el1
+    cbz     x0, el0_resume_dead
     ldr     x0, [x0]
     cbz     x0, el0_resume_dead
     b       restore_user
@@ -131,29 +134,22 @@ el0_no_ctx:
     bl      el0_no_task
 
 enter_user:
-    mov     x10, x0
-    mov     x11, x1
-    adrp    x9, KERNEL_RESUME
-    add     x9, x9, :lo12:KERNEL_RESUME
-    stp     x19, x20, [x9, #0]
-    stp     x21, x22, [x9, #16]
-    stp     x23, x24, [x9, #32]
-    stp     x25, x26, [x9, #48]
-    stp     x27, x28, [x9, #64]
-    stp     x29, x30, [x9, #80]
+    mrs     x9, tpidr_el1
+    cbz     x9, enter_no_cpu
+    stp     x19, x20, [x9, #16]
+    stp     x21, x22, [x9, #32]
+    stp     x23, x24, [x9, #48]
+    stp     x25, x26, [x9, #64]
+    stp     x27, x28, [x9, #80]
+    stp     x29, x30, [x9, #96]
     mov     x12, sp
-    str     x12, [x9, #96]
+    str     x12, [x9, #112]
     mrs     x12, daif
-    str     x12, [x9, #104]
+    str     x12, [x9, #120]
     msr     daifset, #0xf
-    adrp    x9, CURRENT_CTX
-    add     x9, x9, :lo12:CURRENT_CTX
-    str     x10, [x9]
-    adrp    x9, TASK_KSP
-    add     x9, x9, :lo12:TASK_KSP
-    str     x11, [x9]
-    mov     sp, x11
-    mov     x0, x10
+    str     x0, [x9]
+    str     x1, [x9, #8]
+    mov     sp, x1
 
 restore_user:
     ldr     x2, [x0, #248]
@@ -229,23 +225,22 @@ restore_user:
     ldr     x0, [x0, #0]
     eret
 
+enter_no_cpu:
+    mov     x0, #3
+    ret
+
 return_to_kernel:
-    adrp    x1, EL0_ACTION
-    add     x1, x1, :lo12:EL0_ACTION
-    str     x0, [x1]
-    adrp    x1, KERNEL_RESUME
-    add     x1, x1, :lo12:KERNEL_RESUME
-    ldp     x19, x20, [x1, #0]
-    ldp     x21, x22, [x1, #16]
-    ldp     x23, x24, [x1, #32]
-    ldp     x25, x26, [x1, #48]
-    ldp     x27, x28, [x1, #64]
-    ldp     x29, x30, [x1, #80]
-    ldr     x2, [x1, #96]
+    mrs     x1, tpidr_el1
+    str     x0, [x1, #128]
+    ldp     x19, x20, [x1, #16]
+    ldp     x21, x22, [x1, #32]
+    ldp     x23, x24, [x1, #48]
+    ldp     x25, x26, [x1, #64]
+    ldp     x27, x28, [x1, #80]
+    ldp     x29, x30, [x1, #96]
+    ldr     x2, [x1, #112]
     mov     sp, x2
-    ldr     x2, [x1, #104]
+    ldr     x2, [x1, #120]
     msr     daif, x2
-    adrp    x1, EL0_ACTION
-    add     x1, x1, :lo12:EL0_ACTION
-    ldr     x0, [x1]
+    ldr     x0, [x1, #128]
     ret

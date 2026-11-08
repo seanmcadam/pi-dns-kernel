@@ -5,7 +5,16 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use http_server::{parse_basic_auth, HttpMethod, HttpRequest, HttpResponse, ParseError};
+
+const HTTP_WORKERS: usize = 4;
+static JOB: [AtomicU32; HTTP_WORKERS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 
 const YIELD: u64 = 1;
 const EXIT: u64 = 3;
@@ -34,16 +43,55 @@ pub fn run() -> ! {
     if listen < 0 {
         exit(1);
     }
+    let mut worker = 0;
+    while worker < HTTP_WORKERS {
+        let top = 0x1_000A_0000u64 + (1536 * 1024) - (worker as u64 + 1) * (16 * 1024);
+        let _ = crate::thread::spawn(conn_worker, top, worker as u64);
+        worker += 1;
+    }
     loop {
         let conn = sys(TCP_ACCEPT, listen as u64, 0, 0, 0, 0, 0);
         if conn < 0 {
             yield_now();
             continue;
         }
-        serve(conn);
-        let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+        if !handoff(conn as u32) {
+            serve(conn);
+            let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+        }
         yield_now();
     }
+}
+
+extern "C" fn conn_worker(index: u64) {
+    let job = &JOB[index as usize];
+    loop {
+        let value = job.load(Ordering::Acquire);
+        if value == 0 {
+            let _ = crate::thread::futex_wait(job, 0);
+            continue;
+        }
+        job.store(0, Ordering::Release);
+        let conn = (value - 1) as i64;
+        serve(conn);
+        let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+    }
+}
+
+fn handoff(conn: u32) -> bool {
+    let mut index = 0;
+    while index < HTTP_WORKERS {
+        let job = &JOB[index];
+        if job
+            .compare_exchange(0, conn + 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let _ = crate::thread::futex_wake(job, 1);
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 fn serve(conn: i64) {

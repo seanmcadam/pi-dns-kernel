@@ -17,6 +17,9 @@ mod logger;
 mod memory;
 mod net;
 mod panic;
+mod percpu;
+mod smp;
+mod spin;
 mod task;
 mod user_fd;
 mod timer;
@@ -78,6 +81,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     mmu::init();
     uart_write("[OK] MMU and caches enabled\r\n");
 
+    percpu::init_bsp();
+
     uart_write("[1] Starting memory allocator...\r\n");
     unsafe {
         ALLOCATOR.init();
@@ -95,6 +100,12 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("[4] Initializing interrupts...\r\n");
     interrupts::init();
     uart_write("[OK] Interrupts initialized\r\n");
+
+    uart_write("[4a] Starting secondary cores...\r\n");
+    smp::boot(entry_el);
+    uart_write("cores online ");
+    uart_dec(smp::online() as u64);
+    uart_write("\r\n");
 
     uart_write("[4b] Running EL0 tests...\r\n");
     task::run_boot_tests();
@@ -154,6 +165,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         task::poll_http();
         task::poll_log();
         task::poll_spin();
+        let _ = task::schedule_one();
         net::poll();
 
         let now = timer::millis();
@@ -173,6 +185,9 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
             uart_write("HTTP server listening on port 80\r\n");
             uart_write("DNS Server ready\r\n");
             uart_write("MMU and caches enabled\r\n");
+            uart_write("cores online ");
+            uart_dec(smp::online() as u64);
+            uart_write("\r\n");
             report_el(entry_el);
             task::print_summary();
         }

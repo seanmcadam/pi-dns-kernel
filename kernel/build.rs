@@ -44,11 +44,15 @@ fn build_user(out_dir: &Path, manifest_dir: &Path) {
         user_dir.join("src/user.s").display()
     );
     println!("cargo:rerun-if-changed={}", link.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../user-common/thread.rs").display()
+    );
 
-    let obj = out_dir.join("user.o");
     let elf = out_dir.join("user.elf");
     let bin = out_dir.join("user.bin");
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let link_arg = format!("link-arg=-T{}", link.display());
     let status = Command::new(&rustc)
         .args([
             "--target",
@@ -59,22 +63,16 @@ fn build_user(out_dir: &Path, manifest_dir: &Path) {
             "panic=abort",
             "-C",
             "opt-level=z",
-            "--emit=obj",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "linker=aarch64-linux-gnu-ld",
+            "-C",
+            &link_arg,
         ])
         .arg("-o")
-        .arg(&obj)
-        .arg(&src)
-        .status()
-        .unwrap_or_else(|err| panic!("failed to run rustc for user-test: {err}"));
-    if !status.success() {
-        panic!("user-test rustc failed");
-    }
-    let status = Command::new("aarch64-linux-gnu-ld")
-        .arg("-T")
-        .arg(&link)
-        .arg("-o")
         .arg(&elf)
-        .arg(&obj)
+        .arg(&src)
         .status()
         .unwrap_or_else(|err| panic!("failed to link user-test: {err}"));
     if !status.success() {
@@ -109,6 +107,10 @@ fn build_dns(out_dir: &Path, manifest_dir: &Path) {
     for rel in ["src/main.rs", "src/server.rs", "src/start.s", "link.ld"] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../user-common/thread.rs").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../dns-protocol/src").display()
@@ -229,6 +231,10 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
     for rel in ["src/main.rs", "src/server.rs", "src/start.s", "link.ld"] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../user-common/thread.rs").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../http-server/src").display()

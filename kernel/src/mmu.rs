@@ -370,9 +370,9 @@ pub fn use_user_slot(slot: usize, asid: u64) {
 pub fn flush_tlb() {
     unsafe {
         core::arch::asm!(
-            "dsb sy",
-            "tlbi vmalle1",
-            "dsb sy",
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
             "isb",
             options(nostack),
         );
@@ -562,9 +562,9 @@ unsafe fn install_high_map(ttbr1: u64) {
     let mut sctlr: u64;
     core::arch::asm!(
         "msr ttbr1_el1, {ttbr1}",
-        "dsb sy",
-        "tlbi vmalle1",
-        "dsb sy",
+        "dsb ish",
+        "tlbi vmalle1is",
+        "dsb ish",
         "isb",
         "mrs {sctlr}, sctlr_el1",
         "orr {sctlr}, {sctlr}, #0x80000",

@@ -17,6 +17,7 @@ echo "Starting QEMU..."
 timeout 120 qemu-system-aarch64 \
     -M virt,gic-version=2 \
     -cpu cortex-a72 \
+    -smp 4 \
     -m 512M \
     -kernel boot/kernel8.img \
     -serial mon:tcp:127.0.0.1:4444,server,nowait \
@@ -302,7 +303,7 @@ echo "Test 9: DHCP client and static fallback"
 ./scripts/build.sh --features dhcp-default >/tmp/build-dhcp.txt
 rm -f qemu/dhcp-serial.txt qemu/dhcp-fallback.txt
 timeout 20 qemu-system-aarch64 \
-    -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/dhcp-serial.txt \
     -display none -monitor none -nographic \
@@ -317,7 +318,7 @@ if grep -q "DHCP configured 10.0.2.15" qemu/dhcp-serial.txt; then
     echo "✓ QEMU user-net DHCP leased 10.0.2.15"
     grep "DHCP configured" qemu/dhcp-serial.txt
     timeout 20 qemu-system-aarch64 \
-        -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
+        -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
         -kernel boot/kernel8.img \
         -serial file:qemu/dhcp-fallback.txt \
         -display none -monitor none -nographic \
@@ -357,7 +358,7 @@ mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/disk.img >/dev/null
 DISK_OFF=$((2048 * 512))
 rm -f qemu/persist-a.txt qemu/persist-b.txt
 timeout 40 qemu-system-aarch64 \
-    -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/persist-a.txt \
     -display none -monitor none -nographic \
@@ -406,7 +407,7 @@ elif ! mcopy -i qemu/disk.img@@${DISK_OFF} ::LOG.OLD - | grep -q "record added";
     TESTS_FAILED=$((TESTS_FAILED + 1))
 else
     timeout 30 qemu-system-aarch64 \
-        -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
+        -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
         -kernel boot/kernel8.img \
         -serial file:qemu/persist-b.txt \
         -display none -monitor none -nographic \
@@ -441,7 +442,7 @@ fault_case() {
     local serial="qemu/fault-${name}.txt"
     rm -f "$serial"
     timeout 30 qemu-system-aarch64 \
-        -M virt,gic-version=2 -cpu cortex-a72 -m 512M \
+        -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
         -kernel boot/kernel8.img \
         -serial "file:${serial}" \
         -display none -monitor none -nographic \
@@ -499,7 +500,7 @@ echo "Test 16: EL0 round trip, IRQ, and fault isolation"
 rm -f qemu/el0-serial.txt
 timeout 30 qemu-system-aarch64 \
     -M virt,gic-version=2 \
-    -cpu cortex-a72 -m 512M \
+    -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/el0-serial.txt \
     -display none -monitor none -nographic \
@@ -537,7 +538,7 @@ echo "Test 14: Boot from EL2 (QEMU virtualization=on)"
 rm -f qemu/el2-serial.txt
 timeout 25 qemu-system-aarch64 \
     -M virt,virtualization=on,gic-version=2 \
-    -cpu cortex-a72 -m 512M \
+    -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/el2-serial.txt \
     -display none -monitor none -nographic \
@@ -579,6 +580,64 @@ else
 fi
 # Leave the QEMU image in boot/ for the virt machine.
 ./scripts/build.sh >/tmp/build-qemu-final.txt
+
+echo ""
+echo "Test 19: Four cores online"
+if grep -q "cores online 4" qemu/boot-output.txt; then
+    echo "✓ All 4 cores reported online"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Did not see cores online 4"
+    grep "cores online" qemu/boot-output.txt || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 21: Futex-protected counter"
+if grep -q "user: futex counter 4000" qemu/el0-serial.txt; then
+    echo "✓ Four threads incremented a futex counter to 4000"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Futex counter was not exactly 4000"
+    grep "futex" qemu/el0-serial.txt || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 20: Concurrent DNS and HTTP"
+rm -f qemu/load-serial.txt
+timeout 25 qemu-system-aarch64 \
+    -M virt,gic-version=2 \
+    -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/load-serial.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    >/tmp/qemu-load.txt 2>&1 &
+LOAD_PID=$!
+sleep 6
+LOAD_OK=0
+for n in 1 2 3 4; do
+    dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short +time=3 +tries=1 > /tmp/load-dig-$n.txt 2>/dev/null &
+    curl -s -u admin:admin --max-time 4 http://127.0.0.1:${HTTP_HOST_PORT}/status > /tmp/load-http-$n.txt 2>/dev/null &
+done
+wait
+for n in 1 2 3 4; do
+    if grep -q "192.168.1.100" /tmp/load-dig-$n.txt && grep -q '"status":"running"' /tmp/load-http-$n.txt; then
+        LOAD_OK=$((LOAD_OK + 1))
+    fi
+done
+kill $LOAD_PID 2>/dev/null || true
+wait $LOAD_PID 2>/dev/null || true
+if [ "$LOAD_OK" -eq 4 ]; then
+    echo "✓ Four parallel DNS queries and four HTTP status reads"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Concurrent DNS+HTTP load: ${LOAD_OK}/4 pairs"
+    cat /tmp/load-dig-*.txt /tmp/load-http-*.txt || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
 
 # Summary
 echo ""

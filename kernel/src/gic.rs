@@ -48,10 +48,12 @@ fn dsb() {
 }
 
 pub fn init() {
-    // CPU interface off while the distributor is programmed. Priority mask
-    // 0xff lets every priority through once the interface is enabled.
-    write(GICC, GICC_CTLR, 0);
-    write(GICC, GICC_PMR, 0xff);
+    init_distributor();
+    init_cpu();
+}
+
+/// Distributor, once, from core 0. Shared SPI registers are not banked.
+pub fn init_distributor() {
     write(GICD, GICD_CTLR, 0);
 
     // Group 1 is what Non-secure EL1 can take, and what Secure EL1 can take
@@ -69,9 +71,20 @@ pub fn init() {
         id += 32;
     }
 
+    // Group 1 and the distributor enable are shared. CPU interfaces are not.
+    write(GICD, GICD_CTLR, 0x3);
+    dsb();
+}
+
+/// CPU interface and the banked virtual-timer PPI. Every core calls this.
+pub fn init_cpu() {
+    write(GICC, GICC_CTLR, 0);
+    write(GICC, GICC_PMR, 0xff);
     let bit = 1u32 << (TIMER_IRQ % 32);
+    // IGROUPR for a PPI is banked. Core 0's distributor init does not
+    // cover the other cores, so each CPU marks its timer Group 1.
     let word = ((TIMER_IRQ / 32) * 4) as usize;
-    // One byte of priority per interrupt. 0xa0 sits under the mask.
+    // Priority bytes for PPIs are banked per CPU. 0xa0 sits under the mask.
     let byte = GICD_IPRIORITYR + TIMER_IRQ as usize;
     let aligned = byte & !3;
     let shift = (byte & 3) * 8;
@@ -79,6 +92,8 @@ pub fn init() {
     priority &= !(0xff << shift);
     priority |= 0xa0 << shift;
     write(GICD, aligned, priority);
+    let group = read(GICD, GICD_IGROUPR + word);
+    write(GICD, GICD_IGROUPR + word, group | bit);
     write(GICD, GICD_ISENABLER + word, bit);
 
     // QEMU's GICv2 treats this CPU as Secure. A Secure ack of a Group 1
@@ -88,7 +103,6 @@ pub fn init() {
     // same addresses alias to EnableGrp1, which is what a Pi 4 firmware
     // handover needs. FIQEn stays clear, so Group 0 would also arrive as IRQ.
     // EOImode stays 0: one EOIR write drops priority and deactivates.
-    write(GICD, GICD_CTLR, 0x3);
     write(GICC, GICC_CTLR, 0x7);
     dsb();
 }
