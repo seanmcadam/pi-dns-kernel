@@ -4,7 +4,9 @@
 //! accepted only when it is well formed, every required field is present, each
 //! value has the right type and lies inside its bounds, and no key is unknown.
 //! Callers apply cross-field rules, such as the log-file budget, after this
-//! check and before anything is written.
+//! check and before anything is written. A saved file is pretty-printed when
+//! that text still fits in [`UPLOAD_MAX`]. A larger pretty form is stored
+//! compact instead of being truncated, and the input limit stays 4096.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -15,6 +17,10 @@ use alloc::vec::Vec;
 
 pub const SCHEMA_VERSION: u64 = 1;
 pub const UPLOAD_MAX: usize = 4096;
+
+/// Canonical `LOG.JSN` written when the file is missing. Version 1,
+/// `max_bytes` 4096, `archives` 3.
+pub const DEFAULT_LOG_JSON: &str = "{\n  \"version\": 1,\n  \"max_bytes\": 4096,\n  \"archives\": 3\n}\n";
 
 /// Active log file size, in bytes.
 pub const LOG_MIN_BYTES: u64 = 4096;
@@ -143,6 +149,34 @@ pub fn parse(text: &str) -> Result<Value, Error> {
         return Err(Error::new("$", "malformed json"));
     }
     Ok(value)
+}
+
+/// Pretty-print `value` when the result fits in [`UPLOAD_MAX`].
+///
+/// Otherwise emit a compact document if that fits. The `Err` path means
+/// neither form fits, so the caller must leave the previous file untouched.
+/// Strings are escaped without dropping characters. Object key order and
+/// array order are kept.
+pub fn format_document(value: &Value) -> Result<String, Error> {
+    let mut buf = DocBuf::new();
+    write_value(&mut buf, value, 0, true);
+    if buf.fail == Fail::None {
+        buf.push_str("\n");
+    }
+    if buf.fail == Fail::None {
+        return Ok(buf.out);
+    }
+    if buf.fail == Fail::Size {
+        buf.reset();
+        write_value(&mut buf, value, 0, false);
+        if buf.fail == Fail::None {
+            return Ok(buf.out);
+        }
+    }
+    Err(match buf.fail {
+        Fail::Value => Error::new("$", "formatted config cannot preserve a value"),
+        Fail::Size | Fail::None => Error::new("$", "formatted config exceeds 4096 bytes"),
+    })
 }
 
 pub fn check(value: &Value, fields: &[Field]) -> Result<(), Error> {
@@ -654,6 +688,169 @@ impl<'a> Parser<'a> {
     }
 }
 
+struct DocBuf {
+    out: String,
+    fail: Fail,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fail {
+    None,
+    Size,
+    Value,
+}
+
+impl DocBuf {
+    fn new() -> Self {
+        Self {
+            out: String::with_capacity(UPLOAD_MAX),
+            fail: Fail::None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.out.clear();
+        self.fail = Fail::None;
+    }
+
+    fn push_str(&mut self, text: &str) {
+        if self.fail != Fail::None {
+            return;
+        }
+        if self.out.len().saturating_add(text.len()) > UPLOAD_MAX {
+            self.fail = Fail::Size;
+            return;
+        }
+        self.out.push_str(text);
+    }
+
+    fn push_char(&mut self, ch: char) {
+        let mut tmp = [0u8; 4];
+        self.push_str(ch.encode_utf8(&mut tmp));
+    }
+
+    fn push_u64(&mut self, mut value: u64) {
+        let mut buf = [0u8; 20];
+        let mut index = 20;
+        loop {
+            index -= 1;
+            buf[index] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        self.push_str(core::str::from_utf8(&buf[index..]).unwrap_or(""));
+    }
+}
+
+fn write_value(buf: &mut DocBuf, value: &Value, indent: usize, pretty: bool) {
+    if buf.fail != Fail::None {
+        return;
+    }
+    if indent > 32 {
+        buf.fail = Fail::Value;
+        return;
+    }
+    match value {
+        Value::Null => buf.push_str("null"),
+        Value::Bool(true) => buf.push_str("true"),
+        Value::Bool(false) => buf.push_str("false"),
+        Value::Number(number) => buf.push_u64(*number),
+        Value::String(text) => write_string(buf, text),
+        Value::Array(items) => write_array(buf, items, indent, pretty),
+        Value::Object(items) => write_object(buf, items, indent, pretty),
+    }
+}
+
+fn write_object(buf: &mut DocBuf, items: &[(String, Value)], indent: usize, pretty: bool) {
+    if items.is_empty() {
+        buf.push_str("{}");
+        return;
+    }
+    buf.push_str("{");
+    for (index, (key, value)) in items.iter().enumerate() {
+        if index > 0 {
+            buf.push_str(",");
+        }
+        if pretty {
+            newline_indent(buf, indent + 1);
+        }
+        write_string(buf, key);
+        buf.push_str(if pretty { ": " } else { ":" });
+        write_value(buf, value, indent + 1, pretty);
+    }
+    if pretty {
+        newline_indent(buf, indent);
+    }
+    buf.push_str("}");
+}
+
+fn write_array(buf: &mut DocBuf, items: &[Value], indent: usize, pretty: bool) {
+    if items.is_empty() {
+        buf.push_str("[]");
+        return;
+    }
+    buf.push_str("[");
+    for (index, value) in items.iter().enumerate() {
+        if index > 0 {
+            buf.push_str(",");
+        }
+        if pretty {
+            newline_indent(buf, indent + 1);
+        }
+        write_value(buf, value, indent + 1, pretty);
+    }
+    if pretty {
+        newline_indent(buf, indent);
+    }
+    buf.push_str("]");
+}
+
+fn newline_indent(buf: &mut DocBuf, indent: usize) {
+    buf.push_str("\n");
+    let mut left = indent.saturating_mul(2);
+    while left > 0 {
+        buf.push_str(" ");
+        left -= 1;
+    }
+}
+
+fn write_string(buf: &mut DocBuf, text: &str) {
+    buf.push_str("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            ch if (0x20..0x7f).contains(&(ch as u32)) => buf.push_char(ch),
+            ch if (ch as u32) <= 0xffff => {
+                let value = ch as u32;
+                buf.push_str("\\u");
+                for shift in [12, 8, 4, 0] {
+                    buf.push_char(hex_digit((value >> shift) & 0xf));
+                }
+            }
+            _ => {
+                buf.fail = Fail::Value;
+                return;
+            }
+        }
+    }
+    buf.push_str("\"");
+}
+
+fn hex_digit(n: u32) -> char {
+    let n = n as u8;
+    if n < 10 {
+        (b'0' + n) as char
+    } else {
+        (b'a' + (n - 10)) as char
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,5 +883,98 @@ mod tests {
             .message
             .contains("unknown"));
         assert!(log_budget(65_536, 16).is_err());
+        assert!(log_budget(65_536, 15).is_ok());
+        assert!(log_budget(4096, 0).is_ok());
+        let below = parse(r#"{"version":1,"max_bytes":4095,"archives":0}"#).unwrap();
+        assert!(check(&below, log_fields())
+            .unwrap_err()
+            .message
+            .contains("out of bounds"));
+        let archives = parse(r#"{"version":1,"max_bytes":4096,"archives":17}"#).unwrap();
+        assert!(check(&archives, log_fields())
+            .unwrap_err()
+            .message
+            .contains("out of bounds"));
+    }
+
+    #[test]
+    fn default_log_json_is_pretty_and_stable() {
+        let value = parse(DEFAULT_LOG_JSON).unwrap();
+        check(&value, log_fields()).unwrap();
+        assert_eq!(value.get("version").and_then(Value::as_u64), Some(1));
+        assert_eq!(value.get("max_bytes").and_then(Value::as_u64), Some(4096));
+        assert_eq!(value.get("archives").and_then(Value::as_u64), Some(3));
+        let formatted = format_document(&value).unwrap();
+        assert_eq!(formatted, DEFAULT_LOG_JSON);
+        assert!(formatted.len() <= UPLOAD_MAX);
+        assert_eq!(format_document(&parse(&formatted).unwrap()).unwrap(), formatted);
+    }
+
+    #[test]
+    fn format_preserves_strings_and_escapes() {
+        let raw = r#"{"version":1,"password":"a\"b\\c/\u0041\n\u0001"}"#;
+        let value = parse(raw).unwrap();
+        let text = value.get("password").and_then(Value::as_str).unwrap();
+        assert_eq!(text, "a\"b\\c/A\n\u{0001}");
+        let formatted = format_document(&value).unwrap();
+        assert!(formatted.starts_with("{\n"));
+        assert!(formatted.ends_with("\n"));
+        assert!(formatted.contains("\\\""));
+        assert!(formatted.contains("\\\\"));
+        assert!(formatted.contains("\\n"));
+        assert!(formatted.contains("\\u0001"));
+        assert_eq!(parse(&formatted).unwrap(), value);
+        assert_eq!(format_document(&parse(&formatted).unwrap()).unwrap(), formatted);
+        assert!(formatted.len() <= UPLOAD_MAX);
+    }
+
+    #[test]
+    fn whitespace_and_key_order_round_trip_without_dropping_fields() {
+        let raw = "{\n\t\"archives\" : 3, \"version\" : 1, \"max_bytes\" : 4096 }\n";
+        let value = parse(raw).unwrap();
+        check(&value, log_fields()).unwrap();
+        let formatted = format_document(&value).unwrap();
+        assert_eq!(
+            formatted,
+            "{\n  \"archives\": 3,\n  \"version\": 1,\n  \"max_bytes\": 4096\n}\n"
+        );
+        assert_eq!(parse(&formatted).unwrap(), value);
+    }
+
+    #[test]
+    fn pretty_form_that_exceeds_4096_falls_back_to_compact() {
+        let mut items = Vec::new();
+        let mut index = 0;
+        while index < 300 {
+            items.push((alloc::format!("k{index:03}"), Value::String(String::from("z"))));
+            index += 1;
+        }
+        let value = Value::Object(items);
+        let formatted = format_document(&value).unwrap();
+        assert!(formatted.len() <= UPLOAD_MAX);
+        assert!(!formatted.contains('\n'), "compact fallback must not be truncated pretty text");
+        assert_eq!(parse(&formatted).unwrap(), value);
+        assert_eq!(format_document(&parse(&formatted).unwrap()).unwrap(), formatted);
+    }
+
+    #[test]
+    fn oversized_document_is_rejected_whole() {
+        let mut items = Vec::new();
+        let mut index = 0;
+        while index < 400 {
+            items.push(Value::String(String::from("abcdefghijklmnopqrstuvwxyz012345")));
+            index += 1;
+        }
+        let err = format_document(&Value::Array(items)).unwrap_err();
+        assert!(err.message.contains("exceeds 4096"));
+        assert_eq!(UPLOAD_MAX, 4096);
+    }
+
+    #[test]
+    fn duplicate_keys_and_bad_escapes_are_rejected() {
+        assert!(parse(r#"{"version":1,"version":1}"#).is_err());
+        assert!(parse(r#"{"version":"\u12"}"#).is_err());
+        assert!(parse(r#"{"version":"\uXXXX"}"#).is_err());
+        assert!(parse("{\"version\":\"\n\"}").is_err());
     }
 }
