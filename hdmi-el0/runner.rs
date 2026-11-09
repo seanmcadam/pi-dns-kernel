@@ -263,7 +263,8 @@ fn yield_now() {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    panic_rt::report_panic(b"hdmi", info);
     let _ = sys(EXIT, 1, 0, 0, 0, 0, 0);
     loop {
         yield_now();

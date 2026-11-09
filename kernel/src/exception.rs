@@ -1,8 +1,13 @@
 //! Exception reports.
 //!
-//! `exception_handler` is the target of every vector in `exception.s`. It
-//! prints a fault report on the UART and halts. It does not allocate: the
-//! fault may be inside the allocator, and it does not take locks.
+//! `exception_handler` is the target of every vector in `exception.s` except
+//! the IRQ and EL0 sync entries. It prints a fault report on the UART and
+//! halts. It does not allocate: the fault may be inside the allocator. It
+//! does not wait on a lock. One short line is copied into the log queue
+//! only when that lock is free and the log task is up. The UART report is
+//! the record that survives a halt. `LOG.TXT` is updated only if some other
+//! core still runs the log task and drains the queue. A nested fault prints
+//! one fixed line and halts, without walking the register frame again.
 
 use core::ptr::addr_of;
 
@@ -181,6 +186,10 @@ pub fn read_u32_catching(addr: *const u32) -> Option<u32> {
 /// Print the fault and stop. Called from `exception.s` with a saved frame.
 #[no_mangle]
 pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
+    if !crate::fault_log::enter() {
+        put("\r\nnested fault log\r\n");
+        halt();
+    }
     let esr = reg("esr");
     let elr = reg("elr");
     let far = reg("far");
@@ -225,7 +234,18 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
         put("\r\n");
         index += 1;
     }
+    let mut raw = [0u8; 80];
+    let n = crate::fault_log::write_kfault(&mut raw, kind, ec, iss, elr, far);
+    if let Ok(line) = core::str::from_utf8(&raw[..n]) {
+        put(line);
+        put("\r\n");
+        let _ = crate::logger::try_queue_fault(line);
+    }
     put("halting\r\n");
+    halt();
+}
+
+fn halt() -> ! {
     loop {
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));

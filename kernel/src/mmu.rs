@@ -659,6 +659,17 @@ fn give_up(message: &str) -> ! {
     crate::console::write_str("MMU setup failed: ");
     crate::console::write_str(message);
     crate::console::write_str("\r\n");
+    let mut raw = [0u8; 80];
+    let prefix = b"mmu failed ";
+    let mut n = prefix.len().min(raw.len());
+    raw[..n].copy_from_slice(&prefix[..n]);
+    let msg = message.as_bytes();
+    let take = msg.len().min(raw.len() - n);
+    raw[n..n + take].copy_from_slice(&msg[..take]);
+    n += take;
+    if let Ok(line) = core::str::from_utf8(&raw[..n]) {
+        let _ = crate::logger::try_queue_fault(line);
+    }
     loop {
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));

@@ -622,6 +622,10 @@ if matched is None:
     text = page()
     fail("dns fault or leak\n%s\nbaseline %s" % (text, base_count))
 print("no leak", counters(matched))
+console = open("qemu/supervisor-console.txt", "rb").read()
+if b"elfault dns" not in console or b"ec=24" not in console or b"far=0000000000000000" not in console:
+    fail("dns fault log missing\n" + console[-500:].decode("utf-8", "replace"))
+print("dns fault logged")
 
 before = int(field(page(), "http", "restarts"))
 status, body = get("/debug/crash/http")
@@ -683,6 +687,10 @@ for sock in clients:
         break
 if not saw:
     fail("no telnet client kept streaming")
+console = open("qemu/supervisor-console.txt", "rb").read()
+if b"elfault telnet" not in console:
+    fail("telnet worker fault was not logged")
+print("telnet fault logged")
 opened = False
 for _ in range(12):
     sock = socket.create_connection(("127.0.0.1", telnet), 5)
@@ -1729,7 +1737,10 @@ fault_case() {
         && grep -q "x30:" "$serial" \
         && grep -q "halting" "$serial" \
         && grep -q "$marker" "$serial" \
-        && grep -q "$iss" "$serial"; then
+        && grep -q "$iss" "$serial" \
+        && grep -q "kfault v=" "$serial" \
+        && grep -q "elr=" "$serial" \
+        && grep -q "far=" "$serial"; then
         echo "✓ Fault report for ${name}"
         grep -E "type:|ESR_EL1:|ISS:|FAR_EL1:|ELR_EL1:" "$serial"
         TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -1775,6 +1786,7 @@ if echo "$EL0_LINE" | grep -q "log ok, yield ok, irq ok, exit 0, bad-syscall -1,
     && grep -q "EL0 syscall: unknown" qemu/el0-serial.txt \
     && grep -q "user: bad syscall survived" qemu/el0-serial.txt \
     && grep -q "user: bad pointer survived" qemu/el0-serial.txt \
+    && grep -q "elfault boot" qemu/el0-serial.txt \
     && grep -q "DNS Server ready" qemu/el0-serial.txt \
     && echo "$EL0_DNS" | grep -q "192.168.1.100"; then
     echo "✓ EL0 round trip, IRQ resume, bad syscall, bad pointer, and user faults"

@@ -10,6 +10,7 @@ mod console;
 mod cpu_stat;
 mod dns;
 mod exception;
+mod fault_log;
 mod fs;
 mod http;
 mod gic;

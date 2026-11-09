@@ -147,6 +147,7 @@ pub extern "C" fn rust_main() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    panic_rt::report_panic(b"dns", info);
     loop {}
 }

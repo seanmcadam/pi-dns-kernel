@@ -78,6 +78,7 @@ fn build_user(out_dir: &Path, manifest_dir: &Path) {
     let elf = out_dir.join("user.elf");
     let bin = out_dir.join("user.bin");
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let link_arg = format!("link-arg=-T{}", link.display());
     let status = Command::new(&rustc)
         .args([
@@ -95,7 +96,9 @@ fn build_user(out_dir: &Path, manifest_dir: &Path) {
             "linker=aarch64-linux-gnu-ld",
             "-C",
             &link_arg,
+            "--extern",
         ])
+        .arg(format!("panic_rt={}", panic_rt.display()))
         .arg("-o")
         .arg(&elf)
         .arg(&src)
@@ -147,6 +150,7 @@ fn build_dns(out_dir: &Path, manifest_dir: &Path) {
     );
 
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let proto = out_dir.join("libdns_protocol.rlib");
     let cache = out_dir.join("libdns_cache.rlib");
     compile_rlib(
@@ -186,6 +190,8 @@ fn build_dns(out_dir: &Path, manifest_dir: &Path) {
         .arg(format!("dns_protocol={}", proto.display()))
         .arg("--extern")
         .arg(format!("dns_cache={}", cache.display()))
+        .arg("--extern")
+        .arg(format!("panic_rt={}", panic_rt.display()))
         .arg("-o")
         .arg(&elf)
         .arg(dir.join("src/main.rs"))
@@ -267,6 +273,7 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
     );
 
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let http = out_dir.join("libhttp_server.rlib");
     compile_rlib(
         &rustc,
@@ -297,6 +304,8 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
             "--extern",
         ])
         .arg(format!("http_server={}", http.display()))
+        .arg("--extern")
+        .arg(format!("panic_rt={}", panic_rt.display()))
         .arg("-o")
         .arg(&elf)
         .arg(dir.join("src/main.rs"))
@@ -369,6 +378,7 @@ fn build_log(out_dir: &Path, manifest_dir: &Path) {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let elf = out_dir.join("log.elf");
     let link = dir.join("link.ld");
     let link_arg = format!("link-arg=-T{}", link.display());
@@ -388,7 +398,9 @@ fn build_log(out_dir: &Path, manifest_dir: &Path) {
             "linker=aarch64-linux-gnu-ld",
             "-C",
             &link_arg,
+            "--extern",
         ])
+        .arg(format!("panic_rt={}", panic_rt.display()))
         .arg("-o")
         .arg(&elf)
         .arg(dir.join("src/main.rs"))
@@ -462,6 +474,7 @@ fn build_telnet(out_dir: &Path, manifest_dir: &Path) {
         manifest_dir.join("../user-common/thread.rs").display()
     );
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let elf = out_dir.join("telnet.elf");
     let link = dir.join("link.ld");
     let link_arg = format!("link-arg=-T{}", link.display());
@@ -481,7 +494,9 @@ fn build_telnet(out_dir: &Path, manifest_dir: &Path) {
             "linker=aarch64-linux-gnu-ld",
             "-C",
             &link_arg,
+            "--extern",
         ])
+        .arg(format!("panic_rt={}", panic_rt.display()))
         .arg("-o")
         .arg(&elf)
         .arg(dir.join("src/main.rs"))
@@ -560,6 +575,7 @@ fn build_vnc(out_dir: &Path, manifest_dir: &Path, rustc: &str, rfb: &Path, conso
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../display-console/src/font.rs").display()
     );
+    let panic_rt = compile_panic_rt(out_dir, manifest_dir, rustc);
     link_el0(
         out_dir,
         rustc,
@@ -569,6 +585,7 @@ fn build_vnc(out_dir: &Path, manifest_dir: &Path, rustc: &str, rfb: &Path, conso
         &[
             format!("rfb={}", rfb.display()),
             format!("display_console={}", console.display()),
+            format!("panic_rt={}", panic_rt.display()),
         ],
     );
 }
@@ -591,6 +608,7 @@ fn build_hdmi(out_dir: &Path, manifest_dir: &Path, rustc: &str, edid: &Path, con
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../display-console/src/lib.rs").display()
     );
+    let panic_rt = compile_panic_rt(out_dir, manifest_dir, rustc);
     link_el0(
         out_dir,
         rustc,
@@ -600,6 +618,7 @@ fn build_hdmi(out_dir: &Path, manifest_dir: &Path, rustc: &str, edid: &Path, con
         &[
             format!("edid={}", edid.display()),
             format!("display_console={}", console.display()),
+            format!("panic_rt={}", panic_rt.display()),
         ],
     );
 }
@@ -695,6 +714,18 @@ fn link_el0(out_dir: &Path, rustc: &str, src: &Path, link: &Path, name: &str, ex
         ),
     )
     .unwrap();
+}
+
+fn compile_panic_rt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> PathBuf {
+    let src = manifest_dir.join("../user-common/panic_rt.rs");
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../user-common/panic_line.rs").display()
+    );
+    let out = out_dir.join("libpanic_rt.rlib");
+    compile_rlib(rustc, &src, "panic_rt", &out);
+    out
 }
 
 fn compile_rlib(rustc: &str, src: &Path, name: &str, out: &Path) {

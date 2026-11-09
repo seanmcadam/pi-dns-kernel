@@ -44,6 +44,7 @@ pub extern "C" fn rust_main() -> ! {
 fn run() -> ! {
     let listen = sys(TCP_LISTEN, PORT, 0, 0, 0, 0, 0);
     if listen < 0 {
+        panic_rt::note_text(b"telnet listen failed");
         exit_now(1);
     }
     let _ = thread::spawn(reaper, HEAP_VA + STACK_BYTES, 0);
@@ -360,6 +361,7 @@ fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    panic_rt::report_panic(b"telnet", info);
     exit_now(1);
 }

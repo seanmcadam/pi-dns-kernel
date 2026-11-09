@@ -62,7 +62,12 @@ pub fn run() -> ! {
     let tcp = tcp_listen(53);
     if dns < 0 || upstream < 0 {
         let _ = log_line("dns-el0: bind failed");
+        panic_rt::note_text(b"dns-el0: bind failed");
         exit(1);
+    }
+    if tcp < 0 {
+        let _ = log_line("dns-el0: tcp listen failed");
+        panic_rt::note_text(b"dns-el0: tcp listen failed");
     }
     let cache_size = sys(CONFIG_CACHE_SIZE, 0, 0, 0, 0, 0, 0).clamp(1, 1024) as usize;
     let cache = DnsCache::new(cache_size);

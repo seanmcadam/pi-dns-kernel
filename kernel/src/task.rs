@@ -375,6 +375,7 @@ pub fn print_summary() {
 #[no_mangle]
 pub extern "C" fn el0_no_task() -> ! {
     put("EL0 exception with no task\r\n");
+    log_el0_fault("none");
     loop {
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
@@ -574,6 +575,27 @@ fn sys_log(ptr: u64, len: u64) -> u64 {
     0
 }
 
+fn log_el0_fault(name: &str) {
+    let esr = reg("esr_el1");
+    let ec = (esr >> 26) & 0x3f;
+    let iss = esr & 0x1ff_ffff;
+    let elr = reg("elr_el1");
+    let far = reg("far_el1");
+    let mut raw = [0u8; 80];
+    let n = crate::fault_log::write_elfault(
+        &mut raw,
+        name,
+        crate::percpu::thread_index() as u32,
+        ec,
+        iss,
+        elr,
+        far,
+    );
+    // The formatter writes ASCII only.
+    let line = unsafe { core::str::from_utf8_unchecked(&raw[..n]) };
+    crate::logger::note_fault(line);
+}
+
 fn kill(ec: u64) {
     let far = reg("far_el1");
     let elr = reg("elr_el1");
@@ -595,6 +617,11 @@ fn kill(ec: u64) {
         }
     }
     let slot = crate::percpu::slot();
+    log_el0_fault(if unsafe { SCENARIO } == 0xff {
+        crate::fault_log::task_name(slot)
+    } else {
+        "boot"
+    });
     crate::supervisor::note(slot, ec, elr, far);
     let index = crate::percpu::thread_index();
     if index != 0 {

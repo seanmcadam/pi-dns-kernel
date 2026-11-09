@@ -59,6 +59,7 @@ const EAGAIN: i64 = -11;
 pub fn run() -> ! {
     let listen = sys(TCP_LISTEN, 80, 0, 0, 0, 0, 0);
     if listen < 0 {
+        panic_rt::note_text(b"http listen failed");
         exit(1);
     }
     let mut worker = 0;

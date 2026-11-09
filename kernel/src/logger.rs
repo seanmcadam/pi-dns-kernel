@@ -4,6 +4,12 @@
 //! to the UART. That covers early boot, panics, and fault reports that call
 //! the console directly. Once the task is live, records go into a fixed
 //! queue. A full queue drops the record and counts it. It never waits.
+//!
+//! Fault records use `try_lock` on the queue and the recent buffer. If
+//! either lock is already held, that step is skipped. A fatal halt does
+//! not drain the queue: the UART line is the record that is already
+//! written, and `LOG.TXT` or telnet only see the line if another core's
+//! log task drains the queue before the machine stops.
 
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
@@ -125,6 +131,86 @@ pub fn drain(out: &mut [u8]) -> usize {
 pub fn emit_line(text: &str) {
     let _ = writeln!(UartWriter, "{text}\r");
     let mut recent = RECENT.lock();
+    push_recent(&mut recent, text);
+}
+
+/// Queue one error line for the log task. Never waits.
+///
+/// Returns whether the log task will print and, because the persist flag
+/// is set, append the line. A busy or full queue returns false and counts
+/// a drop only when the queue was full. The caller prints the UART line.
+pub fn try_queue_fault(text: &str) -> bool {
+    let live = crate::task::log_live();
+    let mut queue_free = false;
+    let mut full = false;
+    let stored = if live {
+        match QUEUE.try_lock() {
+            Some(mut queue) => {
+                queue_free = true;
+                if queue.len == QLEN {
+                    full = true;
+                    false
+                } else {
+                    let bytes = text.as_bytes();
+                    let n = bytes.len().min(CAP);
+                    let index = (queue.head + queue.len) % QLEN;
+                    let slot = &mut queue.slots[index];
+                    slot.level = 3;
+                    slot.flags = 1;
+                    slot.len = n as u8;
+                    slot.data[..n].copy_from_slice(&bytes[..n]);
+                    queue.len += 1;
+                    true
+                }
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    match crate::fault_log::action(true, live, queue_free, full) {
+        crate::fault_log::FaultAction::Queue => stored,
+        crate::fault_log::FaultAction::Direct => {
+            if full {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+        crate::fault_log::FaultAction::Nested => false,
+    }
+}
+
+/// UART, and the recent buffer when its lock is free. Does not publish to
+/// the telnet ring: the log task is the only publisher, and a fault may
+/// have interrupted it mid-publish.
+pub fn direct_fault(text: &str) {
+    let _ = writeln!(UartWriter, "{text}\r");
+    if let Some(mut recent) = RECENT.try_lock() {
+        push_recent(&mut recent, text);
+    }
+}
+
+/// Best-effort fault record. Matches `fault_log::action`: a nested call
+/// only writes a fixed UART line, and a busy, full, or down queue falls
+/// back to the UART. The queue itself is never waited on.
+pub fn note_fault(text: &str) {
+    if !crate::fault_log::enter() {
+        if crate::fault_log::action(false, false, false, false)
+            == crate::fault_log::FaultAction::Nested
+        {
+            crate::console::write_str("\r\nnested fault log\r\n");
+        }
+        return;
+    }
+    // The UART line is written even when the queue accepts the record.
+    // The log task may be the one that faulted, or it may not drain
+    // before a halt. A second copy appears if that task is still running.
+    direct_fault(text);
+    let _ = try_queue_fault(text);
+    crate::fault_log::leave();
+}
+
+fn push_recent(recent: &mut Recent, text: &str) {
     let line = text.as_bytes();
     let need = line.len() + 1;
     if need >= recent.buf.len() {

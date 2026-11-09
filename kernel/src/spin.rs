@@ -27,7 +27,8 @@
 //! it acknowledges the GIC and the virtio-mmio status register and stores
 //! an atomic. The timer IRQ takes none of these.
 //!
-//! The UART and the panic path take no locks.
+//! The UART takes no locks. A panic or a CPU fault does not wait on a
+//! lock: it tries the log queue and skips the queue when that lock is held.
 //!
 //! The supervisor lock is not in this list. It is taken alone and dropped
 //! before any lock above, including `SCHED` and `LOGQ`.
