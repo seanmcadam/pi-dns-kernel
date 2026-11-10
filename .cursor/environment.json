@@ -1,0 +1,5 @@
+{
+  "name": "pi4-dns-kernel",
+  "user": "ubuntu",
+  "install": "bash scripts/install-qemu-10.sh"
+}

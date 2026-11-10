@@ -2003,6 +2003,10 @@ EOF
     RASPI_OFF=$((2048 * 512))
     printf 'record=pi4.local A 10.0.2.15 300\n' > /tmp/raspi-config.txt
     mcopy -i "qemu/raspi4b-sd.img@@${RASPI_OFF}" /tmp/raspi-config.txt ::CONFIG.TXT
+    # The guest stays up and reprints status, so this budget ends the
+    # process. Exit 124 is that stop. A boot that already printed every
+    # expected line is a pass. A missing line or a kernel panic is not.
+    RASPI_STOP=0
     timeout 45 qemu-system-aarch64 \
         -M raspi4b \
         -smp 4 \
@@ -2010,8 +2014,13 @@ EOF
         -serial file:qemu/raspi4b.txt \
         -display none -monitor none -nographic \
         -drive file=qemu/raspi4b-sd.img,if=sd,format=raw \
-        >/tmp/qemu-raspi4b.txt 2>&1 || true
+        >/tmp/qemu-raspi4b.txt 2>&1 || RASPI_STOP=$?
     RASPI_OK=1
+    if grep -F -q "!!! KERNEL PANIC !!!" qemu/raspi4b.txt \
+        || grep -F -q "=== EXCEPTION ===" qemu/raspi4b.txt; then
+        echo "✗ raspi4b panicked"
+        RASPI_OK=0
+    fi
     for need in \
         "MMU and caches enabled" \
         "Running at EL1" \
@@ -2022,7 +2031,7 @@ EOF
         "EL0 test" \
         "[WARN] No NIC"
     do
-        if ! grep -q "$need" qemu/raspi4b.txt; then
+        if ! grep -F -q "$need" qemu/raspi4b.txt; then
             echo "✗ raspi4b missing: $need"
             RASPI_OK=0
         fi
@@ -2032,6 +2041,9 @@ EOF
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo "✗ raspi4b smoke failed"
+        if [ "$RASPI_STOP" -ne 0 ] && [ "$RASPI_STOP" -ne 124 ]; then
+            echo "qemu exit ${RASPI_STOP}"
+        fi
         echo "--- serial ---"
         cat qemu/raspi4b.txt 2>/dev/null || true
         echo "--- qemu ---"
