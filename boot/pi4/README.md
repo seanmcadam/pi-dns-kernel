@@ -98,8 +98,16 @@ should read `0x000002FF` (256 descriptors × 3 words − 1) and `z` should
 read `0x01000800` (count 256, buffer 2048). A different `e` or `z` means
 the write-once ring register kept an earlier value.
 `d` climbing means the stack is retrying because the ring is full; the
-driver does not spin on the consumer. Probe steps are also logged as
-`[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling region. `nic=` in
+driver does not spin on the consumer. `d0` is descriptor 0's
+length/status word. `0x01307FC0` is length `0x130` (304 bytes) in the
+high half and `SOP|EOP|APPEND_CRC|qtag 0x3F` in the low half: one DHCP
+DISCOVER (14 + 20 + 8 + 262). The scrolling log prints that decode and
+the first 16 bytes of the first TX frame and the first RX frame.
+`rxE` counts DMA receives dropped for a bad status word. smoltcp retries
+DISCOVER once a second; the kernel falls back to the static address
+after four seconds and then sends one gratuitous ARP. Probe steps are
+also logged as `[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling
+region. `nic=` in
 the `[status]` line is a GIC interrupt count. Zero there does not mean
 the controller is missing. QEMU raspi4b has no GENET block, so that
 image prints `[FAIL] GENET revision register is not present` and

@@ -1,11 +1,12 @@
 pub mod service;
 mod stack;
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use smoltcp::iface::SocketHandle;
+use smoltcp::phy::{Device, TxToken};
 use smoltcp::socket::dhcpv4;
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 
 pub use crate::board::Nic as EthernetDevice;
 pub use stack::NetworkStack;
@@ -35,6 +36,7 @@ const LINK_HOLD_MS: u64 = 15_000;
 /// 0 absent, 1 waiting, 2 leased, 3 fallback, 4 static.
 static DHCP_PHASE: AtomicU8 = AtomicU8::new(0);
 static DHCP_IP: AtomicU32 = AtomicU32::new(0);
+static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
 pub enum NetworkMode {
@@ -100,7 +102,16 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
             console_line("[OK] DHCP waiting for a lease");
             DHCP_PHASE.store(1, Ordering::Relaxed);
             DHCP_IP.store(0, Ordering::Relaxed);
-            let handle = stack.sockets_mut().add(dhcpv4::Socket::new());
+            // smoltcp waits 10 s between DISCOVER retries. The kernel used
+            // to give up at 3 s, so the wire saw one frame and then the
+            // static address. One second here, four seconds below.
+            let mut dhcp = dhcpv4::Socket::new();
+            let mut retry = dhcpv4::RetryConfig::default();
+            retry.discover_timeout = Duration::from_secs(1);
+            retry.initial_request_timeout = Duration::from_secs(1);
+            retry.request_retries = 4;
+            dhcp.set_retry_config(retry);
+            let handle = stack.sockets_mut().add(dhcp);
             service::install(NetworkState {
                 stack,
                 device,
@@ -145,6 +156,7 @@ pub fn polling_here() -> bool {
 
 pub(crate) fn poll_device(state: &mut NetworkState) {
     crate::board::service_nic();
+    maybe_announce(&mut state.device);
     let timestamp = Instant::from_millis(crate::timer::millis() as i64);
     state.stack.poll(timestamp, &mut state.device);
     hold_for_link(state);
@@ -215,7 +227,51 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
     if let Some(dhcp) = state.dhcp.as_mut() {
         dhcp.finished = true;
     }
+    maybe_announce(&mut state.device);
     refresh_banner();
+}
+
+/// One broadcast ARP for the address we are using, so a peer does not
+/// have to have queried during the DHCP window.
+fn maybe_announce(device: &mut EthernetDevice) {
+    if ANNOUNCED.load(Ordering::Relaxed) {
+        return;
+    }
+    let ip = DHCP_IP.load(Ordering::Relaxed);
+    if ip == 0 || !crate::board::nic_link() {
+        return;
+    }
+    if announce(device, ip.to_be_bytes()) {
+        ANNOUNCED.store(true, Ordering::Relaxed);
+        console_line("[OK] gratuitous ARP");
+    }
+}
+
+fn announce(device: &mut EthernetDevice, ip: [u8; 4]) -> bool {
+    let mac = device.mac_address();
+    let Some(token) = device.transmit(Instant::from_millis(crate::timer::millis() as i64)) else {
+        return false;
+    };
+    token.consume(60, |buf| {
+        buf.fill(0);
+        buf[..6].fill(0xff);
+        buf[6..12].copy_from_slice(&mac);
+        buf[12] = 0x08;
+        buf[13] = 0x06;
+        buf[14] = 0x00;
+        buf[15] = 0x01;
+        buf[16] = 0x08;
+        buf[17] = 0x00;
+        buf[18] = 6;
+        buf[19] = 4;
+        buf[20] = 0x00;
+        buf[21] = 0x01;
+        buf[22..28].copy_from_slice(&mac);
+        buf[28..32].copy_from_slice(&ip);
+        buf[32..38].copy_from_slice(&mac);
+        buf[38..42].copy_from_slice(&ip);
+    });
+    true
 }
 
 fn hold_for_link(state: &mut NetworkState) {

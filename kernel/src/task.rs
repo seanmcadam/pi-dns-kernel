@@ -891,7 +891,7 @@ pub fn start_log() -> Result<(), ()> {
             0,
             0,
         );
-        maintain_code(code, LOG_BIN.len());
+        maintain_code(code, LOG_CODE_BYTES);
         let ctx = addr_of_mut!(LOG_TASK.ctx);
         core::ptr::write_bytes(ctx, 0, 1);
         (*ctx).elr = crate::mmu::USER_CODE_VA;
@@ -963,7 +963,7 @@ pub fn start_telnet() -> Result<(), ()> {
             addr_of!(TELNET_MEM.heap) as u64,
             TELNET_HEAP_BYTES as u64,
         );
-        maintain_code(code, TELNET_BIN.len());
+        maintain_code(code, TELNET_CODE_BYTES);
         let ctx = addr_of_mut!(TELNET_TASK.ctx);
         core::ptr::write_bytes(ctx, 0, 1);
         (*ctx).elr = crate::mmu::USER_CODE_VA;
@@ -1031,7 +1031,7 @@ pub fn start_vnc() -> Result<(), ()> {
             addr_of!(VNC_MEM.heap) as u64,
             VNC_HEAP_BYTES as u64,
         );
-        maintain_code(code, VNC_BIN.len());
+        maintain_code(code, VNC_CODE_BYTES);
         let ctx = addr_of_mut!(VNC_TASK.ctx);
         core::ptr::write_bytes(ctx, 0, 1);
         (*ctx).elr = crate::mmu::USER_CODE_VA;
@@ -1088,7 +1088,7 @@ pub fn start_hdmi() -> Result<(), ()> {
             image.heap,
             crate::board::HDMI_HEAP_BYTES as u64,
         );
-        maintain_code(image.code as *mut u8, image.bin_len);
+        maintain_code(image.code as *mut u8, crate::board::HDMI_CODE_BYTES);
         let ctx = addr_of_mut!(HDMI_TASK.ctx);
         core::ptr::write_bytes(ctx, 0, 1);
         (*ctx).elr = crate::mmu::USER_CODE_VA;
@@ -1259,7 +1259,7 @@ pub fn start_spin() -> Result<(), ()> {
             addr_of!(SPIN_MEM.code) as u64,
             addr_of!(SPIN_MEM.stack) as u64,
         );
-        maintain_code(code, 64);
+        maintain_code(code, 4096);
         let ctx = addr_of_mut!(SPIN_TASK.ctx);
         core::ptr::write_bytes(ctx, 0, 1);
         (*ctx).elr = crate::mmu::USER_CODE_VA;
@@ -1349,28 +1349,36 @@ fn load_image(mem: *mut UserMem, bin: &[u8], data_off: usize, data_len: usize, d
         {
             core::ptr::copy_nonoverlapping(bin.as_ptr().add(data_off), data.add(data_place), data_len);
         }
-        maintain_code(code, code_len);
+        // The whole window was zeroed. Lines past the binary are still
+        // executable, and a restart leaves the previous image in the
+        // I-cache there.
+        maintain_code(code, crate::mmu::USER_CODE_BYTES as usize);
     }
 }
 
+/// Make bytes written through the kernel mapping visible to EL0 fetch.
+///
+/// Cortex-A72 requires a DSB between the clean to the point of unification
+/// and the instruction-cache invalidate. Without it the I-cache refills
+/// from stale RAM. QEMU does not model that race, so the same image runs
+/// there and takes undefined-instruction and wild-store faults on a Pi 4.
+/// `ic ialluis` covers every ASID and every core; invalidating only the
+/// user VA under ASID 0 leaves the ASID the task actually runs with stale.
 fn maintain_code(kernel_ptr: *mut u8, len: usize) {
     unsafe {
-        let user = crate::mmu::USER_CODE_VA as usize;
         let mut off = 0;
         while off < len {
             let kva = kernel_ptr as usize + off;
-            let uva = user + off;
-            core::arch::asm!(
-                "dc cvau, {kva}",
-                "ic ivau, {kva}",
-                "ic ivau, {uva}",
-                kva = in(reg) kva,
-                uva = in(reg) uva,
-                options(nostack),
-            );
+            core::arch::asm!("dc cvau, {kva}", kva = in(reg) kva, options(nostack));
             off += 64;
         }
-        core::arch::asm!("dsb ish", "isb", options(nostack));
+        core::arch::asm!(
+            "dsb ish",
+            "ic ialluis",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
     }
 }
 

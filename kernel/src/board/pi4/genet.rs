@@ -179,6 +179,7 @@ const AUX_MISC: u16 = 7;
 const AUX_RGMII_SKEW: u16 = 0x0100;
 
 static RX_COUNT: AtomicU32 = AtomicU32::new(0);
+static RX_ERR: AtomicU32 = AtomicU32::new(0);
 static TX_COUNT: AtomicU32 = AtomicU32::new(0);
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -188,15 +189,16 @@ static mut RX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
 #[link_section = ".dma"]
 static mut TX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
 
-static RX_INDEX: AtomicU32 = AtomicU32::new(0);
 static RX_CONS: AtomicU32 = AtomicU32::new(0);
-static RX_ERR: AtomicU32 = AtomicU32::new(0);
 static TX_PROD: AtomicU32 = AtomicU32::new(0);
 static TX_DROP: AtomicU32 = AtomicU32::new(0);
 static LAST_BMSR: AtomicU32 = AtomicU32::new(0);
 static LAST_LPA: AtomicU32 = AtomicU32::new(0);
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
+static TX_NOTED: AtomicBool = AtomicBool::new(false);
+static RX_NOTED: AtomicBool = AtomicBool::new(false);
+static RX_DROP_NOTED: AtomicBool = AtomicBool::new(false);
 static REV: AtomicU32 = AtomicU32::new(0);
 static VERSION: AtomicU32 = AtomicU32::new(0);
 static LINK_UP: AtomicBool = AtomicBool::new(false);
@@ -293,6 +295,8 @@ pub fn write_diag(out: &mut [u8]) -> usize {
     line.dec(read(MIB_TX_PKT));
     line.push(" mibR=");
     line.dec(read(MIB_RX_PKT));
+    line.push(" rxE=");
+    line.dec(RX_ERR.load(Ordering::Relaxed));
     line.push(" st=");
     line.hex32(read(TDMA_REG_BASE + DMA_STATUS));
     line.push(" ctl=");
@@ -453,7 +457,6 @@ impl GenetDevice {
         let rx_cons = read(RDMA_RING + RDMA_PROD_INDEX) & 0xffff;
         write(RDMA_RING + RDMA_CONS_INDEX, rx_cons);
         RX_CONS.store(rx_cons, Ordering::Relaxed);
-        RX_INDEX.store(rx_cons % DESC_COUNT as u32, Ordering::Relaxed);
         align_tx_prod();
 
         PRESENT.store(true, Ordering::Relaxed);
@@ -498,6 +501,7 @@ impl GenetDevice {
                 | (0x3f << DMA_TX_QTAG_SHIFT);
             barrier();
             write(desc + DESC_LENGTH_STATUS, status);
+            note_tx_frame(buf.as_ptr(), n, status);
         }
         let next = prod.wrapping_add(1) & 0xffff;
         TX_PROD.store(next, Ordering::Relaxed);
@@ -1211,6 +1215,94 @@ fn barrier() {
     }
 }
 
+fn note_tx_frame(ptr: *const u8, len: usize, status: u32) {
+    if TX_NOTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let qtag = (status >> DMA_TX_QTAG_SHIFT) & 0x3f;
+    say("[OK] GENET TX d0 length is the buffer, low half is SOP EOP CRC qtag");
+    let mut buf = [0u8; 96];
+    let mut n = 0;
+    push_str(&mut buf, &mut n, "[OK] GENET TX d0 len ");
+    push_dec(&mut buf, &mut n, len as u32);
+    push_str(&mut buf, &mut n, " flags");
+    if status & DMA_SOP != 0 {
+        push_str(&mut buf, &mut n, " SOP");
+    }
+    if status & DMA_EOP != 0 {
+        push_str(&mut buf, &mut n, " EOP");
+    }
+    if status & DMA_TX_APPEND_CRC != 0 {
+        push_str(&mut buf, &mut n, " CRC");
+    }
+    push_str(&mut buf, &mut n, " qtag ");
+    push_dec(&mut buf, &mut n, qtag);
+    finish_say(&buf, n);
+    say_bytes("[OK] GENET TX hdr", ptr, len.min(16));
+}
+
+fn note_rx_frame(ptr: *const u8, len: usize) {
+    if RX_NOTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    say_bytes("[OK] GENET RX hdr", ptr, len.min(16));
+}
+
+fn note_rx_drop(raw: u32) {
+    if RX_DROP_NOTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    say_hex("[WARN] GENET RX drop", raw);
+}
+
+fn push_str(buf: &mut [u8], n: &mut usize, text: &str) {
+    for byte in text.bytes() {
+        if *n >= buf.len() {
+            return;
+        }
+        buf[*n] = byte;
+        *n += 1;
+    }
+}
+
+fn push_dec(buf: &mut [u8], n: &mut usize, mut value: u32) {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    if value == 0 {
+        push_str(buf, n, "0");
+        return;
+    }
+    while value > 0 && i > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    push_str(buf, n, unsafe { core::str::from_utf8_unchecked(&tmp[i..]) });
+}
+
+fn finish_say(buf: &[u8], n: usize) {
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        say(text);
+    }
+}
+
+fn say_bytes(prefix: &str, ptr: *const u8, len: usize) {
+    let mut buf = [0u8; 96];
+    let mut n = 0;
+    push_str(&mut buf, &mut n, prefix);
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    for byte in bytes {
+        if n + 3 >= buf.len() {
+            break;
+        }
+        buf[n] = b' ';
+        buf[n + 1] = hex_digit(*byte >> 4);
+        buf[n + 2] = hex_digit(*byte & 0xf);
+        n += 3;
+    }
+    finish_say(&buf, n);
+}
+
 /// Push the transmit buffer to the point of coherency. The `.dma` window
 /// is Normal non-cacheable, and a line that was still dirty from an earlier
 /// mapping would otherwise be what the MAC reads.
@@ -1221,6 +1313,20 @@ fn clean_poc(ptr: *const u8, len: usize) {
     while line < end {
         unsafe {
             core::arch::asm!("dc civac, {line}", line = in(reg) line, options(nostack));
+        }
+        line = line.saturating_add(64);
+    }
+    barrier();
+}
+
+/// Drop stale write-back lines so a CPU read sees the MAC's bytes.
+fn invalidate_poc(ptr: *const u8, len: usize) {
+    let start = (ptr as usize) & !63;
+    let end = (ptr as usize).saturating_add(len);
+    let mut line = start;
+    while line < end {
+        unsafe {
+            core::arch::asm!("dc ivac, {line}", line = in(reg) line, options(nostack));
         }
         line = line.saturating_add(64);
     }
@@ -1276,6 +1382,10 @@ impl RxToken for GenetRxToken {
             let frame = RX_BUFS[self.index as usize % DESC_COUNT]
                 .as_mut_ptr()
                 .add(RX_ALIGN);
+            // The early boot map was write-back. A stale line would hide
+            // the bytes the MAC just wrote.
+            invalidate_poc(frame, self.len as usize);
+            note_rx_frame(frame, self.len as usize);
             let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
             f(slice)
         };
@@ -1285,28 +1395,34 @@ impl RxToken for GenetRxToken {
 }
 
 fn poll_rx() -> Option<(u16, u16)> {
-    let cons = RX_CONS.load(Ordering::Relaxed);
-    let prod = read(RDMA_RING + RDMA_PROD_INDEX) & 0xffff;
-    if prod == cons {
-        return None;
+    let mut seen = 0;
+    while seen < DESC_COUNT {
+        seen += 1;
+        let cons = RX_CONS.load(Ordering::Relaxed);
+        let prod = read(RDMA_RING + RDMA_PROD_INDEX) & 0xffff;
+        if prod == cons {
+            return None;
+        }
+        let index = cons as usize % DESC_COUNT;
+        let desc = GENET_RX_OFF + index * DMA_DESC_SIZE;
+        let raw = read(desc + DESC_LENGTH_STATUS);
+        barrier();
+        let flags = raw & 0xffff;
+        let length = ((raw >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
+        let sop_eop = DMA_SOP | DMA_EOP;
+        if flags & DMA_RX_ERRORS != 0
+            || (flags & sop_eop) != sop_eop
+            || length <= RX_ALIGN
+            || length > BUF_LEN
+        {
+            note_rx_drop(raw);
+            reclaim_rx(index as u16, false);
+            continue;
+        }
+        RX_BYTES.fetch_add((length - RX_ALIGN) as u64, Ordering::Relaxed);
+        return Some((index as u16, (length - RX_ALIGN) as u16));
     }
-    let index = RX_INDEX.load(Ordering::Relaxed) as usize % DESC_COUNT;
-    let desc = GENET_RX_OFF + index * DMA_DESC_SIZE;
-    let raw = read(desc + DESC_LENGTH_STATUS);
-    barrier();
-    let flags = raw & 0xffff;
-    let length = ((raw >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
-    let sop_eop = DMA_SOP | DMA_EOP;
-    if flags & DMA_RX_ERRORS != 0
-        || (flags & sop_eop) != sop_eop
-        || length <= RX_ALIGN
-        || length > BUF_LEN
-    {
-        reclaim_rx(index as u16, false);
-        return None;
-    }
-    RX_BYTES.fetch_add((length - RX_ALIGN) as u64, Ordering::Relaxed);
-    Some((index as u16, (length - RX_ALIGN) as u16))
+    None
 }
 
 fn reclaim_rx_static(index: u16) {
@@ -1316,7 +1432,6 @@ fn reclaim_rx_static(index: u16) {
 fn reclaim_rx(index: u16, good: bool) {
     let slot = index as usize % DESC_COUNT;
     program_rx_desc(slot);
-    RX_INDEX.store((slot as u32 + 1) % DESC_COUNT as u32, Ordering::Relaxed);
     let cons = RX_CONS.load(Ordering::Relaxed).wrapping_add(1) & 0xffff;
     RX_CONS.store(cons, Ordering::Relaxed);
     write(RDMA_RING + RDMA_CONS_INDEX, cons);
