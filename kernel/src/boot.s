@@ -121,15 +121,21 @@ _start:
     bl      caches_off
     bl      install_early_vbar
     // Stage 1: MMU is off and the physical stub is installed. Next step
-    // discards cache lines. A fault here repeats 1.
+    // reads the L1 data-cache geometry. No set/way op has run yet.
     mov     x21, #1
     bl      mark
-    // Throw away every data-cache line before the first store. DC ISW
-    // discards the line. A clean would write a stale line back over the
-    // image the GPU just loaded.
+    // Pi 4: clean and invalidate L1 only. The previous image walked L2
+    // with DC ISW here and the board stopped on that instruction: one
+    // blink, then dark, no exception. Virt and Pi 5 keep the full walk.
+    cbz     x22, not_pi4_cache
+    bl      pi4_cache_maint
+    b       cache_done
+not_pi4_cache:
     bl      inval_caches
-    // Stage 2: caches are discarded. Next step is the EL2 to EL1 drop.
-    mov     x21, #2
+cache_done:
+    // Stage 3: maintenance returned. Next step is the EL2 to EL1 drop.
+    // Stage 2, if it played, was the Pi 4 L1 walk itself.
+    mov     x21, #3
     bl      mark
     // -------------------------------------------------------------------------
     // Step 2: Drop from EL2 to EL1, unless we are already at EL1.
@@ -203,7 +209,7 @@ _start:
     isb
     eret
 
-// Wrong exception level. The physical stub repeats stage 2. Other boards
+// Wrong exception level. The physical stub repeats stage 3. Other boards
 // park without touching GPIO.
 bad_el:
     b       fault_blink
@@ -220,8 +226,8 @@ bad_el:
     movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0
     isb
-    // Stage 3: this core is at EL1. Next step enables FP and the stack.
-    mov     x21, #3
+    // Stage 4: this core is at EL1. Next step enables FP and the stack.
+    mov     x21, #4
     bl      mark
     // The Rust compiler freely uses NEON registers (q0-q31) for things like
     // memcpy and struct copies, even in no_std code. QEMU starts with FP/SIMD
@@ -254,8 +260,8 @@ bad_el:
     adrp    x1, __stack_top
     add     x1, x1, :lo12:__stack_top
     mov     sp, x1
-    // Stage 4: FP is on and SP is set. Next step zeros BSS and DMA.
-    mov     x21, #4
+    // Stage 5: FP is on and SP is set. Next step zeros BSS and DMA.
+    mov     x21, #5
     bl      mark
 
     // -------------------------------------------------------------------------
@@ -290,8 +296,8 @@ bad_el:
     b       6b
 
 4:
-    // Stage 5: BSS and DMA are zero. Next step builds the coarse tables.
-    mov     x21, #5
+    // Stage 6: BSS and DMA are zero. Next step builds the coarse tables.
+    mov     x21, #6
     bl      mark
     // -------------------------------------------------------------------------
     // Step 6: Coarse page tables for the jump into the upper half.
@@ -407,8 +413,8 @@ bad_el:
     add     x0, x0, :lo12:early_l1_hi
     bl      clean_page
     dsb     sy
-    // Stage 6: tables are in memory. Next step turns the MMU on.
-    mov     x21, #6
+    // Stage 7: tables are in memory. Next step turns the MMU on.
+    mov     x21, #7
     bl      mark
 
     // -------------------------------------------------------------------------
@@ -454,10 +460,10 @@ bad_el:
     movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0
     isb
-    // Stage 7: the MMU is on. This instruction was fetched through the
+    // Stage 8: the MMU is on. This instruction was fetched through the
     // identity map. Next step jumps to the high alias. The physical stub
     // is still the vector base, and TTBR0 still maps it.
-    mov     x21, #7
+    mov     x21, #8
     bl      mark
 
     // Label 9 is the first instruction fetched through TTBR1.
@@ -471,10 +477,10 @@ bad_el:
     ic      iallu
     dsb     sy
     isb
-    // Stage 8: the high alias fetched. Next step installs the high vector
+    // Stage 9: the high alias fetched. Next step installs the high vector
     // base and drops the identity map. Blink before that drop so a fault
     // here still runs the physical stub.
-    mov     x21, #8
+    mov     x21, #9
     bl      mark
     // High VBAR before TTBR0 is cleared. A fault in the gap used to fetch
     // the physical stub through a map that no longer existed.
@@ -493,9 +499,9 @@ bad_el:
     tlbi    vmalle1
     dsb     sy
     isb
-    // Stage 9: identity map is gone. Next step is kernel_main. GPIO uses
+    // Stage 10: identity map is gone. Next step is kernel_main. GPIO uses
     // the high alias from here on, because SCTLR.M is set.
-    mov     x21, #9
+    mov     x21, #10
     bl      mark
 
     // -------------------------------------------------------------------------
@@ -507,11 +513,11 @@ bad_el:
     mov     x0, x20
     bl      kernel_main
 
-    // kernel_main does not return. If it does, keep showing stage 9 so the
+    // kernel_main does not return. If it does, keep showing stage 10 so the
     // LED does not go dark. Virt has nothing to blink and waits.
 5:
     cbz     x22, 14f
-    mov     x21, #9
+    mov     x21, #10
     bl      mark
     b       5b
 14:
@@ -553,12 +559,69 @@ caches_off_el1:
     isb
     ret
 
+// Pi 4 primary only. Armstub enters with the MMU and caches off, so the
+// shared L2 is left alone: a DC ISW of that level did not return on the
+// board. This is the ARM ARM set/way loop (the same one Linux uses in
+// __flush_dcache_all) restricted to L1 data, and it cleans as well as
+// invalidates. CCSIDR values outside the Cortex-A72 L1D shape (2 ways,
+// 256 sets, 64-byte lines) are not walked. x19 holds the return address
+// across mark. x25-x28 hold the geometry across that call. x20-x22 stay.
+pi4_cache_maint:
+    mov     x19, x30
+    msr     csselr_el1, xzr
+    isb
+    mrs     x1, ccsidr_el1
+    and     x25, x1, #7
+    add     x25, x25, #4
+    mov     x26, #0x3ff
+    and     x26, x26, x1, lsr #3
+    clz     w27, w26
+    mov     x28, #0x7fff
+    and     x28, x28, x1, lsr #13
+    // Stage 2: geometry has been read. Next step is the L1 DC CISW loop,
+    // then the instruction cache. The blink uses the same delay as stage 1.
+    mov     x21, #2
+    bl      mark
+    dsb     sy
+    cmp     x26, #3
+    b.hi    pi4_maint_ic
+    cmp     x28, #511
+    b.hi    pi4_maint_ic
+    cmp     x25, #6
+    b.ne    pi4_maint_ic
+    mov     x10, xzr
+    mov     x12, #1
+    lsl     x12, x12, #12
+pi4_set:
+    mov     x9, x26
+pi4_way:
+    cbz     x12, pi4_maint_ic
+    sub     x12, x12, #1
+    lsl     x6, x9, x27
+    orr     x11, x10, x6
+    lsl     x6, x28, x25
+    orr     x11, x11, x6
+    dc      cisw, x11
+    subs    x9, x9, #1
+    b.ge    pi4_way
+    subs    x28, x28, #1
+    b.ge    pi4_set
+pi4_maint_ic:
+    dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+    msr     csselr_el1, xzr
+    isb
+    mov     x30, x19
+    ret
+
 // Invalidate every data-cache level up to the point of coherency, by set
-// and way, then the instruction cache. DC ISW comes first. An early
-// ic iallu can refill from a stale unified L2 line, and that line is what
-// the core executes after the MMU comes on. Lines are discarded, not
-// written back. A stuck or huge geometry stops after 1<<20 operations so
-// boot cannot spin here. Registers x0-x15 are scratch. x19-x28 are left
+// and way, then the instruction cache. Virt and Pi 5 still use this.
+// Pi 4 primary uses pi4_cache_maint instead. DC ISW comes first. An early
+// ic iallu can refill from a stale unified L2 line. Lines are discarded,
+// not written back. A stuck or huge geometry stops after 1<<20 operations
+// so boot cannot spin here. Registers x0-x15 are scratch. x19-x28 are left
 // alone, including the stage in x21 and the Pi 4 flag in x22.
 // inval_l1 stops after the first level. Secondary cores use it so they
 // do not throw away the primary's shared L2 once that core has caches on.
@@ -690,8 +753,10 @@ gpio42_off:
     ret
 
 // Blink x21 short flashes, then a gap. x22 == 0 returns at once. x24 holds
-// the return address because these calls happen before SP exists. A shift
-// of 4 is about 60 ms at 54 MHz. The gap is twice that.
+// the return address because these calls happen before SP exists. On, off,
+// and the gap all pass the same shift to delay_shift, so stage 1 and stage
+// 2 cannot disagree about the counter. A shift of 4 is about 60 ms at
+// 54 MHz. x19 and x25-x28 are left alone.
 mark:
     cbz     x22, mark_ret
     mov     x24, x30
@@ -708,7 +773,7 @@ mark_pulse:
     sub     x23, x23, #1
     b       mark_pulse
 mark_gap:
-    mov     x0, #3
+    mov     x0, #4
     bl      delay_shift
     mov     x30, x24
 mark_ret:

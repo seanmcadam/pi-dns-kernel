@@ -60,9 +60,9 @@ pub fn arm_expander() {
     EXP_ARM.store(true, Ordering::Relaxed);
 }
 
-/// `count` short flashes, then a gap. Assembly owns 1 through 9. Rust
-/// continues in order: 10 is `kernel_main`, 11 is the framebuffer, 12 is
-/// the strict map, 13 is user tasks. A count that then repeats is the
+/// `count` short flashes, then a gap. Assembly owns 1 through 10. Rust
+/// continues in order: 11 is `kernel_main`, 12 is the framebuffer, 13 is
+/// the strict map, 14 is user tasks. A count that then repeats is the
 /// physical fault stub, not this function.
 pub fn pattern(count: u32) {
     gpio_output();
