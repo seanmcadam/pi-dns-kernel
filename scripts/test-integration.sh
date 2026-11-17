@@ -2029,7 +2029,8 @@ EOF
         "Loaded config from filesystem" \
         "[OK] Log task running" \
         "EL0 test" \
-        "[WARN] No NIC"
+        "[WARN] No NIC" \
+        "[OK] HDMI console"
     do
         if ! grep -F -q "$need" qemu/raspi4b.txt; then
             echo "✗ raspi4b missing: $need"

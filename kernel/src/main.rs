@@ -11,6 +11,8 @@ mod cpu_stat;
 mod dns;
 mod exception;
 mod fault_log;
+#[cfg(feature = "board-pi4")]
+mod fb_con;
 mod fs;
 mod http;
 mod gic;
@@ -85,6 +87,11 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("[0] Enabling MMU and caches...\r\n");
     mmu::init();
     uart_write("[OK] MMU and caches enabled\r\n");
+
+    // After the strict map, so the framebuffer window can be installed.
+    // A failure here is a serial warning. Boot does not stop.
+    #[cfg(feature = "board-pi4")]
+    fb_con::start();
 
     percpu::init_bsp();
 

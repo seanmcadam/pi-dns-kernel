@@ -22,7 +22,8 @@
 //! boot.s drops EL2 to EL1 before this runs. The Pi 4 and Pi 5 ranges are
 //! untested on hardware. Addresses below 4 GiB use the four level-2 tables.
 //! A small extra pool covers the BCM2712 device window above 4 GiB. Virt
-//! and Pi 4 never allocate from that pool.
+//! never allocates from that pool. The Pi 4 HDMI console uses one of those
+//! level-2 tables for a non-identity window at `0xFFFF000200000000`.
 
 use crate::addr::{phys_to_virt, virt_to_phys};
 
@@ -148,6 +149,18 @@ static mut TABLES: Tables = Tables {
 static FB_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static mut NEXT_L3: usize = 0;
+
+/// Page tables for the Pi 4 HDMI window. Eight level-3 tables cover 16 MiB.
+/// They are not the identity-map pool, so a framebuffer cannot exhaust it.
+#[cfg(feature = "board-pi4")]
+struct FbTables {
+    l3: [Table; 8],
+}
+
+#[cfg(feature = "board-pi4")]
+static mut FB_TABLES: FbTables = FbTables {
+    l3: [const { Table { entries: [0; 512] } }; 8],
+};
 
 struct Layout {
     text: (u64, u64),
@@ -653,6 +666,64 @@ unsafe fn l3_for(pa: u64) -> *mut Table {
     let l3 = addr_of_mut!(TABLES.l3[slot]);
     (&mut *l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
     l3
+}
+
+/// Map a Pi 4 framebuffer and return the virtual address to store through.
+///
+/// The window is Normal non-cacheable, EL1-only, and not an identity map.
+/// Identity blocks that cover the same physical pages are switched to the
+/// same attribute when they sit above the kernel heap, so those pages are
+/// not also write-back. A framebuffer that overlaps the kernel is refused.
+#[cfg(feature = "board-pi4")]
+pub fn map_framebuffer(pa: u64, bytes: u64) -> Option<u64> {
+    const WINDOW: u64 = 0x2_0000_0000;
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    if bytes == 0 || bytes > MAX_BYTES || pa % PAGE != 0 {
+        return None;
+    }
+    let Some(end) = pa.checked_add(bytes) else {
+        return None;
+    };
+    let heap_end = virt_to_phys(addr_of!(__heap_end) as u64);
+    if pa < heap_end || end > crate::board::RAM_END {
+        return None;
+    }
+    let pages = align_up(bytes, PAGE) / PAGE;
+    if pages > 8 * 512 {
+        return None;
+    }
+    let flags = attrs(ATTR_DMA, SH_INNER, 0, true);
+    unsafe {
+        let mut page_i = 0u64;
+        while page_i < pages {
+            let va = WINDOW + page_i * PAGE;
+            let l2 = l2_for(va);
+            let l2_index = ((va >> 21) & 511) as usize;
+            let slot = (page_i >> 9) as usize;
+            let l3 = addr_of_mut!(FB_TABLES.l3[slot]);
+            if (&*l2).entries[l2_index] & VALID == 0 {
+                (&mut *l3).entries = [0; 512];
+                (&mut *l2).entries[l2_index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
+            }
+            let l3_index = ((va >> 12) & 511) as usize;
+            (&mut *l3).entries[l3_index] =
+                (pa + page_i * PAGE) | flags | VALID | TABLE_OR_PAGE;
+            page_i += 1;
+        }
+        let mut block = pa & !(BLOCK - 1);
+        let block_end = align_up(end, BLOCK);
+        while block < block_end {
+            if block >= heap_end {
+                let l2 = l2_for(block);
+                let index = ((block >> 21) & 511) as usize;
+                (&mut *l2).entries[index] = block | flags | VALID;
+            }
+            block += BLOCK;
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack));
+    }
+    flush_tlb();
+    Some(phys_to_virt(WINDOW))
 }
 
 fn give_up(message: &str) -> ! {

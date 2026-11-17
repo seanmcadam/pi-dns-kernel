@@ -1,5 +1,5 @@
-//! 8x8 glyphs, ASCII 32..=126. The high bit is the left pixel.
-//! Lowercase uses the uppercase shape.
+// 8x8 glyphs, ASCII 32..=126. The high bit is the left pixel.
+// Lowercase uses the uppercase shape.
 pub static FONT: [[u8; 8]; 95] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
     [0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00],
