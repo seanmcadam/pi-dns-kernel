@@ -103,7 +103,8 @@ static mut SCREEN: Screen = Screen {
 static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
 
-const HEADER_CAP: usize = 96;
+const HEADER_CAP: usize = 220;
+const PINNED_ROWS: u32 = 2;
 static mut HEADER: [u8; HEADER_CAP] = [0; HEADER_CAP];
 static mut HEADER_LEN: usize = 0;
 
@@ -153,7 +154,7 @@ pub fn switch_to_nc() {
     unlock(held);
 }
 
-/// Replace the pinned top row. The log scrolls underneath it. A refused
+/// Replace the two pinned top rows. The log scrolls underneath them. A refused
 /// lock skips this update; the next call tries again. Does not write the UART.
 pub fn set_status(text: &str) {
     let held = lock();
@@ -240,9 +241,9 @@ fn finish(mode: Mode) -> bool {
         screen.bytes = mode.bytes;
         screen.clean = true;
         clear_screen(screen);
-        screen.row = 1;
+        screen.row = PINNED_ROWS;
         if *addr_of!(HEADER_LEN) == 0 {
-            let msg = b"NIC --- link --- mac --- dhcp --- ip ---";
+            let msg = b"NIC --- link --- mac --- dhcp --- ip ---\ntxS=- txC=- mibT=- mibR=-";
             core::ptr::copy_nonoverlapping(msg.as_ptr(), addr_of_mut!(HEADER).cast(), msg.len());
             *addr_of_mut!(HEADER_LEN) = msg.len();
         }
@@ -604,8 +605,8 @@ fn paint(bytes: &[u8]) {
 fn flush_line() {
     let clean = unsafe {
         let screen = &mut *addr_of_mut!(SCREEN);
-        if screen.row == 0 {
-            screen.row = 1;
+        if screen.row < PINNED_ROWS {
+            screen.row = PINNED_ROWS;
         }
         let len = screen.line_len;
         let color = ink(&screen.line[..len], screen.bgr);
@@ -646,8 +647,9 @@ fn draw_status(screen: &mut Screen) {
     };
     let pitch = screen.pitch as usize;
     let row_bytes = pitch * CELL_H as usize;
+    let rows_bytes = row_bytes * PINNED_ROWS as usize;
     let mut off = 0;
-    while off + 4 <= row_bytes {
+    while off + 4 <= rows_bytes {
         unsafe {
             (screen.ptr.add(off) as *mut u32).write_volatile(0);
         }
@@ -655,12 +657,21 @@ fn draw_status(screen: &mut Screen) {
     }
     let color = ink(b"", screen.bgr);
     let cols = columns(screen);
+    let mut row = 0u32;
     let mut col = 0usize;
     for &ch in text {
-        if ch == b'\n' || ch == b'\r' || col >= cols {
-            break;
+        if ch == b'\n' || ch == b'\r' {
+            row += 1;
+            col = 0;
+            if row >= PINNED_ROWS {
+                break;
+            }
+            continue;
         }
-        draw_glyph(screen, col as u32, 0, ch, color);
+        if col >= cols {
+            continue;
+        }
+        draw_glyph(screen, col as u32, row, ch, color);
         col += 1;
     }
 }
@@ -669,10 +680,10 @@ fn scroll(screen: &Screen) {
     let pitch = screen.pitch as usize;
     let row_bytes = pitch * CELL_H as usize;
     let total = pitch * screen.height as usize;
-    if row_bytes == 0 || total <= row_bytes * 2 {
+    if row_bytes == 0 || total <= row_bytes * (PINNED_ROWS as usize + 1) {
         return;
     }
-    let mut src = row_bytes * 2;
+    let mut src = row_bytes * (PINNED_ROWS as usize + 1);
     while src + 4 <= total {
         unsafe {
             let word = (screen.ptr.add(src) as *const u32).read_volatile();
