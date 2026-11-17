@@ -40,8 +40,6 @@ impl NetworkStack {
             .ok();
     }
 
-    /// `Interface::poll` answers ARP and ICMPv4 echo for the configured
-    /// address. No extra socket is required.
     pub fn poll(&mut self, timestamp: Instant, device: &mut EthernetDevice) {
         self.iface.poll(timestamp, device, &mut self.sockets);
     }

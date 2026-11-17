@@ -146,30 +146,17 @@ flashes and then the same group forever is a fault in that stage. A
 single half-second flash, with the rainbow still up, is the firmware,
 not a stage.
 
-## HDMI network rows
+## HDMI network row
 
-The top two rows of the framebuffer do not scroll. The first shows the
-GENET revision (raw word and decoded version; silicon major 6 is version
-5), link up or down, speed, MAC, DHCP state (`wait`, `leased`, `timeout`,
-`static`, or `off`), the IPv4 address, and the LED label. The second is
-the data path: `txS` frames queued, `txC` the TX DMA consumer, `txP` the
-producer, `d` TX drops, `rxS` good RX frames, `rxP` the RX DMA producer,
-`e` RX errors, `mibT` / `mibR` / `crc` the UniMAC TX, RX, and FCS
-counters, then PHY `bmsr` and link-partner `lpa`. A rising `txS` with
-`txC` and `mibT` stuck at 0 means the DMA producer was not kicked. A
-rising `mibT` with no frames on the LAN means the RGMII TX delay is
-still wrong. A rising `mibR` with `rxS` stuck at 0 means the MAC got
-frames and the RX parser dropped them. Probe steps are also logged as
-`[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling region. `nic=` in
-the `[status]` line is a GIC interrupt count. Zero there does not mean
-the controller is missing. QEMU raspi4b has no GENET block, so that
-image prints `[FAIL] GENET revision register is not present` and
-`[WARN] No NIC`.
-
-Pi 4 `phy-mode` is `rgmii-rxid`. The PHY adds the RX clock delay and the
-MAC adds the 2 ns TX delay (`ID_MODE_DIS` clear, `RGMII_MODE_EN` set).
-The transmit ring is GENET v5 queue 16, descriptors 128–159, producer
-at ring offset `0x0C` and consumer at `0x08`.
+The top row of the framebuffer does not scroll. It shows the GENET
+revision (raw word and decoded version; silicon major 6 is version 5),
+link up or down, speed, MAC, DHCP state (`wait`, `leased`, `timeout`,
+`static`, or `off`), the IPv4 address, and the LED label. Probe steps
+are also logged as `[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling
+region. `nic=` in the `[status]` line is a GIC interrupt count. Zero
+there does not mean the controller is missing. QEMU raspi4b has no GENET
+block, so that image prints `[FAIL] GENET revision register is not present`
+and `[WARN] No NIC`.
 
 `./scripts/build.sh pi4` enables DHCP. Without that feature the image
 uses static `10.0.2.15` and does not send a discover.
