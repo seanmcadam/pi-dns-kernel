@@ -292,7 +292,7 @@ Shared kernel code (scheduler, syscalls, the network owner, the filesystem, the 
 | `board-pi4` | Raspberry Pi 4 | `kernel/src/board/pi4/link.ld` | GENET | EMMC2, then the legacy SDHCI | spin table at `0xE0` / `0xE8` / `0xF0` |
 | `board-pi5` | Raspberry Pi 5 | `kernel/src/board/pi5/link.ld` | none (RP1 is not driven) | BCM2712 SDHCI at `0x1000fff000` | PSCI `CPU_ON` via SMC |
 
-`board-pi4` and `board-pi5` each replace the default feature. `./scripts/build.sh pi4` and `./scripts/build-pi4.sh` pass `--no-default-features --features board-pi4`. `./scripts/build.sh pi5` and `./scripts/build-pi5.sh` pass `--no-default-features --features board-pi5`. `./scripts/build.sh` and `./scripts/build.sh --features dhcp-default` still build the virt image.
+`board-pi4` and `board-pi5` each replace the default feature. `./scripts/build.sh pi4` and `./scripts/build-pi4.sh` pass `--no-default-features --features board-pi4,dhcp-default`, so the card image requests a lease and falls back to `10.0.2.15`. `./scripts/build.sh pi5` and `./scripts/build-pi5.sh` pass `--no-default-features --features board-pi5`. `./scripts/build.sh` and `./scripts/build.sh --features dhcp-default` still build the virt image.
 
 ## Deployment
 

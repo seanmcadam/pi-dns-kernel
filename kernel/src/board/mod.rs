@@ -95,6 +95,23 @@ pub trait Board {
     fn disk() -> Self::Disk;
     fn handle_irq(id: u32) -> IrqHit;
 
+    /// Boards with a PHY refresh link state here. Others do nothing.
+    fn service_nic() {}
+
+    /// `false` holds a DHCP timer until the link comes up. Boards without
+    /// that wait report the link as up.
+    fn nic_link() -> bool {
+        true
+    }
+
+    /// Short NIC text for the HDMI status row. The default is a placeholder.
+    fn write_nic_status(out: &mut [u8]) -> usize {
+        let text = b"nic";
+        let n = text.len().min(out.len());
+        out[..n].copy_from_slice(&text[..n]);
+        n
+    }
+
     /// This image has an HDMI process.
     fn hdmi_present() -> bool {
         false
@@ -194,6 +211,18 @@ pub fn disk() -> DiskDev {
 
 pub fn handle_irq(id: u32) -> IrqHit {
     <Active as Board>::handle_irq(id)
+}
+
+pub fn service_nic() {
+    <Active as Board>::service_nic()
+}
+
+pub fn nic_link() -> bool {
+    <Active as Board>::nic_link()
+}
+
+pub fn write_nic_status(out: &mut [u8]) -> usize {
+    <Active as Board>::write_nic_status(out)
 }
 
 pub fn hdmi_present() -> bool {

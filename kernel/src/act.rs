@@ -53,6 +53,7 @@ static mut LED_MSG: Msg = Msg { words: [0; 16] };
 static MBOX_DEAD: AtomicBool = AtomicBool::new(false);
 static MBOX_READY: AtomicBool = AtomicBool::new(false);
 static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HEART: AtomicBool = AtomicBool::new(false);
 static PROGRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static WATCH: AtomicBool = AtomicBool::new(false);
 static SHOWING: AtomicBool = AtomicBool::new(false);
@@ -90,6 +91,27 @@ pub fn pattern(count: u32) {
         wait_ms(GAP_MS);
     }
     gpio_set(true);
+}
+
+/// The idle loop calls this after `pattern(14)` returns. The counted
+/// group has finished; later flashes are the heartbeat, not stage 13.
+pub fn begin_heartbeat() {
+    HEART.store(true, Ordering::Relaxed);
+}
+
+/// Short label for the HDMI status line.
+pub fn led_label() -> &'static str {
+    if HEART.load(Ordering::Relaxed) {
+        "heartbeat"
+    } else {
+        match LAST.load(Ordering::Relaxed) {
+            11 => "11",
+            12 => "12",
+            13 => "13",
+            14 => "14",
+            _ => "boot",
+        }
+    }
 }
 
 /// One 250 ms flash and a 1.5 s pause, repeating from the idle loop.
