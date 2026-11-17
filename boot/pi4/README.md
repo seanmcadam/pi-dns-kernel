@@ -10,6 +10,14 @@ may blink once as the firmware reads the card. That pattern is
 `start4.elf`, not a kernel stage. The kernel counts below start after
 that, once `kernel8.img` is running.
 
+Four kernels in a row showed the same single blink of about half a
+second, then a dark LED, with the rainbow still on the panel. Kernel
+stages are short groups, not one half-second flash, so that blink can be
+the firmware handing off. `boot/pi4-blinktest` is a separate image that
+paints HDMI solid red and blinks GPIO 42 and expander pin 130 on
+opposite phases. A red panel means code is running. The build and the
+copy steps are in `boot/pi4-blinktest/README.md`.
+
 ## ACT LED
 
 Current Pi 4 device trees attach the green activity LED to **GPIO 42**,
@@ -34,6 +42,15 @@ first call. The delay reads `CNTPCT_EL0` and subtracts. A `CNTFRQ_EL0` of
 0 is treated as 54 MHz. A counter that does not move gives up after a
 fixed number of polls. The pin is switched to an output once; later
 flashes only set or clear it. The counts below are unchanged.
+
+The raw file starts with a Linux arm64 Image header. The first instruction
+is a PC-relative branch over that header. Nothing before the MMU is on
+loads an absolute high address. `kernel_address=0x80000` matches the link.
+`os_check=0` is set so a missing Linux device tree does not abort the
+boot. If the firmware still enters at `0x200000`, the Pi 4 image copies
+itself to `0x80000` and continues there. The LED path follows the Pi 4
+link, not "is the PC in the first megabyte", so a load at `0x200000` does
+not take the virt cache walk and does not skip the LED.
 
 `VBAR_EL1` and `VBAR_EL2` point at a physical vector table before the
 cache invalidate returns and before the MMU is enabled. A fault in that

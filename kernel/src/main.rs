@@ -37,9 +37,9 @@ use memory::ALLOCATOR;
 
 core::arch::global_asm!(include_str!("boot.s"));
 
-// 1 only on the Pi 4 image. Assembly keys the ACT LED off the PC instead of
-// this word: a cached load can be stale until the early invalidate finishes.
-// It lives in the loaded image, not in .bss.
+// 1 only on the Pi 4 image. Assembly does not load this word. The linker
+// script's BOOT_PI4_FLAG is patched into a movz, so a stale cache line
+// cannot hide it and the load address does not matter.
 #[used]
 #[no_mangle]
 #[cfg(feature = "board-pi4")]

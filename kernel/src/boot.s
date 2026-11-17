@@ -17,8 +17,10 @@
 //   - QEMU virt (board/virt/link.ld): linked at 0xFFFF000040080000
 //                                     loaded at physical 0x40080000
 //   - Raspberry Pi 4 (board/pi4/link.ld): linked at 0xFFFF000000080000
-//                                     firmware loads the raw image at
-//                                     physical 0x80000. Untested on hardware.
+//                                     physical 0x80000. Newer firmware
+//                                     documents 0x200000 as the 64-bit
+//                                     default. This image copies itself
+//                                     to 0x80000 if it was loaded elsewhere.
 //   - Raspberry Pi 5 (board/pi5/link.ld): linked at 0xFFFF000000200000
 //                                     firmware loads kernel_2712.img at
 //                                     physical 0x200000. Untested on hardware.
@@ -80,7 +82,29 @@
 // Mark _start as a function symbol so debuggers and objdump show it nicely.
 .type _start, %function
 
+// Linux arm64 Image header. code0 branches over the fields. BOOT_ARM64_MAGIC
+// is the "ARM\x64" magic on the Pi 4 image and zero on virt and Pi 5. A
+// loader that keys off that magic then adds KERNEL_PHYS to a 2 MiB-aligned
+// RAM base. On virt that offset is 0x80000, so the image would land at
+// 0x40080000. Putting the absolute address 0x40080000 in this field makes
+// QEMU place the image past the end of RAM ("Not enough space for DTB").
+// Virt and Pi 5 leave the magic zero, so they stay raw binaries and this
+// field is ignored. image_size is 8 MiB, which covers this image. No byte
+// here is an absolute high address: the branch is PC-relative and the
+// quads are constants.
 _start:
+    b       boot_body
+    .word   0
+    .quad   KERNEL_PHYS
+    .quad   0x800000
+    .quad   0
+    .quad   0
+    .quad   0
+    .quad   0
+    .word   BOOT_ARM64_MAGIC
+    .word   0
+
+boot_body:
     // Mask IRQ, FIQ, SError, and debug before any vector base is installed.
     // A pending firmware interrupt must not enter the early stub. Synchronous
     // aborts are not masked by DAIF, so a fault still reaches that stub.
@@ -93,8 +117,7 @@ _start:
     // Pi 4 has 4 cores, numbered 0-3, so the bottom 2 bits are enough.
     mrs     x1, mpidr_el1       // x1 = MPIDR_EL1 (read a system register)
     and     x1, x1, #3          // keep only bits [1:0], so x1 = core number 0..3
-    cbz     x1, 2f              // core 0? branch forward to label 2 to boot.
-                                // "2f" means "the next label 2, going forward".
+    cbz     x1, boot_core0      // core 0 continues. Others park.
 
     // Any core that is not core 0 falls through to here and sleeps forever.
 1:
@@ -102,9 +125,76 @@ _start:
                                 // event or interrupt wakes the core.
     b       1b                  // woke up anyway? go back to sleep.
                                 // "1b" means "the previous label 1, going back".
-// QEMU keeps these cores off until PSCI CPU_ON. A Pi 4
+    // QEMU keeps these cores off until PSCI CPU_ON. A Pi 4
     // firmware stub parks them on the spin table instead.
     // secondary_entry is that later entry, for both.
+
+boot_core0:
+    // BOOT_PI4_FLAG is an absolute 0 or 1 from the linker script, patched
+    // into this movz. It is not a load, so a stale cache line cannot hide
+    // it, and it does not care whether the PC is in the first megabyte.
+    // Virt and Pi 5 are 0 and must not touch GPIO. x22 stays as set here.
+    movz    x22, #:abs_g0_nc:BOOT_PI4_FLAG
+    cbz     x22, 2f
+    adrp    x1, _start
+    add     x1, x1, :lo12:_start
+    movz    x2, #0
+    movk    x2, #0x8, lsl #16
+    cmp     x1, x2
+    b.eq    2f
+    // Loaded somewhere other than 0x80000. A 64-bit firmware default is
+    // 0x200000. The image is larger than the gap between those two, so the
+    // copy overlaps the code that is running. Run the copy from 0x40000,
+    // which is above the firmware stub and below both images.
+    adrp    x3, __data_end
+    add     x3, x3, :lo12:__data_end
+    add     x3, x3, #7
+    bic     x3, x3, #7
+    sub     x4, x3, x1
+    adr     x10, reloc_stub
+    adr     x11, reloc_stub_end
+    movz    x12, #0
+    movk    x12, #0x4, lsl #16
+    mov     x13, x12
+stub_copy:
+    cmp     x10, x11
+    b.hs    stub_go
+    ldr     x14, [x10], #8
+    str     x14, [x13], #8
+    b       stub_copy
+stub_go:
+    dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+    br      x12
+
+    .balign 8
+reloc_stub:
+    mov     x5, x2
+reloc_loop:
+    cmp     x1, x3
+    b.hs    reloc_clean
+    ldr     x6, [x1], #8
+    str     x6, [x5], #8
+    b       reloc_loop
+reloc_clean:
+    mov     x1, x2
+    add     x5, x2, x4
+reloc_line:
+    cmp     x1, x5
+    b.hs    reloc_jump
+    dc      cvau, x1
+    add     x1, x1, #64
+    b       reloc_line
+reloc_jump:
+    dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+    br      x2
+    .balign 8
+reloc_stub_end:
 
 2:
     // Stack before any call. QEMU raspi4b enters at EL2h with SP = 0.
@@ -125,15 +215,9 @@ _start:
     msr     sp_el1, x1
 stack_ready:
     mov     x18, xzr
-    // x22 is 1 only while the PC is still in the first megabyte. That is the
-    // Pi 4 load address. Virt and Pi 5 are not, and must not touch GPIO.
-    // Recomputing this after the high jump would clear the flag, so it stays
-    // in x22. x21 is the LED stage. Both survive the EL drop. mark and the
-    // helpers below do not write them. x18 is 1 after the pin is an output.
-    adrp    x22, _start
-    lsr     x22, x22, #20
-    cmp     x22, #0
-    cset    x22, eq
+    // x22 is 1 on the Pi 4 image and 0 on virt and Pi 5. x21 is the LED
+    // stage. Both survive the EL drop. mark and the helpers below do not
+    // write them. x18 is 1 after the pin is an output.
     // MMU off before VBAR points at a physical table. A vector fetch through
     // a firmware map that is not an identity map would fault again at once.
     bl      caches_off

@@ -1,14 +1,20 @@
 # Raspberry Pi 4 boot file for this kernel.
-# The ELF is linked at 0xFFFF000000080000 (TTBR1). kernel_address is the
-# same physical address the firmware should load. Do not set arm_peri_high:
-# this kernel uses the low peripheral window at 0xFE000000. Leave enable_gic
-# at the firmware default, which is on. The green ACT LED blink codes are
-# in boot/pi4/README.md. This image has not been confirmed on a board yet.
+# The ELF is linked at 0xFFFF000000080000 (TTBR1). The matching physical
+# address is 0x80000. Current firmware documents 0x200000 as the default
+# load address for a 64-bit kernel. kernel_address asks for 0x80000. If a
+# board ignores that and enters at 0x200000, the image copies itself to
+# 0x80000 before it uses a link-time address. os_check=0 is the bare-metal
+# switch from the Pi 5 docs: do not refuse the boot when no Linux device
+# tree is present. Do not set arm_peri_high: this kernel uses the low
+# peripheral window at 0xFE000000. Leave enable_gic at the firmware
+# default, which is on. The green ACT LED blink codes are in
+# boot/pi4/README.md. This image has not been confirmed on a board yet.
 arm_64bit=1
 enable_uart=1
 uart_2ndstage=1
 kernel=kernel8.img
 kernel_address=0x80000
+os_check=0
 core_freq=250
 # PL011 divisor in the kernel assumes a 48 MHz UART clock.
 init_uart_clock=48000000

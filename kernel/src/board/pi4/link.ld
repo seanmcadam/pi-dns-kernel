@@ -1,5 +1,12 @@
 ENTRY(_start)
 
+BOOT_PI4_FLAG = 1;
+KERNEL_PHYS = 0x80000;
+/* Magic "ARM\x64". Only this image advertises the Linux arm64 header.
+   Virt and Pi 5 keep the field zero so their loaders still treat the
+   file as a raw binary. */
+BOOT_ARM64_MAGIC = 0x644d5241;
+
 SECTIONS
 {
     /* The Pi 4 firmware loads the raw kernel8.img at physical 0x80000.
