@@ -93,15 +93,9 @@ fn uart_dec(mut n: u64) {
 pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     // The framebuffer is programmed before the UART and before the strict
     // map. A hang in either of those used to leave the firmware rainbow up.
-    // Assembly already showed stages 1 through 10. These continue that count.
     #[cfg(feature = "board-pi4")]
     {
-        act::pattern(11);
-        let fb_up = fb_con::start_early();
-        act::arm_expander();
-        if fb_up {
-            act::pattern(12);
-        }
+        let _ = fb_con::start_early();
     }
     board::early_init();
     #[cfg(feature = "board-pi4")]
@@ -116,10 +110,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("[0] Enabling MMU and caches...\r\n");
     mmu::init();
     #[cfg(feature = "board-pi4")]
-    {
-        act::pattern(13);
-        fb_con::switch_to_nc();
-    }
+    fb_con::switch_to_nc();
     uart_write("[OK] MMU and caches enabled\r\n");
 
     percpu::init_bsp();
@@ -228,13 +219,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     }
 
     #[cfg(feature = "board-pi4")]
-    {
-        uart_write("[OK] LED stage 14\r\n");
-        act::pattern(14);
-        act::begin_heartbeat();
-        uart_write("[OK] LED heartbeat\r\n");
-        net::refresh_banner();
-    }
+    net::refresh_banner();
 
     let mut next_status = timer::millis() + 2000;
     loop {
@@ -252,7 +237,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
 
         let now = timer::millis();
         #[cfg(feature = "board-pi4")]
-        act::heartbeat_poll(now);
+        act::note_progress(now);
         if now >= next_status {
             next_status = now + 2000;
             let (rx, tx) = net::packet_counts();

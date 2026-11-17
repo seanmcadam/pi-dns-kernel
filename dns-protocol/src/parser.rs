@@ -97,6 +97,7 @@ fn parse_name(data: &[u8], mut offset: usize) -> Result<(String, usize), ParseEr
     let mut name = String::new();
     let mut jumped = false;
     let mut jump_offset = 0;
+    let mut hops = 0u32;
 
     loop {
         if offset >= data.len() {
@@ -111,9 +112,15 @@ fn parse_name(data: &[u8], mut offset: usize) -> Result<(String, usize), ParseEr
         }
 
         if (len & 0xC0) == 0xC0 {
-            // Compression pointer
+            // Compression pointer. A pointer that does not move backward,
+            // or a chain longer than a name, loops forever and pins the
+            // task. Garbage frames on a live LAN do this.
             if offset + 1 >= data.len() {
                 return Err(ParseError::TooShort);
+            }
+            hops += 1;
+            if hops > 16 {
+                return Err(ParseError::InvalidFormat);
             }
 
             if !jumped {
@@ -121,6 +128,9 @@ fn parse_name(data: &[u8], mut offset: usize) -> Result<(String, usize), ParseEr
             }
 
             let pointer = u16::from_be_bytes([len & 0x3F, data[offset + 1]]) as usize;
+            if pointer >= offset {
+                return Err(ParseError::InvalidFormat);
+            }
             offset = pointer;
             jumped = true;
             continue;

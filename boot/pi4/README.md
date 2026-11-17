@@ -2,21 +2,17 @@
 
 The firmware rainbow means `start4.elf` ran and the kernel has not yet
 replaced the framebuffer. This image turns that screen on as soon as the
-mailbox answers, and it blinks the green activity LED so a board with no
-serial adapter still shows how far boot got.
+mailbox answers. The HDMI console is the boot indicator. The green
+activity LED is not a progress counter.
 
 On power-up the green LED flickers, stays solid for several seconds, and
 may blink once as the firmware reads the card. That pattern is
-`start4.elf`, not a kernel stage. The kernel counts below start after
-that, once `kernel8.img` is running.
-
-A single blink of about half a second is not a kernel stage and not a
-documented ACT error code. Error codes repeat (four short flashes means
-`start*.elf` was not found, seven short flashes means the kernel file
-was not found). On the large kernel image that flash matches the
-firmware finishing the read. Raspberry Pi OS on another card reaches a
-login prompt on this board, so the board, the monitor, the cable, and
-the EEPROM are fine.
+`start4.elf`, not this kernel. Error codes repeat (four short flashes
+means `start*.elf` was not found, seven short flashes means the kernel
+file was not found). A single half-second flash matches the firmware
+finishing the read. Raspberry Pi OS on another card reaches a login
+prompt on this board, so the board, the monitor, the cable, and the
+EEPROM are fine.
 
 The card that left the rainbow up used firmware master `start4.elf`
 and `fixup4.dat` and did not have `bcm2711-rpi-4-b.dtb`. That pair is
@@ -39,112 +35,44 @@ Current Pi 4 device trees attach the green activity LED to **GPIO 42**,
 active high (`STATUS_LED_G_CLK` in `bcm2711-rpi-4-b.dts`). The firmware
 GPIO expander pin 2 is mailbox GPIO **130** (`128 + 2`) and is the **red
 power LED** on that same tree (`PWR_LED_OFF`, active low). Older notes
-call pin 130 the activity LED. Rust pulses both, with the same count.
-GPIO 42 is what lights the green LED on current boards. The expander
-uses mailbox tags `0x00038043` (SET_GPIO_CONFIG) and `0x00038041`
-(SET_GPIO_STATE). The call tries the `0xC0000000` bus alias, then the
-raw physical address. A timed-out or refused pair is not sent again.
-The expander stays quiet until the framebuffer mailbox transaction has
-finished. GPIO 42 itself does not use the mailbox, and its delay is
-`CNTPCT_EL0`, so a stuck property channel cannot hold the green LED on.
-
-Assembly owns the early counts. It talks only to GPIO 42. Each stage is
-N flashes of 250 ms on and 250 ms off, then a 1.5 s gap. The on and off
-times are `CNTFRQ >> 2`. The gap is three `CNTFRQ >> 1` waits. The group
-is the stage that is about to run. The pin is left on while that stage
-runs, so a hang there stays lit. Virt and Pi 5 do not touch the pin.
-
-Core 0 points the current stack and `SP_EL1` at `__stack_top` before the
-first call. The delay reads `CNTPCT_EL0` and subtracts. A `CNTFRQ_EL0` of
-0 is treated as 54 MHz. A counter that does not move gives up after a
-fixed number of polls. The pin is switched to an output once; later
-flashes only set or clear it. The counts below are unchanged.
+call pin 130 the activity LED. This image does not pulse either pin
+during boot. GPIO 42 is what lights the green LED on current boards,
+and only a fault drives it. Virt and Pi 5 do not touch the pin.
 
 The raw file starts with a Linux arm64 Image header. The first instruction
 is a PC-relative branch over that header. Nothing before the MMU is on
 loads an absolute high address. `kernel_address=0x80000` asks for the
 link address. If the firmware still enters at `0x200000`, this image
-copies itself to `0x80000` and continues there. The LED path follows the
-Pi 4 link, not "is the PC in the first megabyte", so that load does not
-take the virt cache walk and does not skip the LED.
+copies itself to `0x80000` and continues there.
 
 `VBAR_EL1` and `VBAR_EL2` point at a physical vector table before the
 cache invalidate returns and before the MMU is enabled. A fault in that
-window used to hang with the LED already off, because the reset vector
-is not a blink. The stub flashes three times quickly, then repeats the
-stage number at the slow rate, forever. A stage of 0 repeats only the
-three rapid flashes. The loop never finishes on an off period. A panic
-or a hang after the virtual timer is armed uses the same shape, with
-the last stage Rust recorded. That repeat does not advance, so the
-number can be counted after the fact.
+window lights GPIO 42 once and waits. It does not blink a stage number.
 
-## Blink codes
+## LED
 
-Count the flashes in a group. A flash is about a quarter of a second,
-and the gap before the next group is about a second and a half. A
-healthy boot walks 1 through 14 in order, then one quarter-second flash
-repeats with that same gap. That heartbeat means the idle loop is
-running. The framebuffer is programmed before the strict page tables,
-so 12 comes before 13.
+The boot-stage blink sequence and the idle heartbeat are gone. They
+existed to show progress before the HDMI console worked, and each
+counted group cost a quarter-second per flash plus a 1.5 s gap. The
+console is the boot indicator now. GPIO 42 stays off through a normal
+boot. The pinned row says `led:off`.
 
-This image does not issue a set/way op to L2. Stage 1 only reads the L1
-geometry, and that read happens after the one-flash announcement. The
-blink and the delay are leaves, the pin is programmed once, and a stuck
-counter cannot sit in the gap forever. The counts are unchanged.
+A fault lights the pin once and leaves it on (`led:fault`). The physical
+vector stub does that before the framebuffer exists, and then waits.
+A kernel panic and the idle-loop watchdog (60 s with no pass through
+the idle loop) do the same and also paint `LOCKUP halt` or
+`LOCKUP idle` on the top HDMI row. A heap allocation that does not fit
+paints `LOCKUP heap` and returns failure; it does not halt and does not
+light the pin by itself. None of these blink. The paint does not take
+the console lock and does not allocate, so a stuck painter still leaves
+a line. The status refresh overwrites that line only if the idle loop
+is still running. Virt and Pi 5 do not touch GPIO.
 
-| Count | What is about to run | If three rapid flashes, then this count, repeat |
-| --- | --- | --- |
-| 1 | Read the L1 data-cache geometry. Physical vectors are already installed. No set/way op yet | Fault in that register read |
-| 2 | Clean and invalidate L1 data only, then the instruction cache. L2 is not walked | Fault in the L1 loop |
-| 3 | Drop EL2 to EL1 | Fault in the drop, or the core was not at EL1 or EL2 |
-| 4 | Enable FP/SIMD and set the stack | Fault in `CPACR_EL1` or the stack pointer |
-| 5 | Zero `.bss` and `.dma` | Fault in that zeroing |
-| 6 | Build the coarse page tables | Fault while writing or cleaning the tables |
-| 7 | Turn the MMU on | Fault programming `MAIR`, `TCR`, `TTBR`, or `SCTLR` |
-| 8 | Jump to the high address | MMU is on. Fault is in the jump |
-| 9 | Install the high vector base and drop the identity map | High fetch worked. Fault is in that blink |
-| 10 | Call `kernel_main` | Identity map is gone. The next fault uses the high vectors |
-| 11 | Rust entered `kernel_main` | High vectors. The rapid three, then the last count Rust stored |
-| 12 | HDMI framebuffer programmed | Rainbow should already be gone, or the link stayed up |
-| 13 | Strict kernel page tables installed | |
-| 14 | Scheduler and user tasks started | After this group the heartbeat replaces the count |
-| Heartbeat | One 250 ms flash, 1.5 s off, repeating | The idle loop is running |
-
-Stage 14 is not skipped when the count seems to stop at 13. `pattern(13)`
-leaves GPIO 42 on, and the pin stays solid through the allocator, the
-filesystem, and GENET bring-up. That solid stretch is stage 13's work,
-not a hang, as long as it ends. Stage 14 then flashes fourteen times.
-After that the idle loop shows one 250 ms flash and a 1.5 s gap. A photo
-taken once the console is reprinting status is looking at that heartbeat.
-The HDMI log prints `[OK] LED stage 14` before the fourteen flashes and
-`[OK] LED heartbeat` when the idle loop starts. The pinned top row ends
-in `led:13` during the solid stretch and `led:heartbeat` afterwards.
-Three rapid flashes and then thirteen slow flashes, forever, is the hang
-pattern with the last stored stage still 13. The status line in the
-console means that pattern did not stick.
-| Rapid three, forever | Fault before a count was stored | |
-
-On `413ef6d` the board showed stage flashing, then a faster stretch,
-then the LED went out. That image used 50–60 ms flashes, so stages
-11–14 look like one fast run, and `pattern` ended by clearing GPIO 42.
-The idle loop never set the pin again. UART setup writes `GPFSEL1`
-(GPIO 14 and 15), not `GPFSEL4`. The expander mailbox drives pin 130
-only, and only after the framebuffer call. Nothing in the dashboard or
-the idle loop turns GPIO 42 off. Dark after the fast stretch was the
-designed end of stage 14, or a hang that started while the pin was
-already clear. A fault in the physical stub would have kept repeating.
-Panic was a 40 ms blink that also did not stop. Off now means the
-indicator itself stopped: the core is not in the idle loop, not in a
-fault loop, and not in a stage that left the pin on. After the virtual
-timer is armed, 60 s without a blink or a stage wait starts the fault
-pattern instead of staying dark. A hang with interrupts masked, before
-that timer, stays in whatever state the last stage left (lit, while
-that stage is running).
-
-A group that plays once, then the next group, is progress. Three rapid
-flashes and then the same group forever is a fault in that stage. A
-single half-second flash, with the rainbow still up, is the firmware,
-not a stage.
+UART setup writes `GPFSEL1` (GPIO 14 and 15), not `GPFSEL4`. A single
+half-second flash with the rainbow still up is the firmware, not this
+image. Solid green after the console has been updating means the pin
+was turned on by a fault, or the core stopped while the pin was already
+on. Dark while the console is still scrolling is a healthy boot.
 
 ## HDMI network rows
 
@@ -155,10 +83,20 @@ GENET revision (raw word and decoded version; silicon major 6 is version
 the transmit DMA: `txS` frames queued, `txC` the hardware consumer, `txP`
 the hardware producer, `d` times the ring was full, `mibT` and `mibR`
 the UniMAC TX and RX counters, then `st` (`TDMA_STATUS`),
-`ctl` (`TDMA_CTRL`), `rd` and `wr` (ring 16 read and write pointers).
+`ctl` (`TDMA_CTRL`), `rd` and `wr` (ring 16 read and write pointers),
+`e` (end address in words), `z` (ring size register), and `d0` (the
+length/status word of TX descriptor 0).
 `txP` moving while `txC` and `mibT` stay 0 means the producer was written
 and the DMA engine did not take the descriptor. `ctl` bit 0 is `DMA_EN`
-and bit 17 is ring 16. `st` bit 0 set means TX DMA is still disabled.
+and bit 17 is ring 16. `st` bit 0 clear means `DMA_DISABLED` is not set,
+so the engine reports enabled. Linux only defines that bit and bit 1
+(`DMA_DESC_RAM_INIT_BUSY`). Bits 1..16 set in a value such as
+`0x0001FFFE` are not the control register's ring-enable mask
+(`DMA_RING_BUF_EN_SHIFT` is a `TDMA_CTRL` field). `wr` is the word index
+of the next free descriptor and advances with each queued frame. `e`
+should read `0x000002FF` (256 descriptors × 3 words − 1) and `z` should
+read `0x01000800` (count 256, buffer 2048). A different `e` or `z` means
+the write-once ring register kept an earlier value.
 `d` climbing means the stack is retrying because the ring is full; the
 driver does not spin on the consumer. Probe steps are also logged as
 `[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling region. `nic=` in
@@ -169,10 +107,15 @@ image prints `[FAIL] GENET revision register is not present` and
 
 Pi 4 `phy-mode` is `rgmii-rxid`. The PHY adds the RX clock delay and the
 MAC adds the 2 ns TX delay (`ID_MODE_DIS` clear, `RGMII_MODE_EN` set).
-The only transmit ring is queue 16. Its descriptors are 0–31 in the
-TDMA window at GENET+`0x4000` (12 bytes each: length/status, address low,
-address high). The producer is ring offset `0x0C` and the consumer is
-`0x08`. The consumer is not written. The arbiter is round-robin.
+The only transmit ring is queue 16, and it owns all 256 TDMA
+descriptors (U-Boot's layout). They live at GENET+`0x4000`, 12 bytes
+each: length/status, address low, address high. The producer is ring
+offset `0x0C` and the consumer is `0x08`. The consumer is not written.
+The software write pointer is the word index of the next free
+descriptor. Only 32 frame buffers are kept, so at most 32 descriptors
+are in flight; the index into the 256-deep ring is the free-running
+producer. GENET's GIC lines are masked in the handler and re-armed from
+the poll path only while the interrupt summary is clear.
 
 `./scripts/build.sh pi4` enables DHCP. Without that feature the image
 uses static `10.0.2.15` and does not send a discover.
