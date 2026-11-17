@@ -111,6 +111,10 @@ impl Board for Pi4 {
         genet::write_status(out)
     }
 
+    fn write_nic_diag(out: &mut [u8]) -> usize {
+        genet::write_diag(out)
+    }
+
     fn handle_irq(id: u32) -> IrqHit {
         // Packet data is polled. These lines are armed so the status counter
         // moves. A summary that stays set after the clear is masked here.
