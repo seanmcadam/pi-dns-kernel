@@ -1,5 +1,13 @@
 ENTRY(_start)
 
+BOOT_PI4_FLAG = 0;
+/* Linux text_offset, not the absolute load address. QEMU virt RAM starts at
+   0x40000000, so an offset of 0x80000 lands at physical 0x40080000. The
+   ARM64 magic is zero on this image, so QEMU loads the raw file at its
+   machine default and does not apply this field. */
+KERNEL_PHYS = 0x80000;
+BOOT_ARM64_MAGIC = 0;
+
 SECTIONS
 {
     /* QEMU loads the raw image at physical 0x40080000 (RAM 0x40000000 + 0x80000).

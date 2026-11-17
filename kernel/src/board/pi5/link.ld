@@ -1,5 +1,11 @@
 ENTRY(_start)
 
+BOOT_PI4_FLAG = 0;
+KERNEL_PHYS = 0x200000;
+/* Zero so the Pi 5 firmware keeps treating kernel_2712.img as a raw
+   binary and honors kernel_address=0x200000. */
+BOOT_ARM64_MAGIC = 0;
+
 SECTIONS
 {
     /* The Pi 5 firmware loads kernel_2712.img at physical 0x200000.
