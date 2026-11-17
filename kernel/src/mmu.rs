@@ -190,6 +190,12 @@ pub fn init() {
 
         let ttbr1 = virt_to_phys(addr_of!(TABLES.l0) as u64);
         install_high_map(ttbr1);
+        // `.dma` was zeroed while the early map was write-back. Those dirty
+        // lines still hit after the pages become Normal non-cacheable, so
+        // the CPU would read the zeros and the MAC would see whatever was
+        // in RAM. Drop the lines. Later TX cleans its buffer; RX invalidates
+        // before the CPU looks.
+        discard_dma_lines(&layout);
         if pan_supported() {
             // SPAN clear: an exception into EL1 sets PAN, so a user fault
             // cannot leave EL1 able to read the user window by accident.
@@ -755,6 +761,21 @@ fn give_up(message: &str) -> ! {
 /// read-only, so WXN does not make them unexecutable. The TLB is invalidated
 /// before WXN is set, so a stale writable translation of text cannot be
 /// fetched under the new bit.
+fn discard_dma_lines(layout: &Layout) {
+    let start = phys_to_virt(layout.dma.0) as usize & !63;
+    let end = phys_to_virt(layout.dma.1) as usize;
+    let mut line = start;
+    while line < end {
+        unsafe {
+            core::arch::asm!("dc ivac, {line}", line = in(reg) line, options(nostack));
+        }
+        line = line.saturating_add(64);
+    }
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
 unsafe fn install_high_map(ttbr1: u64) {
     let mut sctlr: u64;
     core::arch::asm!(
