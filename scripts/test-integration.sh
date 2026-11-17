@@ -1837,7 +1837,7 @@ if [ -f boot/pi4/kernel8.img ] && [ -f boot/pi4/config.txt ] \
     && grep -q 'kernel=kernel8.img' boot/pi4/config.txt \
     && grep -q 'arm_64bit=1' boot/pi4/config.txt; then
     echo "✓ Pi 4 kernel8.img linked at 0x${START_ADDR} with config.txt"
-    echo "  This image has not been tested on hardware."
+    echo "  QEMU raspi4b has no GENET. DHCP is enabled in this image."
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo "✗ Pi 4 image is incomplete (_start=${START_ADDR})"

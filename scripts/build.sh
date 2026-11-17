@@ -13,9 +13,11 @@ if [ "${1:-}" = "virt" ] || [ "${1:-}" = "pi4" ] || [ "${1:-}" = "pi5" ]; then
 fi
 
 if [ "$BOARD" = "pi4" ]; then
-    echo "=== Building Raspberry Pi 4 kernel (untested on hardware) ==="
+    echo "=== Building Raspberry Pi 4 kernel ==="
+    # dhcp-default asks for a lease before the 10.0.2.15 fallback. A card
+    # image built without it never sends DHCP.
     cargo build --release --target aarch64-unknown-none -p pi4-dns-kernel \
-        --no-default-features --features board-pi4 "$@"
+        --no-default-features --features board-pi4,dhcp-default "$@"
     mkdir -p boot/pi4
     aarch64-linux-gnu-objcopy -O binary \
         target/aarch64-unknown-none/release/kernel8 boot/pi4/kernel8.img
@@ -34,7 +36,7 @@ EOF
     echo "$START_ADDR" | grep -Eq '^0*ffff000000080000$'
     echo "Kernel size: $(stat -c%s boot/pi4/kernel8.img) bytes"
     echo "SD card files: boot/pi4/kernel8.img and boot/pi4/config.txt"
-    echo "This build has not been tested on Raspberry Pi hardware."
+    echo "Pi 4 image requests DHCP, then falls back to 10.0.2.15."
     exit 0
 fi
 

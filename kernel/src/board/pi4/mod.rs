@@ -1,6 +1,7 @@
 //! Raspberry Pi 4 (BCM2711). QEMU `raspi4b` (QEMU 9 or newer) can boot this
 //! image far enough to exercise the UART, the GIC-400, the spin table, and
-//! EMMC2. GENET is not in that machine. The image has not been run on hardware.
+//! EMMC2. GENET is not in that machine, so a revision read there fails and
+//! the image continues without a NIC. On a Pi 4 the same image drives GENET.
 //!
 //! The link script is `link.ld` in this directory. The firmware loads the raw
 //! image at physical `0x80000`. The link address is `0xFFFF000000080000`.
@@ -32,7 +33,8 @@ pub struct Pi4;
 
 const DEVICE_RANGES: &[(u64, u64)] = &[(0xFC00_0000, 0x1_0000_0000)];
 
-/// BCM2711 GIC-400 SPI 157 and 158. Untested on hardware.
+/// BCM2711 GIC-400 SPI 157 and 158. The driver arms these after a real
+/// revision read. QEMU raspi4b never raises them.
 const GENET_IRQ0: u32 = 32 + 157;
 const GENET_IRQ1: u32 = 32 + 158;
 /// BCM2711 EMMC2, SPI 126. QEMU raspi4b raises this line. Untested on hardware.
@@ -97,11 +99,26 @@ impl Board for Pi4 {
         emmc::DiskDev
     }
 
+    fn service_nic() {
+        genet::service_link();
+    }
+
+    fn nic_link() -> bool {
+        genet::link_is_up()
+    }
+
+    fn write_nic_status(out: &mut [u8]) -> usize {
+        genet::write_status(out)
+    }
+
     fn handle_irq(id: u32) -> IrqHit {
-        // GENET's INTRL2 mask is not programmed. If a line is ever enabled
-        // and sticks high, drop it after one count so it cannot spin the core.
+        // Packet data is polled. These lines are armed so the status counter
+        // moves. A summary that stays set after the clear is masked here.
         if id == GENET_IRQ0 || id == GENET_IRQ1 {
-            crate::gic::disable_id(id);
+            let which = if id == GENET_IRQ0 { 0 } else { 1 };
+            if !genet::ack_irq(which) {
+                crate::gic::disable_id(id);
+            }
             return IrqHit::Net;
         }
         if id == EMMC_IRQ {

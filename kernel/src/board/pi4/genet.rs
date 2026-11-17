@@ -1,35 +1,47 @@
-//! BCM2711 GENET v5 Ethernet (Pi 4, MMIO 0xFD580000).
+//! BCM2711 GENET Ethernet (Pi 4, MMIO `0xFD580000`) and the BCM54213PE PHY.
 //!
-//! One RX ring and one TX ring (queue 16, the default priority queue) share
-//! 32 descriptors each. Frames are placed in static RAM buffers. The 2-byte
-//! RX offset matches the controller's IP-header alignment.
+//! The March 2025 firmware leaves this block clock-gated when a device tree
+//! is loaded, because Linux turns the clock on itself. A read of the
+//! revision register then aborts or returns nothing, which QEMU raspi4b
+//! also does because it has no GENET. The probe enables the GENET clocks
+//! and retries before it decides the block is absent.
 //!
-//! This driver is compiled into the Pi 4 image and has not been run on hardware.
+//! Silicon major 6 is GENET v5. Major 5 is v4. A readable value other than
+//! 0 or `0xffffffff` is accepted either way. The raw word is logged.
 //!
-//! BCM2711 GENET uses GIC-400 SPI 157 and SPI 158 (INTID 189 and 190). The
-//! IRQ handler recognizes those ids, counts them, and masks the line so a
-//! stuck level cannot spin a core. The lines are left disabled: the device
-//! INTRL2 mask is not programmed here, and that register block has not been
-//! tested on hardware. Packet completion is therefore still observed when the
-//! owner wakes for `poll_delay` or a socket-queue SGI. The owner does sleep
-//! instead of spinning. None of this has been run on a Pi 4.
+//! The PHY is external, address 1, RGMII with the receive delay in the PHY
+//! (`rgmii-rxid`). Packet data is polled. The GIC lines are armed as well,
+//! and a stuck level is masked after one acknowledgement that does not clear.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
 const BASE: usize = crate::addr::phys_to_virt(0xFD58_0000) as usize;
 
 const SYS_REV_CTRL: usize = 0x00;
+const SYS_PORT_CTRL: usize = 0x04;
+const PORT_MODE_EXT_GPHY: u32 = 3;
 const SYS_RBUF_FLUSH_CTRL: usize = 0x08;
 const EXT_RGMII_OOB_CTRL: usize = 0x8c;
+const INTRL2_0: usize = 0x200;
+const INTRL2_1: usize = 0x240;
+const INTRL2_STAT: usize = 0x00;
+const INTRL2_CLEAR: usize = 0x08;
+const INTRL2_MASK_STATUS: usize = 0x0c;
+const INTRL2_MASK_SET: usize = 0x10;
+const INTRL2_MASK_CLEAR: usize = 0x14;
+const IRQ_RXDMA_DONE: u32 = 1 << 13;
+const IRQ_TXDMA_DONE: u32 = 1 << 16;
 const RBUF_CTRL: usize = 0x300;
 const RBUF_TBUF_SIZE_CTRL: usize = 0x3b4;
 const UMAC_CMD: usize = 0x808;
 const UMAC_MAC0: usize = 0x80c;
 const UMAC_MAC1: usize = 0x810;
 const UMAC_MAX_FRAME_LEN: usize = 0x814;
+const UMAC_MDF_CTRL: usize = 0xe50;
+const UMAC_MDF_ADDR: usize = 0xe54;
 const UMAC_TX_FLUSH: usize = 0xb34;
 const UMAC_MIB_CTRL: usize = 0xd80;
 const MDIO_CMD: usize = 0xe14;
@@ -75,9 +87,13 @@ const DMA_MAX_BURST: u32 = 0x8;
 const CMD_TX_EN: u32 = 1 << 0;
 const CMD_RX_EN: u32 = 1 << 1;
 const CMD_SPEED_SHIFT: u32 = 2;
-const UMAC_SPEED_1000: u32 = 2;
+const CMD_SPEED_MASK: u32 = 3;
+const CMD_PROMISC: u32 = 1 << 4;
+const CMD_HD_EN: u32 = 1 << 10;
 const CMD_SW_RESET: u32 = 1 << 13;
 const CMD_LCL_LOOP_EN: u32 = 1 << 15;
+const CMD_RX_PAUSE_IGNORE: u32 = 1 << 8;
+const CMD_TX_PAUSE_IGNORE: u32 = 1 << 28;
 const RGMII_LINK: u32 = 1 << 4;
 const OOB_DISABLE: u32 = 1 << 5;
 const RGMII_MODE_EN: u32 = 1 << 6;
@@ -92,16 +108,198 @@ const DESC_LENGTH_STATUS: usize = 0x00;
 const DESC_ADDRESS_LO: usize = 0x04;
 const DESC_ADDRESS_HI: usize = 0x08;
 
+const CM_BASE: usize = crate::addr::phys_to_virt(0xFE10_1000) as usize;
+const CM_PASSWORD: u32 = 0x5a00_0000;
+const CM_ENABLE: u32 = 1 << 4;
+const CM_BUSY: u32 = 1 << 7;
+const CM_GENET250_CTL: usize = 0x1e8;
+const CM_GENET250_DIV: usize = 0x1ec;
+const CM_GENET125_CTL: usize = 0x210;
+const CM_GENET125_DIV: usize = 0x214;
+const CLKGEN: usize = crate::addr::phys_to_virt(0xFD5E_0048) as usize;
+const CLKGEN_GATES: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
+    | (1 << 8);
+
+const GENET_IRQ0: u32 = 32 + 157;
+const GENET_IRQ1: u32 = 32 + 158;
+
+const MII_BMCR: u32 = 0;
+const MII_BMSR: u32 = 1;
+const MII_PHYSID1: u32 = 2;
+const MII_PHYSID2: u32 = 3;
+const MII_ADVERTISE: u32 = 4;
+const MII_LPA: u32 = 5;
+const MII_CTRL1000: u32 = 9;
+const MII_STAT1000: u32 = 10;
+const BMCR_RESET: u16 = 1 << 15;
+const BMCR_ANENABLE: u16 = 1 << 12;
+const BMCR_ANRESTART: u16 = 1 << 9;
+const BMSR_LSTATUS: u16 = 1 << 2;
+const ADVERTISE_ALL: u16 = 0x0de1;
+const ADVERTISE_1000FULL: u16 = 0x0200;
+const LPA_1000FULL: u16 = 0x0800;
+const LPA_1000HALF: u16 = 0x0400;
+const AUXCTL: u32 = 0x18;
+const AUX_MISC: u16 = 7;
+const AUX_RGMII_SKEW: u16 = 0x0100;
+
 static RX_COUNT: AtomicU32 = AtomicU32::new(0);
 static TX_COUNT: AtomicU32 = AtomicU32::new(0);
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 
+#[link_section = ".dma"]
 static mut RX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
+#[link_section = ".dma"]
 static mut TX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
 
 static RX_INDEX: AtomicU32 = AtomicU32::new(0);
 static RX_CONS: AtomicU32 = AtomicU32::new(0);
+
+static PRESENT: AtomicBool = AtomicBool::new(false);
+static REV: AtomicU32 = AtomicU32::new(0);
+static VERSION: AtomicU32 = AtomicU32::new(0);
+static LINK_UP: AtomicBool = AtomicBool::new(false);
+static SPEED: AtomicU32 = AtomicU32::new(0);
+static FULL_DUPLEX: AtomicBool = AtomicBool::new(true);
+static PHY_ADDR: AtomicU32 = AtomicU32::new(1);
+static LAST_LINK_MS: AtomicU64 = AtomicU64::new(0);
+static MAC: [AtomicU8; 6] = [
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+];
+
+#[repr(C, align(16))]
+struct MacMsg {
+    size: u32,
+    code: u32,
+    tag: u32,
+    val_len: u32,
+    req: u32,
+    mac: [u8; 6],
+    pad: [u8; 2],
+    end: u32,
+}
+
+#[link_section = ".dma"]
+static mut MAC_MSG: MacMsg = MacMsg {
+    size: 0,
+    code: 0,
+    tag: 0,
+    val_len: 0,
+    req: 0,
+    mac: [0; 6],
+    pad: [0; 2],
+    end: 0,
+};
+
+pub fn link_is_up() -> bool {
+    LINK_UP.load(Ordering::Relaxed)
+}
+
+pub fn write_status(out: &mut [u8]) -> usize {
+    let mut line = StatusLine { buf: out, n: 0 };
+    if !PRESENT.load(Ordering::Relaxed) {
+        line.push("absent");
+        return line.n;
+    }
+    line.push("v");
+    line.dec(VERSION.load(Ordering::Relaxed));
+    line.push(" ");
+    line.hex(REV.load(Ordering::Relaxed));
+    if LINK_UP.load(Ordering::Relaxed) {
+        line.push(" UP ");
+        line.dec(SPEED.load(Ordering::Relaxed));
+        if FULL_DUPLEX.load(Ordering::Relaxed) {
+            line.push("F");
+        } else {
+            line.push("H");
+        }
+    } else {
+        line.push(" DOWN");
+    }
+    line.push(" ");
+    for (index, slot) in MAC.iter().enumerate() {
+        if index > 0 {
+            line.push(":");
+        }
+        line.byte(slot.load(Ordering::Relaxed));
+    }
+    line.n
+}
+
+struct StatusLine<'a> {
+    buf: &'a mut [u8],
+    n: usize,
+}
+
+impl StatusLine<'_> {
+    fn push(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if self.n >= self.buf.len() {
+                return;
+            }
+            self.buf[self.n] = byte;
+            self.n += 1;
+        }
+    }
+
+    fn dec(&mut self, mut value: u32) {
+        let mut tmp = [0u8; 10];
+        let mut i = tmp.len();
+        if value == 0 {
+            self.push("0");
+            return;
+        }
+        while value > 0 {
+            i -= 1;
+            tmp[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        if let Ok(text) = core::str::from_utf8(&tmp[i..]) {
+            self.push(text);
+        }
+    }
+
+    fn hex(&mut self, value: u32) {
+        self.push("0x");
+        for shift in (0..8).rev() {
+            let nibble = ((value >> (shift * 4)) & 0xf) as u8;
+            let digit = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+            if self.n >= self.buf.len() {
+                return;
+            }
+            self.buf[self.n] = digit;
+            self.n += 1;
+        }
+    }
+
+    fn byte(&mut self, value: u8) {
+        let hi = value >> 4;
+        let lo = value & 0xf;
+        let digit = |nibble: u8| {
+            if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            }
+        };
+        if self.n + 2 > self.buf.len() {
+            return;
+        }
+        self.buf[self.n] = digit(hi);
+        self.buf[self.n + 1] = digit(lo);
+        self.n += 2;
+    }
+}
 
 pub struct GenetDevice {
     mac: [u8; 6],
@@ -124,30 +322,41 @@ pub fn packet_counts() -> (u32, u32) {
 
 impl GenetDevice {
     pub fn new() -> Option<Self> {
-        // raspi4b has no GENET. A read of the register is an external abort
-        // there, not a zero. A real controller returns a revision.
-        let rev = match crate::exception::read_u32_catching((BASE + SYS_REV_CTRL) as *const u32) {
-            Some(rev) if rev != 0 && rev != 0xffff_ffff => rev,
-            _ => {
-                log::warn!("GENET revision register is not present");
-                return None;
-            }
+        enable_clocks();
+        let Some(rev) = read_revision() else {
+            say("[FAIL] GENET revision register is not present");
+            return None;
         };
-        log::info!("GENET revision {:#x}", rev);
+        let version = genet_version(rev);
+        REV.store(rev, Ordering::Relaxed);
+        VERSION.store(version, Ordering::Relaxed);
+        say_hex("[OK] GENET revision", rev);
+        if version == 5 {
+            say("[OK] GENET version 5 (silicon major 6)");
+        } else {
+            say_hex("[WARN] GENET version is not 5, continuing", version);
+        }
 
         umac_reset();
+        write(SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
+        say("[OK] GENET port mode external RGMII");
+
         let mac = board_mac();
+        store_mac(&mac);
         write_mac(&mac);
+        set_rx_filter(&mac);
+        say_mac("[OK] GENET MAC", &mac);
+
         disable_dma();
         init_rx_descriptors();
         init_rx_ring();
         init_tx_ring();
         enable_dma();
-        bring_up_link();
-        log::info!(
-            "GENET MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        );
+        program_irqs();
+
+        if !start_phy() {
+            say("[WARN] GENET PHY did not answer on MDIO");
+        }
 
         let rx_cons = read(RDMA_RING + DMA_PROD_INDEX) & 0xffff;
         write(RDMA_RING + DMA_CONS_INDEX, rx_cons);
@@ -155,6 +364,10 @@ impl GenetDevice {
         RX_INDEX.store(rx_cons % DESC_COUNT as u32, Ordering::Relaxed);
         let tx_index = (read(TDMA_RING + DMA_CONS_INDEX) & 0xff) as u16;
         write(TDMA_RING + DMA_PROD_INDEX, tx_index as u32);
+
+        PRESENT.store(true, Ordering::Relaxed);
+        service_link();
+        say("[OK] GENET DMA rings ready, link polled");
 
         Some(Self {
             mac,
@@ -193,10 +406,89 @@ impl GenetDevice {
     }
 }
 
+fn genet_version(rev: u32) -> u32 {
+    match (rev >> 24) & 0xf {
+        6 => 5,
+        5 => 4,
+        0 => 1,
+        n => n,
+    }
+}
+
+fn read_revision() -> Option<u32> {
+    match crate::exception::read_u32_catching((BASE + SYS_REV_CTRL) as *const u32) {
+        Some(rev) if rev != 0 && rev != 0xffff_ffff => Some(rev),
+        _ => None,
+    }
+}
+
+fn enable_clocks() {
+    match crate::exception::read_u32_catching((CM_BASE + CM_GENET250_CTL) as *const u32) {
+        None => say("[WARN] GENET clock manager is not present"),
+        Some(0xffff_ffff) => say("[WARN] GENET clock manager read 0xffffffff"),
+        Some(_) => {
+            let genet250 = enable_one_clock(CM_GENET250_CTL, CM_GENET250_DIV);
+            let genet125 = enable_one_clock(CM_GENET125_CTL, CM_GENET125_DIV);
+            if genet250 && genet125 {
+                say("[OK] GENET clocks enabled");
+            }
+        }
+    }
+    match crate::exception::read_u32_catching(CLKGEN as *const u32) {
+        Some(value) if value != 0xffff_ffff => {
+            write_at(CLKGEN, value | CLKGEN_GATES);
+            say("[OK] GENET clock gates on");
+        }
+        Some(_) => say("[WARN] GENET clock gate read 0xffffffff"),
+        None => say("[WARN] GENET clock gate is not present"),
+    }
+}
+
+fn enable_one_clock(ctl: usize, div: usize) -> bool {
+    let ctl_addr = CM_BASE + ctl;
+    let Some(cur) = crate::exception::read_u32_catching(ctl_addr as *const u32) else {
+        say("[WARN] GENET clock manager is not present");
+        return false;
+    };
+    if cur == 0xffff_ffff {
+        say("[WARN] GENET clock manager read 0xffffffff");
+        return false;
+    }
+    if cur & CM_ENABLE != 0 {
+        return true;
+    }
+    let div_addr = CM_BASE + div;
+    let mut divisor = crate::exception::read_u32_catching(div_addr as *const u32).unwrap_or(0);
+    if divisor & 0xfff == 0 {
+        divisor = 1 << 8;
+    }
+    write_at(div_addr, CM_PASSWORD | (divisor & 0x00ff_ffff));
+    let src = {
+        let source = cur & 0xf;
+        if source == 0 {
+            6
+        } else {
+            source
+        }
+    };
+    write_at(ctl_addr, CM_PASSWORD | CM_ENABLE | src);
+    let start = crate::timer::millis();
+    let mut spins = 0u32;
+    while crate::timer::millis().saturating_sub(start) < 20 {
+        spins = spins.saturating_add(1);
+        if spins > 100_000 {
+            break;
+        }
+        match crate::exception::read_u32_catching(ctl_addr as *const u32) {
+            Some(value) if value & CM_BUSY == 0 => break,
+            _ => core::hint::spin_loop(),
+        }
+    }
+    true
+}
+
 fn umac_reset() {
-    let mut flush = read(SYS_RBUF_FLUSH_CTRL);
-    flush |= 1 << 1;
-    write(SYS_RBUF_FLUSH_CTRL, flush);
+    write(SYS_RBUF_FLUSH_CTRL, 1 << 1);
     spin(1000);
     write(SYS_RBUF_FLUSH_CTRL, 0);
     write(UMAC_CMD, 0);
@@ -229,11 +521,8 @@ fn enable_dma() {
 }
 
 fn init_rx_descriptors() {
-    let status = (BUF_LEN as u32) << DMA_BUFLENGTH_SHIFT | DMA_OWN;
     for index in 0..DESC_COUNT {
         program_rx_desc(index);
-        let desc = GENET_RX_OFF + index * DMA_DESC_SIZE;
-        write(desc + DESC_LENGTH_STATUS, status);
     }
 }
 
@@ -255,7 +544,10 @@ fn init_rx_ring() {
     write(RDMA_RING + DMA_START_ADDR, 0);
     write(RDMA_RING + DMA_READ_PTR, 0);
     write(RDMA_RING + DMA_WRITE_PTR, 0);
-    write(RDMA_RING + DMA_END_ADDR, (DESC_COUNT * DMA_DESC_SIZE / 4 - 1) as u32);
+    write(
+        RDMA_RING + DMA_END_ADDR,
+        (DESC_COUNT * DMA_DESC_SIZE / 4 - 1) as u32,
+    );
     write(
         RDMA_RING + DMA_RING_BUF_SIZE_REG,
         ((DESC_COUNT as u32) << 16) | BUF_LEN as u32,
@@ -269,7 +561,10 @@ fn init_tx_ring() {
     write(TDMA_RING + DMA_START_ADDR, 0);
     write(TDMA_RING + DMA_READ_PTR, 0);
     write(TDMA_RING + DMA_WRITE_PTR, 0);
-    write(TDMA_RING + DMA_END_ADDR, (DESC_COUNT * DMA_DESC_SIZE / 4 - 1) as u32);
+    write(
+        TDMA_RING + DMA_END_ADDR,
+        (DESC_COUNT * DMA_DESC_SIZE / 4 - 1) as u32,
+    );
     write(TDMA_RING + DMA_MBUF_DONE_THRESH, 1);
     write(TDMA_RING + DMA_FLOW_PERIOD, 0);
     write(
@@ -279,17 +574,189 @@ fn init_tx_ring() {
     write(TDMA_REG_BASE + DMA_RING_CFG, 1 << DEFAULT_Q);
 }
 
-fn bring_up_link() {
-    let _phy = mdio_read(0x01, 0x01).or_else(|| mdio_read(0x00, 0x01));
-    let oob = (read(EXT_RGMII_OOB_CTRL) & !OOB_DISABLE) | RGMII_LINK | RGMII_MODE_EN | ID_MODE_DIS;
+fn program_irqs() {
+    for base in [INTRL2_0, INTRL2_1] {
+        write(base + INTRL2_MASK_SET, 0xffff_ffff);
+        write(base + INTRL2_CLEAR, 0xffff_ffff);
+    }
+    write(
+        INTRL2_0 + INTRL2_MASK_CLEAR,
+        IRQ_RXDMA_DONE | IRQ_TXDMA_DONE,
+    );
+    crate::gic::arm_spi(GENET_IRQ0, 0x80, 1);
+    crate::gic::arm_spi(GENET_IRQ1, 0x80, 1);
+    say("[OK] GENET IRQ armed, data path is polled");
+}
+
+/// Clear the GENET interrupt summary. `false` means the line stayed
+/// asserted, and the caller should mask it in the GIC.
+pub fn ack_irq(which: u32) -> bool {
+    let base = if which == 0 { INTRL2_0 } else { INTRL2_1 };
+    let stat_addr = (BASE + base + INTRL2_STAT) as *const u32;
+    let Some(stat) = crate::exception::read_u32_catching(stat_addr) else {
+        return false;
+    };
+    write(base + INTRL2_CLEAR, stat);
+    let Some(left) = crate::exception::read_u32_catching(stat_addr) else {
+        return false;
+    };
+    let mask = read(base + INTRL2_MASK_STATUS);
+    left & !mask == 0
+}
+
+fn start_phy() -> bool {
+    let phy = if mdio_read(1, MII_BMSR).is_some() {
+        1
+    } else if mdio_read(0, MII_BMSR).is_some() {
+        say("[WARN] GENET PHY address 1 did not answer, trying 0");
+        0
+    } else {
+        return false;
+    };
+    PHY_ADDR.store(phy, Ordering::Relaxed);
+    let id1 = mdio_read(phy, MII_PHYSID1).unwrap_or(0);
+    let id2 = mdio_read(phy, MII_PHYSID2).unwrap_or(0);
+    say_hex("[OK] GENET PHY id1", id1 as u32);
+    say_hex("[OK] GENET PHY id2", id2 as u32);
+
+    if mdio_write(phy, MII_BMCR, BMCR_RESET).is_none() {
+        return false;
+    }
+    let start = crate::timer::millis();
+    let mut spins = 0u32;
+    while crate::timer::millis().saturating_sub(start) < 50 {
+        spins = spins.saturating_add(1);
+        if spins > 8 {
+            break;
+        }
+        match mdio_read(phy, MII_BMCR) {
+            Some(value) if value & BMCR_RESET == 0 => break,
+            _ => core::hint::spin_loop(),
+        }
+    }
+    let _ = mdio_write(phy, MII_ADVERTISE, ADVERTISE_ALL);
+    let _ = mdio_write(phy, MII_CTRL1000, ADVERTISE_1000FULL);
+    enable_rx_skew(phy);
+    let oob = (read(EXT_RGMII_OOB_CTRL) & !OOB_DISABLE) | RGMII_MODE_EN | ID_MODE_DIS;
+    write(EXT_RGMII_OOB_CTRL, oob & !RGMII_LINK);
+    say("[OK] GENET RGMII rgmii-rxid, autoneg started");
+    let _ = mdio_write(phy, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
+    true
+}
+
+fn enable_rx_skew(phy: u32) {
+    let select = AUX_MISC | (AUX_MISC << 12);
+    if mdio_write(phy, AUXCTL, select).is_none() {
+        say("[WARN] GENET PHY skew register did not write");
+        return;
+    }
+    let Some(value) = mdio_read(phy, AUXCTL) else {
+        say("[WARN] GENET PHY skew register did not read");
+        return;
+    };
+    if mdio_write(phy, AUXCTL, AUX_MISC | value | AUX_RGMII_SKEW).is_some() {
+        say("[OK] GENET PHY RX delay enabled");
+    }
+}
+
+pub fn service_link() {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = crate::timer::millis();
+    if now.saturating_sub(LAST_LINK_MS.load(Ordering::Relaxed)) < 200 {
+        return;
+    }
+    LAST_LINK_MS.store(now, Ordering::Relaxed);
+    let phy = PHY_ADDR.load(Ordering::Relaxed);
+    let Some(first) = mdio_read(phy, MII_BMSR) else {
+        return;
+    };
+    let status = mdio_read(phy, MII_BMSR).unwrap_or(first);
+    let up = status & BMSR_LSTATUS != 0;
+    let (speed, full) = if up {
+        link_speed(phy)
+    } else {
+        (0, true)
+    };
+    let changed = up != LINK_UP.load(Ordering::Relaxed)
+        || (up && speed != SPEED.load(Ordering::Relaxed));
+    if !changed {
+        return;
+    }
+    apply_link(up, speed, full);
+    LINK_UP.store(up, Ordering::Relaxed);
+    SPEED.store(speed, Ordering::Relaxed);
+    FULL_DUPLEX.store(full, Ordering::Relaxed);
+    if up {
+        say_hex("[OK] GENET link up, Mb/s", speed);
+    } else {
+        say("[WARN] GENET link down");
+    }
+}
+
+fn link_speed(phy: u32) -> (u32, bool) {
+    let gig = mdio_read(phy, MII_STAT1000).unwrap_or(0);
+    if gig & LPA_1000FULL != 0 {
+        return (1000, true);
+    }
+    if gig & LPA_1000HALF != 0 {
+        return (1000, false);
+    }
+    let lpa = mdio_read(phy, MII_LPA).unwrap_or(0);
+    if lpa & 0x0100 != 0 {
+        return (100, true);
+    }
+    if lpa & 0x0080 != 0 {
+        return (100, false);
+    }
+    if lpa & 0x0040 != 0 {
+        return (10, true);
+    }
+    if lpa & 0x0020 != 0 {
+        return (10, false);
+    }
+    (100, true)
+}
+
+fn apply_link(up: bool, speed: u32, full: bool) {
+    let spd = match speed {
+        1000 => 2,
+        100 => 1,
+        _ => 0,
+    };
+    let mut cmd = read(UMAC_CMD);
+    cmd &= !(CMD_SPEED_MASK << CMD_SPEED_SHIFT);
+    cmd &= !CMD_HD_EN;
+    cmd &= !(CMD_TX_EN | CMD_RX_EN | CMD_PROMISC);
+    cmd |= spd << CMD_SPEED_SHIFT;
+    if !full {
+        cmd |= CMD_HD_EN;
+    }
+    if up {
+        cmd |= CMD_TX_EN | CMD_RX_EN | CMD_RX_PAUSE_IGNORE | CMD_TX_PAUSE_IGNORE;
+    }
+    write(UMAC_CMD, cmd);
+    let mut oob = read(EXT_RGMII_OOB_CTRL) & !OOB_DISABLE;
+    oob |= RGMII_MODE_EN | ID_MODE_DIS;
+    if up {
+        oob |= RGMII_LINK;
+    } else {
+        oob &= !RGMII_LINK;
+    }
     write(EXT_RGMII_OOB_CTRL, oob);
-    write(UMAC_CMD, (UMAC_SPEED_1000 << CMD_SPEED_SHIFT) | CMD_TX_EN | CMD_RX_EN);
 }
 
 fn mdio_read(phy: u32, reg: u32) -> Option<u16> {
     let cmd = (1 << 29) | (2 << 26) | ((phy & 0x1f) << 21) | ((reg & 0x1f) << 16);
     write(MDIO_CMD, cmd);
-    for _ in 0..10_000 {
+    let start = crate::timer::millis();
+    let mut spins = 0u32;
+    while crate::timer::millis().saturating_sub(start) < 10 {
+        spins = spins.saturating_add(1);
+        if spins > 100_000 {
+            return None;
+        }
         let value = read(MDIO_CMD);
         if value & (1 << 29) == 0 {
             if value & (1 << 28) != 0 {
@@ -297,7 +764,29 @@ fn mdio_read(phy: u32, reg: u32) -> Option<u16> {
             }
             return Some(value as u16);
         }
-        spin(50);
+        core::hint::spin_loop();
+    }
+    None
+}
+
+fn mdio_write(phy: u32, reg: u32, val: u16) -> Option<()> {
+    let cmd = (1 << 29) | (1 << 26) | ((phy & 0x1f) << 21) | ((reg & 0x1f) << 16) | (val as u32);
+    write(MDIO_CMD, cmd);
+    let start = crate::timer::millis();
+    let mut spins = 0u32;
+    while crate::timer::millis().saturating_sub(start) < 10 {
+        spins = spins.saturating_add(1);
+        if spins > 100_000 {
+            return None;
+        }
+        let value = read(MDIO_CMD);
+        if value & (1 << 29) == 0 {
+            if value & (1 << 28) != 0 {
+                return None;
+            }
+            return Some(());
+        }
+        core::hint::spin_loop();
     }
     None
 }
@@ -309,35 +798,71 @@ fn write_mac(mac: &[u8; 6]) {
     write(UMAC_MAC1, lo);
 }
 
+fn store_mac(mac: &[u8; 6]) {
+    for (slot, byte) in MAC.iter().zip(mac.iter()) {
+        slot.store(*byte, Ordering::Relaxed);
+    }
+}
+
+fn set_rx_filter(mac: &[u8; 6]) {
+    write(UMAC_MDF_CTRL, 0);
+    mdf_slot(0, &[0xff; 6], 0);
+    mdf_slot(1, mac, 1);
+    let mut cmd = read(UMAC_CMD);
+    cmd &= !CMD_PROMISC;
+    write(UMAC_CMD, cmd);
+}
+
+fn mdf_slot(index: usize, addr: &[u8; 6], which: u32) {
+    let base = UMAC_MDF_ADDR + index * 8;
+    write(base, (addr[0] as u32) << 8 | addr[1] as u32);
+    write(
+        base + 4,
+        (addr[2] as u32) << 24 | (addr[3] as u32) << 16 | (addr[4] as u32) << 8 | addr[5] as u32,
+    );
+    let mut ctrl = read(UMAC_MDF_CTRL);
+    ctrl |= 1 << (16 - which);
+    write(UMAC_MDF_CTRL, ctrl);
+}
+
 fn board_mac() -> [u8; 6] {
-    #[repr(C, align(16))]
-    struct Msg {
-        size: u32,
-        code: u32,
-        tag: u32,
-        val_len: u32,
-        req: u32,
-        mac: [u8; 6],
-        pad: [u8; 2],
-        end: u32,
+    let mac = mailbox_mac();
+    if mac.iter().any(|byte| *byte != 0) && mac != [0xff; 6] {
+        return mac;
     }
-    let mut msg = Msg {
-        size: 32,
-        code: 0,
-        tag: 0x0001_0003,
-        val_len: 6,
-        req: 0,
-        mac: [0; 6],
-        pad: [0; 2],
-        end: 0,
-    };
-    let addr = crate::addr::virt_to_phys(&mut msg as *mut Msg as u64) as u32;
-    if mailbox_call(addr) {
-        if msg.mac.iter().any(|b| *b != 0) {
-            return msg.mac;
-        }
-    }
+    say("[WARN] GENET mailbox MAC unavailable, using 02:00:00:00:00:01");
     [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
+}
+
+fn mailbox_mac() -> [u8; 6] {
+    unsafe {
+        let msg = &mut *core::ptr::addr_of_mut!(MAC_MSG);
+        msg.size = 32;
+        msg.code = 0;
+        msg.tag = 0x0001_0003;
+        msg.val_len = 6;
+        msg.req = 0;
+        msg.mac = [0; 6];
+        msg.pad = [0; 2];
+        msg.end = 0;
+        let phys = crate::addr::virt_to_phys(msg as *mut MacMsg as u64) as u32;
+        if !mailbox_call(phys | 0xC000_0000) {
+            msg.size = 32;
+            msg.code = 0;
+            msg.tag = 0x0001_0003;
+            msg.val_len = 6;
+            msg.req = 0;
+            msg.mac = [0; 6];
+            msg.end = 0;
+            if !mailbox_call(phys) {
+                return [0; 6];
+            }
+        }
+        if msg.code != 0x8000_0000 {
+            return [0; 6];
+        }
+        msg.mac
+    }
 }
 
 fn mailbox_call(addr: u32) -> bool {
@@ -348,30 +873,110 @@ fn mailbox_call(addr: u32) -> bool {
     const FULL: u32 = 0x8000_0000;
     const EMPTY: u32 = 0x4000_0000;
     let msg = (addr & !0xf) | 8;
-    let mut spins = 0;
+    let start = crate::timer::get_ticks();
+    let budget = crate::timer::frequency() / 5;
+    if budget == 0 {
+        return false;
+    }
+    let mut spins = 0u32;
     while read_at(MAILBOX + STATUS) & FULL != 0 {
-        spins += 1;
-        if spins > 100_000 {
+        spins = spins.saturating_add(1);
+        if spins > 100_000 || crate::timer::get_ticks().wrapping_sub(start) > budget {
             return false;
         }
     }
-    write_at(MAILBOX + WRITE, msg | 0xC000_0000);
-    spins = 0;
+    write_at(MAILBOX + WRITE, msg);
     loop {
-        while read_at(MAILBOX + STATUS) & EMPTY != 0 {
-            spins += 1;
-            if spins > 200_000 {
-                return false;
-            }
+        spins = spins.saturating_add(1);
+        if spins > 200_000 || crate::timer::get_ticks().wrapping_sub(start) > budget {
+            return false;
+        }
+        if read_at(MAILBOX + STATUS) & EMPTY != 0 {
+            continue;
         }
         let response = read_at(MAILBOX + READ);
         if response & 0xf == 8 {
             return true;
         }
-        spins += 1;
-        if spins > 200_000 {
-            return false;
+    }
+}
+
+fn say(text: &str) {
+    crate::console::write_str(text);
+    crate::console::write_str("\r\n");
+}
+
+fn say_hex(prefix: &str, value: u32) {
+    let mut buf = [0u8; 80];
+    let mut n = 0;
+    for byte in prefix.bytes() {
+        if n + 1 >= buf.len() {
+            break;
         }
+        buf[n] = byte;
+        n += 1;
+    }
+    if n + 1 < buf.len() {
+        buf[n] = b' ';
+        n += 1;
+    }
+    if n + 2 < buf.len() {
+        buf[n] = b'0';
+        buf[n + 1] = b'x';
+        n += 2;
+    }
+    for shift in (0..8).rev() {
+        if n >= buf.len() {
+            break;
+        }
+        let nibble = ((value >> (shift * 4)) & 0xf) as u8;
+        buf[n] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        n += 1;
+    }
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        say(text);
+    }
+}
+
+fn say_mac(prefix: &str, mac: &[u8; 6]) {
+    let mut buf = [0u8; 80];
+    let mut n = 0;
+    for byte in prefix.bytes() {
+        if n + 1 >= buf.len() {
+            break;
+        }
+        buf[n] = byte;
+        n += 1;
+    }
+    for (index, byte) in mac.iter().enumerate() {
+        if n + 3 >= buf.len() {
+            break;
+        }
+        if index > 0 {
+            buf[n] = b':';
+            n += 1;
+        } else if n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        buf[n] = hex_digit(byte >> 4);
+        buf[n + 1] = hex_digit(byte & 0xf);
+        n += 2;
+    }
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        say(text);
+    }
+}
+
+fn hex_digit(nibble: u8) -> u8 {
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + (nibble - 10)
     }
 }
 
@@ -408,6 +1013,7 @@ impl Device for GenetDevice {
     type TxToken<'a> = GenetTxToken<'a> where Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        service_link();
         let (index, len) = poll_rx()?;
         Some((
             GenetRxToken { index, len },
@@ -416,6 +1022,9 @@ impl Device for GenetDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if !LINK_UP.load(Ordering::Relaxed) {
+            return None;
+        }
         Some(GenetTxToken { device: self })
     }
 
@@ -445,8 +1054,6 @@ impl RxToken for GenetRxToken {
             let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
             f(slice)
         };
-        // The device that handed out the token is the only GENET. Reclaim
-        // through the ring registers directly; the next receive() observes it.
         reclaim_rx_static(self.index);
         result
     }
@@ -461,6 +1068,7 @@ fn poll_rx() -> Option<(u16, u16)> {
     let index = RX_INDEX.load(Ordering::Relaxed) as usize % DESC_COUNT;
     let desc = GENET_RX_OFF + index * DMA_DESC_SIZE;
     let raw = read(desc + DESC_LENGTH_STATUS);
+    barrier();
     let length = ((raw >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
     if length <= RX_ALIGN || length > BUF_LEN {
         reclaim_rx_static(index as u16);

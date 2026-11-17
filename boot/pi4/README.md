@@ -109,6 +109,19 @@ counter cannot sit in the gap forever. The counts are unchanged.
 | 13 | Strict kernel page tables installed | |
 | 14 | Scheduler and user tasks started | After this group the heartbeat replaces the count |
 | Heartbeat | One 250 ms flash, 1.5 s off, repeating | The idle loop is running |
+
+Stage 14 is not skipped when the count seems to stop at 13. `pattern(13)`
+leaves GPIO 42 on, and the pin stays solid through the allocator, the
+filesystem, and GENET bring-up. That solid stretch is stage 13's work,
+not a hang, as long as it ends. Stage 14 then flashes fourteen times.
+After that the idle loop shows one 250 ms flash and a 1.5 s gap. A photo
+taken once the console is reprinting status is looking at that heartbeat.
+The HDMI log prints `[OK] LED stage 14` before the fourteen flashes and
+`[OK] LED heartbeat` when the idle loop starts. The pinned top row ends
+in `led:13` during the solid stretch and `led:heartbeat` afterwards.
+Three rapid flashes and then thirteen slow flashes, forever, is the hang
+pattern with the last stored stage still 13. The status line in the
+console means that pattern did not stick.
 | Rapid three, forever | Fault before a count was stored | |
 
 On `413ef6d` the board showed stage flashing, then a faster stretch,
@@ -132,6 +145,21 @@ A group that plays once, then the next group, is progress. Three rapid
 flashes and then the same group forever is a fault in that stage. A
 single half-second flash, with the rainbow still up, is the firmware,
 not a stage.
+
+## HDMI network row
+
+The top row of the framebuffer does not scroll. It shows the GENET
+revision (raw word and decoded version; silicon major 6 is version 5),
+link up or down, speed, MAC, DHCP state (`wait`, `leased`, `timeout`,
+`static`, or `off`), the IPv4 address, and the LED label. Probe steps
+are also logged as `[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling
+region. `nic=` in the `[status]` line is a GIC interrupt count. Zero
+there does not mean the controller is missing. QEMU raspi4b has no GENET
+block, so that image prints `[FAIL] GENET revision register is not present`
+and `[WARN] No NIC`.
+
+`./scripts/build.sh pi4` enables DHCP. Without that feature the image
+uses static `10.0.2.15` and does not send a discover.
 
 ## Files on the card
 

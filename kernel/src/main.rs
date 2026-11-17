@@ -228,7 +228,13 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     }
 
     #[cfg(feature = "board-pi4")]
-    act::pattern(14);
+    {
+        uart_write("[OK] LED stage 14\r\n");
+        act::pattern(14);
+        act::begin_heartbeat();
+        uart_write("[OK] LED heartbeat\r\n");
+        net::refresh_banner();
+    }
 
     let mut next_status = timer::millis() + 2000;
     loop {
@@ -278,6 +284,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
             uart_write("cores online ");
             uart_dec(smp::online() as u64);
             uart_write("\r\n");
+            #[cfg(feature = "board-pi4")]
+            net::refresh_banner();
             report_el(entry_el);
             task::print_summary();
         }

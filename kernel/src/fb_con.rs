@@ -103,6 +103,10 @@ static mut SCREEN: Screen = Screen {
 static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
 
+const HEADER_CAP: usize = 96;
+static mut HEADER: [u8; HEADER_CAP] = [0; HEADER_CAP];
+static mut HEADER_LEN: usize = 0;
+
 /// Allocate the framebuffer and paint one line, before the strict map.
 /// Does not write the UART. Returns whether the panel was programmed.
 pub fn start_early() -> bool {
@@ -143,6 +147,31 @@ pub fn switch_to_nc() {
             if let Some(va) = crate::mmu::map_framebuffer(screen.pa, screen.bytes) {
                 screen.ptr = va as *mut u8;
                 screen.clean = false;
+            }
+        }
+    }
+    unlock(held);
+}
+
+/// Replace the pinned top row. The log scrolls underneath it. A refused
+/// lock skips this update; the next call tries again. Does not write the UART.
+pub fn set_status(text: &str) {
+    let held = lock();
+    if !held {
+        return;
+    }
+    unsafe {
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(HEADER_CAP);
+        let same = *addr_of!(HEADER_LEN) == n && core::slice::from_raw_parts(addr_of!(HEADER).cast::<u8>(), n) == &bytes[..n];
+        if !same {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr_of_mut!(HEADER).cast(), n);
+            *addr_of_mut!(HEADER_LEN) = n;
+            if READY.load(Ordering::Relaxed) {
+                let screen = &mut *addr_of_mut!(SCREEN);
+                if !screen.ptr.is_null() {
+                    draw_status(screen);
+                }
             }
         }
     }
@@ -211,6 +240,13 @@ fn finish(mode: Mode) -> bool {
         screen.bytes = mode.bytes;
         screen.clean = true;
         clear_screen(screen);
+        screen.row = 1;
+        if *addr_of!(HEADER_LEN) == 0 {
+            let msg = b"NIC --- link --- mac --- dhcp --- ip ---";
+            core::ptr::copy_nonoverlapping(msg.as_ptr(), addr_of_mut!(HEADER).cast(), msg.len());
+            *addr_of_mut!(HEADER_LEN) = msg.len();
+        }
+        draw_status(screen);
     }
     MODE_W.store(mode.width, Ordering::Relaxed);
     MODE_H.store(mode.height, Ordering::Relaxed);
@@ -568,6 +604,9 @@ fn paint(bytes: &[u8]) {
 fn flush_line() {
     let clean = unsafe {
         let screen = &mut *addr_of_mut!(SCREEN);
+        if screen.row == 0 {
+            screen.row = 1;
+        }
         let len = screen.line_len;
         let color = ink(&screen.line[..len], screen.bgr);
         let mut col = 0u32;
@@ -600,14 +639,40 @@ fn advance(screen: &mut Screen) {
     }
 }
 
+fn draw_status(screen: &mut Screen) {
+    let text = unsafe {
+        let n = *addr_of!(HEADER_LEN);
+        core::slice::from_raw_parts(addr_of!(HEADER).cast::<u8>(), n)
+    };
+    let pitch = screen.pitch as usize;
+    let row_bytes = pitch * CELL_H as usize;
+    let mut off = 0;
+    while off + 4 <= row_bytes {
+        unsafe {
+            (screen.ptr.add(off) as *mut u32).write_volatile(0);
+        }
+        off += 4;
+    }
+    let color = ink(b"", screen.bgr);
+    let cols = columns(screen);
+    let mut col = 0usize;
+    for &ch in text {
+        if ch == b'\n' || ch == b'\r' || col >= cols {
+            break;
+        }
+        draw_glyph(screen, col as u32, 0, ch, color);
+        col += 1;
+    }
+}
+
 fn scroll(screen: &Screen) {
     let pitch = screen.pitch as usize;
     let row_bytes = pitch * CELL_H as usize;
     let total = pitch * screen.height as usize;
-    if row_bytes == 0 || total <= row_bytes {
+    if row_bytes == 0 || total <= row_bytes * 2 {
         return;
     }
-    let mut src = row_bytes;
+    let mut src = row_bytes * 2;
     while src + 4 <= total {
         unsafe {
             let word = (screen.ptr.add(src) as *const u32).read_volatile();
@@ -684,7 +749,8 @@ fn ink(line: &[u8], bgr: bool) -> u32 {
         GREEN
     } else if has_prefix(line, b"[WARN]") {
         YELLOW
-    } else if has_prefix(line, b"[ERROR]")
+    } else if has_prefix(line, b"[FAIL]")
+        || has_prefix(line, b"[ERROR]")
         || has_prefix(line, b"!!!")
         || has_prefix(line, b"=== EXCEPTION")
         || has_prefix(line, b"elfault")
