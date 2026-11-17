@@ -146,17 +146,33 @@ flashes and then the same group forever is a fault in that stage. A
 single half-second flash, with the rainbow still up, is the firmware,
 not a stage.
 
-## HDMI network row
+## HDMI network rows
 
-The top row of the framebuffer does not scroll. It shows the GENET
-revision (raw word and decoded version; silicon major 6 is version 5),
-link up or down, speed, MAC, DHCP state (`wait`, `leased`, `timeout`,
-`static`, or `off`), the IPv4 address, and the LED label. Probe steps
-are also logged as `[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling
-region. `nic=` in the `[status]` line is a GIC interrupt count. Zero
-there does not mean the controller is missing. QEMU raspi4b has no GENET
-block, so that image prints `[FAIL] GENET revision register is not present`
-and `[WARN] No NIC`.
+The top two rows of the framebuffer do not scroll. The first shows the
+GENET revision (raw word and decoded version; silicon major 6 is version
+5), link up or down, speed, MAC, DHCP state (`wait`, `leased`, `timeout`,
+`static`, or `off`), the IPv4 address, and the LED label. The second is
+the transmit DMA: `txS` frames queued, `txC` the hardware consumer, `txP`
+the hardware producer, `d` times the ring was full, `mibT` and `mibR`
+the UniMAC TX and RX counters, then `st` (`TDMA_STATUS`),
+`ctl` (`TDMA_CTRL`), `rd` and `wr` (ring 16 read and write pointers).
+`txP` moving while `txC` and `mibT` stay 0 means the producer was written
+and the DMA engine did not take the descriptor. `ctl` bit 0 is `DMA_EN`
+and bit 17 is ring 16. `st` bit 0 set means TX DMA is still disabled.
+`d` climbing means the stack is retrying because the ring is full; the
+driver does not spin on the consumer. Probe steps are also logged as
+`[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling region. `nic=` in
+the `[status]` line is a GIC interrupt count. Zero there does not mean
+the controller is missing. QEMU raspi4b has no GENET block, so that
+image prints `[FAIL] GENET revision register is not present` and
+`[WARN] No NIC`.
+
+Pi 4 `phy-mode` is `rgmii-rxid`. The PHY adds the RX clock delay and the
+MAC adds the 2 ns TX delay (`ID_MODE_DIS` clear, `RGMII_MODE_EN` set).
+The only transmit ring is queue 16. Its descriptors are 0–31 in the
+TDMA window at GENET+`0x4000` (12 bytes each: length/status, address low,
+address high). The producer is ring offset `0x0C` and the consumer is
+`0x08`. The consumer is not written. The arbiter is round-robin.
 
 `./scripts/build.sh pi4` enables DHCP. Without that feature the image
 uses static `10.0.2.15` and does not send a discover.

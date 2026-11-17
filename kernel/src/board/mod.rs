@@ -112,6 +112,12 @@ pub trait Board {
         n
     }
 
+    /// Second HDMI row: DMA and MAC counters. Empty on boards without them.
+    fn write_nic_diag(out: &mut [u8]) -> usize {
+        let _ = out;
+        0
+    }
+
     /// This image has an HDMI process.
     fn hdmi_present() -> bool {
         false
@@ -223,6 +229,10 @@ pub fn nic_link() -> bool {
 
 pub fn write_nic_status(out: &mut [u8]) -> usize {
     <Active as Board>::write_nic_status(out)
+}
+
+pub fn write_nic_diag(out: &mut [u8]) -> usize {
+    <Active as Board>::write_nic_diag(out)
 }
 
 pub fn hdmi_present() -> bool {
