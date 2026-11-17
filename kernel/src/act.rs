@@ -34,9 +34,9 @@ const TAG_GET_CONFIG: u32 = 0x0003_0043;
 const TAG_SET_CONFIG: u32 = 0x0003_8043;
 const EXP_GPIO: u32 = 130;
 
-const ON_MS: u64 = 100;
-const OFF_MS: u64 = 100;
-const GAP_MS: u64 = 300;
+const ON_MS: u64 = 50;
+const OFF_MS: u64 = 50;
+const GAP_MS: u64 = 200;
 const FAST_MS: u64 = 40;
 
 #[repr(C, align(16))]
@@ -60,9 +60,10 @@ pub fn arm_expander() {
     EXP_ARM.store(true, Ordering::Relaxed);
 }
 
-/// `count` short flashes, then a gap. 1 is Rust, 2 is the strict map,
-/// 3 is the framebuffer, 4 is user tasks. The framebuffer is brought up
-/// before the strict map, so a healthy boot shows 1, then 3, then 2, then 4.
+/// `count` short flashes, then a gap. Assembly owns 1 through 9. Rust
+/// continues in order: 10 is `kernel_main`, 11 is the framebuffer, 12 is
+/// the strict map, 13 is user tasks. A count that then repeats is the
+/// physical fault stub, not this function.
 pub fn pattern(count: u32) {
     gpio_output();
     let mut n = 0;
