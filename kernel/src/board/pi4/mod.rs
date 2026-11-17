@@ -101,6 +101,7 @@ impl Board for Pi4 {
 
     fn service_nic() {
         genet::service_link();
+        genet::rearm_irq();
     }
 
     fn nic_link() -> bool {
@@ -120,9 +121,9 @@ impl Board for Pi4 {
         // moves. A summary that stays set after the clear is masked here.
         if id == GENET_IRQ0 || id == GENET_IRQ1 {
             let which = if id == GENET_IRQ0 { 0 } else { 1 };
-            if !genet::ack_irq(which) {
-                crate::gic::disable_id(id);
-            }
+            let _ = genet::ack_irq(which);
+            genet::note_irq_held();
+            crate::gic::disable_id(id);
             return IrqHit::Net;
         }
         if id == EMMC_IRQ {

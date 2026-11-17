@@ -154,6 +154,39 @@ pub fn switch_to_nc() {
     unlock(held);
 }
 
+/// Paint one line on row 0 without taking the console lock. A lockup may
+/// already hold that lock, or the owner may be the core that is stuck.
+/// Does not allocate and does not write the UART. A missing framebuffer
+/// is a no-op.
+pub fn emergency(text: &str) {
+    if !READY.load(Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        let screen = &mut *addr_of_mut!(SCREEN);
+        if screen.ptr.is_null() {
+            return;
+        }
+        let pitch = screen.pitch as usize;
+        let row_bytes = pitch * CELL_H as usize;
+        let mut off = 0;
+        while off + 4 <= row_bytes {
+            (screen.ptr.add(off) as *mut u32).write_volatile(0);
+            off += 4;
+        }
+        let color = if screen.bgr { 0x00FF_0000 } else { RED };
+        let cols = columns(screen);
+        let mut col = 0usize;
+        for &ch in text.as_bytes() {
+            if ch == b'\n' || ch == b'\r' || col >= cols {
+                break;
+            }
+            draw_glyph(screen, col as u32, 0, ch, color);
+            col += 1;
+        }
+    }
+}
+
 /// Replace the two pinned top rows. The log scrolls underneath them. A refused
 /// lock skips this update; the next call tries again. Does not write the UART.
 pub fn set_status(text: &str) {

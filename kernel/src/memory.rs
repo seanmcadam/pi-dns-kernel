@@ -36,6 +36,8 @@ impl BumpAllocator {
         };
 
         if alloc_end > self.heap_end {
+            #[cfg(feature = "board-pi4")]
+            crate::fb_con::emergency("LOCKUP heap");
             null_mut()
         } else {
             self.next = alloc_end;

@@ -10,8 +10,10 @@
 //! 0 or `0xffffffff` is accepted either way. The raw word is logged.
 //!
 //! The PHY is external, address 1, RGMII with the receive delay in the PHY
-//! (`rgmii-rxid`). Packet data is polled. The GIC lines are armed as well,
-//! and a stuck level is masked after one acknowledgement that does not clear.
+//! (`rgmii-rxid`). Packet data is polled. The GIC lines are armed so the
+//! status counter can move, then masked in the handler and re-armed from
+//! the poll path only while the summary is clear, so a level line cannot
+//! livelock the core.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -68,7 +70,6 @@ const DMA_EN: u32 = 1;
 const DMA_DISABLED: u32 = 1;
 const DMA_DESC_RAM_INIT_BUSY: u32 = 1 << 1;
 const DMA_RING_BUF_EN_SHIFT: u32 = 1;
-const DMA_PRIORITY_2: usize = 0x38;
 
 // GENET v4/v5 ring map. The 40-bit pointer words sit between the v3
 // indexes, and the RX names are swapped with the TX names.
@@ -89,10 +90,6 @@ const DMA_READ_PTR: usize = 0x00;
 const DMA_READ_PTR_HI: usize = 0x04;
 const DMA_WRITE_PTR: usize = 0x2c;
 const DMA_WRITE_PTR_HI: usize = 0x30;
-const DMA_ARB_CTRL: usize = 0x2c;
-/// Round-robin. Strict priority with every ring left at priority 0 never
-/// selects ring 16, so the producer increments and the consumer stays put.
-const DMA_ARBITER_RR: u32 = 0;
 
 const DMA_OWN: u32 = 0x8000;
 const DMA_EOP: u32 = 0x4000;
@@ -109,6 +106,11 @@ const DMA_RX_ERRORS: u32 =
 const DMA_BUFLENGTH_SHIFT: u32 = 16;
 const DMA_BUFLENGTH_MASK: u32 = 0x0fff;
 const DMA_MAX_BURST: u32 = 0x10;
+/// U-Boot's Pi 4 driver uses 8. TX follows that. RX keeps the Linux burst.
+const DMA_MAX_BURST_TX: u32 = 0x08;
+/// U-Boot assigns all 256 TDMA descriptors to ring 16. A 32-deep window
+/// left the consumer at 0 on this silicon.
+const TX_RING_DESCS: u32 = 256;
 
 const CMD_TX_EN: u32 = 1 << 0;
 const CMD_RX_EN: u32 = 1 << 1;
@@ -126,9 +128,6 @@ const RGMII_MODE_EN: u32 = 1 << 6;
 const ID_MODE_DIS: u32 = 1 << 16;
 const RBUF_64B_EN: u32 = 1 << 0;
 const RBUF_ALIGN_2B: u32 = 1 << 1;
-const TBUF_CTRL: usize = 0x600;
-const TBUF_64B_EN: u32 = 1 << 0;
-const TBUF_BP_MC: usize = 0x60c;
 /// UniMAC MIB block, offsets from the GENET base. RX good packets, RX FCS
 /// errors, and TX packets. These count frames the MAC accepted, which is
 /// independent of the DMA rings.
@@ -193,7 +192,6 @@ static RX_INDEX: AtomicU32 = AtomicU32::new(0);
 static RX_CONS: AtomicU32 = AtomicU32::new(0);
 static RX_ERR: AtomicU32 = AtomicU32::new(0);
 static TX_PROD: AtomicU32 = AtomicU32::new(0);
-static TX_SLOT: AtomicU32 = AtomicU32::new(0);
 static TX_DROP: AtomicU32 = AtomicU32::new(0);
 static LAST_BMSR: AtomicU32 = AtomicU32::new(0);
 static LAST_LPA: AtomicU32 = AtomicU32::new(0);
@@ -303,6 +301,12 @@ pub fn write_diag(out: &mut [u8]) -> usize {
     line.dec(read(TDMA_RING + DMA_READ_PTR));
     line.push(" wr=");
     line.dec(read(TDMA_RING + DMA_WRITE_PTR));
+    line.push(" e=");
+    line.hex32(read(TDMA_RING + DMA_END_ADDR));
+    line.push(" z=");
+    line.hex32(read(TDMA_RING + DMA_RING_BUF_SIZE_REG));
+    line.push(" d0=");
+    line.hex32(read(GENET_TX_OFF + DESC_LENGTH_STATUS));
     line.n
 }
 
@@ -454,7 +458,7 @@ impl GenetDevice {
 
         PRESENT.store(true, Ordering::Relaxed);
         service_link();
-        say("[OK] GENET v5 TX ring 16 at descriptor 0, producer follows consumer");
+        say("[OK] GENET v5 TX ring 16, 256 descriptors, producer follows consumer");
 
         Some(Self { mac })
     }
@@ -469,7 +473,8 @@ impl GenetDevice {
             return;
         }
         let prod = TX_PROD.load(Ordering::Relaxed);
-        let slot = TX_SLOT.load(Ordering::Relaxed) as usize % DESC_COUNT;
+        let desc_index = prod as usize % TX_RING_DESCS as usize;
+        let slot = prod as usize % DESC_COUNT;
         let mut n = frame.len().min(BUF_LEN);
         if n < 60 {
             n = 60;
@@ -483,7 +488,7 @@ impl GenetDevice {
             }
             clean_poc(buf.as_ptr(), n);
             let addr = crate::addr::virt_to_phys(buf.as_ptr() as u64);
-            let desc = GENET_TX_OFF + slot * DMA_DESC_SIZE;
+            let desc = GENET_TX_OFF + desc_index * DMA_DESC_SIZE;
             write(desc + DESC_ADDRESS_LO, addr as u32);
             write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
             let status = ((n as u32) << DMA_BUFLENGTH_SHIFT)
@@ -496,7 +501,13 @@ impl GenetDevice {
         }
         let next = prod.wrapping_add(1) & 0xffff;
         TX_PROD.store(next, Ordering::Relaxed);
-        TX_SLOT.store((slot as u32 + 1) % DESC_COUNT as u32, Ordering::Relaxed);
+        // The hardware does not advance TDMA_WRITE_PTR from the producer
+        // index. A read pointer and a write pointer that both stay 0 is an
+        // empty ring, so the consumer never moves. The write pointer is the
+        // word index of the next free descriptor.
+        let write_ptr = (next % TX_RING_DESCS) * WORDS_PER_BD;
+        barrier();
+        write(TDMA_RING + DMA_WRITE_PTR, write_ptr);
         barrier();
         write(TDMA_RING + TDMA_PROD_INDEX, next);
         TX_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -516,7 +527,6 @@ fn align_tx_prod() {
     let cons = read(TDMA_RING + TDMA_CONS_INDEX) & 0xffff;
     write(TDMA_RING + TDMA_PROD_INDEX, cons);
     TX_PROD.store(cons, Ordering::Relaxed);
-    TX_SLOT.store(cons % DESC_COUNT as u32, Ordering::Relaxed);
 }
 
 fn genet_version(rev: u32) -> u32 {
@@ -615,12 +625,8 @@ fn umac_reset() {
     rbuf &= !RBUF_64B_EN;
     rbuf |= RBUF_ALIGN_2B;
     write(RBUF_CTRL, rbuf);
-    let mut tbuf = read(TBUF_CTRL);
-    tbuf &= !TBUF_64B_EN;
-    write(TBUF_CTRL, tbuf);
-    write(TBUF_BP_MC, 0);
     write(RBUF_TBUF_SIZE_CTRL, 1);
-    say("[OK] GENET RBUF align 2, TBUF status and backpressure off");
+    say("[OK] GENET RBUF align 2, TBUF left as reset");
 }
 
 fn disable_dma() {
@@ -695,27 +701,30 @@ fn init_rx_ring() {
 
 fn init_tx_ring() {
     wait_desc_ram(TDMA_REG_BASE);
-    let end = DESC_COUNT as u32 * WORDS_PER_BD - 1;
-    write(TDMA_REG_BASE + DMA_SCB_BURST_SIZE, DMA_MAX_BURST);
-    write(TDMA_REG_BASE + DMA_ARB_CTRL, DMA_ARBITER_RR);
-    write(TDMA_REG_BASE + DMA_PRIORITY_2, 4 << 20);
+    // U-Boot's Pi 4 driver: one ring, descriptors 0..255, no high pointer
+    // words, no arbiter write. END is the last word (256 * 3 - 1). The
+    // size field is the descriptor count in the high half and the buffer
+    // length in the low half. START, READ, END, and the consumer are
+    // write-once after a BCM2711 reset, so the value that reads back is
+    // the one the engine will use.
+    let end = TX_RING_DESCS * WORDS_PER_BD - 1;
+    let size = (TX_RING_DESCS << 16) | BUF_LEN as u32;
+    write(TDMA_REG_BASE + DMA_SCB_BURST_SIZE, DMA_MAX_BURST_TX);
     write(TDMA_RING + DMA_START_ADDR, 0);
-    write(TDMA_RING + DMA_START_ADDR_HI, 0);
     write(TDMA_RING + DMA_READ_PTR, 0);
-    write(TDMA_RING + DMA_READ_PTR_HI, 0);
     write(TDMA_RING + DMA_WRITE_PTR, 0);
-    write(TDMA_RING + DMA_WRITE_PTR_HI, 0);
     write(TDMA_RING + DMA_END_ADDR, end);
-    write(TDMA_RING + DMA_END_ADDR_HI, 0);
     write(TDMA_RING + DMA_MBUF_DONE_THRESH, 1);
     write(TDMA_RING + DMA_FLOW_PERIOD, 0);
-    write(
-        TDMA_RING + DMA_RING_BUF_SIZE_REG,
-        ((DESC_COUNT as u32) << 16) | BUF_LEN as u32,
-    );
+    write(TDMA_RING + DMA_RING_BUF_SIZE_REG, size);
     align_tx_prod();
     write(TDMA_REG_BASE + DMA_RING_CFG, 1 << DEFAULT_Q);
-    say("[OK] GENET TDMA arbiter round-robin, descriptors at 0");
+    let got_end = read(TDMA_RING + DMA_END_ADDR);
+    let got_size = read(TDMA_RING + DMA_RING_BUF_SIZE_REG);
+    if got_end != end || got_size != size {
+        say("[WARN] GENET TDMA ring end or size did not stick");
+    }
+    say("[OK] GENET TDMA ring 16 uses 256 descriptors from 0");
 }
 
 fn wait_desc_ram(base: usize) {
@@ -746,6 +755,32 @@ fn program_irqs() {
     crate::gic::arm_spi(GENET_IRQ0, 0x80, 1);
     crate::gic::arm_spi(GENET_IRQ1, 0x80, 1);
     say("[OK] GENET IRQ armed, data path is polled");
+}
+
+static IRQ_HELD: AtomicBool = AtomicBool::new(false);
+
+/// The handler masks the GIC line. Re-arm it only after the summary has
+/// gone quiet, so a level source cannot re-enter before the poll path runs.
+pub fn note_irq_held() {
+    IRQ_HELD.store(true, Ordering::Relaxed);
+}
+
+pub fn rearm_irq() {
+    if !PRESENT.load(Ordering::Relaxed) || !IRQ_HELD.load(Ordering::Relaxed) {
+        return;
+    }
+    if irq_pending(INTRL2_0) || irq_pending(INTRL2_1) {
+        return;
+    }
+    crate::gic::enable_id(GENET_IRQ0);
+    crate::gic::enable_id(GENET_IRQ1);
+    IRQ_HELD.store(false, Ordering::Relaxed);
+}
+
+fn irq_pending(base: usize) -> bool {
+    let stat = read(base + INTRL2_STAT);
+    let mask = read(base + INTRL2_MASK_STATUS);
+    stat & !mask != 0
 }
 
 /// Clear the GENET interrupt summary. `false` means the line stayed
