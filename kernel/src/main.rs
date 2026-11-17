@@ -245,6 +245,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         supervisor::tick();
 
         let now = timer::millis();
+        #[cfg(feature = "board-pi4")]
+        act::heartbeat_poll(now);
         if now >= next_status {
             next_status = now + 2000;
             let (rx, tx) = net::packet_counts();

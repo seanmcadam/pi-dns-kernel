@@ -617,16 +617,10 @@ bad_el:
     mov     x0, x20
     bl      kernel_main
 
-    // kernel_main does not return. If it does, keep showing stage 10 so the
-    // LED does not go dark. Virt has nothing to blink and waits.
-5:
-    cbz     x22, 14f
+    // kernel_main does not return. If it does, repeat stage 10 with the
+    // fault prefix. Virt has nothing to blink and fault_blink waits.
     mov     x21, #10
-    bl      mark
-    b       5b
-14:
-    wfe
-    b       14b
+    b       fault_blink
 
 // x0 = level-0 table, x1 = level-1 table.
 // x2 = RAM block descriptor, x3 = its level-1 index.
@@ -884,12 +878,11 @@ gpio_out_wc:
     str     w2, [x1]
     ret
 
-// Blink x21 short flashes, then a gap. x22 == 0 returns at once. x29 holds
-// the return address. On, off, and the gap all pass the same shift to
-// delay_shift. A shift of 4 is about 60 ms at 54 MHz. The function-select
-// register is written once (x18), because repeating that read is what sits
-// between stage 1 and stage 2. Leaves called from here do not write
-// x18-x29.
+// Blink x21 flashes, then a gap. x22 == 0 returns at once. x29 holds the
+// return address. A shift of 2 is 250 ms and a shift of 1 is 500 ms, so
+// three of those are the 1.5 s gap. The function-select register is written
+// once (x18). Leaves called from here do not write x18-x29. The pin is left
+// on, so a hang in the stage that follows stays lit instead of going dark.
 mark:
     cbz     x22, mark_ret
     mov     x29, x30
@@ -901,55 +894,64 @@ mark_ready:
 mark_pulse:
     cbz     x23, mark_gap
     bl      gpio42_on
-    mov     x0, #4
+    mov     x0, #2
     bl      delay_shift
     bl      gpio42_off
-    mov     x0, #4
+    mov     x0, #2
     bl      delay_shift
     sub     x23, x23, #1
     b       mark_pulse
 mark_gap:
-    mov     x0, #4
+    mov     x0, #1
     bl      delay_shift
+    mov     x0, #1
+    bl      delay_shift
+    mov     x0, #1
+    bl      delay_shift
+    bl      gpio42_on
     mov     x30, x29
 mark_ret:
     ret
 
-// Physical vector target. No stack. A Pi 4 fast-blinks eight times so a
-// fault is obvious, then repeats x21 forever so the stage can be counted.
-// x21 == 0 stays on the fast pattern. Any other board waits.
+// Physical vector target. No stack. Three rapid flashes, then x21 at the
+// slow rate, forever. x21 == 0 repeats only the rapid three. The pin is
+// never left off at the end of the loop. Any other board waits.
 fault_blink:
     cbz     x22, fault_park
-    cbnz    x18, fault_fast
+    cbnz    x18, fault_rapid
     bl      gpio42_output
     mov     x18, #1
-fault_fast:
-    mov     x23, #8
-fault_fast_one:
+fault_rapid:
+    mov     x23, #3
+fault_rapid_one:
     bl      gpio42_on
-    mov     x0, #6
+    mov     x0, #4
     bl      delay_shift
     bl      gpio42_off
-    mov     x0, #6
+    mov     x0, #4
     bl      delay_shift
     subs    x23, x23, #1
-    b.ne    fault_fast_one
-    cbz     x21, fault_fast
+    b.ne    fault_rapid_one
+    cbz     x21, fault_rapid
     mov     x23, x21
 fault_count:
     cbz     x23, fault_count_gap
     bl      gpio42_on
-    mov     x0, #4
+    mov     x0, #2
     bl      delay_shift
     bl      gpio42_off
-    mov     x0, #4
+    mov     x0, #2
     bl      delay_shift
     sub     x23, x23, #1
     b       fault_count
 fault_count_gap:
-    mov     x0, #3
+    mov     x0, #1
     bl      delay_shift
-    b       fault_fast
+    mov     x0, #1
+    bl      delay_shift
+    mov     x0, #1
+    bl      delay_shift
+    b       fault_rapid
 fault_park:
     wfe
     b       fault_park

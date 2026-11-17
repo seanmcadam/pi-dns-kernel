@@ -25,9 +25,11 @@ trio, the same diagnostic did start: after the firmware's solid LED
 there was a quick blink, GPIO 42 stayed solid on, and HDMI went from
 the rainbow to no signal. That image asked for a 640x480 framebuffer
 and sent a blank tag before it cleared the pin. The diagnostic now
-toggles GPIO 42 from `CNTPCT_EL0` before any mailbox call, then asks
-for the firmware's current mode, or 1280x720, with no blank tag, and
-fills that panel red. A rainbow that stays, with no toggle, still means
+toggles GPIO 42 from `CNTPCT_EL0` before any mailbox call, then
+allocates the firmware's current framebuffer without setting a new
+mode. Setting that same size is the fallback. There is no blank tag.
+1280x720 is used only when the firmware reports no size. The panel is
+filled red. A rainbow that stays, with no toggle, still means
 the firmware did not enter the file. The diagnostic build is in
 `boot/pi4-blinktest/README.md`.
 
@@ -47,10 +49,10 @@ finished. GPIO 42 itself does not use the mailbox, and its delay is
 `CNTPCT_EL0`, so a stuck property channel cannot hold the green LED on.
 
 Assembly owns the early counts. It talks only to GPIO 42. Each stage is
-a group of short flashes (about 60 ms on, 60 ms off) and then the same
-60 ms again as the gap. On, off, and the gap share one delay, so a pause
-between stages is not a different timer path. The group is the stage
-that is about to run. Virt and Pi 5 do not touch the pin.
+N flashes of 250 ms on and 250 ms off, then a 1.5 s gap. The on and off
+times are `CNTFRQ >> 2`. The gap is three `CNTFRQ >> 1` waits. The group
+is the stage that is about to run. The pin is left on while that stage
+runs, so a hang there stays lit. Virt and Pi 5 do not touch the pin.
 
 Core 0 points the current stack and `SP_EL1` at `__stack_top` before the
 first call. The delay reads `CNTPCT_EL0` and subtracts. A `CNTFRQ_EL0` of
@@ -69,25 +71,28 @@ take the virt cache walk and does not skip the LED.
 `VBAR_EL1` and `VBAR_EL2` point at a physical vector table before the
 cache invalidate returns and before the MMU is enabled. A fault in that
 window used to hang with the LED already off, because the reset vector
-is not a blink. The stub flashes quickly eight times, then repeats the
-stage number for as long as the core sits there. A stage of 0 stays on
-the fast flash. That repeat is the end state of a fault: it does not
-advance, so the number can be counted after the fact.
+is not a blink. The stub flashes three times quickly, then repeats the
+stage number at the slow rate, forever. A stage of 0 repeats only the
+three rapid flashes. The loop never finishes on an off period. A panic
+or a hang after the virtual timer is armed uses the same shape, with
+the last stage Rust recorded. That repeat does not advance, so the
+number can be counted after the fact.
 
 ## Blink codes
 
-Count the flashes in a group. A healthy boot walks 1 through 14 in
-order, then the LED goes dark while the server runs. The framebuffer is
-programmed before the strict page tables, so 12 comes before 13.
+Count the flashes in a group. A flash is about a quarter of a second,
+and the gap before the next group is about a second and a half. A
+healthy boot walks 1 through 14 in order, then one quarter-second flash
+repeats with that same gap. That heartbeat means the idle loop is
+running. The framebuffer is programmed before the strict page tables,
+so 12 comes before 13.
 
 This image does not issue a set/way op to L2. Stage 1 only reads the L1
 geometry, and that read happens after the one-flash announcement. The
-previous image still went dark after that one flash, with no fast
-flashes, so the hang was not the L2 walk. The blink and the delay are
-leaves, the pin is programmed once, and a stuck counter cannot sit in
-the gap forever. The counts are unchanged.
+blink and the delay are leaves, the pin is programmed once, and a stuck
+counter cannot sit in the gap forever. The counts are unchanged.
 
-| Count | What is about to run | If this count repeats after eight fast flashes |
+| Count | What is about to run | If three rapid flashes, then this count, repeat |
 | --- | --- | --- |
 | 1 | Read the L1 data-cache geometry. Physical vectors are already installed. No set/way op yet | Fault in that register read |
 | 2 | Clean and invalidate L1 data only, then the instruction cache. L2 is not walked | Fault in the L1 loop |
@@ -99,20 +104,34 @@ the gap forever. The counts are unchanged.
 | 8 | Jump to the high address | MMU is on. Fault is in the jump |
 | 9 | Install the high vector base and drop the identity map | High fetch worked. Fault is in that blink |
 | 10 | Call `kernel_main` | Identity map is gone. The next fault uses the high vectors |
-| 11 | Rust entered `kernel_main` | High vectors: fast blink, no counted repeat |
-| 12 | HDMI framebuffer programmed | Rainbow should already be gone |
+| 11 | Rust entered `kernel_main` | High vectors. The rapid three, then the last count Rust stored |
+| 12 | HDMI framebuffer programmed | Rainbow should already be gone, or the link stayed up |
 | 13 | Strict kernel page tables installed | |
-| 14 | Scheduler and user tasks started | |
-| Fast, continuous | Panic or a fault after the high vectors are in | The physical stub is no longer installed |
+| 14 | Scheduler and user tasks started | After this group the heartbeat replaces the count |
+| Heartbeat | One 250 ms flash, 1.5 s off, repeating | The idle loop is running |
+| Rapid three, forever | Fault before a count was stored | |
 
-A group that plays once, then the next group, is progress. A group that
-plays once and is followed by eight fast flashes and then the same group
-forever is a fault in that stage. A group that plays once and then the
-LED stays dark, with no fast flashes, is a hang that did not take an
-exception (the core is stuck in that stage, not in the vector stub).
-After 14, dark is the idle loop. A short group that plays once and then
-stays dark means the core stopped in that stage. A single half-second
-flash, with the rainbow still up, is not that group.
+On `413ef6d` the board showed stage flashing, then a faster stretch,
+then the LED went out. That image used 50–60 ms flashes, so stages
+11–14 look like one fast run, and `pattern` ended by clearing GPIO 42.
+The idle loop never set the pin again. UART setup writes `GPFSEL1`
+(GPIO 14 and 15), not `GPFSEL4`. The expander mailbox drives pin 130
+only, and only after the framebuffer call. Nothing in the dashboard or
+the idle loop turns GPIO 42 off. Dark after the fast stretch was the
+designed end of stage 14, or a hang that started while the pin was
+already clear. A fault in the physical stub would have kept repeating.
+Panic was a 40 ms blink that also did not stop. Off now means the
+indicator itself stopped: the core is not in the idle loop, not in a
+fault loop, and not in a stage that left the pin on. After the virtual
+timer is armed, 60 s without a blink or a stage wait starts the fault
+pattern instead of staying dark. A hang with interrupts masked, before
+that timer, stays in whatever state the last stage left (lit, while
+that stage is running).
+
+A group that plays once, then the next group, is progress. Three rapid
+flashes and then the same group forever is a fault in that stage. A
+single half-second flash, with the rainbow still up, is the firmware,
+not a stage.
 
 ## Files on the card
 

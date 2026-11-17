@@ -20,10 +20,10 @@ number of polls.
 2. Configures firmware GPIO expander pin 130 once (`SET_GPIO_CONFIG`,
    `0x00038043`). A refused call does not stop the blink.
 3. Reads the current physical display size (`GET_PHYSICAL_DISPLAY`,
-   `0x00040003`). A size outside 320x240 through 3840x2160 becomes
-   1280x720. It then sets that size, 32-bit depth, RGB order, offset
-   0,0, allocates the buffer, and reads the pitch. There is no blank
-   tag and no forced 640x480 mode. The bus pointer is masked with
+   `0x00040003`). When that size is sane it allocates the buffer the
+   firmware is already scanning, with no set-size tags and no blank
+   tag. Setting that same size is the fallback. 1280x720 is used only
+   when the firmware reports no size. The bus pointer is masked with
    `0x3FFFFFFF`. A pointer outside RAM is ignored. The panel is filled
    solid red (`0x000000FF`, or `0x00FF0000` if the firmware answers
    BGR). Each mailbox wait gives up after `1<<24` polls.

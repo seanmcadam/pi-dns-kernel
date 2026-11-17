@@ -185,11 +185,18 @@ exp_state_fill:
     ret
 
 // Read the current physical size, then paint that panel solid red.
-// A missing or absurd size becomes 1280x720. Failure returns, and the
-// LED loop keeps running. w22 and w23 are the width and height.
+// The first request does not set a size: it allocates the buffer the
+// firmware is already scanning. Setting that same size is the fallback.
+// 1280x720 is used only when the firmware reports no size. Failure
+// returns, and the LED loop keeps running. w22 and w23 are the width
+// and height.
 screen_red:
     mov     x29, x30
     bl      get_mode
+    cbz     w24, screen_set
+    bl      screen_keep
+    cbnz    w0, screen_ret
+screen_set:
     adr     x0, fb_work
     adr     x1, fb_template
     mov     x2, #140
@@ -284,8 +291,71 @@ screen_ret:
     mov     x30, x29
     ret
 
+// Allocate the firmware's current buffer. No set-size and no blank tag.
+// w0 is 1 when the panel was filled. w22 and w23 stay the width and height.
+screen_keep:
+    mov     x28, x30
+    adr     x0, fb_work
+    adr     x1, fb_keep
+    mov     x2, #100
+    bl      copy_bytes
+    adr     x0, fb_work
+    mov     x1, #100
+    mov     x2, #1
+    bl      mbox_call
+    cbnz    w0, keep_have
+    adr     x0, fb_work
+    adr     x1, fb_keep
+    mov     x2, #100
+    bl      copy_bytes
+    adr     x0, fb_work
+    mov     x1, #100
+    mov     x2, #0
+    bl      mbox_call
+    cbz     w0, keep_fail
+keep_have:
+    adr     x21, fb_work
+    ldr     w4, [x21, #76]
+    cmp     w4, #32
+    b.ne    keep_fail
+    ldr     w0, [x21, #40]
+    movz    w1, #0xffff
+    movk    w1, #0x3fff, lsl #16
+    and     w0, w0, w1
+    cbz     w0, keep_fail
+    cmp     w0, #0x10000
+    b.lo    keep_fail
+    movz    w1, #0xFC00, lsl #16
+    cmp     w0, w1
+    b.hs    keep_fail
+    ldr     w3, [x21, #60]
+    lsl     w4, w22, #2
+    cmp     w3, w4
+    b.lo    keep_fail
+    umull   x1, w3, w23
+    movz    x5, #0x80, lsl #16
+    cmp     x1, x5
+    b.hi    keep_fail
+    movz    x6, #0xFC00, lsl #16
+    adds    x7, x0, x1
+    b.cs    keep_fail
+    cmp     x7, x6
+    b.hi    keep_fail
+    ldr     w2, [x21, #92]
+    movz    w3, #0x00FF
+    cbnz    w2, keep_paint
+    movz    w3, #0x0000
+    movk    w3, #0x00FF, lsl #16
+keep_paint:
+    b       screen_fill
+keep_fail:
+    mov     w0, #0
+    mov     x30, x28
+    ret
+
 // w22 width, w23 height. GET_PHYSICAL_DISPLAY uses tag 0x00040003.
 // Width is accepted from 320 to 3840, height from 240 to 2160.
+// A rejected read becomes 1280x720 for the set-size fallback only.
 get_mode:
     mov     x28, x30
     bl      fill_get
@@ -312,10 +382,12 @@ get_read:
     b.lo    get_default
     cmp     w23, #2160
     b.hi    get_default
+    mov     w24, #1
     b       get_ret
 get_default:
     mov     w22, #1280
     mov     w23, #720
+    mov     w24, #0
 get_ret:
     mov     x30, x28
     ret
@@ -411,6 +483,34 @@ mbox_code:
 mbox_fail:
     mov     w0, #0
     ret
+
+    .balign 16
+fb_keep:
+    .word   100
+    .word   0
+    .word   0x00048009
+    .word   8
+    .word   0
+    .word   0
+    .word   0
+    .word   0x00040001
+    .word   8
+    .word   0
+    .word   4096
+    .word   0
+    .word   0x00040008
+    .word   4
+    .word   0
+    .word   0
+    .word   0x00040005
+    .word   4
+    .word   0
+    .word   0
+    .word   0x00040006
+    .word   4
+    .word   0
+    .word   0
+    .word   0
 
     .balign 16
 fb_template:

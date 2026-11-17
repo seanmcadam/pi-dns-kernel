@@ -27,6 +27,8 @@ pub fn irq_counts() -> (u64, u64) {
 pub fn init() {
     crate::gic::init();
     crate::timer::arm();
+    #[cfg(feature = "board-pi4")]
+    crate::act::arm_watch();
     log::info!(
         "GICv2 virtual timer irq {} at {} Hz",
         crate::gic::TIMER_IRQ,
