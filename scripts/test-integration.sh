@@ -2006,8 +2006,10 @@ EOF
     # The guest stays up and reprints status, so this budget ends the
     # process. Exit 124 is that stop. A boot that already printed every
     # expected line is a pass. A missing line or a kernel panic is not.
+    # Stages 1 through 13 are 250 ms flashes with a 1.5 s gap, so the
+    # serial lines land well after the old 45 s budget.
     RASPI_STOP=0
-    timeout 45 qemu-system-aarch64 \
+    timeout 180 qemu-system-aarch64 \
         -M raspi4b \
         -smp 4 \
         -kernel boot/pi4/kernel8.img \

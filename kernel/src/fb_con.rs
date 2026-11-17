@@ -41,7 +41,9 @@ const TAG_SET_ORDER: u32 = 0x0004_8006;
 const TAG_SET_OFFSET: u32 = 0x0004_8009;
 const TAG_ALLOC: u32 = 0x0004_0001;
 const TAG_PITCH: u32 = 0x0004_0008;
-const TAG_BLANK: u32 = 0x0004_0002;
+const TAG_GET_PHYS: u32 = 0x0004_0003;
+const TAG_GET_DEPTH: u32 = 0x0004_0005;
+const TAG_GET_ORDER: u32 = 0x0004_0006;
 
 const EARLY_CAP: usize = 2048;
 const LINE_CAP: usize = 240;
@@ -162,12 +164,22 @@ pub fn push(text: &str) {
 }
 
 fn bring_up() -> bool {
-    // 1280x720 is the request. A firmware that substitutes another size is
-    // accepted. A refused call is tried again at 640x480.
-    if let Some(mode) = allocate(1280, 720) {
-        return finish(mode);
+    // The firmware already chose a mode for the rainbow. With the dtb
+    // loaded and no vc4-kms overlay, that scanout is the one to keep.
+    // Setting another size, or the blank tag, made this board drop HDMI
+    // to no signal. Take the existing buffer first. Set the same size
+    // only when the firmware will not hand that buffer over. 1280x720 is
+    // used only when the firmware reports no current mode.
+    if let Some((w, h)) = current_size() {
+        if let Some(mode) = keep_mode(w, h) {
+            return finish(mode);
+        }
+        if let Some(mode) = allocate(w, h) {
+            return finish(mode);
+        }
+        return false;
     }
-    if let Some(mode) = allocate(640, 480) {
+    if let Some(mode) = allocate(1280, 720) {
         return finish(mode);
     }
     false
@@ -256,6 +268,83 @@ fn fb_reachable(pa: u64, bytes: u64) -> bool {
     true
 }
 
+fn current_size() -> Option<(u32, u32)> {
+    if let Some(size) = current_size_at(true) {
+        return Some(size);
+    }
+    current_size_at(false)
+}
+
+fn current_size_at(bus_alias: bool) -> Option<(u32, u32)> {
+    let mut msg = [0u32; 8];
+    msg[0] = 32;
+    msg[2] = TAG_GET_PHYS;
+    msg[3] = 8;
+    if !exchange(&mut msg, bus_alias) || msg[1] != REQ_OK {
+        return None;
+    }
+    let width = msg[5];
+    let height = msg[6];
+    if (320..=3840).contains(&width) && (240..=2160).contains(&height) {
+        Some((width, height))
+    } else {
+        None
+    }
+}
+
+fn keep_mode(width: u32, height: u32) -> Option<Mode> {
+    if let Some(mode) = keep_mode_at(width, height, true) {
+        return Some(mode);
+    }
+    keep_mode_at(width, height, false)
+}
+
+fn keep_mode_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
+    let mut msg = [0u32; 40];
+    let mut n = 1usize;
+    msg[n] = 0;
+    n += 1;
+    n = tag2(&mut msg, n, TAG_SET_OFFSET, 0, 0);
+    let alloc_at = n;
+    n = tag2(&mut msg, n, TAG_ALLOC, 4096, 0);
+    let pitch_at = n;
+    n = tag1(&mut msg, n, TAG_PITCH, 0);
+    let depth_at = n;
+    n = tag1(&mut msg, n, TAG_GET_DEPTH, 0);
+    let order_at = n;
+    n = tag1(&mut msg, n, TAG_GET_ORDER, 0);
+    msg[n] = 0;
+    n += 1;
+    msg[0] = (n * 4) as u32;
+    if !exchange(&mut msg[..n], bus_alias) || msg[1] != REQ_OK {
+        return None;
+    }
+    let depth = msg[depth_at + 3];
+    let order = msg[order_at + 3];
+    let bus = msg[alloc_at + 3];
+    let gpu_bytes = msg[alloc_at + 4] as u64;
+    let pitch = msg[pitch_at + 3];
+    if depth != 32 || width < CELL_W || pitch < width.saturating_mul(4) || bus == 0 {
+        return None;
+    }
+    let bytes = (pitch as u64).checked_mul(height as u64)?;
+    if gpu_bytes < bytes {
+        return None;
+    }
+    let pa = (bus & 0x3FFF_FFFF) as u64;
+    if pa % 4096 != 0 {
+        return None;
+    }
+    Some(Mode {
+        width,
+        height,
+        pitch,
+        pa,
+        bytes,
+        bgr: order == 0,
+    })
+}
+
 fn allocate(width: u32, height: u32) -> Option<Mode> {
     if let Some(mode) = allocate_at(width, height, true) {
         return Some(mode);
@@ -277,7 +366,6 @@ fn allocate_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
     n = tag2(&mut msg, n, TAG_ALLOC, 4096, 0);
     let pitch_at = n;
     n = tag1(&mut msg, n, TAG_PITCH, 0);
-    n = tag1(&mut msg, n, TAG_BLANK, 0);
     msg[n] = 0;
     n += 1;
     msg[0] = (n * 4) as u32;

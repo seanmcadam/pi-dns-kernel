@@ -65,6 +65,8 @@ pub fn on_tick() {
     // and uses it for preemption. Adding all four would report 400 Hz.
     if crate::percpu::id() == 0 {
         TICKS.fetch_add(steps, Ordering::Relaxed);
+        #[cfg(feature = "board-pi4")]
+        crate::act::check_hang();
     }
 }
 

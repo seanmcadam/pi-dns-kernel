@@ -7,6 +7,7 @@ qemu/*.img
 qemu/*.pcap
 boot/pi4/*.img
 boot/pi4-blinktest/*.img
+boot/pi4/card/
 boot/pi5/*.img
 
 # IDE

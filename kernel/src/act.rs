@@ -5,9 +5,10 @@
 //! pin 2 is mailbox GPIO 130 (128+2) and is the red power LED on that tree
 //! (`PWR_LED_OFF`, active low). Older write-ups call pin 130 the activity
 //! LED. Both are driven with the same pulse count. GPIO 42 is the one that
-//! lights the green LED on current boards. The mailbox path is best-effort
-//! and is abandoned after one timed-out or refused call, so a missing
-//! expander cannot stall boot.
+//! lights the green LED on current boards. The mailbox path is best-effort.
+//! Each call tries the `0xC0000000` bus alias and then the raw physical
+//! address. A timed-out or refused pair is abandoned, so a missing expander
+//! cannot stall boot.
 //!
 //! Counted pulses use the architectural counter. A counter that does not
 //! advance hits a spin budget and returns. The panic pattern does not touch
@@ -34,10 +35,12 @@ const TAG_GET_CONFIG: u32 = 0x0003_0043;
 const TAG_SET_CONFIG: u32 = 0x0003_8043;
 const EXP_GPIO: u32 = 130;
 
-const ON_MS: u64 = 50;
-const OFF_MS: u64 = 50;
-const GAP_MS: u64 = 200;
-const FAST_MS: u64 = 40;
+const ON_MS: u64 = 250;
+const OFF_MS: u64 = 250;
+const GAP_MS: u64 = 1500;
+const RAPID_MS: u64 = 60;
+/// Silent time after the timer is armed before a stuck core is shown.
+const HANG_MS: u64 = 60_000;
 
 #[repr(C, align(16))]
 struct Msg {
@@ -49,6 +52,12 @@ static mut LED_MSG: Msg = Msg { words: [0; 16] };
 
 static MBOX_DEAD: AtomicBool = AtomicBool::new(false);
 static MBOX_READY: AtomicBool = AtomicBool::new(false);
+static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PROGRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WATCH: AtomicBool = AtomicBool::new(false);
+static SHOWING: AtomicBool = AtomicBool::new(false);
+static BEAT_ON: AtomicBool = AtomicBool::new(false);
+static BEAT_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The expander shares the property mailbox with the framebuffer. It stays
 /// quiet until the framebuffer transaction has finished.
 static EXP_ARM: AtomicBool = AtomicBool::new(false);
@@ -60,11 +69,14 @@ pub fn arm_expander() {
     EXP_ARM.store(true, Ordering::Relaxed);
 }
 
-/// `count` short flashes, then a gap. Assembly owns 1 through 10. Rust
-/// continues in order: 11 is `kernel_main`, 12 is the framebuffer, 13 is
-/// the strict map, 14 is user tasks. A count that then repeats is the
-/// physical fault stub, not this function.
+/// `count` flashes of 250 ms on and 250 ms off, then a 1.5 s gap. Assembly
+/// owns 1 through 10. Rust continues in order: 11 is `kernel_main`, 12 is
+/// the framebuffer, 13 is the strict map, 14 is user tasks. The pin is left
+/// on so the work that follows is not a dark gap. The count is remembered
+/// for a later fault.
 pub fn pattern(count: u32) {
+    LAST.store(count, Ordering::Relaxed);
+    note();
     gpio_output();
     let mut n = 0;
     while n < count {
@@ -77,18 +89,81 @@ pub fn pattern(count: u32) {
     if count > 0 {
         wait_ms(GAP_MS);
     }
+    gpio_set(true);
 }
 
-/// Fast continuous blink. Does not return. Mailbox is not used.
-pub fn halt_blink() -> ! {
-    gpio_output();
-    gpio_set(false);
-    loop {
-        gpio_set(true);
-        wait_ms(FAST_MS);
-        gpio_set(false);
-        wait_ms(FAST_MS);
+/// One 250 ms flash and a 1.5 s pause, repeating from the idle loop.
+/// GPIO 42 only. The expander mailbox is not used here.
+pub fn heartbeat_poll(now: u64) {
+    note_at(now);
+    if now < BEAT_NEXT.load(Ordering::Relaxed) {
+        return;
     }
+    gpio_output();
+    let on = !BEAT_ON.load(Ordering::Relaxed);
+    BEAT_ON.store(on, Ordering::Relaxed);
+    gpio_set(on);
+    let step = if on { ON_MS } else { GAP_MS };
+    BEAT_NEXT.store(now.saturating_add(step), Ordering::Relaxed);
+}
+
+/// Start the hang check. Call once the virtual timer is armed.
+pub fn arm_watch() {
+    note();
+    WATCH.store(true, Ordering::Relaxed);
+}
+
+/// Timer tick. A core that has not touched the indicator for `HANG_MS`
+/// shows the fault pattern and does not return.
+pub fn check_hang() {
+    if SHOWING.load(Ordering::Relaxed) || !WATCH.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = crate::timer::millis();
+    if now.saturating_sub(PROGRESS.load(Ordering::Relaxed)) > HANG_MS {
+        show_fault();
+    }
+}
+
+/// Three rapid flashes, then the last stage at the slow rate, forever.
+/// Does not return and does not use the mailbox. A stage of 0 repeats
+/// only the rapid three, so the pin still cycles.
+pub fn halt_blink() -> ! {
+    show_fault();
+}
+
+fn show_fault() -> ! {
+    SHOWING.store(true, Ordering::Relaxed);
+    crate::interrupts::mask();
+    let count = LAST.load(Ordering::Relaxed);
+    gpio_output();
+    loop {
+        let mut n = 0;
+        while n < 3 {
+            gpio_set(true);
+            wait_ms(RAPID_MS);
+            gpio_set(false);
+            wait_ms(RAPID_MS);
+            n += 1;
+        }
+        let mut n = 0;
+        while n < count {
+            gpio_set(true);
+            wait_ms(ON_MS);
+            gpio_set(false);
+            wait_ms(OFF_MS);
+            n += 1;
+        }
+        wait_ms(GAP_MS);
+    }
+}
+
+fn note() {
+    note_at(crate::timer::millis());
+}
+
+fn note_at(now: u64) {
+    PROGRESS.store(now, Ordering::Relaxed);
 }
 
 fn set_both(on: bool) {
@@ -176,7 +251,11 @@ fn mbox_tag_inout(tag: u32, values: &[u32], out: &mut [u32]) -> bool {
         dst.add(5 + values.len()).write_volatile(0);
         clean(msg as *const u8, words * 4);
         let phys = crate::addr::virt_to_phys(msg as u64) as u32;
-        if !mbox_send((phys & !0xF) | 8, start) {
+        // The framebuffer path tries the 0xC0000000 alias first. A refused
+        // alias is sent once more as a raw physical address. Alias success
+        // does not send the second request.
+        let aliased = (phys | 0xC000_0000) & !0xF;
+        if !mbox_send(aliased | 8, start) && !mbox_send((phys & !0xF) | 8, start) {
             return false;
         }
         clean(msg as *const u8, words * 4);
@@ -258,18 +337,21 @@ fn clean(ptr: *const u8, len: usize) {
 fn wait_ms(ms: u64) {
     let freq = crate::timer::frequency();
     if freq == 0 || ms == 0 {
+        note();
         return;
     }
     let ticks = freq / 1000 * ms;
     let start = crate::timer::get_ticks();
-    let mut spins = 0u32;
+    // About 200k polls per millisecond. A 1.8 GHz core finishes a 1.5 s
+    // wait on the counter before this cap. A stuck counter returns.
+    let budget = ms.saturating_mul(200_000);
+    let mut spins = 0u64;
     while crate::timer::get_ticks().wrapping_sub(start) < ticks {
         spins = spins.saturating_add(1);
-        // A stuck counter must not park the core. The budget is large
-        // enough for a short blink when the counter is moving.
-        if spins > 8_000_000 {
-            return;
+        if spins > budget {
+            break;
         }
         core::hint::spin_loop();
     }
+    note();
 }

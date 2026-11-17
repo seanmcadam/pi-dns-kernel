@@ -19,7 +19,6 @@ mkdir -p boot/pi4-blinktest
 "$LD" -T boot/pi4-blinktest/link.ld --nmagic \
     -o /tmp/blinktest.elf /tmp/blinktest.o
 "$OBJCOPY" -O binary /tmp/blinktest.elf boot/pi4-blinktest/kernel8.img
-cp boot/pi4/config.txt boot/pi4-blinktest/config.txt
 
 python3 - <<'PY'
 import pathlib
