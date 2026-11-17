@@ -17,9 +17,7 @@ static PANIC_ONCE: AtomicU8 = AtomicU8::new(0);
 fn panic(info: &PanicInfo) -> ! {
     if PANIC_ONCE.fetch_add(1, Ordering::Relaxed) != 0 {
         crate::console::write_str("\r\nnested kernel panic\r\n");
-        loop {
-            cortex_a::asm::wfe();
-        }
+        halt();
     }
     let _ = writeln!(UartWriter, "\r\n!!! KERNEL PANIC !!!\r\n{}\r\n", info);
     let (file, line) = match info.location() {
@@ -40,6 +38,13 @@ fn panic(info: &PanicInfo) -> ! {
     if let Ok(text) = core::str::from_utf8(&raw[..n]) {
         crate::logger::note_fault(text);
     }
+    halt();
+}
+
+fn halt() -> ! {
+    #[cfg(feature = "board-pi4")]
+    crate::act::halt_blink();
+    #[cfg(not(feature = "board-pi4"))]
     loop {
         cortex_a::asm::wfe();
     }

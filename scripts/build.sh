@@ -21,13 +21,19 @@ if [ "$BOARD" = "pi4" ]; then
         target/aarch64-unknown-none/release/kernel8 boot/pi4/kernel8.img
     cat > boot/pi4/config.txt <<'EOF'
 # Raspberry Pi 4 boot file for this kernel.
-# The ELF is linked at 0xFFFF000000080000 (TTBR1). The firmware loads the
-# raw kernel8.img at physical 0x80000. This image has not been tested on hardware.
+# The ELF is linked at 0xFFFF000000080000 (TTBR1). kernel_address is the
+# same physical address the firmware should load. Do not set arm_peri_high:
+# this kernel uses the low peripheral window at 0xFE000000. Leave enable_gic
+# at the firmware default, which is on. The green ACT LED blink codes are
+# in boot/pi4/README.md. This image has not been confirmed on a board yet.
 arm_64bit=1
 enable_uart=1
 uart_2ndstage=1
 kernel=kernel8.img
+kernel_address=0x80000
 core_freq=250
+# PL011 divisor in the kernel assumes a 48 MHz UART clock.
+init_uart_clock=48000000
 # Bring HDMI up even when the cable is detected late, and use the full
 # panel. The kernel asks the mailbox for a 1280x720 framebuffer.
 hdmi_force_hotplug=1

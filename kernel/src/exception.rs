@@ -246,6 +246,9 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
 }
 
 fn halt() -> ! {
+    #[cfg(feature = "board-pi4")]
+    crate::act::halt_blink();
+    #[cfg(not(feature = "board-pi4"))]
     loop {
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
@@ -268,11 +271,7 @@ pub fn fault_guard() -> ! {
     unsafe {
         core::ptr::read_volatile(addr);
     }
-    loop {
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
+    halt();
 }
 
 /// Authenticated debug path: store to kernel .text. The page is read-only
@@ -283,9 +282,5 @@ pub fn fault_text() -> ! {
     unsafe {
         core::ptr::write_volatile(addr, 0);
     }
-    loop {
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
+    halt();
 }
