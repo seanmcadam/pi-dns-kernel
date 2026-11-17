@@ -35,12 +35,16 @@
 //     virtualization=on starts at EL2. A real Pi 4 with arm_64bit=1 normally
 //     hands over at EL2. The Pi 5 stub normally does the same. The EL2 path
 //     below is untested on Pi hardware. An EL3 entry parks.
-//   - The MMU and caches are off, so every address is a physical address.
+//   - The MMU and caches should be off. A firmware can still leave dirty
+//     data-cache lines, and turning the cache on over those lines is
+//     UNPREDICTABLE. Core 0 discards them before it stores anything.
 //   - There is no stack yet, so we cannot call any Rust code until we set
 //     one up.
-//   - Every core may jump here. On QEMU virt only one core runs. On the Pi 4
-//     the firmware usually parks cores 1-3 itself, but we park them here too
-//     to be safe.
+//   - Every core may jump here. The Pi 4 armstub enters at EL2 on core 0
+//     and parks cores 1-3 on the spin table at 0xd8, 0xe0, 0xe8, and 0xf0.
+//     Those cores do not execute this image. QEMU -kernel does the same
+//     with its own stub. A core that does land here, other than core 0,
+//     waits. Rust releases the parked cores later by writing that table.
 //
 // What this file does, in order
 // -----------------------------
@@ -99,6 +103,14 @@ _start:
     // secondary_entry is that later entry, for both.
 
 2:
+    // Drop a stale EL2 or EL1 translation and throw away every data-cache
+    // line before the first store. DC ISW discards the line. A clean would
+    // write a stale line back over the image the GPU just loaded.
+    bl      caches_off
+    bl      inval_caches
+    // One long ACT flash means this image is running on core 0. The count
+    // codes below are Rust. Virt and Pi 5 leave the pin alone.
+    bl      act_long
     // -------------------------------------------------------------------------
     // Step 2: Drop from EL2 to EL1, unless we are already at EL1.
     // -------------------------------------------------------------------------
@@ -116,7 +128,7 @@ _start:
     cmp     x20, #1
     b.eq    8f                  // already EL1: stack, vectors, and Rust
     cmp     x20, #2
-    b.ne    1b                  // not EL1 or EL2: park with the other cores
+    b.ne    bad_el              // not EL1 or EL2: blink, then park
 
     // HCR_EL2.RW, bit 31. The level below EL2 must be AArch64. Leaving this
     // clear would make eret enter EL1 as AArch32.
@@ -165,6 +177,13 @@ _start:
     msr     elr_el2, x0
     isb
     eret
+
+// Wrong exception level. A Pi 4 flashes the ACT LED fast so a serial-less
+// board can show that the image started and then stopped here. Other
+// boards fall through to the same wait the extra cores use.
+bad_el:
+    bl      act_fast_forever
+    b       1b
 
     // -------------------------------------------------------------------------
     // Step 3: Enable the FP/SIMD (NEON) unit. Now at EL1.
@@ -446,6 +465,177 @@ build_early:
     str     x4, [x1, x5, lsl #3]
     ret
 
+// Turn the MMU and both caches off at the level we are in, and in EL1.
+// Writes of SCTLR_EL2 happen only at EL2. Clearing a bit that is already
+// clear is the usual case: firmware and QEMU enter with the MMU off.
+caches_off:
+    mrs     x9, currentel
+    lsr     x9, x9, #2
+    cmp     x9, #2
+    b.ne    caches_off_el1
+    mrs     x0, sctlr_el2
+    bic     x0, x0, #1
+    bic     x0, x0, #4
+    bic     x0, x0, #0x1000
+    msr     sctlr_el2, x0
+    isb
+caches_off_el1:
+    mrs     x0, sctlr_el1
+    bic     x0, x0, #1
+    bic     x0, x0, #4
+    bic     x0, x0, #0x1000
+    msr     sctlr_el1, x0
+    isb
+    ret
+
+// Invalidate the instruction cache, then every data-cache level up to the
+// point of coherency, by set and way. Lines are discarded, not written
+// back. A stuck or huge geometry stops after 1<<20 operations so boot
+// cannot spin here. Registers x0-x15 are scratch. x19-x28 are left alone.
+inval_caches:
+    ic      iallu
+    dsb     sy
+    isb
+    mrs     x0, clidr_el1
+    and     x3, x0, #0x7000000
+    lsr     x3, x3, #23
+    cbz     x3, inval_done
+    mov     x10, #0
+    mov     x12, #1
+    lsl     x12, x12, #20
+inval_level:
+    add     x2, x10, x10, lsr #1
+    lsr     x1, x0, x2
+    and     x1, x1, #7
+    cmp     x1, #2
+    b.lt    inval_next
+    msr     csselr_el1, x10
+    isb
+    mrs     x1, ccsidr_el1
+    and     x2, x1, #7
+    add     x2, x2, #4
+    mov     x4, #0x3ff
+    and     x4, x4, x1, lsr #3
+    clz     w5, w4
+    mov     x7, #0x7fff
+    and     x7, x7, x1, lsr #13
+inval_set:
+    mov     x9, x4
+inval_way:
+    cbz     x12, inval_done
+    sub     x12, x12, #1
+    lsl     x6, x9, x5
+    orr     x11, x10, x6
+    lsl     x6, x7, x2
+    orr     x11, x11, x6
+    dc      isw, x11
+    subs    x9, x9, #1
+    b.ge    inval_way
+    subs    x7, x7, #1
+    b.ge    inval_set
+inval_next:
+    add     x10, x10, #2
+    cmp     x3, x10
+    b.gt    inval_level
+inval_done:
+    dsb     sy
+    isb
+    ret
+
+// GPIO 42 is the green ACT LED on current Pi 4 boards, active high.
+// GPFSEL4 at 0xFE200010, bits 8:6. GPSET1 and GPCLR1 use bit 10.
+// Physical addresses: this runs with the MMU off. BOOT_PI4 is 0 on the
+// other images, and those images do not touch the pin.
+gpio42_output:
+    movz    x1, #0x0010
+    movk    x1, #0xFE20, lsl #16
+    ldr     w2, [x1]
+    mov     w3, #7
+    lsl     w3, w3, #6
+    bic     w2, w2, w3
+    mov     w3, #1
+    lsl     w3, w3, #6
+    orr     w2, w2, w3
+    str     w2, [x1]
+    ret
+
+gpio42_on:
+    movz    x1, #0x0020
+    movk    x1, #0xFE20, lsl #16
+    mov     w2, #0x400
+    str     w2, [x1]
+    ret
+
+gpio42_off:
+    movz    x1, #0x002C
+    movk    x1, #0xFE20, lsl #16
+    mov     w2, #0x400
+    str     w2, [x1]
+    ret
+
+// Wait CNTFRQ >> x0 ticks. A counter that does not move stops after a
+// fixed spin, so a stuck CNTPCT cannot park the core. x0 is the shift.
+delay_shift:
+    mrs     x12, cntfrq_el0
+    lsr     x12, x12, x0
+    cbz     x12, delay_spin
+    mrs     x13, cntpct_el0
+    add     x13, x13, x12
+    mov     x15, #1
+    lsl     x15, x15, #30
+delay_poll:
+    mrs     x14, cntpct_el0
+    cmp     x14, x13
+    b.hs    delay_shift_ret
+    subs    x15, x15, #1
+    b.ne    delay_poll
+delay_shift_ret:
+    ret
+delay_spin:
+    mov     x15, #1
+    lsl     x15, x15, #24
+delay_spin_loop:
+    subs    x15, x15, #1
+    b.ne    delay_spin_loop
+    ret
+
+// One long on, about half a second, then off. Distinct from the short
+// counted blinks Rust uses for the later stages.
+act_long:
+    mov     x19, x30
+    adrp    x0, BOOT_PI4
+    add     x0, x0, :lo12:BOOT_PI4
+    ldr     x0, [x0]
+    cbz     x0, act_long_ret
+    bl      gpio42_output
+    bl      gpio42_on
+    mov     x0, #1
+    bl      delay_shift
+    bl      gpio42_off
+    mov     x0, #2
+    bl      delay_shift
+act_long_ret:
+    mov     x30, x19
+    ret
+
+// Fast continuous blink. Returns only when this is not a Pi 4 image.
+act_fast_forever:
+    adrp    x0, BOOT_PI4
+    add     x0, x0, :lo12:BOOT_PI4
+    ldr     x0, [x0]
+    cbz     x0, act_fast_ret
+    bl      gpio42_output
+act_fast_loop:
+    bl      gpio42_on
+    mov     x0, #5
+    bl      delay_shift
+    bl      gpio42_off
+    mov     x0, #5
+    bl      delay_shift
+    b       act_fast_loop
+act_fast_ret:
+    ret
+
 // Clean and invalidate the 4 KiB page at x0, one cache line at a time.
 clean_page:
     mov     x2, #64
@@ -468,6 +658,8 @@ clean_page:
 .type secondary_entry, %function
 secondary_entry:
     mov     x21, x0
+    bl      caches_off
+    bl      inval_caches
     cbnz    x21, 18f
     mrs     x21, mpidr_el1
     and     x22, x21, #0xff

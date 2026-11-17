@@ -4,6 +4,8 @@
 extern crate alloc;
 
 mod addr;
+#[cfg(feature = "board-pi4")]
+mod act;
 mod board;
 mod config_manager;
 mod console;
@@ -34,6 +36,19 @@ mod timer;
 use memory::ALLOCATOR;
 
 core::arch::global_asm!(include_str!("boot.s"));
+
+// boot.s reads this before the MMU is on. 1 only on the Pi 4 image, so the
+// ACT LED code is not stored to a virt or Pi 5 GPIO block. It lives in the
+// loaded image, not in .bss, because the read happens before .bss is cleared.
+#[used]
+#[no_mangle]
+#[cfg(feature = "board-pi4")]
+pub static BOOT_PI4: u64 = 1;
+
+#[used]
+#[no_mangle]
+#[cfg(not(feature = "board-pi4"))]
+pub static BOOT_PI4: u64 = 0;
 
 fn uart_write(s: &str) {
     console::write_str(s);
@@ -76,7 +91,20 @@ fn uart_dec(mut n: u64) {
 
 #[no_mangle]
 pub extern "C" fn kernel_main(entry_el: u64) -> ! {
+    // The framebuffer is programmed before the UART and before the strict
+    // map. A hang in either of those used to leave the firmware rainbow up.
+    #[cfg(feature = "board-pi4")]
+    {
+        act::pattern(1);
+        let fb_up = fb_con::start_early();
+        act::arm_expander();
+        if fb_up {
+            act::pattern(3);
+        }
+    }
     board::early_init();
+    #[cfg(feature = "board-pi4")]
+    fb_con::announce();
 
     uart_write("\r\n=== Pi4 DNS Server Kernel ===\r\n");
     uart_write("board ");
@@ -86,12 +114,12 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
 
     uart_write("[0] Enabling MMU and caches...\r\n");
     mmu::init();
-    uart_write("[OK] MMU and caches enabled\r\n");
-
-    // After the strict map, so the framebuffer window can be installed.
-    // A failure here is a serial warning. Boot does not stop.
     #[cfg(feature = "board-pi4")]
-    fb_con::start();
+    {
+        act::pattern(2);
+        fb_con::switch_to_nc();
+    }
+    uart_write("[OK] MMU and caches enabled\r\n");
 
     percpu::init_bsp();
 
@@ -197,6 +225,9 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
             Err(()) => uart_write("[WARN] HDMI task failed\r\n"),
         }
     }
+
+    #[cfg(feature = "board-pi4")]
+    act::pattern(4);
 
     let mut next_status = timer::millis() + 2000;
     loop {

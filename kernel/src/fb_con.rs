@@ -7,12 +7,15 @@
 //! already holds the console, or another core does, the extra copy is
 //! skipped. The UART write has already happened.
 //!
-//! The mailbox buffer is 16-byte aligned in `.dma` (Normal non-cacheable).
-//! Cache lines are cleaned and invalidated around the call in case an
-//! earlier write-back translation left a stale line. The GPU bus address
-//! is the physical address with `0xC0000000` set. A refused call is tried
-//! once more with the raw physical address. The address the firmware
-//! returns has those bits cleared before it is mapped.
+//! The mailbox buffer is 16-byte aligned in `.dma`. The coarse map is
+//! write-back, so every mailbox word is cleaned and invalidated. The GPU
+//! bus address is the physical address with `0xC0000000` set. A refused
+//! call is tried once more with the raw physical address. A returned
+//! address whose top bits are a Pi 4 alias becomes an ARM address with
+//! `bus & 0x3FFFFFFF`. Pixels are stored through the coarse map and the
+//! cache is cleaned, then the strict map moves them to a non-cacheable
+//! window. A mailbox that never answers gives up on a counter timeout
+//! and a spin budget.
 //!
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
@@ -74,6 +77,11 @@ struct Screen {
     line: [u8; LINE_CAP],
     line_len: usize,
     bgr: bool,
+    /// Physical framebuffer. Kept so the strict map can retarget it.
+    pa: u64,
+    bytes: u64,
+    /// True while `ptr` is the write-back alias. Stores are cleaned.
+    clean: bool,
 }
 
 static mut SCREEN: Screen = Screen {
@@ -85,21 +93,30 @@ static mut SCREEN: Screen = Screen {
     line: [0; LINE_CAP],
     line_len: 0,
     bgr: false,
+    pa: 0,
+    bytes: 0,
+    clean: false,
 };
 
 static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
 
-/// Allocate the framebuffer and replay the lines already sent to the UART.
-/// On failure the serial console is unchanged apart from one warning.
-pub fn start() {
+/// Allocate the framebuffer and paint one line, before the strict map.
+/// Does not write the UART. Returns whether the panel was programmed.
+pub fn start_early() -> bool {
     let held = lock();
     let ok = held && bring_up();
     if ok {
         replay();
+        paint(b"Pi 4 boot\n");
     }
     unlock(held);
-    if ok {
+    ok
+}
+
+/// Serial line for the mode. Call after the UART is programmed.
+pub fn announce() {
+    if READY.load(Ordering::Acquire) {
         crate::console::write_str("[OK] HDMI console ");
         write_dec(MODE_W.load(Ordering::Relaxed));
         crate::console::write_str("x");
@@ -108,6 +125,26 @@ pub fn start() {
     } else {
         crate::console::write_str("[WARN] HDMI console unavailable\r\n");
     }
+}
+
+/// Point the painter at the non-cacheable window. The strict map has to
+/// be installed first. A refused window keeps the write-back alias.
+pub fn switch_to_nc() {
+    let held = lock();
+    if !held {
+        return;
+    }
+    unsafe {
+        let screen = &mut *addr_of_mut!(SCREEN);
+        if !screen.ptr.is_null() && screen.clean && screen.bytes > 0 {
+            civac(screen.ptr, screen.bytes as usize);
+            if let Some(va) = crate::mmu::map_framebuffer(screen.pa, screen.bytes) {
+                screen.ptr = va as *mut u8;
+                screen.clean = false;
+            }
+        }
+    }
+    unlock(held);
 }
 
 /// Copy one UART string onto the display. Safe to skip. Never writes the UART.
@@ -146,23 +183,76 @@ struct Mode {
 }
 
 fn finish(mode: Mode) -> bool {
-    let Some(va) = crate::mmu::map_framebuffer(mode.pa, mode.bytes) else {
+    if !fb_reachable(mode.pa, mode.bytes) {
         return false;
-    };
+    }
     unsafe {
         let screen = &mut *addr_of_mut!(SCREEN);
-        screen.ptr = va as *mut u8;
+        screen.ptr = crate::addr::phys_to_virt(mode.pa) as *mut u8;
         screen.width = mode.width;
         screen.height = mode.height;
         screen.pitch = mode.pitch;
         screen.row = 0;
         screen.line_len = 0;
         screen.bgr = mode.bgr;
+        screen.pa = mode.pa;
+        screen.bytes = mode.bytes;
+        screen.clean = true;
         clear_screen(screen);
     }
     MODE_W.store(mode.width, Ordering::Relaxed);
     MODE_H.store(mode.height, Ordering::Relaxed);
     READY.store(true, Ordering::Release);
+    true
+}
+
+/// The coarse map covers the kernel gigabyte as Normal write-back. A Pi 4
+/// framebuffer address is in that gigabyte after the alias bits are
+/// removed. Any other gigabyte gets a Normal block so the clear is stored
+/// before the strict map exists.
+fn fb_reachable(pa: u64, bytes: u64) -> bool {
+    let Some(end) = pa.checked_add(bytes) else {
+        return false;
+    };
+    if bytes == 0 || pa % 4096 != 0 {
+        return false;
+    }
+    extern "C" {
+        static __heap_end: u8;
+        static mut early_l1_hi: u64;
+    }
+    let heap_end = crate::addr::virt_to_phys(core::ptr::addr_of!(__heap_end) as u64);
+    if pa < heap_end || end > crate::board::RAM_END {
+        return false;
+    }
+    let mut gb = pa >> 30;
+    let last = (end - 1) >> 30;
+    while gb <= last {
+        let base = gb << 30;
+        let index = gb as usize;
+        if index >= 512 {
+            return false;
+        }
+        unsafe {
+            let slot = addr_of_mut!(early_l1_hi).cast::<u64>().add(index);
+            let entry = slot.read_volatile();
+            if entry & 1 == 0 {
+                let desc = base | 1 | 0x300 | 0x400 | (0x40u64 << 48);
+                slot.write_volatile(desc);
+                civac(slot as *const u8, 8);
+                core::arch::asm!(
+                    "dsb ish",
+                    "tlbi vmalle1is",
+                    "dsb ish",
+                    "isb",
+                    options(nostack)
+                );
+            } else if (entry >> 2) & 7 != 0 {
+                return false;
+            }
+        }
+        gb += 1;
+    }
     true
 }
 
@@ -211,7 +301,11 @@ fn allocate_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
     if gpu_bytes < bytes || bus == 0 {
         return None;
     }
-    let pa = (bus & !0xC000_0000) as u64;
+    // Pi 4 aliases live in bits 31:30. 0xC0000000 is the uncached alias of
+    // the low 1 GiB. QEMU's property channel returns a GPU-bus address in
+    // one of those aliases, and the low 30 bits are the ARM address the
+    // scanout actually reads. Masking a plain low address changes nothing.
+    let pa = (bus & 0x3FFF_FFFF) as u64;
     if pa % 4096 != 0 {
         return None;
     }
@@ -273,8 +367,10 @@ fn exchange(msg: &mut [u32], bus_alias: bool) -> bool {
 
 fn mbox_send(msg: u32, start: u64) -> bool {
     let base = crate::addr::phys_to_virt(MBOX_BASE);
+    let mut spins = 0u32;
     loop {
-        if timed_out(start) {
+        spins = spins.saturating_add(1);
+        if spins > 1_000_000 || timed_out(start) {
             return false;
         }
         let Some(status) = crate::exception::read_u32_catching((base + STATUS) as *const u32)
@@ -289,7 +385,8 @@ fn mbox_send(msg: u32, start: u64) -> bool {
         core::ptr::write_volatile((base + WRITE) as *mut u32, msg);
     }
     loop {
-        if timed_out(start) {
+        spins = spins.saturating_add(1);
+        if spins > 2_000_000 || timed_out(start) {
             return false;
         }
         let Some(status) = crate::exception::read_u32_catching((base + STATUS) as *const u32)
@@ -381,7 +478,7 @@ fn paint(bytes: &[u8]) {
 }
 
 fn flush_line() {
-    unsafe {
+    let clean = unsafe {
         let screen = &mut *addr_of_mut!(SCREEN);
         let len = screen.line_len;
         let color = ink(&screen.line[..len], screen.bgr);
@@ -394,6 +491,12 @@ fn flush_line() {
         }
         screen.line_len = 0;
         advance(screen);
+        screen.clean
+    };
+    if clean {
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack));
+        }
     }
 }
 
@@ -431,6 +534,9 @@ fn scroll(screen: &Screen) {
         }
         dst += 4;
     }
+    if screen.clean {
+        civac(screen.ptr, total);
+    }
 }
 
 fn clear_screen(screen: &Screen) {
@@ -441,6 +547,9 @@ fn clear_screen(screen: &Screen) {
             (screen.ptr.add(off) as *mut u32).write_volatile(0);
         }
         off += 4;
+    }
+    if screen.clean {
+        civac(screen.ptr, total);
     }
 }
 
@@ -465,7 +574,11 @@ fn draw_glyph(screen: &Screen, col: u32, row: u32, ch: u8, color: u32) {
 fn put_px(screen: &Screen, x: u32, y: u32, color: u32) {
     let off = y as usize * screen.pitch as usize + x as usize * 4;
     unsafe {
-        (screen.ptr.add(off) as *mut u32).write_volatile(color);
+        let px = screen.ptr.add(off) as *mut u32;
+        px.write_volatile(color);
+        if screen.clean {
+            core::arch::asm!("dc civac, {px}", px = in(reg) px, options(nostack));
+        }
     }
 }
 

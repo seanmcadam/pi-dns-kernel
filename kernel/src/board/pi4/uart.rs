@@ -43,7 +43,15 @@ impl Pl011Uart {
     }
 
     pub fn write_byte(&mut self, byte: u8) {
+        let start = crate::timer::get_ticks();
+        let freq = crate::timer::frequency();
+        let mut spins = 0u32;
         while (self.read_reg(UARTFR) & FR_TXFF) != 0 {
+            spins = spins.saturating_add(1);
+            let stalled = freq != 0 && crate::timer::get_ticks().wrapping_sub(start) > freq / 10;
+            if spins > 100_000 || stalled || freq == 0 {
+                return;
+            }
             core::hint::spin_loop();
         }
         self.write_reg(UARTDR, byte as u32);
