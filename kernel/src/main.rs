@@ -93,14 +93,14 @@ fn uart_dec(mut n: u64) {
 pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     // The framebuffer is programmed before the UART and before the strict
     // map. A hang in either of those used to leave the firmware rainbow up.
-    // Assembly already showed stages 1 through 9. These continue that count.
+    // Assembly already showed stages 1 through 10. These continue that count.
     #[cfg(feature = "board-pi4")]
     {
-        act::pattern(10);
+        act::pattern(11);
         let fb_up = fb_con::start_early();
         act::arm_expander();
         if fb_up {
-            act::pattern(11);
+            act::pattern(12);
         }
     }
     board::early_init();
@@ -117,7 +117,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     mmu::init();
     #[cfg(feature = "board-pi4")]
     {
-        act::pattern(12);
+        act::pattern(13);
         fb_con::switch_to_nc();
     }
     uart_write("[OK] MMU and caches enabled\r\n");
@@ -228,7 +228,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     }
 
     #[cfg(feature = "board-pi4")]
-    act::pattern(13);
+    act::pattern(14);
 
     let mut next_status = timer::millis() + 2000;
     loop {

@@ -24,9 +24,10 @@ expander stays quiet until the framebuffer mailbox transaction has
 finished.
 
 Assembly owns the early counts. It talks only to GPIO 42. Each stage is
-a group of short flashes (about 60 ms on, 60 ms off) and then a longer
-gap. The group is the stage that is about to run. Virt and Pi 5 do not
-touch the pin.
+a group of short flashes (about 60 ms on, 60 ms off) and then the same
+60 ms again as the gap. On, off, and the gap share one delay, so a pause
+between stages is not a different timer path. The group is the stage
+that is about to run. Virt and Pi 5 do not touch the pin.
 
 `VBAR_EL1` and `VBAR_EL2` point at a physical vector table before the
 cache invalidate returns and before the MMU is enabled. A fault in that
@@ -38,25 +39,33 @@ advance, so the number can be counted after the fact.
 
 ## Blink codes
 
-Count the flashes in a group. A healthy boot walks 1 through 13 in
+Count the flashes in a group. A healthy boot walks 1 through 14 in
 order, then the LED goes dark while the server runs. The framebuffer is
-programmed before the strict page tables, so 11 comes before 12.
+programmed before the strict page tables, so 12 comes before 13.
+
+The previous image announced stage 1 and then went dark with no fast
+flashes. That was the full-cache `dc isw` walk, including the shared L2,
+and it never took an exception. This image does not issue a set/way op
+to L2. Stage 1 only reads the L1 geometry. Stage 2 is the L1
+clean-and-invalidate. The numbers from the old stage 2 onward each moved
+up by one.
 
 | Count | What is about to run | If this count repeats after eight fast flashes |
 | --- | --- | --- |
-| 1 | Discard caches. Physical vectors are already installed | Fault in the cache invalidate |
-| 2 | Drop EL2 to EL1 | Fault in the drop, or the core was not at EL1 or EL2 |
-| 3 | Enable FP/SIMD and set the stack | Fault in `CPACR_EL1` or the stack pointer |
-| 4 | Zero `.bss` and `.dma` | Fault in that zeroing |
-| 5 | Build the coarse page tables | Fault while writing or cleaning the tables |
-| 6 | Turn the MMU on | Fault programming `MAIR`, `TCR`, `TTBR`, or `SCTLR` |
-| 7 | Jump to the high address | MMU is on. Fault is in the jump |
-| 8 | Install the high vector base and drop the identity map | High fetch worked. Fault is in that blink |
-| 9 | Call `kernel_main` | Identity map is gone. The next fault uses the high vectors |
-| 10 | Rust entered `kernel_main` | High vectors: fast blink, no counted repeat |
-| 11 | HDMI framebuffer programmed | Rainbow should already be gone |
-| 12 | Strict kernel page tables installed | |
-| 13 | Scheduler and user tasks started | |
+| 1 | Read the L1 data-cache geometry. Physical vectors are already installed. No set/way op yet | Fault in that register read |
+| 2 | Clean and invalidate L1 data only, then the instruction cache. L2 is not walked | Fault in the L1 loop |
+| 3 | Drop EL2 to EL1 | Fault in the drop, or the core was not at EL1 or EL2 |
+| 4 | Enable FP/SIMD and set the stack | Fault in `CPACR_EL1` or the stack pointer |
+| 5 | Zero `.bss` and `.dma` | Fault in that zeroing |
+| 6 | Build the coarse page tables | Fault while writing or cleaning the tables |
+| 7 | Turn the MMU on | Fault programming `MAIR`, `TCR`, `TTBR`, or `SCTLR` |
+| 8 | Jump to the high address | MMU is on. Fault is in the jump |
+| 9 | Install the high vector base and drop the identity map | High fetch worked. Fault is in that blink |
+| 10 | Call `kernel_main` | Identity map is gone. The next fault uses the high vectors |
+| 11 | Rust entered `kernel_main` | High vectors: fast blink, no counted repeat |
+| 12 | HDMI framebuffer programmed | Rainbow should already be gone |
+| 13 | Strict kernel page tables installed | |
+| 14 | Scheduler and user tasks started | |
 | Fast, continuous | Panic or a fault after the high vectors are in | The physical stub is no longer installed |
 
 A group that plays once, then the next group, is progress. A group that
@@ -64,7 +73,10 @@ plays once and is followed by eight fast flashes and then the same group
 forever is a fault in that stage. A group that plays once and then the
 LED stays dark, with no fast flashes, is a hang that did not take an
 exception (the core is stuck in that stage, not in the vector stub).
-After 13, dark is the idle loop.
+After 14, dark is the idle loop. One flash and then dark means the core
+stopped before the L1 walk (the geometry read, or the delay that stage 1
+and stage 2 share). Two flashes and then dark means the L1 walk itself
+did not return.
 
 If stage 1 never plays, the firmware did not enter this image (wrong
 `kernel=` / `kernel_address`, or the file on the card is not this
