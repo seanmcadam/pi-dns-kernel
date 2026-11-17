@@ -41,7 +41,7 @@ const TAG_SET_ORDER: u32 = 0x0004_8006;
 const TAG_SET_OFFSET: u32 = 0x0004_8009;
 const TAG_ALLOC: u32 = 0x0004_0001;
 const TAG_PITCH: u32 = 0x0004_0008;
-const TAG_BLANK: u32 = 0x0004_0002;
+const TAG_GET_PHYS: u32 = 0x0004_0003;
 
 const EARLY_CAP: usize = 2048;
 const LINE_CAP: usize = 240;
@@ -162,12 +162,17 @@ pub fn push(text: &str) {
 }
 
 fn bring_up() -> bool {
-    // 1280x720 is the request. A firmware that substitutes another size is
-    // accepted. A refused call is tried again at 640x480.
-    if let Some(mode) = allocate(1280, 720) {
-        return finish(mode);
+    // Keep the mode the firmware is already scanning out. Forcing 640x480,
+    // or sending the blank tag, dropped a live HDMI link to no signal on
+    // this board. A missing size falls back to 1280x720.
+    if let Some((w, h)) = current_size() {
+        if (w, h) != (1280, 720) {
+            if let Some(mode) = allocate(w, h) {
+                return finish(mode);
+            }
+        }
     }
-    if let Some(mode) = allocate(640, 480) {
+    if let Some(mode) = allocate(1280, 720) {
         return finish(mode);
     }
     false
@@ -256,6 +261,30 @@ fn fb_reachable(pa: u64, bytes: u64) -> bool {
     true
 }
 
+fn current_size() -> Option<(u32, u32)> {
+    if let Some(size) = current_size_at(true) {
+        return Some(size);
+    }
+    current_size_at(false)
+}
+
+fn current_size_at(bus_alias: bool) -> Option<(u32, u32)> {
+    let mut msg = [0u32; 8];
+    msg[0] = 32;
+    msg[2] = TAG_GET_PHYS;
+    msg[3] = 8;
+    if !exchange(&mut msg, bus_alias) || msg[1] != REQ_OK {
+        return None;
+    }
+    let width = msg[5];
+    let height = msg[6];
+    if (320..=3840).contains(&width) && (240..=2160).contains(&height) {
+        Some((width, height))
+    } else {
+        None
+    }
+}
+
 fn allocate(width: u32, height: u32) -> Option<Mode> {
     if let Some(mode) = allocate_at(width, height, true) {
         return Some(mode);
@@ -277,7 +306,6 @@ fn allocate_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
     n = tag2(&mut msg, n, TAG_ALLOC, 4096, 0);
     let pitch_at = n;
     n = tag1(&mut msg, n, TAG_PITCH, 0);
-    n = tag1(&mut msg, n, TAG_BLANK, 0);
     msg[n] = 0;
     n += 1;
     msg[0] = (n * 4) as u32;

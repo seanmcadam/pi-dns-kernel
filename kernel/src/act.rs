@@ -5,9 +5,10 @@
 //! pin 2 is mailbox GPIO 130 (128+2) and is the red power LED on that tree
 //! (`PWR_LED_OFF`, active low). Older write-ups call pin 130 the activity
 //! LED. Both are driven with the same pulse count. GPIO 42 is the one that
-//! lights the green LED on current boards. The mailbox path is best-effort
-//! and is abandoned after one timed-out or refused call, so a missing
-//! expander cannot stall boot.
+//! lights the green LED on current boards. The mailbox path is best-effort.
+//! Each call tries the `0xC0000000` bus alias and then the raw physical
+//! address. A timed-out or refused pair is abandoned, so a missing expander
+//! cannot stall boot.
 //!
 //! Counted pulses use the architectural counter. A counter that does not
 //! advance hits a spin budget and returns. The panic pattern does not touch
@@ -176,7 +177,11 @@ fn mbox_tag_inout(tag: u32, values: &[u32], out: &mut [u32]) -> bool {
         dst.add(5 + values.len()).write_volatile(0);
         clean(msg as *const u8, words * 4);
         let phys = crate::addr::virt_to_phys(msg as u64) as u32;
-        if !mbox_send((phys & !0xF) | 8, start) {
+        // The framebuffer path tries the 0xC0000000 alias first. A refused
+        // alias is sent once more as a raw physical address. Alias success
+        // does not send the second request.
+        let aliased = (phys | 0xC000_0000) & !0xF;
+        if !mbox_send(aliased | 8, start) && !mbox_send((phys & !0xF) | 8, start) {
             return false;
         }
         clean(msg as *const u8, words * 4);

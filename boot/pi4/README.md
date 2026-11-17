@@ -10,13 +10,26 @@ may blink once as the firmware reads the card. That pattern is
 `start4.elf`, not a kernel stage. The kernel counts below start after
 that, once `kernel8.img` is running.
 
-Four kernels in a row showed the same single blink of about half a
-second, then a dark LED, with the rainbow still on the panel. Kernel
-stages are short groups, not one half-second flash, so that blink can be
-the firmware handing off. `boot/pi4-blinktest` is a separate image that
-paints HDMI solid red and blinks GPIO 42 and expander pin 130 on
-opposite phases. A red panel means code is running. The build and the
-copy steps are in `boot/pi4-blinktest/README.md`.
+A single blink of about half a second is not a kernel stage and not a
+documented ACT error code. Error codes repeat (four short flashes means
+`start*.elf` was not found, seven short flashes means the kernel file
+was not found). On the large kernel image that flash matches the
+firmware finishing the read. Raspberry Pi OS on another card reaches a
+login prompt on this board, so the board, the monitor, the cable, and
+the EEPROM are fine.
+
+The card that left the rainbow up used firmware master `start4.elf`
+and `fixup4.dat` and did not have `bcm2711-rpi-4-b.dtb`. That pair is
+matched to itself. It is not the March 2025 pair. With the March 2025
+trio, the same diagnostic did start: after the firmware's solid LED
+there was a quick blink, GPIO 42 stayed solid on, and HDMI went from
+the rainbow to no signal. That image asked for a 640x480 framebuffer
+and sent a blank tag before it cleared the pin. The diagnostic now
+toggles GPIO 42 from `CNTPCT_EL0` before any mailbox call, then asks
+for the firmware's current mode, or 1280x720, with no blank tag, and
+fills that panel red. A rainbow that stays, with no toggle, still means
+the firmware did not enter the file. The diagnostic build is in
+`boot/pi4-blinktest/README.md`.
 
 ## ACT LED
 
@@ -27,9 +40,11 @@ power LED** on that same tree (`PWR_LED_OFF`, active low). Older notes
 call pin 130 the activity LED. Rust pulses both, with the same count.
 GPIO 42 is what lights the green LED on current boards. The expander
 uses mailbox tags `0x00038043` (SET_GPIO_CONFIG) and `0x00038041`
-(SET_GPIO_STATE). A timed-out or refused call is not retried. The
-expander stays quiet until the framebuffer mailbox transaction has
-finished.
+(SET_GPIO_STATE). The call tries the `0xC0000000` bus alias, then the
+raw physical address. A timed-out or refused pair is not sent again.
+The expander stays quiet until the framebuffer mailbox transaction has
+finished. GPIO 42 itself does not use the mailbox, and its delay is
+`CNTPCT_EL0`, so a stuck property channel cannot hold the green LED on.
 
 Assembly owns the early counts. It talks only to GPIO 42. Each stage is
 a group of short flashes (about 60 ms on, 60 ms off) and then the same
@@ -45,12 +60,11 @@ flashes only set or clear it. The counts below are unchanged.
 
 The raw file starts with a Linux arm64 Image header. The first instruction
 is a PC-relative branch over that header. Nothing before the MMU is on
-loads an absolute high address. `kernel_address=0x80000` matches the link.
-`os_check=0` is set so a missing Linux device tree does not abort the
-boot. If the firmware still enters at `0x200000`, the Pi 4 image copies
-itself to `0x80000` and continues there. The LED path follows the Pi 4
-link, not "is the PC in the first megabyte", so a load at `0x200000` does
-not take the virt cache walk and does not skip the LED.
+loads an absolute high address. `kernel_address=0x80000` asks for the
+link address. If the firmware still enters at `0x200000`, this image
+copies itself to `0x80000` and continues there. The LED path follows the
+Pi 4 link, not "is the PC in the first megabyte", so that load does not
+take the virt cache walk and does not skip the LED.
 
 `VBAR_EL1` and `VBAR_EL2` point at a physical vector table before the
 cache invalidate returns and before the MMU is enabled. A fault in that
@@ -96,14 +110,114 @@ plays once and is followed by eight fast flashes and then the same group
 forever is a fault in that stage. A group that plays once and then the
 LED stays dark, with no fast flashes, is a hang that did not take an
 exception (the core is stuck in that stage, not in the vector stub).
-After 14, dark is the idle loop. One flash and then dark means the core
-stopped before the L1 walk (the geometry read, or the delay that stage 1
-and stage 2 share). Two flashes and then dark means the L1 walk itself
-did not return.
+After 14, dark is the idle loop. A short group that plays once and then
+stays dark means the core stopped in that stage. A single half-second
+flash, with the rainbow still up, is not that group.
 
-If stage 1 never plays, the firmware did not enter this image (wrong
-`kernel=` / `kernel_address`, or the file on the card is not this
-build). The old single half-second flash is gone. Do not wait for it.
+## Files on the card
 
-`uart_2ndstage=1` prints firmware diagnostics on the UART only. It does
-not change the LED or the panel.
+Raspberry Pi OS from another card reaches a login prompt on this Pi, so
+the board and the EEPROM can boot. That card's boot FAT (Bookworm label
+`bootfs`, files in the root) contains `start4.elf`, `fixup4.dat`,
+`bcm2711-rpi-4-b.dtb`, `overlays/`, `config.txt`, `cmdline.txt`, and
+`kernel8.img`. Ours had `start4.elf` and `fixup4.dat` and did not have
+the dtb. A 2019 bare-metal port did not boot a Pi 4 without
+`bcm2711-rpi-4-b.dtb`. Later firmware can boot some images with no dtb
+if `enable_gic=1` is set and `device_tree=` is empty, but Raspberry Pi
+OS always ships the dtb, and a missing tree is the difference between
+the card that reaches a login prompt and the card that leaves the
+rainbow up. `bootcode.bin` is not read on a Pi 4. `overlays/` is only
+for `dtoverlay=` lines, which this config does not use. `cmdline.txt`
+is for Linux. `armstub8-gic.bin` is not required; the firmware has its
+own stub.
+
+The two `start4.elf` files are not the same build, and the failing pair
+was not mixed.
+
+| Card | `start4.elf` | `fixup4.dat` | `bcm2711-rpi-4-b.dtb` |
+| --- | --- | --- | --- |
+| Raspberry Pi OS, boots to a login prompt | 2263840 bytes, built Mar 19 2025, `VC_BUILD_ID` `ca6e8171a80ea46924ffaa629250bfb482f3a02c` | 5459 bytes | 56211 bytes |
+| Public firmware commit `80f23d4be5` (Mar 19 2025) | 2263840 | 5459 | 56211 |
+| Bare-metal card that left the rainbow up | 2289248 bytes, `VC_BUILD_ID` `fed420a1c80559ebb4830efe4d8073976d3ae518` (Nov 16 2026) | 5413 bytes | absent |
+| Public firmware master `d131b57900` (Nov 16 2026) | 2289248 | 5413 | 56431, not copied onto the card |
+
+`ca6e8171` and `fed420a1` are the `VC_BUILD_ID_VERSION` strings inside
+`start4.elf`. They are not commits in `raspberrypi/firmware`. The public
+commit that contains the working bytes is `80f23d4be5`. The public
+commit that contains the failing bytes is master `d131b57900`, and its
+`fixup4.dat` is the 5413-byte file. Those two files were published
+together. The missing piece on that card is the dtb, which master does
+ship.
+
+Both binaries log `Failed to load Device Tree file` and, separately,
+`Starting ARM`. The March 2025 firmware that boots this Pi has the same
+two strings, so a missing dtb is not a new master-only refusal that can
+be read out of the file. `os_check` is the Pi 5 "no compatible kernel"
+check. The Pi OS `config.txt` does not set it, and it does set
+`arm_boost=1`, `disable_overscan=1`, and `dtoverlay=vc4-kms-v3d`. It
+does not set `kernel_address`, `core_freq`, or the UART lines. Do not
+copy that `config.txt`: `dtoverlay=vc4-kms-v3d` needs `overlays/` and
+the Linux display stack. Do not set `device_tree=` to an empty value.
+
+Use the March 2025 trio from the working card. Do not pair master's
+`start4.elf` with the March dtb or fixup. A Pi 400 uses
+`bcm2711-rpi-400.dtb`. A CM4 uses `bcm2711-rpi-cm4.dtb`. Every Pi 4B
+revision, including rev 1.5 and the 8 GB boards, uses
+`bcm2711-rpi-4-b.dtb`.
+
+`./scripts/fetch-pi4-boot.sh` downloads the March 2025 trio from
+`80f23d4be5` when that card is not mounted. The test already running
+uses the card's copies, which are the same bytes.
+
+`config.txt` for that test is:
+
+```
+arm_64bit=1
+kernel=kernel8.img
+kernel_address=0x80000
+enable_uart=1
+```
+
+`kernel_address=0x80000` is the link address. `enable_uart=1` turns the
+PL011 on. These lines stay out until the image is known to start:
+`os_check=0`, `uart_2ndstage=1`, `core_freq=250`,
+`init_uart_clock=48000000`, `hdmi_force_hotplug=1`,
+`disable_overscan=1`, `arm_boost=1`, and `dtoverlay=vc4-kms-v3d`.
+After the LED blinks, add `init_uart_clock=48000000` and `core_freq=250`
+before trusting the serial baud. The PL011 divisor assumes 48 MHz.
+
+The boot FAT root for this test should contain `start4.elf`,
+`fixup4.dat`, `bcm2711-rpi-4-b.dtb`, `config.txt`, and `kernel8.img`.
+
+### Blink test
+
+On desktop2, from a current tree:
+
+```
+sudo apt-get install gcc-aarch64-linux-gnu
+./scripts/fetch-pi4-boot.sh blinktest
+```
+
+Overwrite `boot/pi4/card/start4.elf`, `fixup4.dat`, and
+`bcm2711-rpi-4-b.dtb` from the Pi OS boot FAT if that card is mounted.
+Mount the bare-metal card's boot FAT and replace its root with the
+staged files:
+
+```
+cp boot/pi4/card/* /path/to/bare-boot/
+sync
+```
+
+Power on. After the firmware's solid green LED, GPIO 42 should blink
+four times, about one second per blink, before any mailbox call. The
+panel should then leave the rainbow and stay red, and the green LED
+should keep blinking. A rainbow that stays, with no toggle, means
+`start4.elf` still did not enter `kernel8.img`. No signal with the LED
+stuck on is the previous diagnostic: it programmed the framebuffer
+before the first off write.
+
+### DNS kernel
+
+`./scripts/build-pi4.sh`, then `./scripts/fetch-pi4-boot.sh kernel`, then
+the same copy. `boot/pi4/config.txt` is the same four lines. The ACT
+counts in the table above apply only after the firmware enters the image.

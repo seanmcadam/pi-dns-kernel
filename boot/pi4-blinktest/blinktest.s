@@ -1,6 +1,10 @@
-// Pi 4 diagnostic. No stack, no MMU, no timer. Position-independent:
-// every code address is a branch or an ADR, and device addresses are
+// Pi 4 diagnostic. No stack and no MMU. The delay reads CNTPCT_EL0.
+// Every code address is a branch or an ADR, and device addresses are
 // immediate constants. It runs at 0x80000 or 0x200000.
+//
+// GPIO 42 toggles before any mailbox call. A stuck property channel
+// cannot hold the green LED on. The framebuffer request uses the
+// firmware's current size, or 1280x720, and does not send a blank tag.
 //
 // Do not use curly braces in this file. The diagnostic is assembled with
 // gas, which has no such rule, and the kernel's boot.s must stay free of
@@ -25,19 +29,29 @@ blink_body:
     mrs     x1, mpidr_el1
     and     x1, x1, #0xff
     cbnz    x1, park
-    bl      screen_red
     bl      gpio42_output
-    bl      exp_config
-blink_loop:
+    mov     w20, #4
+pre_blink:
+    cbz     w20, pre_done
     mov     w0, #1
     bl      gpio42_level
-    mov     w0, #0
-    bl      exp_level
     bl      delay
     mov     w0, #0
     bl      gpio42_level
-    mov     w0, #1
+    bl      delay
+    sub     w20, w20, #1
+    b       pre_blink
+pre_done:
+    bl      exp_config
+    bl      screen_red
+    mov     w0, #0
     bl      exp_level
+blink_loop:
+    mov     w0, #1
+    bl      gpio42_level
+    bl      delay
+    mov     w0, #0
+    bl      gpio42_level
     bl      delay
     b       blink_loop
 
@@ -45,15 +59,27 @@ park:
     wfe
     b       park
 
-// About half a second to a second on a 1.5 GHz Cortex-A72. Two of these
-// make one GPIO42 period, so the green pin blinks near 1 Hz. The expander
-// pin is the opposite level, so the two LEDs are out of phase.
+// Half a second. CNTFRQ_EL0 of 0 is the Pi 4 54 MHz counter. A counter
+// that does not advance returns after 1<<28 polls, so the LED still
+// toggles. The period does not depend on a 1.5 GHz or 1.8 GHz loop.
 delay:
-    mov     x0, #1
-    lsl     x0, x0, #29
-delay_loop:
-    subs    x0, x0, #1
-    b.ne    delay_loop
+    mrs     x1, cntfrq_el0
+    cbnz    x1, delay_have
+    movz    x1, #0xf980
+    movk    x1, #0x0337, lsl #16
+delay_have:
+    lsr     x1, x1, #1
+    mrs     x2, cntpct_el0
+    mov     x3, #1
+    lsl     x3, x3, #28
+delay_poll:
+    subs    x3, x3, #1
+    b.eq    delay_ret
+    mrs     x4, cntpct_el0
+    sub     x4, x4, x2
+    cmp     x4, x1
+    b.lo    delay_poll
+delay_ret:
     ret
 
 gpio42_output:
@@ -121,7 +147,8 @@ exp_cfg_fill:
     str     wzr, [x10, #44]
     ret
 
-// w0 is the SET_GPIO_STATE value for pin 130.
+// w0 is the SET_GPIO_STATE value for pin 130. Called once, after the
+// framebuffer, never between a GPIO42 set and the matching clear.
 exp_level:
     mov     x29, x30
     mov     w19, w0
@@ -157,45 +184,79 @@ exp_state_fill:
     str     wzr, [x10, #28]
     ret
 
-// Paint 640x480 solid red, then return. Failure leaves the rainbow up
-// and still returns, so the LED loop runs either way.
+// Read the current physical size, then paint that panel solid red.
+// A missing or absurd size becomes 1280x720. Failure returns, and the
+// LED loop keeps running. w22 and w23 are the width and height.
 screen_red:
     mov     x29, x30
+    bl      get_mode
     adr     x0, fb_work
     adr     x1, fb_template
-    mov     x2, #156
+    mov     x2, #140
     bl      copy_bytes
+    adr     x21, fb_work
+    str     w22, [x21, #20]
+    str     w23, [x21, #24]
+    str     w22, [x21, #40]
+    str     w23, [x21, #44]
     adr     x0, fb_work
-    mov     x1, #156
+    mov     x1, #140
     mov     x2, #1
     bl      mbox_call
     cbnz    w0, screen_have
     adr     x0, fb_work
     adr     x1, fb_template
-    mov     x2, #156
+    mov     x2, #140
     bl      copy_bytes
+    adr     x21, fb_work
+    str     w22, [x21, #20]
+    str     w23, [x21, #24]
+    str     w22, [x21, #40]
+    str     w23, [x21, #44]
     adr     x0, fb_work
-    mov     x1, #156
+    mov     x1, #140
     mov     x2, #0
     bl      mbox_call
     cbz     w0, screen_ret
 screen_have:
     adr     x21, fb_work
+    ldr     w22, [x21, #20]
+    ldr     w23, [x21, #24]
+    cmp     w22, #320
+    b.lo    screen_ret
+    cmp     w22, #3840
+    b.hi    screen_ret
+    cmp     w23, #240
+    b.lo    screen_ret
+    cmp     w23, #2160
+    b.hi    screen_ret
     ldr     w0, [x21, #112]
-    bic     w0, w0, #0xC0000000
+    movz    w1, #0xffff
+    movk    w1, #0x3fff, lsl #16
+    and     w0, w0, w1
     cbz     w0, screen_ret
+    cmp     w0, #0x10000
+    b.lo    screen_ret
+    movz    w1, #0xFC00, lsl #16
+    cmp     w0, w1
+    b.hs    screen_ret
     ldr     w3, [x21, #132]
-    cmp     w3, #2560
+    lsl     w4, w22, #2
+    cmp     w3, w4
     b.hs    screen_pitch
-    mov     w3, #2560
+    mov     w3, w4
 screen_pitch:
-    mov     w4, #480
-    umull   x1, w3, w4
+    umull   x1, w3, w23
     movz    x5, #0x80, lsl #16
     cmp     x1, x5
     b.ls    screen_bytes
     mov     x1, x5
 screen_bytes:
+    movz    x6, #0xFC00, lsl #16
+    adds    x7, x0, x1
+    b.cs    screen_ret
+    cmp     x7, x6
+    b.hi    screen_ret
     ldr     w2, [x21, #76]
     movz    w3, #0x00FF
     cbnz    w2, screen_fill
@@ -223,6 +284,58 @@ screen_ret:
     mov     x30, x29
     ret
 
+// w22 width, w23 height. GET_PHYSICAL_DISPLAY uses tag 0x00040003.
+// Width is accepted from 320 to 3840, height from 240 to 2160.
+get_mode:
+    mov     x28, x30
+    bl      fill_get
+    adr     x0, fb_work
+    mov     x1, #32
+    mov     x2, #1
+    bl      mbox_call
+    cbnz    w0, get_read
+    bl      fill_get
+    adr     x0, fb_work
+    mov     x1, #32
+    mov     x2, #0
+    bl      mbox_call
+    cbz     w0, get_default
+get_read:
+    adr     x10, fb_work
+    ldr     w22, [x10, #20]
+    ldr     w23, [x10, #24]
+    cmp     w22, #320
+    b.lo    get_default
+    cmp     w22, #3840
+    b.hi    get_default
+    cmp     w23, #240
+    b.lo    get_default
+    cmp     w23, #2160
+    b.hi    get_default
+    b       get_ret
+get_default:
+    mov     w22, #1280
+    mov     w23, #720
+get_ret:
+    mov     x30, x28
+    ret
+
+fill_get:
+    adr     x10, fb_work
+    mov     w1, #32
+    str     w1, [x10]
+    str     wzr, [x10, #4]
+    movz    w1, #0x0003
+    movk    w1, #0x0004, lsl #16
+    str     w1, [x10, #8]
+    mov     w1, #8
+    str     w1, [x10, #12]
+    str     wzr, [x10, #16]
+    str     wzr, [x10, #20]
+    str     wzr, [x10, #24]
+    str     wzr, [x10, #28]
+    ret
+
 // x0 = dest, x1 = src, x2 = length in bytes.
 copy_bytes:
     mov     x4, #0
@@ -238,6 +351,7 @@ copy_ret:
 
 // x0 buffer, x1 length, x2 nonzero to set the 0xC0000000 bus alias.
 // w0 is 1 when the property channel returns code 0x80000000.
+// Each wait gives up after 1<<24 polls.
 mbox_call:
     mov     x9, x0
     mov     x10, x1
@@ -260,7 +374,7 @@ mbox_phys:
     movz    x3, #0xB880
     movk    x3, #0xFE00, lsl #16
     mov     x4, #1
-    lsl     x4, x4, #20
+    lsl     x4, x4, #24
 mbox_wait_room:
     subs    x4, x4, #1
     b.eq    mbox_fail
@@ -268,7 +382,7 @@ mbox_wait_room:
     tbnz    w5, #31, mbox_wait_room
     str     w0, [x3, #0x20]
     mov     x4, #1
-    lsl     x4, x4, #20
+    lsl     x4, x4, #24
 mbox_wait_reply:
     subs    x4, x4, #1
     b.eq    mbox_fail
@@ -300,18 +414,18 @@ mbox_fail:
 
     .balign 16
 fb_template:
-    .word   156
+    .word   140
     .word   0
     .word   0x00048003
     .word   8
     .word   0
-    .word   640
-    .word   480
+    .word   1280
+    .word   720
     .word   0x00048004
     .word   8
     .word   0
-    .word   640
-    .word   480
+    .word   1280
+    .word   720
     .word   0x00048005
     .word   4
     .word   0
@@ -331,10 +445,6 @@ fb_template:
     .word   4096
     .word   0
     .word   0x00040008
-    .word   4
-    .word   0
-    .word   0
-    .word   0x00040002
     .word   4
     .word   0
     .word   0
