@@ -271,7 +271,7 @@ pub fn packet_counts() -> (u32, u32) {
 
 /// Pinned HDMI row on the Pi 4. Other boards build the same text and drop it.
 pub fn refresh_banner() {
-    let mut buf = [0u8; 220];
+    let mut buf = [0u8; 96];
     let mut n = 0;
     n += crate::board::write_nic_status(&mut buf[n..]);
     push(&mut buf, &mut n, " dhcp:");
@@ -293,16 +293,12 @@ pub fn refresh_banner() {
     {
         push(&mut buf, &mut n, " led:");
         push(&mut buf, &mut n, crate::act::led_label());
-        push(&mut buf, &mut n, "\n");
-        n += crate::board::write_nic_diag(&mut buf[n..]);
         if let Ok(text) = core::str::from_utf8(&buf[..n]) {
             crate::fb_con::set_status(text);
         }
     }
     #[cfg(not(feature = "board-pi4"))]
     {
-        push(&mut buf, &mut n, "\n");
-        n += crate::board::write_nic_diag(&mut buf[n..]);
         let _ = n;
     }
 }
