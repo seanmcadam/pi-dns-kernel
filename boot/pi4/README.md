@@ -29,6 +29,12 @@ a group of short flashes (about 60 ms on, 60 ms off) and then the same
 between stages is not a different timer path. The group is the stage
 that is about to run. Virt and Pi 5 do not touch the pin.
 
+Core 0 points the current stack and `SP_EL1` at `__stack_top` before the
+first call. The delay reads `CNTPCT_EL0` and subtracts. A `CNTFRQ_EL0` of
+0 is treated as 54 MHz. A counter that does not move gives up after a
+fixed number of polls. The pin is switched to an output once; later
+flashes only set or clear it. The counts below are unchanged.
+
 `VBAR_EL1` and `VBAR_EL2` point at a physical vector table before the
 cache invalidate returns and before the MMU is enabled. A fault in that
 window used to hang with the LED already off, because the reset vector
@@ -43,12 +49,12 @@ Count the flashes in a group. A healthy boot walks 1 through 14 in
 order, then the LED goes dark while the server runs. The framebuffer is
 programmed before the strict page tables, so 12 comes before 13.
 
-The previous image announced stage 1 and then went dark with no fast
-flashes. That was the full-cache `dc isw` walk, including the shared L2,
-and it never took an exception. This image does not issue a set/way op
-to L2. Stage 1 only reads the L1 geometry. Stage 2 is the L1
-clean-and-invalidate. The numbers from the old stage 2 onward each moved
-up by one.
+This image does not issue a set/way op to L2. Stage 1 only reads the L1
+geometry, and that read happens after the one-flash announcement. The
+previous image still went dark after that one flash, with no fast
+flashes, so the hang was not the L2 walk. The blink and the delay are
+leaves, the pin is programmed once, and a stuck counter cannot sit in
+the gap forever. The counts are unchanged.
 
 | Count | What is about to run | If this count repeats after eight fast flashes |
 | --- | --- | --- |

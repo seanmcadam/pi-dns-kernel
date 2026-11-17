@@ -107,11 +107,29 @@ _start:
     // secondary_entry is that later entry, for both.
 
 2:
+    // Stack before any call. QEMU raspi4b enters at EL2h with SP = 0.
+    // QEMU virt enters at EL1h, also with SP = 0. The blink path does not
+    // use the stack. The code after this point does. SPSel 1 makes mov
+    // write the current level's pointer: SP_EL2 at EL2, SP_EL1 at EL1.
+    // MSR SP_EL1 is undefined at EL1, so that write happens only when the
+    // core is not already there. __stack_top is the physical load address
+    // with the MMU off, and it is 16-byte aligned.
+    adrp    x1, __stack_top
+    add     x1, x1, :lo12:__stack_top
+    msr     spsel, #1
+    mov     sp, x1
+    mrs     x0, currentel
+    lsr     x0, x0, #2
+    cmp     x0, #1
+    b.eq    stack_ready
+    msr     sp_el1, x1
+stack_ready:
+    mov     x18, xzr
     // x22 is 1 only while the PC is still in the first megabyte. That is the
     // Pi 4 load address. Virt and Pi 5 are not, and must not touch GPIO.
     // Recomputing this after the high jump would clear the flag, so it stays
     // in x22. x21 is the LED stage. Both survive the EL drop. mark and the
-    // helpers below do not write them.
+    // helpers below do not write them. x18 is 1 after the pin is an output.
     adrp    x22, _start
     lsr     x22, x22, #20
     cmp     x22, #0
@@ -256,7 +274,9 @@ bad_el:
     //   QEMU:  stack grows down from 0x40080000
     //   Pi 4:  stack grows down from 0x00080000 (untested on hardware)
     // The stack pointer must stay 16-byte aligned. __stack_top is page-aligned.
-    // After the jump to the upper half, the same offset is added to SP.
+    // Core 0 already set this at entry. Set it again so the value is the
+    // physical top even if a later step moved it. After the jump to the
+    // upper half, the same offset is added to SP.
     adrp    x1, __stack_top
     add     x1, x1, :lo12:__stack_top
     mov     sp, x1
@@ -682,40 +702,77 @@ inval_done:
 
 // GPIO 42 is the green ACT LED on current Pi 4 boards, active high.
 // GPFSEL4 at 0xFE200010, bits 8:6. GPSET1 and GPCLR1 use bit 10.
-// With the MMU off the address is physical. With the MMU on at the level
-// that is running, the high alias is used so the access still hits after
-// TTBR0 is dropped. EL2 keeps its own SCTLR: a trap into the stub at EL2
-// must not follow SCTLR_EL1.M while EL2's MMU is off. Callers have already
-// decided this is a Pi 4. x16 holds the return address across gpio_alias.
-// x20-x22 are not written.
-gpio_alias:
+// These are leaves. They do not call, they do not use the stack, and they
+// write only x0-x3. x16 is the linker's veneer register, so a saved return
+// address must not live there across a call. With the MMU off the address
+// is physical. With the MMU on at the level that is running, the high
+// alias is used. EL2 reads SCTLR_EL2 so a trap into the stub does not
+// follow SCTLR_EL1.M while EL2's MMU is off.
+gpio_store:
     mrs     x0, currentel
     lsr     x0, x0, #2
     cmp     x0, #2
-    b.eq    gpio_alias_el2
-    mrs     x0, sctlr_el1
-    b       gpio_alias_test
-gpio_alias_el2:
+    b.ne    gpio_store_el1
     mrs     x0, sctlr_el2
-gpio_alias_test:
-    tbz     x0, #0, gpio_alias_ret
+    b       gpio_store_test
+gpio_store_el1:
+    mrs     x0, sctlr_el1
+gpio_store_test:
+    tbz     x0, #0, gpio_store_write
     movz    x0, #0xFFFF, lsl #48
     orr     x1, x1, x0
-gpio_alias_ret:
+gpio_store_write:
+    str     w2, [x1]
     ret
 
-gpio42_output:
-    mov     x16, x30
-    // Set the pin before the function-select read. A hang on that load
-    // still leaves the LED on.
+gpio42_on:
     movz    x1, #0x0020
     movk    x1, #0xFE20, lsl #16
-    bl      gpio_alias
     mov     w2, #0x400
+    b       gpio_store
+
+gpio42_off:
+    movz    x1, #0x002C
+    movk    x1, #0xFE20, lsl #16
+    mov     w2, #0x400
+    b       gpio_store
+
+// Program the pin as an output. Leaf: the function-select update is inline
+// so a call from mark cannot lose its return address. The set happens
+// before the read. A hang on that load leaves the LED on.
+gpio42_output:
+    movz    x1, #0x0020
+    movk    x1, #0xFE20, lsl #16
+    mov     w2, #0x400
+    mrs     x0, currentel
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    gpio_out_el1a
+    mrs     x0, sctlr_el2
+    b       gpio_out_ta
+gpio_out_el1a:
+    mrs     x0, sctlr_el1
+gpio_out_ta:
+    tbz     x0, #0, gpio_out_wa
+    movz    x0, #0xFFFF, lsl #48
+    orr     x1, x1, x0
+gpio_out_wa:
     str     w2, [x1]
     movz    x1, #0x0010
     movk    x1, #0xFE20, lsl #16
-    bl      gpio_alias
+    mrs     x0, currentel
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    gpio_out_el1b
+    mrs     x0, sctlr_el2
+    b       gpio_out_tb
+gpio_out_el1b:
+    mrs     x0, sctlr_el1
+gpio_out_tb:
+    tbz     x0, #0, gpio_out_wb
+    movz    x0, #0xFFFF, lsl #48
+    orr     x1, x1, x0
+gpio_out_wb:
     ldr     w2, [x1]
     mov     w3, #7
     lsl     w3, w3, #6
@@ -726,41 +783,36 @@ gpio42_output:
     str     w2, [x1]
     movz    x1, #0x0020
     movk    x1, #0xFE20, lsl #16
-    bl      gpio_alias
     mov     w2, #0x400
+    mrs     x0, currentel
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    gpio_out_el1c
+    mrs     x0, sctlr_el2
+    b       gpio_out_tc
+gpio_out_el1c:
+    mrs     x0, sctlr_el1
+gpio_out_tc:
+    tbz     x0, #0, gpio_out_wc
+    movz    x0, #0xFFFF, lsl #48
+    orr     x1, x1, x0
+gpio_out_wc:
     str     w2, [x1]
-    mov     x30, x16
     ret
 
-gpio42_on:
-    mov     x16, x30
-    movz    x1, #0x0020
-    movk    x1, #0xFE20, lsl #16
-    bl      gpio_alias
-    mov     w2, #0x400
-    str     w2, [x1]
-    mov     x30, x16
-    ret
-
-gpio42_off:
-    mov     x16, x30
-    movz    x1, #0x002C
-    movk    x1, #0xFE20, lsl #16
-    bl      gpio_alias
-    mov     w2, #0x400
-    str     w2, [x1]
-    mov     x30, x16
-    ret
-
-// Blink x21 short flashes, then a gap. x22 == 0 returns at once. x24 holds
-// the return address because these calls happen before SP exists. On, off,
-// and the gap all pass the same shift to delay_shift, so stage 1 and stage
-// 2 cannot disagree about the counter. A shift of 4 is about 60 ms at
-// 54 MHz. x19 and x25-x28 are left alone.
+// Blink x21 short flashes, then a gap. x22 == 0 returns at once. x29 holds
+// the return address. On, off, and the gap all pass the same shift to
+// delay_shift. A shift of 4 is about 60 ms at 54 MHz. The function-select
+// register is written once (x18), because repeating that read is what sits
+// between stage 1 and stage 2. Leaves called from here do not write
+// x18-x29.
 mark:
     cbz     x22, mark_ret
-    mov     x24, x30
+    mov     x29, x30
+    cbnz    x18, mark_ready
     bl      gpio42_output
+    mov     x18, #1
+mark_ready:
     mov     x23, x21
 mark_pulse:
     cbz     x23, mark_gap
@@ -775,7 +827,7 @@ mark_pulse:
 mark_gap:
     mov     x0, #4
     bl      delay_shift
-    mov     x30, x24
+    mov     x30, x29
 mark_ret:
     ret
 
@@ -784,7 +836,9 @@ mark_ret:
 // x21 == 0 stays on the fast pattern. Any other board waits.
 fault_blink:
     cbz     x22, fault_park
+    cbnz    x18, fault_fast
     bl      gpio42_output
+    mov     x18, #1
 fault_fast:
     mov     x23, #8
 fault_fast_one:
@@ -865,30 +919,32 @@ early_vectors:
     .balign 128
     b       fault_blink
 
-// Wait CNTFRQ >> x0 ticks. A counter that does not move stops after a
-// fixed spin, so a stuck CNTPCT cannot park the core. x0 is the shift.
+// Wait CNTFRQ >> x0 ticks. Leaf. Clobbers x12-x15 only. Elapsed time is a
+// subtract, not a deadline compare, so a wrapped absolute count cannot
+// stick. CNTFRQ of 0 uses 54 MHz, which is what the Pi armstub programs.
+// A counter that does not move stops after 1<<26 polls. The old cap was
+// 1<<30, long enough to look like a dark hang after the first flash.
 delay_shift:
     mrs     x12, cntfrq_el0
+    cbnz    x12, delay_have_freq
+    movz    x12, #0xf980
+    movk    x12, #0x0337, lsl #16
+delay_have_freq:
     lsr     x12, x12, x0
-    cbz     x12, delay_spin
+    cbnz    x12, delay_have_ticks
+    mov     x12, #1
+delay_have_ticks:
     mrs     x13, cntpct_el0
-    add     x13, x13, x12
     mov     x15, #1
-    lsl     x15, x15, #30
+    lsl     x15, x15, #26
 delay_poll:
     mrs     x14, cntpct_el0
-    cmp     x14, x13
+    sub     x14, x14, x13
+    cmp     x14, x12
     b.hs    delay_shift_ret
     subs    x15, x15, #1
     b.ne    delay_poll
 delay_shift_ret:
-    ret
-delay_spin:
-    mov     x15, #1
-    lsl     x15, x15, #24
-delay_spin_loop:
-    subs    x15, x15, #1
-    b.ne    delay_spin_loop
     ret
 
 // Clean and invalidate the 4 KiB page at x0, one cache line at a time.
