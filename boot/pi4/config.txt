@@ -6,3 +6,7 @@ enable_uart=1
 uart_2ndstage=1
 kernel=kernel8.img
 core_freq=250
+# Bring HDMI up even when the cable is detected late, and use the full
+# panel. The kernel asks the mailbox for a 1280x720 framebuffer.
+hdmi_force_hotplug=1
+disable_overscan=1

@@ -10,4 +10,7 @@ pub fn write_str(s: &str) {
             core::ptr::write_volatile(uart, byte as u32);
         }
     }
+    // The Pi 4 HDMI console is a second sink. It does not write the UART.
+    #[cfg(feature = "board-pi4")]
+    crate::fb_con::push(s);
 }
