@@ -81,6 +81,10 @@
 .type _start, %function
 
 _start:
+    // Mask IRQ, FIQ, SError, and debug before any vector base is installed.
+    // A pending firmware interrupt must not enter the early stub. Synchronous
+    // aborts are not masked by DAIF, so a fault still reaches that stub.
+    msr     daifset, #0xf
     // -------------------------------------------------------------------------
     // Step 1: Find out which core we are, and park all but core 0.
     // -------------------------------------------------------------------------
@@ -103,14 +107,30 @@ _start:
     // secondary_entry is that later entry, for both.
 
 2:
-    // Drop a stale EL2 or EL1 translation and throw away every data-cache
-    // line before the first store. DC ISW discards the line. A clean would
-    // write a stale line back over the image the GPU just loaded.
+    // x22 is 1 only while the PC is still in the first megabyte. That is the
+    // Pi 4 load address. Virt and Pi 5 are not, and must not touch GPIO.
+    // Recomputing this after the high jump would clear the flag, so it stays
+    // in x22. x21 is the LED stage. Both survive the EL drop. mark and the
+    // helpers below do not write them.
+    adrp    x22, _start
+    lsr     x22, x22, #20
+    cmp     x22, #0
+    cset    x22, eq
+    // MMU off before VBAR points at a physical table. A vector fetch through
+    // a firmware map that is not an identity map would fault again at once.
     bl      caches_off
+    bl      install_early_vbar
+    // Stage 1: MMU is off and the physical stub is installed. Next step
+    // discards cache lines. A fault here repeats 1.
+    mov     x21, #1
+    bl      mark
+    // Throw away every data-cache line before the first store. DC ISW
+    // discards the line. A clean would write a stale line back over the
+    // image the GPU just loaded.
     bl      inval_caches
-    // One long ACT flash means this image is running on core 0. The count
-    // codes below are Rust. Virt and Pi 5 leave the pin alone.
-    bl      act_long
+    // Stage 2: caches are discarded. Next step is the EL2 to EL1 drop.
+    mov     x21, #2
+    bl      mark
     // -------------------------------------------------------------------------
     // Step 2: Drop from EL2 to EL1, unless we are already at EL1.
     // -------------------------------------------------------------------------
@@ -171,6 +191,11 @@ _start:
     movz    x0, #0x3c5
     msr     spsr_el2, x0
 
+    // Firmware may have left EL1 translations. Drop them before eret.
+    // tlbi alle1 is an EL2 instruction. EL1 uses vmalle1 later.
+    tlbi    alle1
+    dsb     sy
+    isb
     // Land on label 8, which is the first EL1 instruction. adr is a
     // PC-relative address, so it is correct with the MMU off.
     adr     x0, 8f
@@ -178,17 +203,26 @@ _start:
     isb
     eret
 
-// Wrong exception level. A Pi 4 flashes the ACT LED fast so a serial-less
-// board can show that the image started and then stopped here. Other
-// boards fall through to the same wait the extra cores use.
+// Wrong exception level. The physical stub repeats stage 2. Other boards
+// park without touching GPIO.
 bad_el:
-    bl      act_fast_forever
-    b       1b
+    b       fault_blink
 
     // -------------------------------------------------------------------------
     // Step 3: Enable the FP/SIMD (NEON) unit. Now at EL1.
     // -------------------------------------------------------------------------
 8:
+    // SCTLR_EL1 reset value, MMU and caches off, RES1 bits set. The EL2
+    // path wrote this before eret. The EL1 path (QEMU virt) must write it
+    // too: caches_off only clears M, C, and I, and a later enable must not
+    // OR those bits onto a register that is missing the RES1 set.
+    movz    x0, #0x0800
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+    isb
+    // Stage 3: this core is at EL1. Next step enables FP and the stack.
+    mov     x21, #3
+    bl      mark
     // The Rust compiler freely uses NEON registers (q0-q31) for things like
     // memcpy and struct copies, even in no_std code. QEMU starts with FP/SIMD
     // access trapped, and the first such instruction would raise an exception
@@ -220,6 +254,9 @@ bad_el:
     adrp    x1, __stack_top
     add     x1, x1, :lo12:__stack_top
     mov     sp, x1
+    // Stage 4: FP is on and SP is set. Next step zeros BSS and DMA.
+    mov     x21, #4
+    bl      mark
 
     // -------------------------------------------------------------------------
     // Step 5: Clear the .bss section, then .dma.
@@ -253,6 +290,9 @@ bad_el:
     b       6b
 
 4:
+    // Stage 5: BSS and DMA are zero. Next step builds the coarse tables.
+    mov     x21, #5
+    bl      mark
     // -------------------------------------------------------------------------
     // Step 6: Coarse page tables for the jump into the upper half.
     // -------------------------------------------------------------------------
@@ -367,6 +407,9 @@ bad_el:
     add     x0, x0, :lo12:early_l1_hi
     bl      clean_page
     dsb     sy
+    // Stage 6: tables are in memory. Next step turns the MMU on.
+    mov     x21, #6
+    bl      mark
 
     // -------------------------------------------------------------------------
     // Step 7: Turn the MMU on and jump to the high alias.
@@ -398,14 +441,24 @@ bad_el:
     ic      iallu
     dsb     sy
     isb
+    // Stale EL1 translations fault the first fetch after M is set. QEMU
+    // has none. Real firmware can. vmalle1 is the EL1 invalidate.
+    tlbi    vmalle1
+    dsb     sy
+    isb
 
-    // SCTLR M, C, and I. Not WXN. The block map is writable and executable.
-    mrs     x0, sctlr_el1
-    orr     x0, x0, #1
-    orr     x0, x0, #4
-    orr     x0, x0, #0x1000
+    // Full SCTLR_EL1: reset RES1 bits, plus M, C, and I. Not WXN. The
+    // block map is writable and executable. Writing the constant avoids
+    // OR-ing M onto whatever mrs returned.
+    movz    x0, #0x1805
+    movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0
     isb
+    // Stage 7: the MMU is on. This instruction was fetched through the
+    // identity map. Next step jumps to the high alias. The physical stub
+    // is still the vector base, and TTBR0 still maps it.
+    mov     x21, #7
+    bl      mark
 
     // Label 9 is the first instruction fetched through TTBR1.
     adr     x0, 9f
@@ -418,6 +471,17 @@ bad_el:
     ic      iallu
     dsb     sy
     isb
+    // Stage 8: the high alias fetched. Next step installs the high vector
+    // base and drops the identity map. Blink before that drop so a fault
+    // here still runs the physical stub.
+    mov     x21, #8
+    bl      mark
+    // High VBAR before TTBR0 is cleared. A fault in the gap used to fetch
+    // the physical stub through a map that no longer existed.
+    adrp    x0, exception_vectors
+    add     x0, x0, :lo12:exception_vectors
+    msr     vbar_el1, x0
+    isb
     // Drop the identity map. TTBR0's only level-0 entry covered RAM and
     // devices. After this, a low address faults until Rust installs the
     // user window. The store is through the high alias of the same page.
@@ -429,13 +493,10 @@ bad_el:
     tlbi    vmalle1
     dsb     sy
     isb
-
-    // VBAR must be the high address. A physical vector base would fault
-    // now that the identity map is gone. IRQs stay masked until Rust.
-    adrp    x0, exception_vectors
-    add     x0, x0, :lo12:exception_vectors
-    msr     vbar_el1, x0
-    isb
+    // Stage 9: identity map is gone. Next step is kernel_main. GPIO uses
+    // the high alias from here on, because SCTLR.M is set.
+    mov     x21, #9
+    bl      mark
 
     // -------------------------------------------------------------------------
     // Step 8: Jump into Rust.
@@ -446,12 +507,16 @@ bad_el:
     mov     x0, x20
     bl      kernel_main
 
-    // -------------------------------------------------------------------------
-    // Step 9: Safety net.
-    // -------------------------------------------------------------------------
+    // kernel_main does not return. If it does, keep showing stage 9 so the
+    // LED does not go dark. Virt has nothing to blink and waits.
 5:
-    wfe
+    cbz     x22, 14f
+    mov     x21, #9
+    bl      mark
     b       5b
+14:
+    wfe
+    b       14b
 
 // x0 = level-0 table, x1 = level-1 table.
 // x2 = RAM block descriptor, x3 = its level-1 index.
@@ -488,17 +553,24 @@ caches_off_el1:
     isb
     ret
 
-// Invalidate the instruction cache, then every data-cache level up to the
-// point of coherency, by set and way. Lines are discarded, not written
-// back. A stuck or huge geometry stops after 1<<20 operations so boot
-// cannot spin here. Registers x0-x15 are scratch. x19-x28 are left alone.
+// Invalidate every data-cache level up to the point of coherency, by set
+// and way, then the instruction cache. DC ISW comes first. An early
+// ic iallu can refill from a stale unified L2 line, and that line is what
+// the core executes after the MMU comes on. Lines are discarded, not
+// written back. A stuck or huge geometry stops after 1<<20 operations so
+// boot cannot spin here. Registers x0-x15 are scratch. x19-x28 are left
+// alone, including the stage in x21 and the Pi 4 flag in x22.
+// inval_l1 stops after the first level. Secondary cores use it so they
+// do not throw away the primary's shared L2 once that core has caches on.
 inval_caches:
-    ic      iallu
-    dsb     sy
-    isb
     mrs     x0, clidr_el1
     and     x3, x0, #0x7000000
     lsr     x3, x3, #23
+    b       inval_have_loc
+inval_l1:
+    mrs     x0, clidr_el1
+    mov     x3, #2
+inval_have_loc:
     cbz     x3, inval_done
     mov     x10, #0
     mov     x12, #1
@@ -540,15 +612,47 @@ inval_next:
 inval_done:
     dsb     sy
     isb
+    ic      iallu
+    dsb     sy
+    isb
     ret
 
 // GPIO 42 is the green ACT LED on current Pi 4 boards, active high.
 // GPFSEL4 at 0xFE200010, bits 8:6. GPSET1 and GPCLR1 use bit 10.
-// Physical addresses: this runs with the MMU off. BOOT_PI4 is 0 on the
-// other images, and those images do not touch the pin.
+// With the MMU off the address is physical. With the MMU on at the level
+// that is running, the high alias is used so the access still hits after
+// TTBR0 is dropped. EL2 keeps its own SCTLR: a trap into the stub at EL2
+// must not follow SCTLR_EL1.M while EL2's MMU is off. Callers have already
+// decided this is a Pi 4. x16 holds the return address across gpio_alias.
+// x20-x22 are not written.
+gpio_alias:
+    mrs     x0, currentel
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.eq    gpio_alias_el2
+    mrs     x0, sctlr_el1
+    b       gpio_alias_test
+gpio_alias_el2:
+    mrs     x0, sctlr_el2
+gpio_alias_test:
+    tbz     x0, #0, gpio_alias_ret
+    movz    x0, #0xFFFF, lsl #48
+    orr     x1, x1, x0
+gpio_alias_ret:
+    ret
+
 gpio42_output:
+    mov     x16, x30
+    // Set the pin before the function-select read. A hang on that load
+    // still leaves the LED on.
+    movz    x1, #0x0020
+    movk    x1, #0xFE20, lsl #16
+    bl      gpio_alias
+    mov     w2, #0x400
+    str     w2, [x1]
     movz    x1, #0x0010
     movk    x1, #0xFE20, lsl #16
+    bl      gpio_alias
     ldr     w2, [x1]
     mov     w3, #7
     lsl     w3, w3, #6
@@ -557,21 +661,144 @@ gpio42_output:
     lsl     w3, w3, #6
     orr     w2, w2, w3
     str     w2, [x1]
+    movz    x1, #0x0020
+    movk    x1, #0xFE20, lsl #16
+    bl      gpio_alias
+    mov     w2, #0x400
+    str     w2, [x1]
+    mov     x30, x16
     ret
 
 gpio42_on:
+    mov     x16, x30
     movz    x1, #0x0020
     movk    x1, #0xFE20, lsl #16
+    bl      gpio_alias
     mov     w2, #0x400
     str     w2, [x1]
+    mov     x30, x16
     ret
 
 gpio42_off:
+    mov     x16, x30
     movz    x1, #0x002C
     movk    x1, #0xFE20, lsl #16
+    bl      gpio_alias
     mov     w2, #0x400
     str     w2, [x1]
+    mov     x30, x16
     ret
+
+// Blink x21 short flashes, then a gap. x22 == 0 returns at once. x24 holds
+// the return address because these calls happen before SP exists. A shift
+// of 4 is about 60 ms at 54 MHz. The gap is twice that.
+mark:
+    cbz     x22, mark_ret
+    mov     x24, x30
+    bl      gpio42_output
+    mov     x23, x21
+mark_pulse:
+    cbz     x23, mark_gap
+    bl      gpio42_on
+    mov     x0, #4
+    bl      delay_shift
+    bl      gpio42_off
+    mov     x0, #4
+    bl      delay_shift
+    sub     x23, x23, #1
+    b       mark_pulse
+mark_gap:
+    mov     x0, #3
+    bl      delay_shift
+    mov     x30, x24
+mark_ret:
+    ret
+
+// Physical vector target. No stack. A Pi 4 fast-blinks eight times so a
+// fault is obvious, then repeats x21 forever so the stage can be counted.
+// x21 == 0 stays on the fast pattern. Any other board waits.
+fault_blink:
+    cbz     x22, fault_park
+    bl      gpio42_output
+fault_fast:
+    mov     x23, #8
+fault_fast_one:
+    bl      gpio42_on
+    mov     x0, #6
+    bl      delay_shift
+    bl      gpio42_off
+    mov     x0, #6
+    bl      delay_shift
+    subs    x23, x23, #1
+    b.ne    fault_fast_one
+    cbz     x21, fault_fast
+    mov     x23, x21
+fault_count:
+    cbz     x23, fault_count_gap
+    bl      gpio42_on
+    mov     x0, #4
+    bl      delay_shift
+    bl      gpio42_off
+    mov     x0, #4
+    bl      delay_shift
+    sub     x23, x23, #1
+    b       fault_count
+fault_count_gap:
+    mov     x0, #3
+    bl      delay_shift
+    b       fault_fast
+fault_park:
+    wfe
+    b       fault_park
+
+// VBAR_EL1 and, at EL2, VBAR_EL2. The table is physical while the MMU is
+// off, and the identity map covers it until TTBR0 is dropped.
+install_early_vbar:
+    adrp    x0, early_vectors
+    add     x0, x0, :lo12:early_vectors
+    msr     vbar_el1, x0
+    mrs     x1, currentel
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.ne    install_early_done
+    msr     vbar_el2, x0
+install_early_done:
+    isb
+    ret
+
+    .balign 2048
+early_vectors:
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
+    .balign 128
+    b       fault_blink
 
 // Wait CNTFRQ >> x0 ticks. A counter that does not move stops after a
 // fixed spin, so a stuck CNTPCT cannot park the core. x0 is the shift.
@@ -599,43 +826,6 @@ delay_spin_loop:
     b.ne    delay_spin_loop
     ret
 
-// One long on, about half a second, then off. Distinct from the short
-// counted blinks Rust uses for the later stages.
-act_long:
-    mov     x19, x30
-    adrp    x0, BOOT_PI4
-    add     x0, x0, :lo12:BOOT_PI4
-    ldr     x0, [x0]
-    cbz     x0, act_long_ret
-    bl      gpio42_output
-    bl      gpio42_on
-    mov     x0, #1
-    bl      delay_shift
-    bl      gpio42_off
-    mov     x0, #2
-    bl      delay_shift
-act_long_ret:
-    mov     x30, x19
-    ret
-
-// Fast continuous blink. Returns only when this is not a Pi 4 image.
-act_fast_forever:
-    adrp    x0, BOOT_PI4
-    add     x0, x0, :lo12:BOOT_PI4
-    ldr     x0, [x0]
-    cbz     x0, act_fast_ret
-    bl      gpio42_output
-act_fast_loop:
-    bl      gpio42_on
-    mov     x0, #5
-    bl      delay_shift
-    bl      gpio42_off
-    mov     x0, #5
-    bl      delay_shift
-    b       act_fast_loop
-act_fast_ret:
-    ret
-
 // Clean and invalidate the 4 KiB page at x0, one cache line at a time.
 clean_page:
     mov     x2, #64
@@ -659,7 +849,8 @@ clean_page:
 secondary_entry:
     mov     x21, x0
     bl      caches_off
-    bl      inval_caches
+    // L1 only. A full DC ISW here would discard the primary's shared L2.
+    bl      inval_l1
     cbnz    x21, 18f
     mrs     x21, mpidr_el1
     and     x22, x21, #0xff
@@ -731,10 +922,11 @@ secondary_entry:
     ic      iallu
     dsb     sy
     isb
-    mrs     x0, sctlr_el1
-    orr     x0, x0, #1
-    orr     x0, x0, #4
-    orr     x0, x0, #0x1000
+    tlbi    vmalle1
+    dsb     sy
+    isb
+    movz    x0, #0x1805
+    movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0
     isb
     adr     x0, 21f
@@ -743,14 +935,15 @@ secondary_entry:
     add     sp, sp, x1
     br      x0
 21:
+    // High vectors before the identity map goes away.
+    adrp    x0, exception_vectors
+    add     x0, x0, :lo12:exception_vectors
+    msr     vbar_el1, x0
+    isb
     msr     ttbr0_el1, xzr
     dsb     nsh
     tlbi    vmalle1
     dsb     nsh
-    isb
-    adrp    x0, exception_vectors
-    add     x0, x0, :lo12:exception_vectors
-    msr     vbar_el1, x0
     isb
     mov     x0, x21
     bl      secondary_main
