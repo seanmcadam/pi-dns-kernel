@@ -320,6 +320,9 @@ bad_el:
     // Step 3: Enable the FP/SIMD (NEON) unit. Now at EL1.
     // -------------------------------------------------------------------------
 8:
+    // EL1, before ic iallu. SMPEN is clear out of reset, and a broadcast
+    // I-cache or TLB op is ignored by every core that has not set it.
+    bl      a72_cpu_setup
     // SCTLR_EL1 reset value, MMU and caches off, RES1 bits set. The EL2
     // path wrote this before eret. The EL1 path (QEMU virt) must write it
     // too: caches_off only clears M, C, and I, and a later enable must not
@@ -984,6 +987,47 @@ clean_page:
     b.ne    12b
     ret
 
+// Cortex-A72 bring-up. No braces: this file is included from global_asm.
+//
+// CPUECTLR_EL1.SMPEN (bit 6) resets to 0. The TRM requires it be set
+// before the caches, the MMU, or any I-cache or TLB maintenance. With it
+// clear, ic ialluis and tlbi vmalle1is run on the issuing core and every
+// other core ignores the broadcast. The boot self-test and the DNS/HTTP
+// tasks share user VA 0x100000000 with different physical pages. A VIPT
+// I-cache then keeps the self-test opcodes. http-el0's server::run at
+// 0x100001188 is tbnz (no memory access). The self-test image at that
+// address is ldrsb w11, [x12], which data-aborts. QEMU does not model
+// this cache, so the same image runs there.
+//
+// Erratum 859971 (A72 r0p3 and earlier, the Pi 4): a speculative
+// instruction prefetch into execute-never memory can corrupt data. The
+// user stack is UXN. CPUACTLR_EL1 bit 32 disables that prefetcher.
+// Later revisions skip the bit. Non-A72 cores return without a write.
+a72_cpu_setup:
+    mrs     x0, midr_el1
+    lsr     x1, x0, #24
+    cmp     x1, #0x41
+    b.ne    92f
+    ubfx    x1, x0, #4, #12
+    movz    x2, #0xd08
+    cmp     x1, x2
+    b.ne    92f
+    mrs     x1, S3_1_C15_C2_1
+    orr     x1, x1, #0x40
+    msr     S3_1_C15_C2_1, x1
+    ubfx    x1, x0, #20, #4
+    cbnz    x1, 91f
+    and     x1, x0, #0xf
+    cmp     x1, #3
+    b.hi    91f
+    mrs     x1, S3_1_C15_C2_0
+    orr     x1, x1, #(1 << 32)
+    msr     S3_1_C15_C2_0, x1
+91:
+    isb
+92:
+    ret
+
 // Secondary cores arrive here with the MMU off. x0 is the PSCI context
 // id. QEMU virt passes the cpu id there, so that path is unchanged.
 // The Pi 4 spin-table stub, including QEMU raspi4b, zeroes x0-x3 and then
@@ -1067,6 +1111,7 @@ secondary_entry:
     msr     ttbr1_el1, x1
     dsb     sy
     isb
+    bl      a72_cpu_setup
     ic      iallu
     dsb     sy
     isb

@@ -89,6 +89,48 @@ fn uart_dec(mut n: u64) {
     uart_write(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
 }
 
+/// Cortex-A72 only. boot.s sets CPUECTLR_EL1.SMPEN and, on r0p3 and
+/// earlier, CPUACTLR_EL1 bit 32 (erratum 859971, disable L1 instruction
+/// prefetch). Other cores ignore broadcast I-cache and TLB maintenance
+/// until SMPEN is 1. QEMU's cortex-a72 does not keep either IMPDEF bit,
+/// so this line is a warning there and an OK on a Pi 4.
+fn note_a72_smp() {
+    let midr: u64;
+    unsafe {
+        core::arch::asm!("mrs {midr}, midr_el1", midr = out(reg) midr, options(nomem, nostack));
+    }
+    let arm = (midr >> 24) & 0xff == 0x41;
+    let a72 = (midr >> 4) & 0xfff == 0xd08;
+    if !arm || !a72 {
+        return;
+    }
+    let ectlr: u64;
+    let actlr: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {ectlr}, S3_1_C15_C2_1",
+            "mrs {actlr}, S3_1_C15_C2_0",
+            ectlr = out(reg) ectlr,
+            actlr = out(reg) actlr,
+            options(nomem, nostack),
+        );
+    }
+    if ectlr & (1 << 6) != 0 {
+        uart_write("[OK] A72 SMPEN\r\n");
+    } else {
+        uart_write("[WARN] A72 SMPEN clear\r\n");
+    }
+    let variant = (midr >> 20) & 0xf;
+    let revision = midr & 0xf;
+    if variant == 0 && revision <= 3 {
+        if actlr & (1 << 32) != 0 {
+            uart_write("[OK] A72 no instruction prefetch\r\n");
+        } else {
+            uart_write("[WARN] A72 instruction prefetch still on\r\n");
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     // The framebuffer is programmed before the UART and before the strict
@@ -112,6 +154,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     #[cfg(feature = "board-pi4")]
     fb_con::switch_to_nc();
     uart_write("[OK] MMU and caches enabled\r\n");
+    note_a72_smp();
 
     percpu::init_bsp();
 

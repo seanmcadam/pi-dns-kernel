@@ -1384,11 +1384,13 @@ fn load_image(mem: *mut UserMem, bin: &[u8], data_off: usize, data_len: usize, d
 /// Make bytes written through the kernel mapping visible to EL0 fetch.
 ///
 /// Cortex-A72 requires a DSB between the clean to the point of unification
-/// and the instruction-cache invalidate. Without it the I-cache refills
-/// from stale RAM. QEMU does not model that race, so the same image runs
-/// there and takes undefined-instruction and wild-store faults on a Pi 4.
-/// `ic ialluis` covers every ASID and every core; invalidating only the
-/// user VA under ASID 0 leaves the ASID the task actually runs with stale.
+/// and the instruction-cache invalidate. `ic ialluis` covers every ASID.
+/// A core accepts that broadcast only when its CPUECTLR_EL1.SMPEN bit is
+/// set; boot.s sets the bit before the caches and before this invalidate.
+/// The issuing core still executes the op when the bit is clear, which is
+/// why QEMU (no I-cache, and it does not keep the bit) runs this image.
+/// Invalidating only the user VA under ASID 0 leaves the ASID the task
+/// actually runs with stale. The boot self-test used this same user VA.
 fn maintain_code(kernel_ptr: *mut u8, len: usize) {
     unsafe {
         let mut off = 0;
