@@ -10,6 +10,7 @@ mod board;
 mod config_manager;
 mod console;
 mod cpu_stat;
+mod dhcp_rx;
 mod dns;
 mod exception;
 mod fault_log;
@@ -261,6 +262,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     let config = config_manager::load_config();
     uart_write("[OK] Config loaded\r\n");
 
+    uart_write(dhcp_rx::self_check_line());
+    uart_write("\r\n");
     uart_write("[6] Initializing network...\r\n");
     // A missing NIC skips DNS, HTTP, and telnet. The log task still starts.
     // QEMU virt has a NIC. raspi4b has no GENET, and the Pi 5 image does

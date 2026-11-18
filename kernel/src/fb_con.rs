@@ -248,15 +248,16 @@ pub fn push(text: &str) {
     if !held {
         return;
     }
-    // Once the idle loop is running, a painter that returns is progress.
-    // A painter that never returns leaves this checkpoint to go stale.
-    if crate::act::looping() && crate::percpu::live() {
-        crate::act::note_core(crate::percpu::id());
-    }
     if READY.load(Ordering::Relaxed) {
         paint(text.as_bytes());
     } else {
         stash(text.as_bytes());
+    }
+    // Noted after the paint returns. A painter that never returns leaves
+    // the previous checkpoint to age, which is what the other cores' timer
+    // reports. Noting on the way in made a stuck scroll look freshly alive.
+    if crate::act::looping() && crate::percpu::live() {
+        crate::act::note_core(crate::percpu::id());
     }
     unlock(held);
 }

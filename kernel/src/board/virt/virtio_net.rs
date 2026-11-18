@@ -199,6 +199,7 @@ impl VirtioNetDevice {
         register_irq(base);
 
         uart_log("VirtIO net ready\r\n");
+        crate::dhcp_rx::arm(&mac);
         Some(dev)
     }
 
@@ -311,6 +312,16 @@ impl Device for VirtioNetDevice {
     type TxToken<'a> = VirtioTxToken<'a> where Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let Some(len) = crate::dhcp_rx::take_len() {
+            return Some((
+                VirtioRxToken {
+                    idx: 0,
+                    len,
+                    probe: true,
+                },
+                VirtioTxToken { device: self },
+            ));
+        }
         self.reclaim_tx();
         self.harvest_rx();
         if self.alloc_tx().is_none() {
@@ -319,7 +330,11 @@ impl Device for VirtioNetDevice {
         let pos = self.pending.iter().position(|s| s.is_some())?;
         let (idx, len) = self.pending[pos].take()?;
         Some((
-            VirtioRxToken { idx, len },
+            VirtioRxToken {
+                idx,
+                len,
+                probe: false,
+            },
             VirtioTxToken { device: self },
         ))
     }
@@ -345,6 +360,7 @@ impl Device for VirtioNetDevice {
 pub struct VirtioRxToken {
     idx: u16,
     len: u16,
+    probe: bool,
 }
 
 impl RxToken for VirtioRxToken {
@@ -352,6 +368,22 @@ impl RxToken for VirtioRxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        if self.probe {
+            let mut tmp = [0u8; 384];
+            let n = crate::dhcp_rx::copy_out(&mut tmp);
+            let result = if n < 16 {
+                f(&mut [])
+            } else {
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(&tmp[..6]);
+                match crate::dhcp_rx::verdict(&tmp[..n], &mac) {
+                crate::dhcp_rx::Verdict::DropChaddr => f(&mut []),
+                _ => f(&mut tmp[..n]),
+            }
+            };
+            crate::console::write_str("[OK] DHCP offer probe delivered\r\n");
+            return result;
+        }
         let result = unsafe {
             let bufs = &mut *addr_of_mut!(RX_BUFS);
             let frame = bufs.bufs[self.idx as usize].as_mut_ptr().add(HDR_LEN);

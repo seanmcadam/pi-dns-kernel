@@ -1967,7 +1967,7 @@ if prev is None:
 idle_d = idle - prev[4]
 busy_d = busy - prev[3]
 print(f"nic={nic} blk={blk} idle_d={idle_d} busy_d={busy_d}")
-# Idle cntpct over the quiet window should dwarf drive() time.
+# Idle milliseconds over the quiet window should dwarf drive() time.
 if idle_d <= 0 or idle_d <= busy_d * 4:
     sys.exit(1)
 sys.exit(0)
@@ -1983,6 +1983,20 @@ else
     cat /tmp/irq-samples.txt 2>/dev/null || true
     grep "irq" qemu/irq-serial.txt || true
     grep "status" qemu/irq-serial.txt | tail -5 || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# The offer is the frame from the frozen Pi 4 photo: Ethernet source
+# 00:00:5e:00:01:01, IPv4/UDP 67->68, home-router options. virtio delivers
+# it through Device::receive. A hang here never reaches the status lines
+# above; this grep is the path returning.
+if grep -F -q "[OK] DHCP offer probe kept src=00:00:5e:00:01:01" qemu/irq-serial.txt \
+    && grep -F -q "[OK] DHCP offer probe delivered" qemu/irq-serial.txt; then
+    echo "✓ virt RX path returned the VRRP DHCP offer"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ virt RX path did not return the VRRP DHCP offer"
+    grep -F "DHCP offer" qemu/irq-serial.txt || true
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -2035,7 +2049,8 @@ EOF
         "[OK] Log task running" \
         "EL0 test" \
         "[WARN] No NIC" \
-        "[OK] HDMI console"
+        "[OK] HDMI console" \
+        "[OK] DHCP offer probe kept src=00:00:5e:00:01:01"
     do
         if ! grep -F -q "$need" qemu/raspi4b.txt; then
             echo "✗ raspi4b missing: $need"

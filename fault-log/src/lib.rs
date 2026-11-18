@@ -6,3 +6,6 @@
 
 #[path = "../../kernel/src/fault_log.rs"]
 mod fault_log;
+
+#[path = "../../kernel/src/dhcp_rx.rs"]
+mod dhcp_rx;

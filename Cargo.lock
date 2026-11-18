@@ -119,6 +119,9 @@ dependencies = [
 [[package]]
 name = "fault-log"
 version = "0.1.0"
+dependencies = [
+ "smoltcp",
+]
 
 [[package]]
 name = "hash32"
