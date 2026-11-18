@@ -16,13 +16,15 @@ echo "Using host ports DNS ${DNS_HOST_PORT}, HTTP ${HTTP_HOST_PORT}, telnet ${TE
 
 # Start QEMU in background
 echo "Starting QEMU..."
+rm -f qemu/boot-output.txt
 timeout 120 qemu-system-aarch64 \
     -M virt,gic-version=2 \
     -cpu cortex-a72 \
     -smp 4 \
     -m 512M \
     -kernel boot/kernel8.img \
-    -serial mon:tcp:127.0.0.1:4444,server,nowait \
+    -chardev socket,id=ser0,host=127.0.0.1,port=4444,server=on,wait=off,logfile=qemu/boot-output.txt \
+    -serial chardev:ser0 \
     -nographic \
     -display none \
     -netdev user,id=net0,${HOSTFWD} \
@@ -32,17 +34,12 @@ timeout 120 qemu-system-aarch64 \
 QEMU_PID=$!
 echo "QEMU PID: $QEMU_PID"
 
-# Wait for boot
+# The serial log starts with QEMU, so a client that attaches later is not
+# required to see the boot lines.
 echo "Waiting for kernel to boot..."
 sleep 5
 
-# Connect and capture boot output
 echo "Checking boot output..."
-timeout 5 nc 127.0.0.1 4444 > qemu/boot-output.txt 2>&1 &
-NC_PID=$!
-
-sleep 2
-kill $NC_PID 2>/dev/null || true
 
 TESTS_PASSED=0
 TESTS_FAILED=0

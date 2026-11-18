@@ -10,9 +10,7 @@ pub fn write_str(s: &str) {
     crate::fb_con::push(s);
 }
 
-/// UART only. The idle loop repeats the boot banner so a serial client that
-/// attaches late still sees it. Mirroring that repeat onto HDMI looks like
-/// the kernel entered `boot.s` again.
+/// UART data register. Does not mirror onto the HDMI console.
 pub fn write_serial(s: &str) {
     let uart = crate::addr::phys_to_virt(crate::board::UART_PHYS) as *mut u32;
     unsafe {
