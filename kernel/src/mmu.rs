@@ -10,9 +10,9 @@
 //! address equal the physical address, so the level-1/2/3 indices match.
 //!
 //! EL0 lives at `USER_CODE_VA` (`0x1_0000_0000`) in its own TTBR0 root, not
-//! in the kernel tables. User pages are non-global and tagged with ASID 1.
-//! Kernel pages stay global and EL1-only. Installing the user window
-//! invalidates the EL1 TLB.
+//! in the kernel tables. User leaves have nG set. TCR_EL1.AS is 0 and A1
+//! is 0, so the 8-bit ASID is TTBR0[55:48] and bits [63:56] are ignored.
+//! Each slot uses ASID slot+1. Kernel pages stay global and EL1-only.
 //!
 //! Virtio descriptor rings and packet buffers live in the `.dma` section.
 //! Those pages are Normal non-cacheable. The device is programmed with the
@@ -76,6 +76,51 @@ pub const USER_FB_MAX: u64 = 1280 * 1024;
 const ATTR_NORMAL: u64 = 0 << 2;
 const ATTR_DEVICE: u64 = 1 << 2;
 const ATTR_DMA: u64 = 2 << 2;
+
+/// Stage-1 leaf for an EL0 page. Bit 11 is nG, so the TLB entry is tagged
+/// with the current ASID and does not match a different process. Kernel
+/// leaves never set this bit.
+const fn user_leaf(exec: bool) -> u64 {
+    let common = ATTR_NORMAL | SH_INNER | AF | NG | PXN;
+    if exec {
+        common | AP_EL0_RO
+    } else {
+        common | AP_EL0_RW | UXN
+    }
+}
+
+const fn user_fb_leaf() -> u64 {
+    ATTR_DMA | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN
+}
+
+/// TCR_EL1.AS is 0. The live ASID is TTBR0[55:48]. [63:56] reads back as
+/// written and is ignored for allocation and matching.
+pub const fn ttbr0_for(base: u64, asid: u64) -> u64 {
+    base | ((asid & 0xff) << 48)
+}
+
+/// TLBI ASIDE1 takes the ASID in Xt[63:48]. With an 8-bit ASID the value
+/// sits in [55:48] and [63:56] is 0.
+pub const fn tlbi_asid_arg(asid: u64) -> u64 {
+    (asid & 0xff) << 48
+}
+
+const _: () = {
+    let code = user_leaf(true);
+    let data = user_leaf(false);
+    let fb = user_fb_leaf();
+    assert!(code & NG != 0 && data & NG != 0 && fb & NG != 0);
+    assert!(code & UXN == 0);
+    assert!(data & UXN != 0 && fb & UXN != 0);
+    assert!(code & AP_EL0_RO == AP_EL0_RO);
+    // Kernel RAM leaves are built without nG. A global entry would match
+    // every ASID, which is what user leaves must not do.
+    assert!((ATTR_NORMAL | SH_INNER | AF | UXN) & NG == 0);
+    assert!(ttbr0_for(0x1000, 2) == 0x1000 | (2 << 48));
+    assert!(ttbr0_for(0x1000, 2) & (0xff << 56) == 0);
+    assert!(tlbi_asid_arg(2) == 2 << 48);
+    assert!(tlbi_asid_arg(2) & (0xff << 56) == 0);
+};
 
 #[repr(C, align(4096))]
 struct Table {
@@ -254,15 +299,15 @@ fn pan_supported() -> bool {
 ///
 /// `slot` is 0 through 6. The arguments are kernel virtual addresses of that
 /// task's backing pages. Descriptors store physical addresses. TTBR0 is
-/// pointed at this slot with ASID 0 so the caller can maintain the user
-/// instruction cache. The scheduler later installs the task ASID.
+/// pointed at this slot with ASID slot+1, which is the id `claim_asid`
+/// prefers. The old ASID is invalidated before the new root is used.
 pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, stack_va: u64) {
     if slot >= USER_SLOTS {
         give_up("user slot out of range");
     }
     prepare_user_root(slot);
-    let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
-    let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    let code = user_leaf(true);
+    let data = user_leaf(false);
     map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), USER_CODE_BYTES, code);
     map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), USER_DATA_BYTES, data);
     map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), USER_HEAP_BYTES, data);
@@ -270,7 +315,7 @@ pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, st
     // Stacks grow down. Leave the page under each stack unmapped, and the
     // page at each initial SP unmapped. The frames stay in the heap image.
     unmap_user_guards(slot);
-    use_user_slot(slot, 0);
+    install_user_asid(slot);
     flush_tlb();
 }
 
@@ -290,8 +335,8 @@ pub fn map_user_sized(
         give_up("user slot out of range");
     }
     prepare_user_root(slot);
-    let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
-    let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    let code = user_leaf(true);
+    let data = user_leaf(false);
     map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), code_len, code);
     if data_len > 0 {
         map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), data_len, data);
@@ -301,7 +346,7 @@ pub fn map_user_sized(
     }
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), stack_len, data);
     unmap_user_guards(slot);
-    use_user_slot(slot, 0);
+    install_user_asid(slot);
     flush_tlb();
 }
 
@@ -311,12 +356,12 @@ pub fn map_user_stub(slot: usize, code_va: u64, stack_va: u64) {
         give_up("user slot out of range");
     }
     prepare_user_root(slot);
-    let code = ATTR_NORMAL | SH_INNER | AP_EL0_RO | AF | NG | PXN;
-    let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    let code = user_leaf(true);
+    let data = user_leaf(false);
     map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), PAGE, code);
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), PAGE, data);
     unmap_user_guards(slot);
-    use_user_slot(slot, 0);
+    install_user_asid(slot);
     flush_tlb();
 }
 
@@ -356,9 +401,10 @@ pub fn map_user_fb(slot: usize, pa: u64, bytes: u64) -> i64 {
         return -4;
     }
     unmap_user_fb(slot);
-    let flags = ATTR_DMA | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
+    let flags = user_fb_leaf();
     map_user_span(slot, USER_FB_VA, pa, bytes, flags);
     FB_BYTES.store(bytes, Ordering::Release);
+    tlbi_asid((slot as u64) + 1);
     flush_tlb();
     USER_FB_VA as i64
 }
@@ -384,6 +430,7 @@ pub fn unmap_user_fb(slot: usize) {
         }
         off += PAGE;
     }
+    tlbi_asid((slot as u64) + 1);
     flush_tlb();
 }
 
@@ -467,22 +514,45 @@ fn checked_end(ptr: u64, len: u64) -> Option<u64> {
     ptr.checked_add(len)
 }
 
-/// ASID lives in TTBR0[63:56] (TCR_EL1.AS is 0, so the ASID is 8 bits).
-/// Kernel translations are global. User translations are non-global, so
-/// ASID 0 does not match them. The preferred ASID is the slot plus one:
-/// dns 1, http 2, spin 3, log 4, telnet 5, vnc 6, hdmi 7. The roots map the
-/// same virtual addresses to different physical pages, and the ASID keeps
-/// those translations from aliasing.
-pub fn set_user_asid(active: bool) {
-    use_user_slot(0, if active { 1 } else { 0 });
+/// Preferred ASID for a slot: dns 1, http 2, spin 3, log 4, telnet 5,
+/// vnc 6, hdmi 7. ASID 0 is not used for a user root. Kernel translations
+/// are global. User translations are non-global, so an entry tagged with
+/// one of these ids does not match another process at the same VA.
+pub fn slot_asid(slot: usize) -> u64 {
+    (slot as u64) + 1
 }
 
+fn install_user_asid(slot: usize) {
+    let asid = slot_asid(slot);
+    use_user_slot(slot, asid);
+    tlbi_asid(asid);
+    invalidate_icache();
+}
+
+/// Boot self-test on slot 0. `active` installs ASID 1. Clearing it drops
+/// that ASID and the I-cache before DNS reuses the same pages and the same
+/// id. TTBR0 is then zero, so a later walk does not refill ASID 0.
+pub fn set_user_asid(active: bool) {
+    if active {
+        use_user_slot(0, 1);
+        return;
+    }
+    tlbi_asid(1);
+    invalidate_icache();
+    unsafe {
+        core::arch::asm!("msr ttbr0_el1, xzr", "isb", options(nostack));
+    }
+}
+
+/// Point TTBR0 at this slot. Does not invalidate. Callers that publish a
+/// new root use `install_user_asid` or `tlbi_asid`. A switch between two
+/// live ids needs no invalidate: nG entries miss when the ASID differs.
 pub fn use_user_slot(slot: usize, asid: u64) {
     if slot >= USER_SLOTS {
         return;
     }
     let base = unsafe { virt_to_phys(addr_of!(TABLES.user_l0[slot]) as u64) };
-    let ttbr = base | ((asid & 0xff) << 56);
+    let ttbr = ttbr0_for(base, asid);
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, {ttbr}",
@@ -518,9 +588,9 @@ pub fn release_user_root(slot: usize) {
 }
 
 /// Invalidate EL0/EL1 stage-1 entries for one ASID on every core.
-/// TCR_EL1.AS is 0, so the ASID lives in the same bits as TTBR0[63:56].
+/// Inner shareable. The argument uses the 8-bit ASID in bits [55:48].
 pub fn tlbi_asid(asid: u64) {
-    let arg = (asid & 0xff) << 56;
+    let arg = tlbi_asid_arg(asid);
     unsafe {
         core::arch::asm!(
             "dsb ish",
@@ -528,6 +598,21 @@ pub fn tlbi_asid(asid: u64) {
             "dsb ish",
             "isb",
             arg = in(reg) arg,
+            options(nostack),
+        );
+    }
+}
+
+/// Drop fetched instructions on every core and every ASID. A core accepts
+/// the broadcast only after CPUECTLR_EL1.SMPEN is set. The issuing core
+/// still executes it.
+pub fn invalidate_icache() {
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "ic ialluis",
+            "dsb ish",
+            "isb",
             options(nostack),
         );
     }
