@@ -16,7 +16,7 @@
 //! livelock the core.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
@@ -213,6 +213,13 @@ static mut TX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
 
 static RX_CONS: AtomicU32 = AtomicU32::new(0);
 static TX_PROD: AtomicU32 = AtomicU32::new(0);
+/// Set around the TX register accesses so `read`/`write` can name the
+/// register before the access. A hung access leaves the name on screen.
+static TX_TRACE: AtomicBool = AtomicBool::new(false);
+static TX_STEP: AtomicU32 = AtomicU32::new(0);
+static TX_STUCK: AtomicBool = AtomicBool::new(false);
+static LAST_MARK_LEN: AtomicUsize = AtomicUsize::new(0);
+static mut LAST_MARK: [u8; 48] = [0; 48];
 static TX_DROP: AtomicU32 = AtomicU32::new(0);
 static DHCP_NOTED: AtomicBool = AtomicBool::new(false);
 /// CPU copy of one received frame. The owner is the only caller of
@@ -224,8 +231,8 @@ static LAST_BMSR: AtomicU32 = AtomicU32::new(0);
 static LAST_LPA: AtomicU32 = AtomicU32::new(0);
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
-static TX_NOTED: AtomicBool = AtomicBool::new(false);
-static RX_NOTED: AtomicBool = AtomicBool::new(false);
+static TX_LOGS: AtomicU32 = AtomicU32::new(0);
+static RX_LOGS: AtomicU32 = AtomicU32::new(0);
 static RX_DROP_NOTED: AtomicBool = AtomicBool::new(false);
 static SPEED_CAP: AtomicU32 = AtomicU32::new(0);
 static ARP_TX: AtomicU32 = AtomicU32::new(0);
@@ -390,6 +397,13 @@ pub fn write_diag(out: &mut [u8]) -> usize {
     line.dec(read(RDMA_RING + RDMA_CONS_INDEX) & 0xffff);
     line.push(" d=");
     line.dec(rx_prod_raw >> 16);
+    let mark_n = LAST_MARK_LEN.load(Ordering::Acquire);
+    if mark_n > 0 {
+        line.push(" mk=");
+        let n = mark_n.min(48);
+        let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(LAST_MARK).cast::<u8>(), n) };
+        line.push_bytes(bytes);
+    }
     line.push("\n");
     if HAVE_TX_HDR.load(Ordering::Relaxed) {
         line.push("tx ");
@@ -422,6 +436,15 @@ struct StatusLine<'a> {
 }
 
 impl StatusLine<'_> {
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            let tmp = [byte];
+            if let Ok(text) = core::str::from_utf8(&tmp) {
+                self.push(text);
+            }
+        }
+    }
+
     fn push(&mut self, text: &str) {
         for byte in text.bytes() {
             if self.n >= self.buf.len() {
@@ -584,6 +607,18 @@ impl GenetDevice {
         service_link();
         crate::dhcp_rx::arm(&mac);
         say("[OK] GENET v5 TX and RX rings are 256 descriptors");
+        unsafe {
+            let buf0 = crate::addr::virt_to_phys(TX_BUFS[0].as_ptr() as u64);
+            let buf1 = crate::addr::virt_to_phys(TX_BUFS[1].as_ptr() as u64);
+            say_hex("[OK] GENET TX buf0", buf0 as u32);
+            say_hex("[OK] GENET TX buf1", buf1 as u32);
+            if buf0 >> 32 != 0 || buf1 >> 32 != 0 {
+                say_hex("[WARN] GENET TX buf high", (buf0 >> 32) as u32);
+            }
+            if buf0 >= 0x4000_0000 || buf1 >= 0x4000_0000 {
+                say("[WARN] GENET TX buffer is at or above 1 GiB");
+            }
+        }
 
         Some(Self { mac })
     }
@@ -593,13 +628,31 @@ impl GenetDevice {
     }
 
     fn transmit_frame(&mut self, frame: &[u8]) {
-        if !tx_ring_has_room() {
-            TX_DROP.fetch_add(1, Ordering::Relaxed);
+        if TX_STUCK.load(Ordering::Relaxed) {
+            mark_text("TX stuck");
             return;
         }
-        let prod = TX_PROD.load(Ordering::Relaxed);
-        let desc_index = prod as usize % TX_RING_DESCS as usize;
-        let slot = prod as usize % DESC_COUNT;
+        // U-Boot `bcmgenet_gmac_eth_send`: program the 12-byte descriptor
+        // for `(prod & 0xff)`, then write `prod + 1` to TDMA_PROD_INDEX,
+        // and wait until the consumer catches it. The write pointer is
+        // left at the value init stored while DMA was off. Moving it
+        // after DMA is enabled points the engine at the next descriptor
+        // before that descriptor is valid; the following producer update
+        // is the access that locks the AXI fabric. Linux `bcmgenet_xmit`
+        // likewise publishes only the producer index.
+        TX_STEP.store(0, Ordering::Relaxed);
+        TX_TRACE.store(true, Ordering::Release);
+        let raw_prod = read(TDMA_RING + TDMA_PROD_INDEX);
+        let prod = raw_prod & 0xffff;
+        let cons = read(TDMA_RING + TDMA_CONS_INDEX) & 0xffff;
+        if prod.wrapping_sub(cons) & 0xffff >= DESC_COUNT as u32 {
+            TX_DROP.fetch_add(1, Ordering::Relaxed);
+            TX_TRACE.store(false, Ordering::Release);
+            mark_text("TX full");
+            return;
+        }
+        let desc_index = (prod as usize) & 0xff;
+        let slot = desc_index % DESC_COUNT;
         let mut n = frame.len().min(BUF_LEN);
         if n < 60 {
             n = 60;
@@ -615,39 +668,49 @@ impl GenetDevice {
             // frame built before that address was installed, or from a
             // stale buffer, must not leave with a different source.
             stamp_tx_source(&mut buf[..n]);
+            mark_tx_buf(buf.as_ptr(), n, desc_index);
             clean_poc(buf.as_ptr(), n);
             note_l2(buf.as_ptr(), n, true);
             let addr = crate::addr::virt_to_phys(buf.as_ptr() as u64);
-            let desc = GENET_TX_OFF + desc_index * DMA_DESC_SIZE;
-            write(desc + DESC_ADDRESS_LO, addr as u32);
-            write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
             let status = ((n as u32) << DMA_BUFLENGTH_SHIFT)
                 | DMA_SOP
                 | DMA_EOP
                 | DMA_TX_APPEND_CRC
                 | (0x3f << DMA_TX_QTAG_SHIFT);
+            let desc = GENET_TX_OFF + desc_index * DMA_DESC_SIZE;
+            write(desc + DESC_ADDRESS_LO, addr as u32);
+            write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
             barrier();
             write(desc + DESC_LENGTH_STATUS, status);
             note_tx_frame(buf.as_ptr(), n, status);
         }
         let next = prod.wrapping_add(1) & 0xffff;
-        TX_PROD.store(next, Ordering::Relaxed);
-        // The ring starts with both pointers at 0, which the DMA treats as
-        // empty, so the first frame also advances the write pointer to the
-        // word just past that descriptor. Linux and U-Boot leave the pointer
-        // alone after that and only publish TDMA_PROD_INDEX. Writing it again
-        // while the engine is live (the DHCP REQUEST that follows an offer)
-        // races the cursor and locks the AXI fabric: every core stops, and
-        // the timer watchdog never runs.
         barrier();
-        if TX_COUNT.load(Ordering::Relaxed) == 0 {
-            let write_ptr = (next % TX_RING_DESCS) * WORDS_PER_BD;
-            write(TDMA_RING + DMA_WRITE_PTR, write_ptr);
-            barrier();
-        }
-        write(TDMA_RING + TDMA_PROD_INDEX, next);
+        // Keep any high bits the register already held. U-Boot increments
+        // the raw producer and writes it back; the index in use is the
+        // low 16 bits, and the descriptor slot is that value mod 256.
+        write(TDMA_RING + TDMA_PROD_INDEX, (raw_prod & !0xffff) | next);
+        TX_PROD.store(next, Ordering::Relaxed);
         TX_COUNT.fetch_add(1, Ordering::Relaxed);
         TX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+        TX_TRACE.store(false, Ordering::Release);
+        mark_text("TX prod posted");
+        let start = crate::timer::millis();
+        loop {
+            let got = read_at(BASE + TDMA_RING + TDMA_CONS_INDEX) & 0xffff;
+            let advanced = got.wrapping_sub(prod) & 0xffff;
+            let posted = next.wrapping_sub(prod) & 0xffff;
+            if advanced >= posted {
+                mark_text("TX cons caught");
+                return;
+            }
+            if crate::timer::millis().saturating_sub(start) > 20 {
+                mark_text("TX cons timeout");
+                say("[WARN] GENET TX consumer did not catch the producer");
+                TX_STUCK.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
     }
 }
 
@@ -1418,11 +1481,119 @@ fn hex_digit(nibble: u8) -> u8 {
     }
 }
 
+/// UART, then the heartbeat row, then a data barrier and a clean of that
+/// row. Called before the GENET access it names. No log queue and no
+/// framebuffer lock: the core that hangs may already hold either.
+fn mark_text(text: &str) {
+    remember_mark(text.as_bytes());
+    raw_uart(text.as_bytes());
+    raw_uart(b"\r\n");
+    barrier();
+    crate::fb_con::raw_mark(text);
+    barrier();
+}
+
+fn mark_mmio(kind: u8, offset: usize, value: u32) {
+    let step = TX_STEP.fetch_add(1, Ordering::Relaxed);
+    let mut buf = [0u8; 40];
+    let mut n = 0;
+    push_str(&mut buf, &mut n, "TX");
+    buf[n] = kind;
+    n += 1;
+    buf[n] = b' ';
+    n += 1;
+    push_dec(&mut buf, &mut n, step);
+    buf[n] = b' ';
+    n += 1;
+    push_hex32(&mut buf, &mut n, offset as u32);
+    buf[n] = b'=';
+    n += 1;
+    push_hex32(&mut buf, &mut n, value);
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        mark_text(text);
+    }
+}
+
+fn mark_tx_buf(ptr: *const u8, len: usize, desc: usize) {
+    let mut buf = [0u8; 40];
+    let mut n = 0;
+    push_str(&mut buf, &mut n, "TX buf d");
+    push_dec(&mut buf, &mut n, desc as u32);
+    push_str(&mut buf, &mut n, " n");
+    push_dec(&mut buf, &mut n, len as u32);
+    if len >= 14 {
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, 14) };
+        push_str(&mut buf, &mut n, " et");
+        push_hex8(&mut buf, &mut n, bytes[12]);
+        push_hex8(&mut buf, &mut n, bytes[13]);
+    }
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        mark_text(text);
+    }
+}
+
+fn mark_rx(frame: &[u8]) {
+    let mut buf = [0u8; 24];
+    let mut n = 0;
+    push_str(&mut buf, &mut n, "RX");
+    if frame.len() >= 14 {
+        push_str(&mut buf, &mut n, " et");
+        push_hex8(&mut buf, &mut n, frame[12]);
+        push_hex8(&mut buf, &mut n, frame[13]);
+    }
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        mark_text(text);
+    }
+}
+
+fn remember_mark(bytes: &[u8]) {
+    let n = bytes.len().min(48);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), core::ptr::addr_of_mut!(LAST_MARK).cast(), n);
+    }
+    LAST_MARK_LEN.store(n, Ordering::Release);
+}
+
+fn raw_uart(bytes: &[u8]) {
+    let uart = crate::addr::phys_to_virt(crate::board::UART_PHYS) as *mut u32;
+    for &byte in bytes {
+        unsafe {
+            write_volatile(uart, byte as u32);
+        }
+    }
+}
+
+fn push_hex32(buf: &mut [u8], n: &mut usize, value: u32) {
+    for shift in (0..8).rev() {
+        if *n >= buf.len() {
+            return;
+        }
+        let nibble = ((value >> (shift * 4)) & 0xf) as u8;
+        buf[*n] = hex_digit(nibble);
+        *n += 1;
+    }
+}
+
+fn push_hex8(buf: &mut [u8], n: &mut usize, value: u8) {
+    if *n + 2 > buf.len() {
+        return;
+    }
+    buf[*n] = hex_digit(value >> 4);
+    buf[*n + 1] = hex_digit(value & 0xf);
+    *n += 2;
+}
+
 fn read(offset: usize) -> u32 {
+    if TX_TRACE.load(Ordering::Relaxed) {
+        mark_mmio(b'r', offset, 0);
+    }
     read_at(BASE + offset)
 }
 
 fn write(offset: usize, value: u32) {
+    if TX_TRACE.load(Ordering::Relaxed) {
+        mark_mmio(b'w', offset, value);
+    }
     write_at(BASE + offset, value);
 }
 
@@ -1475,14 +1646,19 @@ fn bytes_at(ptr: *const u8, index: usize) -> u8 {
 }
 
 fn note_tx_frame(ptr: *const u8, len: usize, status: u32) {
-    if TX_NOTED.swap(true, Ordering::Relaxed) {
+    let which = TX_LOGS.fetch_add(1, Ordering::Relaxed);
+    if which >= 4 {
         return;
     }
     let qtag = (status >> DMA_TX_QTAG_SHIFT) & 0x3f;
-    say("[OK] GENET TX d0 length is the buffer, low half is SOP EOP CRC qtag");
+    if which == 0 {
+        say("[OK] GENET TX length is the buffer, low half is SOP EOP CRC qtag");
+    }
     let mut buf = [0u8; 96];
     let mut n = 0;
-    push_str(&mut buf, &mut n, "[OK] GENET TX d0 len ");
+    push_str(&mut buf, &mut n, "[OK] GENET TX d");
+    push_dec(&mut buf, &mut n, which);
+    push_str(&mut buf, &mut n, " len ");
     push_dec(&mut buf, &mut n, len as u32);
     push_str(&mut buf, &mut n, " flags");
     if status & DMA_SOP != 0 {
@@ -1501,9 +1677,15 @@ fn note_tx_frame(ptr: *const u8, len: usize, status: u32) {
 }
 
 fn note_rx_frame(ptr: *const u8, len: usize) {
-    if RX_NOTED.swap(true, Ordering::Relaxed) {
+    let which = RX_LOGS.fetch_add(1, Ordering::Relaxed);
+    if which >= 4 {
         return;
     }
+    let mut buf = [0u8; 24];
+    let mut n = 0;
+    push_str(&mut buf, &mut n, "[OK] GENET RX");
+    push_dec(&mut buf, &mut n, which);
+    finish_say(&buf, n);
     say_bytes("[OK] GENET RX hdr", ptr, len.min(16));
 }
 
@@ -1626,7 +1808,15 @@ impl Device for GenetDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        if !LINK_UP.load(Ordering::Relaxed) || !tx_ring_has_room() {
+        if !LINK_UP.load(Ordering::Relaxed) || TX_STUCK.load(Ordering::Relaxed) {
+            return None;
+        }
+        TX_STEP.store(0, Ordering::Relaxed);
+        TX_TRACE.store(true, Ordering::Release);
+        let room = tx_ring_has_room();
+        TX_TRACE.store(false, Ordering::Release);
+        if !room {
+            mark_text("TX noroom");
             return None;
         }
         Some(GenetTxToken { device: self })
@@ -1680,15 +1870,20 @@ impl RxToken for GenetRxToken {
                     if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
                         say("[WARN] GENET DHCP chaddr is not the board MAC; dropped");
                     }
+                    mark_text("RX drop chaddr");
                     f(&mut [])
                 }
                 crate::dhcp_rx::Verdict::Pass => {
                     if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
                         say("[OK] GENET DHCP reply");
                     }
+                    mark_text("RX dhcp");
                     f(slice)
                 }
-                crate::dhcp_rx::Verdict::Ignore => f(slice),
+                crate::dhcp_rx::Verdict::Ignore => {
+                    mark_rx(slice);
+                    f(slice)
+                }
             }
         };
         result
@@ -1754,6 +1949,7 @@ impl<'a> TxToken for GenetTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        mark_text("TX tok");
         let mut buf = [0u8; 1514];
         let n = len.min(buf.len());
         let result = f(&mut buf[..n]);
