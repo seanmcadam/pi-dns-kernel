@@ -145,12 +145,22 @@ pub fn check_hang() {
         } else {
             now.saturating_sub(tick_ms)
         };
-        // Timer still firing: the core is executing and missing checkpoints.
-        // Timer silent: IRQs are masked or the core is not being run. The
-        // longer window is the second case.
-        if tick_age < 1_000 && ages[cpu] > STALL_MS {
-            stall = Some(cpu);
-        } else if tick_age > SILENT_MS && ages[cpu] > SILENT_MS {
+        // This check runs on whichever core took the timer, including one
+        // that is not the stuck core. After the idle loop, a core that has
+        // already taken a tick and then stops checkpointing is reported in
+        // two seconds even when its own IRQs are masked. A core that has
+        // never been scheduled keeps the long window. Before the idle loop
+        // the boot tests are allowed the old 4 s / 15 s split.
+        let limit = if tick_ms == 0 {
+            SILENT_MS
+        } else if looping() {
+            2_000
+        } else if tick_age < 1_000 {
+            STALL_MS
+        } else {
+            SILENT_MS
+        };
+        if ages[cpu] > limit {
             stall = Some(cpu);
         }
     }
@@ -205,8 +215,10 @@ fn report_stall(cpu: usize, now: u64) -> ! {
         }
     }
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("STALL");
-    crate::console::write_serial(text);
-    crate::console::write_serial("\r\n");
+    // Straight to the UART data register and the framebuffer. No log queue
+    // and no console lock: the core that is stuck may be holding either.
+    raw_uart(text.as_bytes());
+    raw_uart(b"\r\n");
     crate::fb_con::freeze(text);
     gpio_output();
     gpio_set(true);
@@ -288,6 +300,17 @@ fn push_hex(buf: &mut [u8], n: &mut usize, value: u64) {
             b'a' + (nibble - 10)
         };
         *n += 1;
+    }
+}
+
+/// UART data register, one byte at a time. Does not take the console lock
+/// or the log queue.
+fn raw_uart(bytes: &[u8]) {
+    let uart = crate::addr::phys_to_virt(crate::board::UART_PHYS) as *mut u32;
+    for &byte in bytes {
+        unsafe {
+            write_volatile(uart, byte as u32);
+        }
     }
 }
 

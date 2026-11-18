@@ -215,6 +215,10 @@ static RX_CONS: AtomicU32 = AtomicU32::new(0);
 static TX_PROD: AtomicU32 = AtomicU32::new(0);
 static TX_DROP: AtomicU32 = AtomicU32::new(0);
 static DHCP_NOTED: AtomicBool = AtomicBool::new(false);
+/// CPU copy of one received frame. The owner is the only caller of
+/// `consume`, so this is not shared. The DMA buffer is returned before
+/// the stack reads it.
+static mut RX_COPY: [u8; BUF_LEN] = [0; BUF_LEN];
 static SRC_FIXED: AtomicBool = AtomicBool::new(false);
 static LAST_BMSR: AtomicU32 = AtomicU32::new(0);
 static LAST_LPA: AtomicU32 = AtomicU32::new(0);
@@ -578,6 +582,7 @@ impl GenetDevice {
 
         PRESENT.store(true, Ordering::Relaxed);
         service_link();
+        crate::dhcp_rx::arm(&mac);
         say("[OK] GENET v5 TX and RX rings are 256 descriptors");
 
         Some(Self { mac })
@@ -627,14 +632,19 @@ impl GenetDevice {
         }
         let next = prod.wrapping_add(1) & 0xffff;
         TX_PROD.store(next, Ordering::Relaxed);
-        // The hardware does not advance TDMA_WRITE_PTR from the producer
-        // index. A read pointer and a write pointer that both stay 0 is an
-        // empty ring, so the consumer never moves. The write pointer is the
-        // word index of the next free descriptor.
-        let write_ptr = (next % TX_RING_DESCS) * WORDS_PER_BD;
+        // The ring starts with both pointers at 0, which the DMA treats as
+        // empty, so the first frame also advances the write pointer to the
+        // word just past that descriptor. Linux and U-Boot leave the pointer
+        // alone after that and only publish TDMA_PROD_INDEX. Writing it again
+        // while the engine is live (the DHCP REQUEST that follows an offer)
+        // races the cursor and locks the AXI fabric: every core stops, and
+        // the timer watchdog never runs.
         barrier();
-        write(TDMA_RING + DMA_WRITE_PTR, write_ptr);
-        barrier();
+        if TX_COUNT.load(Ordering::Relaxed) == 0 {
+            let write_ptr = (next % TX_RING_DESCS) * WORDS_PER_BD;
+            write(TDMA_RING + DMA_WRITE_PTR, write_ptr);
+            barrier();
+        }
         write(TDMA_RING + TDMA_PROD_INDEX, next);
         TX_COUNT.fetch_add(1, Ordering::Relaxed);
         TX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
@@ -1232,101 +1242,6 @@ fn stamp_tx_source(buf: &mut [u8]) {
     }
 }
 
-/// Make a DHCP reply (UDP 67 -> 68) acceptable to smoltcp: clamp a length
-/// that runs past the buffer, rewrite a client hardware address that is
-/// not ours, and recompute the IP and UDP checksums.
-fn accept_dhcp(frame: &mut [u8]) {
-    if frame.len() < 14 + 20 + 8 {
-        return;
-    }
-    if frame[12] != 0x08 || frame[13] != 0x00 {
-        return;
-    }
-    let ihl = ((frame[14] & 0x0f) as usize) * 4;
-    if ihl < 20 || frame.len() < 14 + ihl + 8 {
-        return;
-    }
-    if frame[14 + 9] != 17 {
-        return;
-    }
-    let udp = 14 + ihl;
-    let src = u16::from_be_bytes([frame[udp], frame[udp + 1]]);
-    let dst = u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]);
-    if src != 67 || dst != 68 {
-        return;
-    }
-    let room = frame.len() - udp;
-    let mut udp_len = u16::from_be_bytes([frame[udp + 4], frame[udp + 5]]) as usize;
-    if udp_len < 8 || udp_len > room {
-        udp_len = room;
-        frame[udp + 4] = (udp_len >> 8) as u8;
-        frame[udp + 5] = udp_len as u8;
-    }
-    let total = ihl + udp_len;
-    frame[14 + 2] = (total >> 8) as u8;
-    frame[14 + 3] = total as u8;
-    let dhcp = udp + 8;
-    if dhcp + 240 <= udp + udp_len
-        && frame[dhcp] == 2
-        && frame[dhcp + 236] == 0x63
-        && frame[dhcp + 237] == 0x82
-        && frame[dhcp + 238] == 0x53
-        && frame[dhcp + 239] == 0x63
-    {
-        let mac = our_mac();
-        let mut differ = false;
-        let mut i = 0;
-        while i < 6 {
-            if frame[dhcp + 28 + i] != mac[i] {
-                differ = true;
-                frame[dhcp + 28 + i] = mac[i];
-            }
-            i += 1;
-        }
-        if differ {
-            say("[WARN] GENET DHCP chaddr was not the board MAC; rewritten");
-        }
-    }
-    frame[14 + 10] = 0;
-    frame[14 + 11] = 0;
-    let ip_sum = fold_sum(add_words(0, &frame[14..14 + ihl]));
-    frame[14 + 10] = (ip_sum >> 8) as u8;
-    frame[14 + 11] = ip_sum as u8;
-    frame[udp + 6] = 0;
-    frame[udp + 7] = 0;
-    let mut sum = add_words(0, &frame[26..34]);
-    sum += 17;
-    sum += udp_len as u32;
-    sum = add_words(sum, &frame[udp..udp + udp_len]);
-    // UDP uses 0 to mean "no checksum". A computed 0 is sent as 0xffff.
-    let folded = fold_sum(sum);
-    let udp_sum = if folded == 0 { 0xffff } else { folded };
-    frame[udp + 6] = (udp_sum >> 8) as u8;
-    frame[udp + 7] = udp_sum as u8;
-    if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
-        say("[OK] GENET DHCP reply accepted");
-    }
-}
-
-fn add_words(mut sum: u32, data: &[u8]) -> u32 {
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
-    }
-    sum
-}
-
-fn fold_sum(mut sum: u32) -> u16 {
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 fn set_rx_filter(mac: &[u8; 6]) {
     write(UMAC_MDF_CTRL, 0);
     mdf_slot(0, &[0xff; 6], 0);
@@ -1689,9 +1604,23 @@ impl Device for GenetDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         service_link();
+        if let Some(len) = crate::dhcp_rx::take_len() {
+            return Some((
+                GenetRxToken {
+                    index: 0,
+                    len,
+                    probe: true,
+                },
+                GenetTxToken { device: self },
+            ));
+        }
         let (index, len) = poll_rx()?;
         Some((
-            GenetRxToken { index, len },
+            GenetRxToken {
+                index,
+                len,
+                probe: false,
+            },
             GenetTxToken { device: self },
         ))
     }
@@ -1715,6 +1644,7 @@ impl Device for GenetDevice {
 pub struct GenetRxToken {
     index: u16,
     len: u16,
+    probe: bool,
 }
 
 impl RxToken for GenetRxToken {
@@ -1722,24 +1652,45 @@ impl RxToken for GenetRxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        if self.probe {
+            let mut tmp = [0u8; 384];
+            let n = crate::dhcp_rx::copy_out(&mut tmp);
+            let result = f(&mut tmp[..n]);
+            say("[OK] DHCP offer probe delivered");
+            return result;
+        }
+        let n = self.len as usize;
         let result = unsafe {
             let frame = RX_BUFS[self.index as usize % RX_RING_DESCS]
                 .as_mut_ptr()
                 .add(RX_ALIGN);
             // The early boot map was write-back. A stale line would hide
-            // the bytes the MAC just wrote.
-            invalidate_poc(frame, self.len as usize);
-            note_l2(frame, self.len as usize, false);
-            note_rx_frame(frame, self.len as usize);
-            let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
-            // A unicast DHCP offer is delivered before the interface owns
-            // an address. smoltcp accepts it only when the IP checksum,
-            // the UDP checksum, and the client hardware address match.
-            // Repair those three so a good offer is not dropped.
-            accept_dhcp(slice);
-            f(slice)
+            // the bytes the MAC just wrote. Copy out and give the buffer
+            // back before the stack or the console looks at it.
+            invalidate_poc(frame, n);
+            let copy = &mut *core::ptr::addr_of_mut!(RX_COPY);
+            let take = n.min(copy.len());
+            copy[..take].copy_from_slice(core::slice::from_raw_parts(frame, take));
+            reclaim_rx_static(self.index);
+            note_l2(copy.as_ptr(), take, false);
+            note_rx_frame(copy.as_ptr(), take);
+            let slice = &mut copy[..take];
+            match crate::dhcp_rx::verdict(slice, &our_mac()) {
+                crate::dhcp_rx::Verdict::DropChaddr => {
+                    if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
+                        say("[WARN] GENET DHCP chaddr is not the board MAC; dropped");
+                    }
+                    f(&mut [])
+                }
+                crate::dhcp_rx::Verdict::Pass => {
+                    if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
+                        say("[OK] GENET DHCP reply");
+                    }
+                    f(slice)
+                }
+                crate::dhcp_rx::Verdict::Ignore => f(slice),
+            }
         };
-        reclaim_rx_static(self.index);
         result
     }
 }
@@ -1779,9 +1730,11 @@ fn reclaim_rx_static(index: u16) {
     reclaim_rx(index, true);
 }
 
-fn reclaim_rx(index: u16, good: bool) {
-    let slot = index as usize % RX_RING_DESCS;
-    program_rx_desc(slot);
+fn reclaim_rx(_index: u16, good: bool) {
+    // The address was programmed at init and stays. U-Boot only advances
+    // the consumer. Rewriting the length/status word (OWN | 2048) while the
+    // DMA may still be reading descriptor RAM is the other way this engine
+    // locks the bus on the buffer that just held the offer.
     let cons = RX_CONS.load(Ordering::Relaxed).wrapping_add(1) & 0xffff;
     RX_CONS.store(cons, Ordering::Relaxed);
     write(RDMA_RING + RDMA_CONS_INDEX, cons);

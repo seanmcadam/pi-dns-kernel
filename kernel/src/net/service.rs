@@ -270,11 +270,19 @@ pub fn kick_pending() -> bool {
     KICK.load(Ordering::Acquire)
 }
 
-/// `cntpct` spent inside `drive` and inside `wfi` on the owner.
+/// Milliseconds inside `drive` and inside `wfi`.
+///
+/// The counters underneath are CNTPCT deltas. On the Pi 4 the counter runs
+/// at 54 MHz, so the frozen status line `busy=151803611 idle=0` at guest
+/// ms 4457 was 2.81 s spent in `drive` and no completed `wfi`. The DHCP
+/// socket's poll delay stays 0 while the link is down (the discover cannot
+/// leave), and the old deadline of "now" made the owner spin. The value
+/// printed now is `ticks * 1000 / CNTFRQ`.
 pub fn owner_time() -> (u64, u64) {
+    let freq = crate::timer::frequency().max(1);
     (
-        BUSY_TICKS.load(Ordering::Relaxed),
-        IDLE_TICKS.load(Ordering::Relaxed),
+        BUSY_TICKS.load(Ordering::Relaxed).saturating_mul(1000) / freq,
+        IDLE_TICKS.load(Ordering::Relaxed).saturating_mul(1000) / freq,
     )
 }
 
@@ -393,10 +401,16 @@ fn arm_deadline(state: &mut super::NetworkState) {
     let mut deadline = match state.stack.poll_delay(timestamp) {
         Some(delay) => {
             let ms = delay.total_millis();
-            // A zero delay means the stack wants another look. Doing that
-            // immediately is correct; `owner_idle` loops while work is due.
+            // A zero delay means the stack wants another look. While the
+            // link is down that look cannot send, and sleeping 50 ms is
+            // what lets the owner reach `wfi`. Once the link is up, a zero
+            // delay is a discover or a request that should go out now.
             if ms == 0 {
-                now
+                if crate::board::nic_link() {
+                    now
+                } else {
+                    now.saturating_add(50)
+                }
             } else {
                 now.saturating_add(ms)
             }
