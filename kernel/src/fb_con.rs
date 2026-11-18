@@ -826,6 +826,8 @@ fn ink(line: &[u8], bgr: bool) -> u32 {
         || has_prefix(line, b"=== EXCEPTION")
         || has_prefix(line, b"elfault")
         || has_prefix(line, b"kfault")
+        || has_prefix(line, b"STACK OVERFLOW")
+        || has_prefix(line, b"stack overflow")
         || has_prefix(line, b"panic")
         || has_prefix(line, b"nested")
     {

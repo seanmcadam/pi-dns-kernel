@@ -10,6 +10,7 @@
 //   4  mrs currentel. A privileged read must not return.
 //   5  branch to the user stack. That page is not executable.
 //   6  four threads add under a futex mutex. The total must be exact.
+//   7  recurse until the store falls in the guard page under the stack.
 //
 // Syscalls: x8 is the number, x0-x5 the arguments, x0 the return.
 //   0 log(ptr, len)   1 yield   2 uptime_ticks   3 exit(code)
@@ -35,6 +36,8 @@ _start:
     b.eq    6f
     cmp     x19, #6
     b.eq    7f
+    cmp     x19, #7
+    b.eq    8f
     mov     x0, #9
     mov     x8, #3
     svc     #0
@@ -124,6 +127,15 @@ _start:
 7:
     bl      futex_test
     b       .
+
+8:
+    bl      overflow
+    b       .
+
+overflow:
+    sub     sp, sp, #256
+    stp     x29, x30, [sp]
+    bl      overflow
 
 msg_hello:
     .ascii "hello from el0"

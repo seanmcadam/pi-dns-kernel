@@ -28,14 +28,28 @@ static mut SEC_MAIR: u64 = 0;
 #[no_mangle]
 static mut SEC_TCR: u64 = 0;
 
-#[repr(C, align(16))]
-struct CpuStack([u8; 16 * 1024]);
+/// 16 KiB stack with an unmapped page under it and one at the initial SP.
+/// The bytes stay in this array. `mmu::init` leaves both pages unmapped.
+#[repr(C, align(4096))]
+struct CpuStack {
+    below: [u8; 4096],
+    mem: [u8; 16 * 1024],
+    above: [u8; 4096],
+}
+
+const fn blank_cpu_stack() -> CpuStack {
+    CpuStack {
+        below: [0; 4096],
+        mem: [0; 16 * 1024],
+        above: [0; 4096],
+    }
+}
 
 static mut SEC_STACKS: [CpuStack; NCPU] = [
-    CpuStack([0; 16 * 1024]),
-    CpuStack([0; 16 * 1024]),
-    CpuStack([0; 16 * 1024]),
-    CpuStack([0; 16 * 1024]),
+    blank_cpu_stack(),
+    blank_cpu_stack(),
+    blank_cpu_stack(),
+    blank_cpu_stack(),
 ];
 
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -44,6 +58,27 @@ extern "C" {
     fn secondary_entry();
     static mut early_l0_id: u64;
     static early_l1_id: u64;
+}
+
+/// True when `va` is the unmapped page under or above a secondary stack.
+pub fn is_stack_guard_va(va: u64) -> bool {
+    let page = va & !4095;
+    let mut cpu = 0;
+    while cpu < NCPU {
+        unsafe {
+            let below = core::ptr::addr_of!(SEC_STACKS[cpu].below) as u64;
+            let above = core::ptr::addr_of!(SEC_STACKS[cpu].above) as u64;
+            if page == below || page == above {
+                return true;
+            }
+        }
+        cpu += 1;
+    }
+    false
+}
+
+pub fn is_stack_guard_pa(pa: u64) -> bool {
+    is_stack_guard_va(crate::addr::phys_to_virt(pa & !4095))
 }
 
 pub fn online() -> u32 {
@@ -80,7 +115,7 @@ pub fn boot(entry_el: u64) {
         SEC_TCR = tcr;
         let mut cpu = 1;
         while cpu < NCPU {
-            let top = core::ptr::addr_of!(SEC_STACKS[cpu].0) as u64 + 16 * 1024;
+            let top = core::ptr::addr_of!(SEC_STACKS[cpu].mem) as u64 + 16 * 1024;
             SEC_SP[cpu] = virt_to_phys(top);
             cpu += 1;
         }

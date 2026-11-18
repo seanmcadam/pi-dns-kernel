@@ -65,8 +65,8 @@ pub fn run() -> ! {
     let mut worker = 0;
     while worker < HTTP_WORKERS {
         let top = (crate::HEAP_VA + crate::HEAP_SIZE
-            - crate::GUARD_BYTES
-            - (worker + 1) * crate::STACK_BYTES) as u64;
+            - crate::PAGE
+            - worker * (crate::STACK_BYTES + crate::PAGE)) as u64;
         let _ = crate::thread::spawn(conn_worker, top, worker as u64);
         worker += 1;
     }

@@ -26,6 +26,7 @@ const EAGAIN: i64 = -11;
 const MAX_CLIENTS: usize = 16;
 const HEAP_VA: u64 = 0x1_000A_0000;
 const HEAP_SIZE: u64 = 256 * 1024;
+const PAGE: u64 = 4096;
 const STACK_BYTES: u64 = 8 * 1024;
 const PORT: u64 = 23;
 
@@ -35,6 +36,14 @@ static CLOSED: [AtomicU32; MAX_CLIENTS] = [const { AtomicU32::new(0) }; MAX_CLIE
 static FD_LIVE: [AtomicU32; MAX_CLIENTS] = [const { AtomicU32::new(0) }; MAX_CLIENTS];
 static FD_NUM: [AtomicU32; MAX_CLIENTS] = [const { AtomicU32::new(0) }; MAX_CLIENTS];
 static TID: [AtomicI64; MAX_CLIENTS] = [const { AtomicI64::new(0) }; MAX_CLIENTS];
+
+fn client_sp(index: u64) -> u64 {
+    HEAP_VA + HEAP_SIZE - index * (STACK_BYTES + PAGE)
+}
+
+fn reaper_sp() -> u64 {
+    HEAP_VA + PAGE + STACK_BYTES
+}
 
 #[no_mangle]
 pub extern "C" fn rust_main() -> ! {
@@ -47,7 +56,7 @@ fn run() -> ! {
         panic_rt::note_text(b"telnet listen failed");
         exit_now(1);
     }
-    let _ = thread::spawn(reaper, HEAP_VA + STACK_BYTES, 0);
+    let _ = thread::spawn(reaper, reaper_sp(), 0);
     loop {
         let conn = sys(TCP_ACCEPT, listen as u64, 0, 0, 0, 0, 0);
         if conn < 0 {
@@ -62,7 +71,7 @@ fn run() -> ! {
                 FD_NUM[index].store(conn as u32, Ordering::Release);
                 FD_LIVE[index].store(1, Ordering::Release);
                 USED[index].store(1, Ordering::Release);
-                let stack = HEAP_VA + HEAP_SIZE - (index as u64) * STACK_BYTES;
+                let stack = client_sp(index as u64);
                 let arg = ((index as u64) << 32) | (conn as u64);
                 let tid = thread::spawn(client, stack, arg);
                 if tid < 0 {

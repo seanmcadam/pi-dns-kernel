@@ -15,13 +15,14 @@ core::arch::global_asm!(include_str!("start.s"));
 pub(crate) const HEAP_VA: usize = 0x1_000A_0000;
 pub(crate) const HEAP_SIZE: usize = 1536 * 1024;
 /// `serve` takes about 3 KiB and `read_config_file` puts another 8 KiB on
-/// the same stack. A 16 KiB worker stack overflows into the heap and
-/// smashes the return address. The kernel leaves the page above these
-/// stacks unmapped.
+/// the same stack. Stacks grow down, so each worker has 64 KiB and the
+/// kernel leaves the page under that 64 KiB unmapped. One more unmapped
+/// page sits above worker 0, which is the main stack's overflow guard.
+/// The allocator stops at the lowest guard and never receives those pages.
 pub(crate) const STACK_BYTES: usize = 64 * 1024;
-pub(crate) const GUARD_BYTES: usize = 4096;
+pub(crate) const PAGE: usize = 4096;
 pub(crate) const WORKERS: usize = 4;
-pub(crate) const ALLOC_SIZE: usize = HEAP_SIZE - GUARD_BYTES - WORKERS * STACK_BYTES;
+pub(crate) const ALLOC_SIZE: usize = HEAP_SIZE - PAGE - WORKERS * (STACK_BYTES + PAGE);
 const HEADER: usize = 16;
 
 mod thread {

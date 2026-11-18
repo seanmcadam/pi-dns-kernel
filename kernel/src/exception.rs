@@ -235,7 +235,12 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
         index += 1;
     }
     let mut raw = [0u8; 80];
-    let n = crate::fault_log::write_kfault(&mut raw, kind, ec, iss, elr, far);
+    let overflow = kernel_stack_overflow(far);
+    let n = if overflow {
+        crate::fault_log::write_stack_overflow(&mut raw, "kern", 0, ec, elr, far)
+    } else {
+        crate::fault_log::write_kfault(&mut raw, kind, ec, iss, elr, far)
+    };
     if let Ok(line) = core::str::from_utf8(&raw[..n]) {
         put(line);
         put("\r\n");
@@ -246,14 +251,25 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
 }
 
 /// Leave the fault on the pinned HDMI rows and stop. Does not reboot.
+fn kernel_stack_overflow(far: u64) -> bool {
+    let page = far & !0xfff;
+    page == guard_page()
+        || crate::task::is_kstack_guard_va(far)
+        || crate::smp::is_stack_guard_va(far)
+}
+
 fn pin_and_halt(kind: u64, ec: u64, elr: u64, far: u64) -> ! {
     let mut raw = [0u8; 180];
     let mut n = 0;
-    n = pin_push(&mut raw, n, b"kern fault v=");
-    n = pin_dec(&mut raw, n, kind);
-    n = pin_push(&mut raw, n, b" ec=");
+    if kernel_stack_overflow(far) {
+        n = pin_push(&mut raw, n, b"STACK OVERFLOW kern");
+    } else {
+        n = pin_push(&mut raw, n, b"kern fault v=");
+        n = pin_dec(&mut raw, n, kind);
+    }
+    n = pin_push(&mut raw, n, b"\nec=");
     n = pin_hex2(&mut raw, n, (ec & 0x3f) as u8);
-    n = pin_push(&mut raw, n, b"\nelr ");
+    n = pin_push(&mut raw, n, b" elr ");
     n = pin_hex16(&mut raw, n, elr);
     n = pin_push(&mut raw, n, b"\nfar ");
     n = pin_hex16(&mut raw, n, far);

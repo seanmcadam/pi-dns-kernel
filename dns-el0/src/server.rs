@@ -152,8 +152,8 @@ static RETRY_KICK: AtomicU32 = AtomicU32::new(0);
 
 fn thread_stack(index: u64) -> u64 {
     (crate::HEAP_VA + crate::HEAP_SIZE
-        - crate::GUARD_BYTES
-        - (index as usize + 1) * crate::STACK_BYTES) as u64
+        - crate::PAGE
+        - (index as usize) * (crate::STACK_BYTES + crate::PAGE)) as u64
 }
 
 extern "C" fn upstream_worker(_index: u64) {
