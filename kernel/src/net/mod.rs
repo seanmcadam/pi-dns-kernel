@@ -189,7 +189,23 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
             Some(dhcpv4::Event::Configured(config)) => {
                 let ip = config.address.address().0;
                 let mask = prefix_to_mask(config.address.prefix_len());
-                let gateway = config.router.map(|addr| addr.0).unwrap_or(fallback_gateway);
+                let mut dns = [[0u8; 4]; 3];
+                let mut count = 0;
+                for server in config.dns_servers.iter() {
+                    if count >= dns.len() {
+                        break;
+                    }
+                    dns[count] = server.0;
+                    count += 1;
+                }
+                crate::config_manager::note_dhcp_dns(&dns[..count]);
+                let gateway = crate::dhcp_rx::lease_gateway(
+                    ip,
+                    mask,
+                    config.router.map(|addr| addr.0),
+                    config.server.address.0,
+                    fallback_gateway,
+                );
                 Some(DhcpAction::Configured { ip, mask, gateway })
             }
             _ if crate::timer::millis().saturating_sub(started_ms) >= timeout_ms => {
@@ -209,12 +225,14 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
             DHCP_PHASE.store(2, Ordering::Relaxed);
             DHCP_IP.store(u32::from_be_bytes(ip), Ordering::Relaxed);
             log::info!(
-                "DHCP configured {}.{}.{}.{}",
-                ip[0], ip[1], ip[2], ip[3]
+                "DHCP configured {}.{}.{}.{} gateway {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3], gateway[0], gateway[1], gateway[2], gateway[3]
             );
             console_line_ip("[OK] DHCP leased", ip);
+            console_line_ip("[OK] DHCP gateway", gateway);
         }
         DhcpAction::Timeout => {
+            crate::config_manager::note_dhcp_dns(&[]);
             state.stack.sockets_mut().remove(handle);
             state
                 .stack

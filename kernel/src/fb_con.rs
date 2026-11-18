@@ -55,7 +55,11 @@ const GREEN: u32 = 0x0000_FF00;
 const YELLOW: u32 = 0x0000_FFFF;
 const RED: u32 = 0x0000_00FF;
 
-#[repr(C, align(16))]
+// 64-byte alignment keeps the property buffer on its own cache lines.
+// A 16-byte alignment shares the first line with the previous .dma
+// object. Cleaning that line after the GPU has written the reply
+// stores the neighbor back over the answer.
+#[repr(C, align(64))]
 struct Prop {
     words: [u32; 48],
 }
@@ -298,20 +302,20 @@ fn bring_up() -> bool {
     // The firmware already chose a mode for the rainbow. With the dtb
     // loaded and no vc4-kms overlay, that scanout is the one to keep.
     // Setting another size, or the blank tag, made this board drop HDMI
-    // to no signal. Take the existing buffer first. Set the same size
-    // only when the firmware will not hand that buffer over. 1280x720 is
-    // used only when the firmware reports no current mode.
-    if let Some((w, h)) = current_size() {
-        if let Some(mode) = keep_mode(w, h) {
-            return finish(mode);
+    // to no signal. Take the existing buffer first. Set that same size
+    // only when the firmware will not hand the buffer over. A made-up
+    // 1280x720 is not a fallback: it is the call that removes the signal.
+    let mut attempt = 0;
+    while attempt < 4 {
+        if let Some((w, h)) = current_size() {
+            if let Some(mode) = keep_mode(w, h) {
+                return finish(mode);
+            }
+            if let Some(mode) = allocate(w, h) {
+                return finish(mode);
+            }
         }
-        if let Some(mode) = allocate(w, h) {
-            return finish(mode);
-        }
-        return false;
-    }
-    if let Some(mode) = allocate(1280, 720) {
-        return finish(mode);
+        attempt += 1;
     }
     false
 }
@@ -583,7 +587,9 @@ fn exchange(msg: &mut [u32], bus_alias: bool) -> bool {
         if !mbox_send((bus & !0xF) | 8, start) {
             return false;
         }
-        civac(virt as *const u8, msg.len() * 4);
+        // Invalidate only. dc civac would write a dirty line back on
+        // top of the GPU's reply.
+        drop_lines(virt as *const u8, msg.len() * 4);
         for (i, word) in msg.iter_mut().enumerate() {
             *word = dst.add(i).read_volatile();
         }
@@ -637,6 +643,21 @@ fn timed_out(start: u64) -> bool {
         return true;
     }
     crate::timer::get_ticks().wrapping_sub(start) > freq / 2
+}
+
+fn drop_lines(ptr: *const u8, len: usize) {
+    let start = (ptr as usize) & !63;
+    let end = (ptr as usize).saturating_add(len);
+    let mut line = start;
+    while line < end {
+        unsafe {
+            core::arch::asm!("dc ivac, {line}", line = in(reg) line, options(nostack));
+        }
+        line = line.saturating_add(64);
+    }
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
 }
 
 fn civac(ptr: *const u8, len: usize) {

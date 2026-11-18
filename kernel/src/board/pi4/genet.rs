@@ -475,6 +475,16 @@ impl GenetDevice {
         write(desc + DESC_ADDRESS_LO, addr as u32);
         write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
         write(desc + DESC_LENGTH_STATUS, status);
+        // Publish the descriptor before the producer index. dsb sy can
+        // retire at an intermediate bridge while descriptor RAM still
+        // holds the previous word. The hang trace read this status word
+        // and the ring registers back before every kick; those loads
+        // are what drained the stores. The UART and panel text around
+        // them were not.
+        barrier();
+        let _status = read(desc + DESC_LENGTH_STATUS);
+        let _cons = read(TDMA_RING + TDMA_CONS_INDEX);
+        let _ctrl = read(TDMA_REG_BASE + DMA_CTRL);
         barrier();
         let posted = raw_prod.wrapping_add(1);
         write_at(BASE + TDMA_RING + TDMA_PROD_INDEX, posted);
