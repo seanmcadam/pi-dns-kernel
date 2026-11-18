@@ -108,7 +108,7 @@ static FROZEN: AtomicBool = AtomicBool::new(false);
 
 const HEADER_CAP: usize = 640;
 /// NIC status uses the first three rows. The fourth is the per-core
-/// heartbeat and the A72 probe, painted without clearing the rows above.
+/// heartbeat, painted without clearing the rows above.
 const STATUS_ROWS: u32 = 3;
 const PINNED_ROWS: u32 = 4;
 static mut HEADER: [u8; HEADER_CAP] = [0; HEADER_CAP];
@@ -292,35 +292,6 @@ pub fn paint_pinned_row(row: u32, text: &str) {
         }
     }
     unlock(held);
-}
-
-/// One line on the heartbeat row, with no console lock and no log queue.
-/// The bytes are cleaned to the point of coherency before return, so a
-/// GENET access that locks the AXI fabric still leaves this text on screen.
-pub fn raw_mark(text: &str) {
-    if !READY.load(Ordering::Relaxed) {
-        return;
-    }
-    unsafe {
-        let screen = &*addr_of!(SCREEN);
-        if screen.ptr.is_null() {
-            return;
-        }
-        clear_row(screen, 3);
-        let cols = columns(screen);
-        let color = if screen.bgr { 0x00FF_FFFF } else { WHITE };
-        let mut col = 0usize;
-        for &ch in text.as_bytes() {
-            if ch == b'\n' || ch == b'\r' || col >= cols {
-                break;
-            }
-            draw_glyph(screen, col as u32, 3, ch, color);
-            col += 1;
-        }
-        let pitch = screen.pitch as usize;
-        let row_bytes = pitch * CELL_H as usize;
-        civac(screen.ptr.add(3 * row_bytes), row_bytes);
-    }
 }
 
 fn bring_up() -> bool {

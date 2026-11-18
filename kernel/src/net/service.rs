@@ -272,12 +272,9 @@ pub fn kick_pending() -> bool {
 
 /// Milliseconds inside `drive` and inside `wfi`.
 ///
-/// The counters underneath are CNTPCT deltas. On the Pi 4 the counter runs
-/// at 54 MHz, so the frozen status line `busy=151803611 idle=0` at guest
-/// ms 4457 was 2.81 s spent in `drive` and no completed `wfi`. The DHCP
-/// socket's poll delay stays 0 while the link is down (the discover cannot
-/// leave), and the old deadline of "now" made the owner spin. The value
-/// printed now is `ticks * 1000 / CNTFRQ`.
+/// The counters underneath are CNTPCT deltas. The printed value is
+/// `ticks * 1000 / CNTFRQ`. A zero poll delay while the link is down
+/// would otherwise spin the owner inside `drive`.
 pub fn owner_time() -> (u64, u64) {
     let freq = crate::timer::frequency().max(1);
     (

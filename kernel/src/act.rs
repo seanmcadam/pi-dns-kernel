@@ -33,9 +33,6 @@ static PROG_PC: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static TICK_MS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static TICK_PC: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-static mut A72_TEXT: [u8; 32] = [0; 32];
-static A72_LEN: AtomicU64 = AtomicU64::new(0);
-
 /// The idle loop calls this every pass. A core that stops calling it, and
 /// is not sitting in `wfi`, is the hang the timer is watching for.
 #[inline(always)]
@@ -80,16 +77,6 @@ pub fn looping() -> bool {
 pub fn enter_loop() {
     LOOP.store(true, Ordering::Release);
     note_core(0);
-}
-
-/// One line kept on the heartbeat row. Set once the probe has finished.
-pub fn set_a72_text(text: &str) {
-    let bytes = text.as_bytes();
-    let n = bytes.len().min(32);
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), core::ptr::addr_of_mut!(A72_TEXT).cast(), n);
-    }
-    A72_LEN.store(n as u64, Ordering::Release);
 }
 
 /// Short label for the HDMI status line.
@@ -233,21 +220,10 @@ fn paint_heartbeat(now: u64, ages: &[u64; 4], asleep: &[bool; 4], started: &[boo
     LAST_PAINT.store(now, Ordering::Relaxed);
     let mut buf = [0u8; 80];
     let mut n = 0;
-    let a72_n = A72_LEN.load(Ordering::Acquire) as usize;
-    if a72_n == 0 {
-        push(&mut buf, &mut n, "A72 ?");
-    } else {
-        let text = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(A72_TEXT).cast::<u8>(), a72_n) };
-        for &byte in text {
-            if n >= buf.len() {
-                break;
-            }
-            buf[n] = byte;
-            n += 1;
-        }
-    }
     for cpu in 0..4 {
-        push(&mut buf, &mut n, " ");
+        if cpu > 0 {
+            push(&mut buf, &mut n, " ");
+        }
         push_dec(&mut buf, &mut n, cpu as u64);
         push(&mut buf, &mut n, ":");
         if asleep[cpu] {

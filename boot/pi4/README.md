@@ -59,9 +59,13 @@ boot. The pinned row says `led:off`.
 
 A fault lights the pin once and leaves it on (`led:fault`). The physical
 vector stub does that before the framebuffer exists, and then waits.
-A kernel panic and the idle-loop watchdog (60 s with no pass through
-the idle loop) do the same and also paint `LOCKUP halt` or
-`LOCKUP idle` on the top HDMI row. A heap allocation that does not fit
+A kernel panic paints `LOCKUP halt` and lights the pin. After the idle
+loop starts, a core that has taken a timer tick and then stops
+checkpointing for 2 seconds freezes the panel with `STALL` plus that
+core's id and PC. The report goes straight to the UART data register
+and the framebuffer, with no log queue and no console lock. Before the
+idle loop the window is 4 seconds while timer IRQs are arriving and 15
+seconds when they are not. A heap allocation that does not fit
 paints `LOCKUP heap` and returns failure; it does not halt and does not
 light the pin by itself. None of these blink. The paint does not take
 the console lock and does not allocate, so a stuck painter still leaves
@@ -76,37 +80,14 @@ on. Dark while the console is still scrolling is a healthy boot.
 
 ## HDMI network rows
 
-The top three rows of the framebuffer do not scroll. The first shows the
+The top rows of the framebuffer do not scroll. The first shows the
 GENET revision (raw word and decoded version; silicon major 6 is version
 5), link up or down, speed, MAC, DHCP state (`wait`, `leased`, `timeout`,
-`static`, or `off`), the IPv4 address, and the LED label. The second is
-the UniMAC and receive-DMA breakdown: `tS` frames the stack queued, `tPkt` UniMAC TX packets,
-`tOk` TX good packets, `tFcs` TX FCS errors, `e` the RX ring end
-address, `h` the HFB control register, `r` every frame the
-MAC counted, `rOk` good RX, `bca` broadcast, `mca` multicast, `uc`
-unicast, `fcs` / `aln` / `ovr` the RX error counters, `run` runt
-packets, `ovf` the v5 RBUF overflow counter, `uov` the v1 UniMAC
-overflow register (v5 leaves this at zero and counts in `ovf`), `rer`
-the RBUF error counter, `mdf` the address-filter error counter, `p` /
-`c` the RDMA producer and consumer, and `d` the RDMA discard count in
-the top half of the producer. `e` should read `000002ff`
-(256 descriptors × 3 words − 1). A smaller `e` means the write did not
-stick and the engine is not using the buffers this driver armed.
-The third row is the last transmitted header and the last received
-header, as destination, source, and ethertype, then `arp` and `icmp`
-as received/transmitted counts. `rxE` is a descriptor this driver
-rejected. The scrolling log still prints the first TX descriptor decode
-(`d0` length 304, `SOP EOP CRC`, one DHCP DISCOVER).
-
-`r` far above `rOk`, with `fcs` and `aln` climbing, is a bad receive
-clock. `rOk` far above the status line's `rx=`, with `ovf` or `d`
-climbing, is the DMA ring. `rOk` close to `bca`+`uc` and both close to
-`rx=`, with `mca` holding the rest of `r`, means the filter is doing
-its job and the missing frames were multicast. A received header whose first bytes are not a MAC is a
-length or alignment problem. `arp` received climbing while `arp`
-transmitted stays put means the stack did not answer. Both climbing
-while the peer still cannot ping means the reply left the MAC and was
-not accepted on the wire.
+`static`, or `off`), the IPv4 address, and the LED label. The next row
+is `tx` frames this driver queued, `rx` frames it accepted, and `rxE`
+descriptors it rejected. The fourth row is the per-core heartbeat:
+each core's age in milliseconds since its last checkpoint, `z` when
+that core is in `wfi`, or `-` before it has checkpointed.
 
 Linux `bcmgenet_mii_config` sets `ID_MODE_DIS` only for
 `PHY_INTERFACE_MODE_RGMII`. `rgmii-rxid` leaves it clear, so the MAC
