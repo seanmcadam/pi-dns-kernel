@@ -1879,6 +1879,8 @@ fn wait_if_blocked(slot: usize, asid: u64) {
                 unsafe {
                     core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
                 }
+                #[cfg(feature = "board-pi4")]
+                crate::act::note_core(crate::percpu::id());
                 crate::percpu::set_asleep(false);
             }
         }

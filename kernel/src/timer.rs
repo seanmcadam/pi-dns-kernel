@@ -61,12 +61,26 @@ pub fn on_tick() {
     }
     write_cval(next);
     crate::cpu_stat::on_timer();
+    // ELR_EL1 is the instruction this tick interrupted. The hang check
+    // prints it when a core's kernel checkpoint stops moving.
+    #[cfg(feature = "board-pi4")]
+    {
+        let elr: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {elr}, elr_el1",
+                elr = out(reg) elr,
+                options(nomem, nostack)
+            );
+        }
+        let cpu = crate::percpu::id();
+        crate::act::note_tick(cpu, elr);
+        crate::act::check_hang();
+    }
     // One published 100 Hz counter. Every core has its own compare register
     // and uses it for preemption. Adding all four would report 400 Hz.
     if crate::percpu::id() == 0 {
         TICKS.fetch_add(steps, Ordering::Relaxed);
-        #[cfg(feature = "board-pi4")]
-        crate::act::check_hang();
     }
 }
 

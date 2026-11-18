@@ -169,8 +169,12 @@ pub extern "C" fn secondary_main(cpu: u64) -> ! {
     crate::percpu::mark_online(id);
     crate::interrupts::init_secondary();
     loop {
+        #[cfg(feature = "board-pi4")]
+        crate::act::note_core(id);
         if id == 1 && crate::net::service::try_become_owner() {
             loop {
+                #[cfg(feature = "board-pi4")]
+                crate::act::note_core(id);
                 crate::net::service::owner_idle();
             }
         }
@@ -185,6 +189,8 @@ pub extern "C" fn secondary_main(cpu: u64) -> ! {
                     core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
                 }
             }
+            #[cfg(feature = "board-pi4")]
+            crate::act::note_core(id);
             crate::percpu::set_asleep(false);
         }
     }

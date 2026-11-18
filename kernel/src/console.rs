@@ -4,13 +4,20 @@
 //! alias: TTBR0 does not map devices.
 
 pub fn write_str(s: &str) {
+    write_serial(s);
+    // The Pi 4 HDMI console is a second sink. It does not write the UART.
+    #[cfg(feature = "board-pi4")]
+    crate::fb_con::push(s);
+}
+
+/// UART only. The idle loop repeats the boot banner so a serial client that
+/// attaches late still sees it. Mirroring that repeat onto HDMI looks like
+/// the kernel entered `boot.s` again.
+pub fn write_serial(s: &str) {
     let uart = crate::addr::phys_to_virt(crate::board::UART_PHYS) as *mut u32;
     unsafe {
         for byte in s.bytes() {
             core::ptr::write_volatile(uart, byte as u32);
         }
     }
-    // The Pi 4 HDMI console is a second sink. It does not write the UART.
-    #[cfg(feature = "board-pi4")]
-    crate::fb_con::push(s);
 }
