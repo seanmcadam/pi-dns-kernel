@@ -13,11 +13,16 @@ use core::alloc::{GlobalAlloc, Layout};
 
 core::arch::global_asm!(include_str!("start.s"));
 
-const HEAP_VA: usize = 0x1_000A_0000;
-const HEAP_SIZE: usize = 1536 * 1024;
-const STACK_BYTES: usize = 16 * 1024;
-const WORKERS: usize = 5;
-const ALLOC_SIZE: usize = HEAP_SIZE - WORKERS * STACK_BYTES;
+pub(crate) const HEAP_VA: usize = 0x1_000A_0000;
+pub(crate) const HEAP_SIZE: usize = 1536 * 1024;
+/// `udp_recv` alone takes about 1.5 KiB, and a worker that nests a parse
+/// on a 16 KiB stack walks into the allocator. 64 KiB keeps that in the
+/// worker's own pages. The kernel leaves the page above these stacks
+/// unmapped.
+pub(crate) const STACK_BYTES: usize = 64 * 1024;
+pub(crate) const GUARD_BYTES: usize = 4096;
+pub(crate) const WORKERS: usize = 5;
+pub(crate) const ALLOC_SIZE: usize = HEAP_SIZE - GUARD_BYTES - WORKERS * STACK_BYTES;
 const HEADER: usize = 16;
 
 mod thread {

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use http_server::{parse_basic_auth, HttpMethod, HttpRequest, HttpResponse, ParseError};
 
-const HTTP_WORKERS: usize = 4;
+const HTTP_WORKERS: usize = crate::WORKERS;
 static JOB: [AtomicU32; HTTP_WORKERS] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -64,7 +64,9 @@ pub fn run() -> ! {
     }
     let mut worker = 0;
     while worker < HTTP_WORKERS {
-        let top = 0x1_000A_0000u64 + (1536 * 1024) - (worker as u64 + 1) * (16 * 1024);
+        let top = (crate::HEAP_VA + crate::HEAP_SIZE
+            - crate::GUARD_BYTES
+            - (worker + 1) * crate::STACK_BYTES) as u64;
         let _ = crate::thread::spawn(conn_worker, top, worker as u64);
         worker += 1;
     }

@@ -102,6 +102,9 @@ static mut SCREEN: Screen = Screen {
 
 static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
+/// Set when a fault has painted the pinned rows. Later log lines and the
+/// status refresh must not scroll that text off the panel.
+static FROZEN: AtomicBool = AtomicBool::new(false);
 
 const HEADER_CAP: usize = 640;
 const PINNED_ROWS: u32 = 3;
@@ -157,8 +160,16 @@ pub fn switch_to_nc() {
 /// Paint one line on row 0 without taking the console lock. A lockup may
 /// already hold that lock, or the owner may be the core that is stuck.
 /// Does not allocate and does not write the UART. A missing framebuffer
-/// is a no-op.
+/// is a no-op. Newlines fill the other pinned rows, and the log stops
+/// scrolling so the text stays on screen.
 pub fn emergency(text: &str) {
+    freeze(text);
+}
+
+/// Paint up to three pinned rows and stop the scrolling log. Safe to call
+/// from a fault with the console lock already held. Does not allocate.
+pub fn freeze(text: &str) {
+    FROZEN.store(true, Ordering::Relaxed);
     if !READY.load(Ordering::Relaxed) {
         return;
     }
@@ -169,19 +180,29 @@ pub fn emergency(text: &str) {
         }
         let pitch = screen.pitch as usize;
         let row_bytes = pitch * CELL_H as usize;
+        let rows_bytes = row_bytes * PINNED_ROWS as usize;
         let mut off = 0;
-        while off + 4 <= row_bytes {
+        while off + 4 <= rows_bytes {
             (screen.ptr.add(off) as *mut u32).write_volatile(0);
             off += 4;
         }
         let color = if screen.bgr { 0x00FF_0000 } else { RED };
         let cols = columns(screen);
+        let mut row = 0u32;
         let mut col = 0usize;
         for &ch in text.as_bytes() {
-            if ch == b'\n' || ch == b'\r' || col >= cols {
-                break;
+            if ch == b'\n' || ch == b'\r' {
+                row += 1;
+                col = 0;
+                if row >= PINNED_ROWS {
+                    break;
+                }
+                continue;
             }
-            draw_glyph(screen, col as u32, 0, ch, color);
+            if col >= cols {
+                continue;
+            }
+            draw_glyph(screen, col as u32, row, ch, color);
             col += 1;
         }
     }
@@ -190,6 +211,9 @@ pub fn emergency(text: &str) {
 /// Replace the three pinned top rows. The log scrolls underneath them. A refused
 /// lock skips this update; the next call tries again. Does not write the UART.
 pub fn set_status(text: &str) {
+    if FROZEN.load(Ordering::Relaxed) {
+        return;
+    }
     let held = lock();
     if !held {
         return;
@@ -214,6 +238,9 @@ pub fn set_status(text: &str) {
 
 /// Copy one UART string onto the display. Safe to skip. Never writes the UART.
 pub fn push(text: &str) {
+    if FROZEN.load(Ordering::Relaxed) {
+        return;
+    }
     let held = lock();
     if !held {
         return;

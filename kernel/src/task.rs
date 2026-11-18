@@ -185,6 +185,11 @@ static mut TASK: Task = Task {
 };
 
 static mut SCENARIO: u64 = 0;
+/// Real-task EL0 faults. The boot self-test is not counted. Four faults
+/// freeze the HDMI rows and halt so a restart storm cannot scroll the
+/// evidence off the panel.
+#[cfg(feature = "board-pi4")]
+static EL0_FAULTS: AtomicU32 = AtomicU32::new(0);
 static mut EXIT_CODE: u64 = 0;
 static mut LOG_OK: bool = false;
 static mut YIELD_OK: bool = false;
@@ -216,15 +221,15 @@ const TASK_SLOTS: usize = 7;
 
 const LOG_CODE_BYTES: usize = 128 * 1024;
 const LOG_DATA_BYTES: usize = 4096;
-const LOG_STACK_BYTES: usize = 16 * 1024;
+const LOG_STACK_BYTES: usize = 64 * 1024;
 const TELNET_CODE_BYTES: usize = 128 * 1024;
 const TELNET_DATA_BYTES: usize = 4096;
 const TELNET_HEAP_BYTES: usize = 256 * 1024;
-const TELNET_STACK_BYTES: usize = 16 * 1024;
+const TELNET_STACK_BYTES: usize = 64 * 1024;
 const VNC_CODE_BYTES: usize = 128 * 1024;
 const VNC_DATA_BYTES: usize = 4096;
 const VNC_HEAP_BYTES: usize = 1280 * 1024;
-const VNC_STACK_BYTES: usize = 16 * 1024;
+const VNC_STACK_BYTES: usize = 64 * 1024;
 
 /// `b .` — a task that never makes a syscall. Preemption is the only way out.
 const SPIN_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x14];
@@ -594,6 +599,12 @@ fn log_el0_fault(name: &str) {
     // The formatter writes ASCII only.
     let line = unsafe { core::str::from_utf8_unchecked(&raw[..n]) };
     crate::logger::note_fault(line);
+    // The boot self-test plants three faults on purpose. A real task that
+    // keeps faulting is the livelock: freeze the line and stop, no reboot.
+    #[cfg(feature = "board-pi4")]
+    if unsafe { SCENARIO } == 0xff && EL0_FAULTS.fetch_add(1, Ordering::Relaxed) >= 3 {
+        crate::act::halt_with(line);
+    }
 }
 
 fn kill(ec: u64) {
@@ -869,6 +880,8 @@ pub fn start_log() -> Result<(), ()> {
     unsafe {
         let code = addr_of_mut!(LOG_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, LOG_CODE_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(LOG_MEM.data).cast::<u8>(), 0, LOG_DATA_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(LOG_MEM.stack).cast::<u8>(), 0, LOG_STACK_BYTES);
         core::ptr::copy_nonoverlapping(LOG_BIN.as_ptr(), code, LOG_BIN.len());
         if LOG_DATA_LEN > 0
             && LOG_DATA_OFF + LOG_DATA_LEN <= LOG_BIN.len()
@@ -936,10 +949,16 @@ pub fn start_telnet() -> Result<(), ()> {
     unsafe {
         let code = addr_of_mut!(TELNET_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, TELNET_CODE_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(TELNET_MEM.data).cast::<u8>(), 0, TELNET_DATA_BYTES);
         core::ptr::write_bytes(
             addr_of_mut!(TELNET_MEM.heap) as *mut u8,
             0,
             TELNET_HEAP_BYTES,
+        );
+        core::ptr::write_bytes(
+            addr_of_mut!(TELNET_MEM.stack).cast::<u8>(),
+            0,
+            TELNET_STACK_BYTES,
         );
         core::ptr::copy_nonoverlapping(TELNET_BIN.as_ptr(), code, TELNET_BIN.len());
         if TELNET_DATA_LEN > 0
@@ -1008,7 +1027,9 @@ pub fn start_vnc() -> Result<(), ()> {
     unsafe {
         let code = addr_of_mut!(VNC_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, VNC_CODE_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(VNC_MEM.data).cast::<u8>(), 0, VNC_DATA_BYTES);
         core::ptr::write_bytes(addr_of_mut!(VNC_MEM.heap) as *mut u8, 0, VNC_HEAP_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(VNC_MEM.stack).cast::<u8>(), 0, VNC_STACK_BYTES);
         core::ptr::copy_nonoverlapping(VNC_BIN.as_ptr(), code, VNC_BIN.len());
         if VNC_DATA_LEN > 0
             && VNC_DATA_OFF + VNC_DATA_LEN <= VNC_BIN.len()

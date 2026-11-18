@@ -46,7 +46,7 @@ pub struct HdmiImage {
 pub const HDMI_CODE_BYTES: usize = 128 * 1024;
 pub const HDMI_DATA_BYTES: usize = 4096;
 pub const HDMI_HEAP_BYTES: usize = 16 * 1024;
-pub const HDMI_STACK_BYTES: usize = 16 * 1024;
+pub const HDMI_STACK_BYTES: usize = 64 * 1024;
 /// 32 code pages, one data page, four heap pages, four stack pages.
 /// Virt does not call `hdmi_pages`, so this constant is unused in that image.
 #[allow(dead_code)]

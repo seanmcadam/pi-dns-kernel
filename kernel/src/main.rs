@@ -238,6 +238,13 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         let now = timer::millis();
         #[cfg(feature = "board-pi4")]
         act::note_progress(now);
+        // The owner sets this while it is inside smoltcp. Two seconds
+        // without a return is the livelock on the photo (IDLE stays 0,
+        // the first RX is never reclaimed). Freeze the panel and stop.
+        #[cfg(feature = "board-pi4")]
+        if net::service::drive_age(now) > 2_000 {
+            act::halt_with("owner stuck in NIC poll\nDHCP or RX callback did not return\nno reboot");
+        }
         if now >= next_status {
             next_status = now + 2000;
             let (rx, tx) = net::packet_counts();

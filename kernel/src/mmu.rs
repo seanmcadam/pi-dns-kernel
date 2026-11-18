@@ -266,6 +266,11 @@ pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, st
     map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), USER_CODE_BYTES, code);
     map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), USER_DATA_BYTES, data);
     map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), USER_HEAP_BYTES, data);
+    // The DNS and HTTP worker stacks sit at the top of this heap. The last
+    // page stays unmapped so a main-stack overflow faults instead of
+    // landing on a worker, and a worker that stores at its initial SP
+    // faults instead of climbing into the main stack.
+    unmap_user_page(slot, USER_HEAP_VA + USER_HEAP_BYTES - PAGE);
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), USER_STACK_BYTES, data);
     use_user_slot(slot, 0);
     flush_tlb();
@@ -388,6 +393,18 @@ fn fb_l2(page: u64) -> Option<usize> {
         None
     } else {
         Some(l2_index)
+    }
+}
+
+fn unmap_user_page(slot: usize, va: u64) {
+    let l2_index = ((va >> 21) & 511) as usize;
+    let l3_index = ((va >> 12) & 511) as usize;
+    if l2_index >= 2 {
+        return;
+    }
+    unsafe {
+        let l3 = addr_of_mut!(TABLES.l3_user[slot][l2_index]);
+        (&mut *l3).entries[l3_index] = 0;
     }
 }
 

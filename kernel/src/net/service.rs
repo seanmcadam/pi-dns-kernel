@@ -116,6 +116,10 @@ static KICK: AtomicBool = AtomicBool::new(false);
 static DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 static BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
 static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Millisecond when the current `drive` entered the stack. Zero when the
+/// owner is not inside it. The Pi 4 main loop halts if this stays set.
+#[cfg(feature = "board-pi4")]
+static DRIVE_ENTER: AtomicU64 = AtomicU64::new(0);
 static mut STATE: Option<super::NetworkState> = None;
 static mut PENDING: [usize; JOBS_N] = [0; JOBS_N];
 static mut PENDING_LEN: usize = 0;
@@ -274,6 +278,19 @@ pub fn owner_time() -> (u64, u64) {
     )
 }
 
+/// How long the current `drive` has been inside the stack, or 0 if it is
+/// not. A multi-second age means `poll` did not return (the RX callback
+/// is still running) and the owner will never reach `wfi`.
+#[cfg(feature = "board-pi4")]
+pub fn drive_age(now: u64) -> u64 {
+    let entered = DRIVE_ENTER.load(Ordering::Acquire);
+    if entered == 0 {
+        0
+    } else {
+        now.saturating_sub(entered)
+    }
+}
+
 fn work_pending() -> bool {
     KICK.load(Ordering::Acquire)
         || crate::timer::millis() >= DEADLINE_MS.load(Ordering::Acquire)
@@ -343,6 +360,8 @@ pub fn drive() {
     // poll is stored again and the owner loop drives once more.
     KICK.store(false, Ordering::Release);
     let t0 = crate::timer::get_ticks();
+    #[cfg(feature = "board-pi4")]
+    DRIVE_ENTER.store(crate::timer::millis(), Ordering::Release);
     unsafe {
         let state_slot = core::ptr::addr_of_mut!(STATE);
         if let Some(state) = (*state_slot).as_mut() {
@@ -355,6 +374,8 @@ pub fn drive() {
             arm_deadline(state);
         }
     }
+    #[cfg(feature = "board-pi4")]
+    DRIVE_ENTER.store(0, Ordering::Release);
     BUSY_TICKS.fetch_add(crate::timer::get_ticks().wrapping_sub(t0), Ordering::Relaxed);
     IN_STACK.store(false, Ordering::Release);
 }
