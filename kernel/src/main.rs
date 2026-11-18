@@ -89,11 +89,17 @@ fn uart_dec(mut n: u64) {
     uart_write(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
 }
 
-/// Cortex-A72 only. boot.s sets CPUECTLR_EL1.SMPEN and, on r0p3 and
-/// earlier, CPUACTLR_EL1 bit 32 (erratum 859971, disable L1 instruction
-/// prefetch). Other cores ignore broadcast I-cache and TLB maintenance
-/// until SMPEN is 1. QEMU's cortex-a72 does not keep either IMPDEF bit,
-/// so this line is a warning there and an OK on a Pi 4.
+unsafe extern "C" {
+    /// Packed by `a72_cpu_setup`. Bit 0 ran, bit 1 CPUECTLR trapped,
+    /// bit 2 SMPEN reads as 1, bit 3 CPUACTLR trapped, bit 4 prefetch off.
+    static A72_RESULT: u64;
+}
+
+/// Cortex-A72 only. The boot probe reads CPUECTLR and CPUACTLR, at EL2
+/// when the core is still there. This does not touch those registers:
+/// an EL1 read is UNDEFINED unless ACTLR_EL2 and ACTLR_EL3 both allow it.
+/// Pi 4 MIDR is 0x410FD083 (r0p3). The armstub leaves SMPEN set and does
+/// not set CPUACTLR bit 32. QEMU's cortex-a72 keeps neither bit.
 fn note_a72_smp() {
     let midr: u64;
     unsafe {
@@ -104,18 +110,14 @@ fn note_a72_smp() {
     if !arm || !a72 {
         return;
     }
-    let ectlr: u64;
-    let actlr: u64;
-    unsafe {
-        core::arch::asm!(
-            "mrs {ectlr}, S3_1_C15_C2_1",
-            "mrs {actlr}, S3_1_C15_C2_0",
-            ectlr = out(reg) ectlr,
-            actlr = out(reg) actlr,
-            options(nomem, nostack),
-        );
+    let result = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(A72_RESULT)) };
+    if result & 1 == 0 {
+        uart_write("[WARN] A72 probe did not run\r\n");
+        return;
     }
-    if ectlr & (1 << 6) != 0 {
+    if result & 2 != 0 {
+        uart_write("[WARN] A72 CPUECTLR trapped\r\n");
+    } else if result & 4 != 0 {
         uart_write("[OK] A72 SMPEN\r\n");
     } else {
         uart_write("[WARN] A72 SMPEN clear\r\n");
@@ -123,7 +125,9 @@ fn note_a72_smp() {
     let variant = (midr >> 20) & 0xf;
     let revision = midr & 0xf;
     if variant == 0 && revision <= 3 {
-        if actlr & (1 << 32) != 0 {
+        if result & 8 != 0 {
+            uart_write("[WARN] A72 CPUACTLR trapped\r\n");
+        } else if result & 16 != 0 {
             uart_write("[OK] A72 no instruction prefetch\r\n");
         } else {
             uart_write("[WARN] A72 instruction prefetch still on\r\n");

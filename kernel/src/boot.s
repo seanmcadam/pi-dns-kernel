@@ -309,6 +309,9 @@ cache_done:
     adr     x0, 8f
     msr     elr_el2, x0
     isb
+    // Still EL2. armstub sets SMPEN and ACTLR_EL3 before the drop.
+    // ACTLR_EL2 resets to 0, so an EL1 write of CPUECTLR would trap.
+    bl      a72_cpu_setup
     eret
 
 // Wrong exception level. The physical stub repeats stage 3. Other boards
@@ -538,6 +541,9 @@ bad_el:
     // encoding is 0b10. IPS is bits 34:32. 0b010 is a 40-bit physical
     // address, which is bit 33. Virt and Pi 4 addresses still fit.
     // BCM2712 peripherals sit above 4 GiB and need the wider size.
+    // Bit 22 (A1) is clear: the ASID comes from TTBR0, not TTBR1.
+    // Bit 36 (AS) is clear: the ASID is 8 bits, in TTBR0[55:48].
+    // Bits [63:56] are ignored. Rust installs the ASID at bit 48.
     movz    x0, #0x3510
     movk    x0, #0xB510, lsl #16
     movk    x0, #2, lsl #32
@@ -917,7 +923,7 @@ install_early_done:
 
     .balign 2048
 early_vectors:
-    b       fault_blink
+    b       early_sync
     .balign 128
     b       fault_blink
     .balign 128
@@ -925,7 +931,7 @@ early_vectors:
     .balign 128
     b       fault_blink
     .balign 128
-    b       fault_blink
+    b       early_sync
     .balign 128
     b       fault_blink
     .balign 128
@@ -933,7 +939,7 @@ early_vectors:
     .balign 128
     b       fault_blink
     .balign 128
-    b       fault_blink
+    b       early_sync
     .balign 128
     b       fault_blink
     .balign 128
@@ -941,7 +947,7 @@ early_vectors:
     .balign 128
     b       fault_blink
     .balign 128
-    b       fault_blink
+    b       early_sync
     .balign 128
     b       fault_blink
     .balign 128
@@ -988,45 +994,178 @@ clean_page:
     ret
 
 // Cortex-A72 bring-up. No braces: this file is included from global_asm.
+// Clobbers x0-x7, x9-x13, x16, x17, and x30. Leaves x18, x20, x21, x22.
 //
-// CPUECTLR_EL1.SMPEN (bit 6) resets to 0. The TRM requires it be set
-// before the caches, the MMU, or any I-cache or TLB maintenance. With it
-// clear, ic ialluis and tlbi vmalle1is run on the issuing core and every
-// other core ignores the broadcast. The boot self-test and the DNS/HTTP
-// tasks share user VA 0x100000000 with different physical pages. A VIPT
-// I-cache then keeps the self-test opcodes. http-el0's server::run at
-// 0x100001188 is tbnz (no memory access). The self-test image at that
-// address is ldrsb w11, [x12], which data-aborts. QEMU does not model
-// this cache, so the same image runs there.
+// The Pi armstub, at EL3, writes CPUECTLR_EL1 = 0x40 (SMPEN, bit 6) and
+// ACTLR_EL3 = bits 0, 1, 4, 5, and 6. Bit 0 lets a lower EL touch
+// CPUACTLR, bit 1 lets it touch CPUECTLR. ACTLR_EL2 resets to 0, so the
+// same access from EL1 is UNDEFINED until this function sets ACTLR_EL2
+// bits 0 and 1. It runs at EL2 when the core is still there, and again
+// at EL1 for QEMU virt. A read is attempted first. A set SMPEN bit is
+// left alone. CPUACTLR bit 32 (erratum 859971, A72 r0p3 and earlier;
+// Pi 4 MIDR is 0x410FD083) is set only when the read shows it clear.
+// The early vector skips a trapped MRS or MSR, and the bit is then
+// reported trapped instead of written. A core that never ran the stub
+// keeps the reset value if the read itself traps.
 //
-// Erratum 859971 (A72 r0p3 and earlier, the Pi 4): a speculative
-// instruction prefetch into execute-never memory can corrupt data. The
-// user stack is UXN. CPUACTLR_EL1 bit 32 disables that prefetcher.
-// Later revisions skip the bit. Non-A72 cores return without a write.
+// A72_RESULT, written by the primary only:
+//   bit 0  probe ran
+//   bit 1  CPUECTLR read or write trapped
+//   bit 2  SMPEN reads as 1
+//   bit 3  CPUACTLR read or write trapped
+//   bit 4  instruction-prefetch disable reads as 1
 a72_cpu_setup:
     mrs     x0, midr_el1
     lsr     x1, x0, #24
     cmp     x1, #0x41
-    b.ne    92f
+    b.ne    99f
     ubfx    x1, x0, #4, #12
     movz    x2, #0xd08
     cmp     x1, x2
-    b.ne    92f
+    b.ne    99f
+    mrs     x7, currentel
+    lsr     x7, x7, #2
+    cmp     x7, #2
+    b.ne    93f
+    mrs     x1, actlr_el2
+    orr     x1, x1, #3
+    msr     actlr_el2, x1
+    isb
+93:
+    cmp     x7, #2
+    b.eq    94f
+    mrs     x6, vbar_el1
+    adrp    x1, early_vectors
+    add     x1, x1, :lo12:early_vectors
+    msr     vbar_el1, x1
+    b       95f
+94:
+    mrs     x6, vbar_el2
+    adrp    x1, early_vectors
+    add     x1, x1, :lo12:early_vectors
+    msr     vbar_el2, x1
+95:
+    isb
+    msr     daifset, #0xf
+    mov     w1, #1
+    mov     x13, x30
+    bl      a72_cpu_index
+    mov     x30, x13
+    adrp    x2, a72_skip_on
+    add     x2, x2, :lo12:a72_skip_on
+    str     w1, [x2, x11, lsl #2]
+    mov     x10, #1
+    mov     x4, xzr
     mrs     x1, S3_1_C15_C2_1
+    cbnz    x4, 96f
+    tbnz    x1, #6, 97f
     orr     x1, x1, #0x40
+    mov     x4, xzr
     msr     S3_1_C15_C2_1, x1
+    cbnz    x4, 96f
+    mov     x4, xzr
+    mrs     x1, S3_1_C15_C2_1
+    cbnz    x4, 96f
+97:
+    tbz     x1, #6, 98f
+    orr     x10, x10, #4
+    b       98f
+96:
+    orr     x10, x10, #2
+98:
     ubfx    x1, x0, #20, #4
-    cbnz    x1, 91f
+    cbnz    x1, 90f
     and     x1, x0, #0xf
     cmp     x1, #3
-    b.hi    91f
+    b.hi    90f
+    mov     x4, xzr
     mrs     x1, S3_1_C15_C2_0
+    cbnz    x4, 89f
+    tbnz    x1, #32, 88f
     orr     x1, x1, #(1 << 32)
+    mov     x4, xzr
     msr     S3_1_C15_C2_0, x1
-91:
+    cbnz    x4, 89f
+    mov     x4, xzr
+    mrs     x1, S3_1_C15_C2_0
+    cbnz    x4, 89f
+88:
+    tbz     x1, #32, 90f
+    orr     x10, x10, #16
+    b       90f
+89:
+    orr     x10, x10, #8
+90:
+    str     wzr, [x2, x11, lsl #2]
+    cmp     x7, #2
+    b.eq    87f
+    msr     vbar_el1, x6
+    b       86f
+87:
+    msr     vbar_el2, x6
+86:
     isb
-92:
+    mrs     x9, mpidr_el1
+    and     x1, x9, #0xff
+    cbnz    x1, 99f
+    ubfx    x1, x9, #8, #8
+    cbnz    x1, 99f
+    adrp    x1, A72_RESULT
+    add     x1, x1, :lo12:A72_RESULT
+    str     x10, [x1]
+99:
     ret
+
+// Physical sync slot while a72_cpu_setup has a72_skip_on set. A trapped
+// MRS/MSR is skipped. Any other sync still parks. x0 (MIDR) and x6 (the
+// saved VBAR) stay intact. x4 becomes 1 so the probe does not trust x1.
+early_sync:
+    adrp    x16, a72_skip_on
+    add     x16, x16, :lo12:a72_skip_on
+    mrs     x17, mpidr_el1
+    and     x5, x17, #0xff
+    cbnz    x5, early_sync_idx
+    ubfx    x5, x17, #8, #8
+early_sync_idx:
+    and     x5, x5, #3
+    ldr     w17, [x16, x5, lsl #2]
+    cbz     w17, fault_blink
+    mov     x4, #1
+    mrs     x16, currentel
+    lsr     x16, x16, #2
+    cmp     x16, #2
+    b.ne    early_sync_el1
+    mrs     x16, elr_el2
+    add     x16, x16, #4
+    msr     elr_el2, x16
+    eret
+early_sync_el1:
+    mrs     x16, elr_el1
+    add     x16, x16, #4
+    msr     elr_el1, x16
+    eret
+
+// One word per core, indexed by a72_cpu_index. Core 0 is the primary
+// on the Pi 4 (Aff0) and the Pi 5 (Aff1 when Aff0 is 0).
+a72_cpu_index:
+    mrs     x12, mpidr_el1
+    and     x11, x12, #0xff
+    cbnz    x11, a72_cpu_index_ok
+    ubfx    x11, x12, #8, #8
+a72_cpu_index_ok:
+    and     x11, x11, #3
+    ret
+
+.balign 8
+a72_skip_on:
+    .word 0
+    .word 0
+    .word 0
+    .word 0
+.balign 8
+.global A72_RESULT
+A72_RESULT:
+    .quad 0
 
 // Secondary cores arrive here with the MMU off. x0 is the PSCI context
 // id. QEMU virt passes the cpu id there, so that path is unchanged.
@@ -1081,6 +1220,7 @@ secondary_entry:
     adr     x0, 20f
     msr     elr_el2, x0
     isb
+    bl      a72_cpu_setup
     eret
 20:
     mrs     x0, cpacr_el1

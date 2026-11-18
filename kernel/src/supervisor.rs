@@ -514,6 +514,9 @@ fn finish(slot: usize) {
     if asid != 0 {
         crate::mmu::tlbi_asid(asid as u64);
     }
+    // The next start reuses this VA. Drop the old opcodes on every core
+    // before the ASID can be claimed again.
+    crate::mmu::invalidate_icache();
     crate::task::poke_others();
     let outcome = {
         let _hold = guard();

@@ -1399,13 +1399,7 @@ fn maintain_code(kernel_ptr: *mut u8, len: usize) {
             core::arch::asm!("dc cvau, {kva}", kva = in(reg) kva, options(nostack));
             off += 64;
         }
-        core::arch::asm!(
-            "dsb ish",
-            "ic ialluis",
-            "dsb ish",
-            "isb",
-            options(nostack),
-        );
+        crate::mmu::invalidate_icache();
     }
 }
 
