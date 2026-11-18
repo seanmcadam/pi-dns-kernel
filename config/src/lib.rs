@@ -289,6 +289,16 @@ const NET_FIELDS: &[Field] = &[
             max: TIMEOUT_MAX,
         },
     },
+    Field {
+        name: "speed",
+        required: false,
+        kind: FieldKind::U64 { min: 0, max: 1000 },
+    },
+    Field {
+        name: "arp_secs",
+        required: false,
+        kind: FieldKind::U64 { min: 0, max: 60 },
+    },
 ];
 
 const DNS_FIELDS: &[Field] = &[

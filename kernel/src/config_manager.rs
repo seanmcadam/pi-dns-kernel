@@ -28,6 +28,10 @@ pub struct DisplayConfig {
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub mode: NetworkMode,
+    /// 0 autoneg, 100 advertise 100full only, 1000 advertise gigabit.
+    pub speed_cap: u32,
+    /// 0 sends one gratuitous ARP. Any other value repeats it, in seconds.
+    pub arp_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +560,8 @@ fn default_config() -> Config {
     Config {
         network: NetworkConfig {
             mode: default_network_mode(),
+            speed_cap: default_speed_cap(),
+            arp_secs: default_arp_secs(),
         },
         dns: DnsConfig {
             records,
@@ -581,6 +587,22 @@ fn default_config() -> Config {
 
 fn default_network_mode() -> NetworkMode {
     crate::board::default_network()
+}
+
+fn default_speed_cap() -> u32 {
+    if cfg!(feature = "phy-100") {
+        100
+    } else {
+        0
+    }
+}
+
+fn default_arp_secs() -> u64 {
+    if cfg!(feature = "board-pi4") {
+        2
+    } else {
+        0
+    }
 }
 
 fn load_main() -> Config {
@@ -713,6 +735,18 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(3_000);
+    let speed_cap = match network.get("speed").and_then(Value::as_u64) {
+        None => default_speed_cap(),
+        Some(0) => 0,
+        Some(100) => 100,
+        Some(1000) => 1000,
+        Some(_) => return Err(String::from("network.speed: expected 0, 100, or 1000")),
+    };
+    let arp_secs = match network.get("arp_secs").and_then(Value::as_u64) {
+        None => default_arp_secs(),
+        Some(secs) if secs <= 60 => secs,
+        Some(_) => return Err(String::from("network.arp_secs: expected 0..=60")),
+    };
     let username = require_secret(http, "username")?;
     let password = require_secret(http, "password")?;
     let port = http.get("port").and_then(Value::as_u64).unwrap_or(80) as u16;
@@ -797,7 +831,11 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         NetworkMode::Static { ip, netmask, gateway }
     };
     Ok(Config {
-        network: NetworkConfig { mode: network },
+        network: NetworkConfig {
+            mode: network,
+            speed_cap,
+            arp_secs,
+        },
         dns: DnsConfig {
             records,
             upstreams,
@@ -840,6 +878,8 @@ fn needs_restart(old: &Config, new: &Config) -> bool {
     old.http.port != new.http.port
         || old.dns.cache_size != new.dns.cache_size
         || !same_mode(&old.network.mode, &new.network.mode)
+        || old.network.speed_cap != new.network.speed_cap
+        || old.network.arp_secs != new.network.arp_secs
 }
 
 fn same_mode(left: &NetworkMode, right: &NetworkMode) -> bool {
@@ -1021,6 +1061,14 @@ fn config_value(config: &Config) -> Value {
                 (String::from("netmask"), Value::String(ip_text(netmask))),
                 (String::from("gateway"), Value::String(ip_text(gateway))),
                 (String::from("timeout_ms"), Value::Number(timeout_ms)),
+                (
+                    String::from("speed"),
+                    Value::Number(u64::from(config.network.speed_cap)),
+                ),
+                (
+                    String::from("arp_secs"),
+                    Value::Number(config.network.arp_secs),
+                ),
             ]),
         ),
         (

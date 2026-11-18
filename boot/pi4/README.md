@@ -76,38 +76,49 @@ on. Dark while the console is still scrolling is a healthy boot.
 
 ## HDMI network rows
 
-The top two rows of the framebuffer do not scroll. The first shows the
+The top three rows of the framebuffer do not scroll. The first shows the
 GENET revision (raw word and decoded version; silicon major 6 is version
 5), link up or down, speed, MAC, DHCP state (`wait`, `leased`, `timeout`,
 `static`, or `off`), the IPv4 address, and the LED label. The second is
-the transmit DMA: `txS` frames queued, `txC` the hardware consumer, `txP`
-the hardware producer, `d` times the ring was full, `mibT` and `mibR`
-the UniMAC TX and RX counters, then `st` (`TDMA_STATUS`),
-`ctl` (`TDMA_CTRL`), `rd` and `wr` (ring 16 read and write pointers),
-`e` (end address in words), `z` (ring size register), and `d0` (the
-length/status word of TX descriptor 0).
-`txP` moving while `txC` and `mibT` stay 0 means the producer was written
-and the DMA engine did not take the descriptor. `ctl` bit 0 is `DMA_EN`
-and bit 17 is ring 16. `st` bit 0 clear means `DMA_DISABLED` is not set,
-so the engine reports enabled. Linux only defines that bit and bit 1
-(`DMA_DESC_RAM_INIT_BUSY`). Bits 1..16 set in a value such as
-`0x0001FFFE` are not the control register's ring-enable mask
-(`DMA_RING_BUF_EN_SHIFT` is a `TDMA_CTRL` field). `wr` is the word index
-of the next free descriptor and advances with each queued frame. `e`
-should read `0x000002FF` (256 descriptors × 3 words − 1) and `z` should
-read `0x01000800` (count 256, buffer 2048). A different `e` or `z` means
-the write-once ring register kept an earlier value.
-`d` climbing means the stack is retrying because the ring is full; the
-driver does not spin on the consumer. `d0` is descriptor 0's
-length/status word. `0x01307FC0` is length `0x130` (304 bytes) in the
-high half and `SOP|EOP|APPEND_CRC|qtag 0x3F` in the low half: one DHCP
-DISCOVER (14 + 20 + 8 + 262). The scrolling log prints that decode and
-the first 16 bytes of the first TX frame and the first RX frame.
-`rxE` counts DMA receives dropped for a bad status word. smoltcp retries
-DISCOVER once a second; the kernel falls back to the static address
-after four seconds and then sends one gratuitous ARP. Probe steps are
-also logged as `[OK]`, `[WARN]`, and `[FAIL]` lines in the scrolling
-region. `nic=` in
+the UniMAC and receive-DMA breakdown: `tS` frames the stack queued, `tPkt` UniMAC TX packets,
+`tOk` TX good packets, `tFcs` TX FCS errors, `e` the RX ring end
+address, `h` the HFB control register, `r` every frame the
+MAC counted, `rOk` good RX, `bca` broadcast, `mca` multicast, `uc`
+unicast, `fcs` / `aln` / `ovr` the RX error counters, `run` runt
+packets, `ovf` the v5 RBUF overflow counter, `uov` the v1 UniMAC
+overflow register (v5 leaves this at zero and counts in `ovf`), `rer`
+the RBUF error counter, `mdf` the address-filter error counter, `p` /
+`c` the RDMA producer and consumer, and `d` the RDMA discard count in
+the top half of the producer. `e` should read `000002ff`
+(256 descriptors × 3 words − 1). A smaller `e` means the write did not
+stick and the engine is not using the buffers this driver armed.
+The third row is the last transmitted header and the last received
+header, as destination, source, and ethertype, then `arp` and `icmp`
+as received/transmitted counts. `rxE` is a descriptor this driver
+rejected. The scrolling log still prints the first TX descriptor decode
+(`d0` length 304, `SOP EOP CRC`, one DHCP DISCOVER).
+
+`r` far above `rOk`, with `fcs` and `aln` climbing, is a bad receive
+clock. `rOk` far above the status line's `rx=`, with `ovf` or `d`
+climbing, is the DMA ring. `rOk` close to `bca`+`uc` and both close to
+`rx=`, with `mca` holding the rest of `r`, means the filter is doing
+its job and the missing frames were multicast. A received header whose first bytes are not a MAC is a
+length or alignment problem. `arp` received climbing while `arp`
+transmitted stays put means the stack did not answer. Both climbing
+while the peer still cannot ping means the reply left the MAC and was
+not accepted on the wire.
+
+Linux `bcmgenet_mii_config` sets `ID_MODE_DIS` only for
+`PHY_INTERFACE_MODE_RGMII`. `rgmii-rxid` leaves it clear, so the MAC
+inserts the TX delay and the PHY inserts the RX delay. The PHY TX-clock
+shadow (register 0x1c, shadow 3, bit 9) is cleared so the delay is not
+applied twice. At 100 Mbit the MAC suppresses its internal delay. To
+try that, set `network.speed` to `100` in `CONFIG.JSN` (or build with
+`--features phy-100`). `0` is autonegotiation. `network.arp_secs` is how
+often a gratuitous ARP is sent after the address is installed. The Pi 4
+default when the key is absent is 2 seconds. `0` sends one.
+Probe steps are also logged as `[OK]`, `[WARN]`, and `[FAIL]` lines in
+the scrolling region. `nic=` in
 the `[status]` line is a GIC interrupt count. Zero there does not mean
 the controller is missing. QEMU raspi4b has no GENET block, so that
 image prints `[FAIL] GENET revision register is not present` and
@@ -122,7 +133,9 @@ offset `0x0C` and the consumer is `0x08`. The consumer is not written.
 The software write pointer is the word index of the next free
 descriptor. Only 32 frame buffers are kept, so at most 32 descriptors
 are in flight; the index into the 256-deep ring is the free-running
-producer. GENET's GIC lines are masked in the handler and re-armed from
+producer. The receive ring is the same depth and has one buffer per
+descriptor, because the MAC is the producer and will fill every
+descriptor before it waits. GENET's GIC lines are masked in the handler and re-armed from
 the poll path only while the interrupt summary is clear.
 
 `./scripts/build.sh pi4` enables DHCP. Without that feature the image

@@ -187,6 +187,15 @@ pub fn default_network() -> crate::net::NetworkMode {
     <Active as Board>::default_network()
 }
 
+/// Cap PHY advertisement before the NIC is probed. `0` leaves autonegotiation
+/// alone. Only the Pi 4 GENET driver looks at this.
+pub fn set_phy_speed(cap: u32) {
+    #[cfg(feature = "board-pi4")]
+    pi4::set_speed_cap(cap);
+    #[cfg(not(feature = "board-pi4"))]
+    let _ = cap;
+}
+
 pub fn probe_nic() -> Option<Nic> {
     <Active as Board>::probe_nic()
 }

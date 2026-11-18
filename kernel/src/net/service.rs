@@ -385,6 +385,11 @@ fn arm_deadline(state: &mut super::NetworkState) {
             }
         }
     }
+    if let Some(at) = super::next_announce_ms() {
+        if at < deadline {
+            deadline = at;
+        }
+    }
     DEADLINE_MS.store(deadline, Ordering::Release);
 }
 

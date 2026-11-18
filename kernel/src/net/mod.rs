@@ -1,7 +1,7 @@
 pub mod service;
 mod stack;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::phy::{Device, TxToken};
@@ -37,6 +37,8 @@ const LINK_HOLD_MS: u64 = 15_000;
 static DHCP_PHASE: AtomicU8 = AtomicU8::new(0);
 static DHCP_IP: AtomicU32 = AtomicU32::new(0);
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+static ARP_PERIOD_MS: AtomicU64 = AtomicU64::new(0);
+static ARP_NEXT_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub enum NetworkMode {
@@ -60,6 +62,8 @@ pub enum NetworkError {
 }
 
 pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), NetworkError> {
+    crate::board::set_phy_speed(config.speed_cap);
+    ARP_PERIOD_MS.store(config.arp_secs.saturating_mul(1000), Ordering::Relaxed);
     log::info!("Detecting network device...");
     log::info!("Network device: {}", crate::board::nic_name());
 
@@ -231,19 +235,49 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
     refresh_banner();
 }
 
+/// When the next gratuitous ARP is due. The owner sleeps on this so a
+/// period does not wait for an unrelated IRQ.
+pub(crate) fn next_announce_ms() -> Option<u64> {
+    if ARP_PERIOD_MS.load(Ordering::Relaxed) == 0 || DHCP_IP.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    Some(ARP_NEXT_MS.load(Ordering::Relaxed))
+}
+
 /// One broadcast ARP for the address we are using, so a peer does not
-/// have to have queried during the DHCP window.
+/// have to have queried during the DHCP window. `network.arp_secs` repeats it.
 fn maybe_announce(device: &mut EthernetDevice) {
-    if ANNOUNCED.load(Ordering::Relaxed) {
+    let ip = DHCP_IP.load(Ordering::Relaxed);
+    if ip == 0 {
         return;
     }
-    let ip = DHCP_IP.load(Ordering::Relaxed);
-    if ip == 0 || !crate::board::nic_link() {
+    let now = crate::timer::millis();
+    let period = ARP_PERIOD_MS.load(Ordering::Relaxed);
+    if !crate::board::nic_link() {
+        // Leave the next attempt in the future. A deadline of 0 would
+        // wake the owner on every return while the cable is out.
+        if period > 0 && now >= ARP_NEXT_MS.load(Ordering::Relaxed) {
+            ARP_NEXT_MS.store(now.saturating_add(period), Ordering::Relaxed);
+        }
+        return;
+    }
+    if period == 0 {
+        if ANNOUNCED.load(Ordering::Relaxed) {
+            return;
+        }
+    } else if now < ARP_NEXT_MS.load(Ordering::Relaxed) {
         return;
     }
     if announce(device, ip.to_be_bytes()) {
-        ANNOUNCED.store(true, Ordering::Relaxed);
-        console_line("[OK] gratuitous ARP");
+        let first = !ANNOUNCED.swap(true, Ordering::Relaxed);
+        if period == 0 {
+            ARP_NEXT_MS.store(u64::MAX, Ordering::Relaxed);
+        } else {
+            ARP_NEXT_MS.store(now.saturating_add(period), Ordering::Relaxed);
+        }
+        if first {
+            console_line("[OK] gratuitous ARP");
+        }
     }
 }
 
@@ -327,7 +361,7 @@ pub fn packet_counts() -> (u32, u32) {
 
 /// Pinned HDMI row on the Pi 4. Other boards build the same text and drop it.
 pub fn refresh_banner() {
-    let mut buf = [0u8; 220];
+    let mut buf = [0u8; 640];
     let mut n = 0;
     n += crate::board::write_nic_status(&mut buf[n..]);
     push(&mut buf, &mut n, " dhcp:");
