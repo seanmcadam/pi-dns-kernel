@@ -262,6 +262,47 @@ fn add(mut sum: u32, data: &[u8]) -> u32 {
     sum
 }
 
+/// Gateway installed with a DHCP lease.
+///
+/// The router option wins. The QEMU fallback `10.0.2.2` is only used
+/// when it sits on the leased subnet. Otherwise an off-subnet default
+/// route blackholes every forwarded query while on-link HTTP and local
+/// records still work. An on-link DHCP server is the next choice, then
+/// the first host address of the leased subnet.
+pub fn lease_gateway(
+    ip: [u8; 4],
+    mask: [u8; 4],
+    router: Option<[u8; 4]>,
+    server: [u8; 4],
+    fallback: [u8; 4],
+) -> [u8; 4] {
+    if let Some(router) = router {
+        return router;
+    }
+    if on_link(ip, mask, fallback) {
+        return fallback;
+    }
+    if server != ip && server != [0, 0, 0, 0] && on_link(ip, mask, server) {
+        return server;
+    }
+    let network = u32::from_be_bytes(ip) & u32::from_be_bytes(mask);
+    let gateway = network | 1;
+    if gateway == u32::from_be_bytes(ip) {
+        return server;
+    }
+    gateway.to_be_bytes()
+}
+
+fn on_link(ip: [u8; 4], mask: [u8; 4], other: [u8; 4]) -> bool {
+    let mask = u32::from_be_bytes(mask);
+    if mask == 0 {
+        return false;
+    }
+    let ip = u32::from_be_bytes(ip);
+    let other = u32::from_be_bytes(other);
+    ip & mask == other & mask
+}
+
 fn finish(mut sum: u32) -> u16 {
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -272,6 +313,29 @@ fn finish(mut sum: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_gateway_keeps_router_and_rejects_qemu_fallback() {
+        let leased = [172, 18, 3, 137];
+        let mask = [255, 255, 255, 0];
+        let qemu = [10, 0, 2, 2];
+        assert_eq!(
+            lease_gateway(leased, mask, Some([172, 18, 3, 1]), [172, 18, 3, 1], qemu),
+            [172, 18, 3, 1]
+        );
+        assert_eq!(
+            lease_gateway(leased, mask, None, [172, 18, 3, 1], qemu),
+            [172, 18, 3, 1]
+        );
+        assert_eq!(
+            lease_gateway(leased, mask, None, [8, 8, 8, 8], qemu),
+            [172, 18, 3, 1]
+        );
+        assert_eq!(
+            lease_gateway([10, 0, 2, 15], mask, None, [10, 0, 2, 3], qemu),
+            qemu
+        );
+    }
 
     #[test]
     fn photo_header_and_no_rewrite() {

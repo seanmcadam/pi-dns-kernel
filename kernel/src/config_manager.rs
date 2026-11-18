@@ -404,15 +404,61 @@ pub fn write_records(out: &mut [u8]) -> Option<usize> {
     Some(used)
 }
 
+/// Nameservers from the DHCP ACK (option 6). The zone file is not
+/// rewritten. `write_upstreams` offers these first, then the configured
+/// list, so a forwarded query can reach the resolver on the lease subnet
+/// before 8.8.8.8.
+static DHCP_DNS: [AtomicU32; 3] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+pub fn note_dhcp_dns(servers: &[[u8; 4]]) {
+    let mut index = 0;
+    while index < DHCP_DNS.len() {
+        let ip = servers.get(index).copied().unwrap_or([0, 0, 0, 0]);
+        DHCP_DNS[index].store(u32::from_be_bytes(ip), Ordering::Relaxed);
+        index += 1;
+    }
+}
+
 pub fn write_upstreams(out: &mut [u8]) -> Option<usize> {
     let current = CURRENT.lock();
     let Some(config) = current.as_ref() else {
         return Some(0);
     };
     let mut used = 0;
+    let mut seen = [[0u8; 4]; 8];
+    let mut nseen = 0usize;
+    let mut index = 0;
+    while index < DHCP_DNS.len() {
+        let raw = DHCP_DNS[index].load(Ordering::Relaxed);
+        index += 1;
+        if raw == 0 {
+            continue;
+        }
+        let ip = raw.to_be_bytes();
+        if seen[..nseen].contains(&ip) {
+            continue;
+        }
+        used = append_ip(out, used, ip)?;
+        used = push_slice(out, used, b"\n")?;
+        if nseen < seen.len() {
+            seen[nseen] = ip;
+            nseen += 1;
+        }
+    }
     for ip in &config.dns.upstreams {
+        if seen[..nseen].contains(ip) {
+            continue;
+        }
         used = append_ip(out, used, *ip)?;
         used = push_slice(out, used, b"\n")?;
+        if nseen < seen.len() {
+            seen[nseen] = *ip;
+            nseen += 1;
+        }
     }
     Some(used)
 }
