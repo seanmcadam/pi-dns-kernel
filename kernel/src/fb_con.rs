@@ -103,8 +103,8 @@ static mut SCREEN: Screen = Screen {
 static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
 
-const HEADER_CAP: usize = 220;
-const PINNED_ROWS: u32 = 2;
+const HEADER_CAP: usize = 640;
+const PINNED_ROWS: u32 = 3;
 static mut HEADER: [u8; HEADER_CAP] = [0; HEADER_CAP];
 static mut HEADER_LEN: usize = 0;
 
@@ -187,7 +187,7 @@ pub fn emergency(text: &str) {
     }
 }
 
-/// Replace the two pinned top rows. The log scrolls underneath them. A refused
+/// Replace the three pinned top rows. The log scrolls underneath them. A refused
 /// lock skips this update; the next call tries again. Does not write the UART.
 pub fn set_status(text: &str) {
     let held = lock();

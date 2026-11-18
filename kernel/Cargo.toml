@@ -18,6 +18,10 @@ board-pi4 = []
 # Build with --no-default-features --features board-pi5. Enabling it on
 # top of another board feature does not compile. RP1 Ethernet is not driven.
 board-pi5 = []
+# Pi 4 diagnostic: advertise 100 Mbit full duplex only. Gigabit RGMII
+# delay mistakes are invisible at 100 Mbit because the MAC turns its
+# internal delay off. `./scripts/build.sh pi4 --features phy-100`.
+phy-100 = []
 
 [dependencies]
 cortex-a = { workspace = true }

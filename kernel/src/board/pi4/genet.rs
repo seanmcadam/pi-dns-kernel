@@ -132,9 +132,30 @@ const RBUF_ALIGN_2B: u32 = 1 << 1;
 /// errors, and TX packets. These count frames the MAC accepted, which is
 /// independent of the DMA rings.
 const MIB_RX_PKT: usize = 0xc28;
+const MIB_RX_MCA: usize = 0xc30;
+const MIB_RX_BCA: usize = 0xc34;
+const MIB_RX_FCS: usize = 0xc38;
+const MIB_RX_ALN: usize = 0xc48;
+const MIB_RX_OVR: usize = 0xc58;
+const MIB_RX_POK: usize = 0xc64;
+const MIB_RX_UC: usize = 0xc68;
 const MIB_TX_PKT: usize = 0xca8;
+const MIB_TX_FCS: usize = 0xcbc;
+const MIB_TX_POK: usize = 0xcec;
+const MIB_RX_RUNT: usize = 0xd00;
+const RBUF_OVFL_CNT: usize = 0x394;
+/// v1 kept this in the UniMAC block. v5 counts overflow at `RBUF_OVFL_CNT`.
+const UMAC_RBUF_OVFL: usize = 0xe1c;
+const RBUF_ERR_CNT: usize = 0x398;
+const UMAC_MDF_ERR_CNT: usize = 0xe38;
+const HFB_CTRL: usize = 0xfc00;
 
 const DESC_COUNT: usize = 32;
+/// U-Boot gives ring 16 every RX descriptor. The register block is already
+/// placed after 256 of them. A 32-deep END left the engine walking
+/// descriptors this driver never armed, so the MAC counted frames the
+/// stack never saw.
+const RX_RING_DESCS: usize = 256;
 const WORDS_PER_BD: u32 = 3;
 const BUF_LEN: usize = 2048;
 const RX_ALIGN: usize = 2;
@@ -171,6 +192,7 @@ const BMCR_ANENABLE: u16 = 1 << 12;
 const BMCR_ANRESTART: u16 = 1 << 9;
 const BMSR_LSTATUS: u16 = 1 << 2;
 const ADVERTISE_ALL: u16 = 0x0de1;
+const ADVERTISE_100FULL: u16 = 0x0101;
 const ADVERTISE_1000FULL: u16 = 0x0200;
 const LPA_1000FULL: u16 = 0x0800;
 const LPA_1000HALF: u16 = 0x0400;
@@ -185,7 +207,7 @@ static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[link_section = ".dma"]
-static mut RX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
+static mut RX_BUFS: [[u8; BUF_LEN]; RX_RING_DESCS] = [[0; BUF_LEN]; RX_RING_DESCS];
 #[link_section = ".dma"]
 static mut TX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
 
@@ -199,6 +221,38 @@ static PRESENT: AtomicBool = AtomicBool::new(false);
 static TX_NOTED: AtomicBool = AtomicBool::new(false);
 static RX_NOTED: AtomicBool = AtomicBool::new(false);
 static RX_DROP_NOTED: AtomicBool = AtomicBool::new(false);
+static SPEED_CAP: AtomicU32 = AtomicU32::new(0);
+static ARP_TX: AtomicU32 = AtomicU32::new(0);
+static ARP_RX: AtomicU32 = AtomicU32::new(0);
+static ICMP_TX: AtomicU32 = AtomicU32::new(0);
+static ICMP_RX: AtomicU32 = AtomicU32::new(0);
+static HAVE_TX_HDR: AtomicBool = AtomicBool::new(false);
+static HAVE_RX_HDR: AtomicBool = AtomicBool::new(false);
+static LAST_TX: [AtomicU8; 14] = hdr_zeros();
+static LAST_RX: [AtomicU8; 14] = hdr_zeros();
+
+const fn hdr_zeros() -> [AtomicU8; 14] {
+    [
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+    ]
+}
+
+pub fn set_speed_cap(cap: u32) {
+    SPEED_CAP.store(cap, Ordering::Relaxed);
+}
 static REV: AtomicU32 = AtomicU32::new(0);
 static VERSION: AtomicU32 = AtomicU32::new(0);
 static LINK_UP: AtomicBool = AtomicBool::new(false);
@@ -274,43 +328,83 @@ pub fn write_status(out: &mut [u8]) -> usize {
     line.n
 }
 
-/// Second pinned row. `txC` and `txP` are the hardware consumer and
-/// producer. `st` / `ctl` are `TDMA_STATUS` and `TDMA_CTRL`. `rd` / `wr`
-/// are ring 16's read and write pointers.
+/// Second and third pinned rows. The second is the UniMAC and RDMA
+/// breakdown. The third is the last Ethernet header each way, plus how
+/// many of those frames were ARP or ICMP.
 pub fn write_diag(out: &mut [u8]) -> usize {
     let mut line = StatusLine { buf: out, n: 0 };
     if !PRESENT.load(Ordering::Relaxed) {
-        line.push("txS=- txC=- st=- ctl=-");
+        line.push("txS=- mib=-");
         return line.n;
     }
-    line.push("txS=");
+    let rx_prod_raw = read(RDMA_RING + RDMA_PROD_INDEX);
+    line.push("tS=");
     line.dec(TX_COUNT.load(Ordering::Relaxed));
-    line.push(" txC=");
-    line.dec(read(TDMA_RING + TDMA_CONS_INDEX) & 0xffff);
-    line.push(" txP=");
-    line.dec(read(TDMA_RING + TDMA_PROD_INDEX) & 0xffff);
-    line.push(" d=");
-    line.dec(TX_DROP.load(Ordering::Relaxed));
-    line.push(" mibT=");
+    line.push(" tPkt=");
     line.dec(read(MIB_TX_PKT));
-    line.push(" mibR=");
+    line.push(" tOk=");
+    line.dec(read(MIB_TX_POK));
+    line.push(" tFcs=");
+    line.dec(read(MIB_TX_FCS));
+    line.push(" e=");
+    line.hex32(read(RDMA_RING + DMA_END_ADDR));
+    line.push(" h=");
+    line.hex32(read(HFB_CTRL));
+    line.push(" r=");
     line.dec(read(MIB_RX_PKT));
+    line.push(" rOk=");
+    line.dec(read(MIB_RX_POK));
+    line.push(" bca=");
+    line.dec(read(MIB_RX_BCA));
+    line.push(" mca=");
+    line.dec(read(MIB_RX_MCA));
+    line.push(" uc=");
+    line.dec(read(MIB_RX_UC));
+    line.push(" fcs=");
+    line.dec(read(MIB_RX_FCS));
+    line.push(" aln=");
+    line.dec(read(MIB_RX_ALN));
+    line.push(" ovr=");
+    line.dec(read(MIB_RX_OVR));
+    line.push(" run=");
+    line.dec(read(MIB_RX_RUNT));
+    line.push(" ovf=");
+    line.dec(read(RBUF_OVFL_CNT));
+    line.push(" uov=");
+    line.dec(read(UMAC_RBUF_OVFL));
+    line.push(" rer=");
+    line.dec(read(RBUF_ERR_CNT));
+    line.push(" mdf=");
+    line.dec(read(UMAC_MDF_ERR_CNT));
+    line.push(" p=");
+    line.dec(rx_prod_raw & 0xffff);
+    line.push(" c=");
+    line.dec(read(RDMA_RING + RDMA_CONS_INDEX) & 0xffff);
+    line.push(" d=");
+    line.dec(rx_prod_raw >> 16);
+    line.push("\n");
+    if HAVE_TX_HDR.load(Ordering::Relaxed) {
+        line.push("tx ");
+        line.hdr(&LAST_TX);
+    } else {
+        line.push("tx -");
+    }
+    line.push(" rx ");
+    if HAVE_RX_HDR.load(Ordering::Relaxed) {
+        line.hdr(&LAST_RX);
+    } else {
+        line.push("-");
+    }
+    line.push(" arp=");
+    line.dec(ARP_RX.load(Ordering::Relaxed));
+    line.push("/");
+    line.dec(ARP_TX.load(Ordering::Relaxed));
+    line.push(" icmp=");
+    line.dec(ICMP_RX.load(Ordering::Relaxed));
+    line.push("/");
+    line.dec(ICMP_TX.load(Ordering::Relaxed));
     line.push(" rxE=");
     line.dec(RX_ERR.load(Ordering::Relaxed));
-    line.push(" st=");
-    line.hex32(read(TDMA_REG_BASE + DMA_STATUS));
-    line.push(" ctl=");
-    line.hex32(read(TDMA_REG_BASE + DMA_CTRL));
-    line.push(" rd=");
-    line.dec(read(TDMA_RING + DMA_READ_PTR));
-    line.push(" wr=");
-    line.dec(read(TDMA_RING + DMA_WRITE_PTR));
-    line.push(" e=");
-    line.hex32(read(TDMA_RING + DMA_END_ADDR));
-    line.push(" z=");
-    line.hex32(read(TDMA_RING + DMA_RING_BUF_SIZE_REG));
-    line.push(" d0=");
-    line.hex32(read(GENET_TX_OFF + DESC_LENGTH_STATUS));
     line.n
 }
 
@@ -396,6 +490,25 @@ impl StatusLine<'_> {
         self.buf[self.n + 1] = digit(lo);
         self.n += 2;
     }
+
+    fn hdr(&mut self, bytes: &[AtomicU8; 14]) {
+        for index in 0..6 {
+            if index > 0 {
+                self.push(":");
+            }
+            self.byte(bytes[index].load(Ordering::Relaxed));
+        }
+        self.push(" ");
+        for index in 6..12 {
+            if index > 6 {
+                self.push(":");
+            }
+            self.byte(bytes[index].load(Ordering::Relaxed));
+        }
+        self.push(" ");
+        self.byte(bytes[12].load(Ordering::Relaxed));
+        self.byte(bytes[13].load(Ordering::Relaxed));
+    }
 }
 
 pub struct GenetDevice {
@@ -461,7 +574,7 @@ impl GenetDevice {
 
         PRESENT.store(true, Ordering::Relaxed);
         service_link();
-        say("[OK] GENET v5 TX ring 16, 256 descriptors, producer follows consumer");
+        say("[OK] GENET v5 TX and RX rings are 256 descriptors");
 
         Some(Self { mac })
     }
@@ -490,6 +603,7 @@ impl GenetDevice {
                 buf[copied..60].fill(0);
             }
             clean_poc(buf.as_ptr(), n);
+            note_l2(buf.as_ptr(), n, true);
             let addr = crate::addr::virt_to_phys(buf.as_ptr() as u64);
             let desc = GENET_TX_OFF + desc_index * DMA_DESC_SIZE;
             write(desc + DESC_ADDRESS_LO, addr as u32);
@@ -630,7 +744,14 @@ fn umac_reset() {
     rbuf |= RBUF_ALIGN_2B;
     write(RBUF_CTRL, rbuf);
     write(RBUF_TBUF_SIZE_CTRL, 1);
-    say("[OK] GENET RBUF align 2, TBUF left as reset");
+    let hfb = read(HFB_CTRL);
+    if hfb != 0 {
+        say_hex("[WARN] GENET HFB was enabled", hfb);
+    }
+    write(HFB_CTRL, 0);
+    write(HFB_CTRL + 4, 0);
+    write(HFB_CTRL + 8, 0);
+    say("[OK] GENET RBUF align 2, HFB off, TBUF left as reset");
 }
 
 fn disable_dma() {
@@ -664,7 +785,7 @@ fn enable_dma() {
 }
 
 fn init_rx_descriptors() {
-    for index in 0..DESC_COUNT {
+    for index in 0..RX_RING_DESCS {
         program_rx_desc(index);
     }
 }
@@ -683,10 +804,11 @@ fn program_rx_desc(index: usize) {
 }
 
 fn init_rx_ring() {
-    let end = DESC_COUNT as u32 * WORDS_PER_BD - 1;
+    let end = RX_RING_DESCS as u32 * WORDS_PER_BD - 1;
+    let size = ((RX_RING_DESCS as u32) << 16) | BUF_LEN as u32;
     write(RDMA_REG_BASE + DMA_SCB_BURST_SIZE, DMA_MAX_BURST);
-    write(RDMA_RING + RDMA_PROD_INDEX, 0);
-    write(RDMA_RING + RDMA_CONS_INDEX, 0);
+    // The producer is hardware-owned. U-Boot does not write it; the
+    // consumer is aligned to whatever the register already holds.
     write(RDMA_RING + DMA_START_ADDR, 0);
     write(RDMA_RING + DMA_START_ADDR_HI, 0);
     write(RDMA_RING + DMA_READ_PTR, 0);
@@ -695,12 +817,18 @@ fn init_rx_ring() {
     write(RDMA_RING + DMA_WRITE_PTR_HI, 0);
     write(RDMA_RING + DMA_END_ADDR, end);
     write(RDMA_RING + DMA_END_ADDR_HI, 0);
-    write(
-        RDMA_RING + DMA_RING_BUF_SIZE_REG,
-        ((DESC_COUNT as u32) << 16) | BUF_LEN as u32,
-    );
-    write(RDMA_RING + DMA_FLOW_PERIOD, (5 << 16) | 16);
+    write(RDMA_RING + DMA_RING_BUF_SIZE_REG, size);
+    write(RDMA_RING + DMA_FLOW_PERIOD, (5 << 16) | (RX_RING_DESCS as u32 >> 4));
     write(RDMA_REG_BASE + DMA_RING_CFG, 1 << DEFAULT_Q);
+    let got_end = read(RDMA_RING + DMA_END_ADDR);
+    let got_size = read(RDMA_RING + DMA_RING_BUF_SIZE_REG);
+    if got_end != end || got_size != size {
+        say("[WARN] GENET RDMA ring end or size did not stick");
+    }
+    let prod = read(RDMA_RING + RDMA_PROD_INDEX) & 0xffff;
+    write(RDMA_RING + RDMA_CONS_INDEX, prod);
+    RX_CONS.store(prod, Ordering::Relaxed);
+    say("[OK] GENET RDMA ring 16 uses 256 descriptors from 0");
 }
 
 fn init_tx_ring() {
@@ -833,11 +961,19 @@ fn start_phy() -> bool {
             _ => core::hint::spin_loop(),
         }
     }
-    let _ = mdio_write(phy, MII_ADVERTISE, ADVERTISE_ALL);
-    let _ = mdio_write(phy, MII_CTRL1000, ADVERTISE_1000FULL);
+    let cap = SPEED_CAP.load(Ordering::Relaxed);
+    if cap == 100 {
+        let _ = mdio_write(phy, MII_ADVERTISE, ADVERTISE_100FULL);
+        let _ = mdio_write(phy, MII_CTRL1000, 0);
+        say("[OK] GENET PHY advertises 100full only");
+    } else {
+        let _ = mdio_write(phy, MII_ADVERTISE, ADVERTISE_ALL);
+        let _ = mdio_write(phy, MII_CTRL1000, ADVERTISE_1000FULL);
+    }
     enable_rx_skew(phy);
+    clear_phy_tx_delay(phy);
     program_rgmii(false);
-    say("[OK] GENET rgmii-rxid: MAC TX delay on, PHY RX delay on");
+    say("[OK] GENET rgmii-rxid: MAC TX delay on, PHY RX delay on, PHY TX delay off");
     let _ = mdio_write(phy, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
     true
 }
@@ -853,8 +989,30 @@ fn enable_rx_skew(phy: u32) {
         return;
     };
     if mdio_write(phy, AUXCTL, AUX_MISC | value | AUX_RGMII_SKEW).is_some() {
-        say("[OK] GENET PHY RX delay enabled");
+        say_hex("[OK] GENET PHY RX skew shadow", (value | AUX_RGMII_SKEW) as u32);
     }
+}
+
+/// Shadow 0x03 bit 9 is the PHY's own TX clock delay. rgmii-rxid leaves
+/// that to the MAC, so a strap that set it would delay TX twice at 1000.
+fn clear_phy_tx_delay(phy: u32) {
+    let Some(raw) = shadow_read(phy, 0x03) else {
+        say("[WARN] GENET PHY TX clock shadow did not read");
+        return;
+    };
+    let cleared = raw & !(1 << 9);
+    if shadow_write(phy, 0x03, cleared).is_some() {
+        say_hex("[OK] GENET PHY TX clock shadow", cleared as u32);
+    }
+}
+
+fn shadow_read(phy: u32, shadow: u16) -> Option<u16> {
+    mdio_write(phy, 0x1c, shadow << 10)?;
+    mdio_read(phy, 0x1c).map(|raw| raw & 0x3ff)
+}
+
+fn shadow_write(phy: u32, shadow: u16, value: u16) -> Option<()> {
+    mdio_write(phy, 0x1c, 0x8000 | (shadow << 10) | (value & 0x3ff))
 }
 
 pub fn service_link() {
@@ -946,9 +1104,11 @@ fn apply_link(up: bool, speed: u32, full: bool) {
     }
 }
 
-/// Pi 4 `phy-mode` is `rgmii-rxid`: the PHY adds the RX clock delay and the
-/// MAC adds the TX clock delay. `ID_MODE_DIS` set disables that MAC delay,
-/// which leaves a 1000 Mbit link up and the wire silent.
+/// Linux `bcmgenet_mii_config` sets `ID_MODE_DIS` only for
+/// `PHY_INTERFACE_MODE_RGMII`. `RGMII_RXID` and `RGMII_TXID` leave it
+/// clear, so the MAC inserts the 2 ns TX delay. The Pi 4 device tree is
+/// `rgmii-rxid`: PHY RX delay, MAC TX delay. At 100 Mbit the MAC turns
+/// that internal delay off by itself.
 fn program_rgmii(link: bool) {
     let mut oob = read(EXT_RGMII_OOB_CTRL) & !OOB_DISABLE & !ID_MODE_DIS;
     oob |= RGMII_MODE_EN;
@@ -958,6 +1118,9 @@ fn program_rgmii(link: bool) {
         oob &= !RGMII_LINK;
     }
     write(EXT_RGMII_OOB_CTRL, oob);
+    if link {
+        say_hex("[OK] GENET RGMII OOB", oob);
+    }
 }
 
 fn mdio_read(phy: u32, reg: u32) -> Option<u16> {
@@ -1215,6 +1378,40 @@ fn barrier() {
     }
 }
 
+fn note_l2(ptr: *const u8, len: usize, tx: bool) {
+    if len < 14 {
+        return;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, 14) };
+    let dest = if tx { &LAST_TX } else { &LAST_RX };
+    for (slot, byte) in dest.iter().zip(bytes.iter()) {
+        slot.store(*byte, Ordering::Relaxed);
+    }
+    if tx {
+        HAVE_TX_HDR.store(true, Ordering::Relaxed);
+    } else {
+        HAVE_RX_HDR.store(true, Ordering::Relaxed);
+    }
+    let ethertype = u16::from_be_bytes([bytes[12], bytes[13]]);
+    if ethertype == 0x0806 {
+        if tx {
+            ARP_TX.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ARP_RX.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if ethertype == 0x0800 && len >= 34 && bytes_at(ptr, 23) == 1 {
+        if tx {
+            ICMP_TX.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ICMP_RX.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn bytes_at(ptr: *const u8, index: usize) -> u8 {
+    unsafe { ptr.add(index).read() }
+}
+
 fn note_tx_frame(ptr: *const u8, len: usize, status: u32) {
     if TX_NOTED.swap(true, Ordering::Relaxed) {
         return;
@@ -1379,12 +1576,13 @@ impl RxToken for GenetRxToken {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = unsafe {
-            let frame = RX_BUFS[self.index as usize % DESC_COUNT]
+            let frame = RX_BUFS[self.index as usize % RX_RING_DESCS]
                 .as_mut_ptr()
                 .add(RX_ALIGN);
             // The early boot map was write-back. A stale line would hide
             // the bytes the MAC just wrote.
             invalidate_poc(frame, self.len as usize);
+            note_l2(frame, self.len as usize, false);
             note_rx_frame(frame, self.len as usize);
             let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
             f(slice)
@@ -1396,14 +1594,14 @@ impl RxToken for GenetRxToken {
 
 fn poll_rx() -> Option<(u16, u16)> {
     let mut seen = 0;
-    while seen < DESC_COUNT {
+    while seen < RX_RING_DESCS {
         seen += 1;
         let cons = RX_CONS.load(Ordering::Relaxed);
         let prod = read(RDMA_RING + RDMA_PROD_INDEX) & 0xffff;
         if prod == cons {
             return None;
         }
-        let index = cons as usize % DESC_COUNT;
+        let index = cons as usize % RX_RING_DESCS;
         let desc = GENET_RX_OFF + index * DMA_DESC_SIZE;
         let raw = read(desc + DESC_LENGTH_STATUS);
         barrier();
@@ -1430,7 +1628,7 @@ fn reclaim_rx_static(index: u16) {
 }
 
 fn reclaim_rx(index: u16, good: bool) {
-    let slot = index as usize % DESC_COUNT;
+    let slot = index as usize % RX_RING_DESCS;
     program_rx_desc(slot);
     let cons = RX_CONS.load(Ordering::Relaxed).wrapping_add(1) & 0xffff;
     RX_CONS.store(cons, Ordering::Relaxed);

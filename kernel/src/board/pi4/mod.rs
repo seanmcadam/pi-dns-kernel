@@ -31,6 +31,10 @@ use crate::net::NetworkMode;
 
 pub struct Pi4;
 
+pub fn set_speed_cap(cap: u32) {
+    genet::set_speed_cap(cap);
+}
+
 const DEVICE_RANGES: &[(u64, u64)] = &[(0xFC00_0000, 0x1_0000_0000)];
 
 /// BCM2711 GIC-400 SPI 157 and 158. The driver arms these after a real
