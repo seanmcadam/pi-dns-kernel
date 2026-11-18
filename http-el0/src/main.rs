@@ -12,11 +12,17 @@ use core::alloc::{GlobalAlloc, Layout};
 
 core::arch::global_asm!(include_str!("start.s"));
 
-const HEAP_VA: usize = 0x1_000A_0000;
-const HEAP_SIZE: usize = 1536 * 1024;
-const STACK_BYTES: usize = 16 * 1024;
-const WORKERS: usize = 4;
-const ALLOC_SIZE: usize = HEAP_SIZE - WORKERS * STACK_BYTES;
+pub(crate) const HEAP_VA: usize = 0x1_000A_0000;
+pub(crate) const HEAP_SIZE: usize = 1536 * 1024;
+/// `serve` takes about 3 KiB and `read_config_file` puts another 8 KiB on
+/// the same stack. Stacks grow down, so each worker has 64 KiB and the
+/// kernel leaves the page under that 64 KiB unmapped. One more unmapped
+/// page sits above worker 0, which is the main stack's overflow guard.
+/// The allocator stops at the lowest guard and never receives those pages.
+pub(crate) const STACK_BYTES: usize = 64 * 1024;
+pub(crate) const PAGE: usize = 4096;
+pub(crate) const WORKERS: usize = 4;
+pub(crate) const ALLOC_SIZE: usize = HEAP_SIZE - PAGE - WORKERS * (STACK_BYTES + PAGE);
 const HEADER: usize = 16;
 
 mod thread {

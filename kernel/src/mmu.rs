@@ -64,10 +64,10 @@ pub const USER_CODE_VA: u64 = 0x1_0000_0000;
 pub const USER_CODE_BYTES: u64 = 512 * 1024;
 pub const USER_DATA_VA: u64 = 0x1_0009_0000;
 pub const USER_DATA_BYTES: u64 = 64 * 1024;
-pub const USER_HEAP_VA: u64 = 0x1_000A_0000;
-pub const USER_HEAP_BYTES: u64 = 1536 * 1024;
-pub const USER_STACK_VA: u64 = 0x1_0022_0000;
-pub const USER_STACK_BYTES: u64 = 64 * 1024;
+pub const USER_HEAP_VA: u64 = crate::fault_log::USER_HEAP_VA;
+pub const USER_HEAP_BYTES: u64 = crate::fault_log::USER_HEAP_BYTES;
+pub const USER_STACK_VA: u64 = crate::fault_log::USER_STACK_VA;
+pub const USER_STACK_BYTES: u64 = crate::fault_log::USER_STACK_BYTES;
 /// Firmware framebuffer, mapped only into the HDMI task. It sits in the gap
 /// after the user stack so a 640x480 surface still fits in the two level-3
 /// tables. Level-2 index 1.
@@ -267,6 +267,9 @@ pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, st
     map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), USER_DATA_BYTES, data);
     map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), USER_HEAP_BYTES, data);
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), USER_STACK_BYTES, data);
+    // Stacks grow down. Leave the page under each stack unmapped, and the
+    // page at each initial SP unmapped. The frames stay in the heap image.
+    unmap_user_guards(slot);
     use_user_slot(slot, 0);
     flush_tlb();
 }
@@ -297,6 +300,7 @@ pub fn map_user_sized(
         map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), heap_len, data);
     }
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), stack_len, data);
+    unmap_user_guards(slot);
     use_user_slot(slot, 0);
     flush_tlb();
 }
@@ -311,6 +315,7 @@ pub fn map_user_stub(slot: usize, code_va: u64, stack_va: u64) {
     let data = ATTR_NORMAL | SH_INNER | AP_EL0_RW | AF | NG | PXN | UXN;
     map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), PAGE, code);
     map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), PAGE, data);
+    unmap_user_guards(slot);
     use_user_slot(slot, 0);
     flush_tlb();
 }
@@ -391,6 +396,26 @@ fn fb_l2(page: u64) -> Option<usize> {
     }
 }
 
+fn unmap_user_guards(slot: usize) {
+    let mut index = 0;
+    while let Some(page) = crate::fault_log::user_guard_page(slot, index) {
+        unmap_user_page(slot, page);
+        index += 1;
+    }
+}
+
+fn unmap_user_page(slot: usize, va: u64) {
+    let l2_index = ((va >> 21) & 511) as usize;
+    let l3_index = ((va >> 12) & 511) as usize;
+    if l2_index >= 2 {
+        return;
+    }
+    unsafe {
+        let l3 = addr_of_mut!(TABLES.l3_user[slot][l2_index]);
+        (&mut *l3).entries[l3_index] = 0;
+    }
+}
+
 fn map_user_span(slot: usize, va: u64, pa: u64, bytes: u64, flags: u64) {
     let mut off = 0;
     while off < bytes {
@@ -416,10 +441,11 @@ pub fn user_slice_ok(ptr: u64, len: u64) -> bool {
     let Some(end) = checked_end(ptr, len) else {
         return false;
     };
-    in_window(ptr, end, USER_CODE_VA, USER_CODE_BYTES)
+    let inside = in_window(ptr, end, USER_CODE_VA, USER_CODE_BYTES)
         || in_window(ptr, end, USER_DATA_VA, USER_DATA_BYTES)
         || in_window(ptr, end, USER_HEAP_VA, USER_HEAP_BYTES)
-        || in_window(ptr, end, USER_STACK_VA, USER_STACK_BYTES)
+        || in_window(ptr, end, USER_STACK_VA, USER_STACK_BYTES);
+    inside && !crate::fault_log::user_range_hits_guard(crate::percpu::slot(), ptr, end)
 }
 
 /// Pages EL0 may store to. Code is read-only, so a recv buffer there is rejected
@@ -428,9 +454,10 @@ pub fn user_write_ok(ptr: u64, len: u64) -> bool {
     let Some(end) = checked_end(ptr, len) else {
         return false;
     };
-    in_window(ptr, end, USER_DATA_VA, USER_DATA_BYTES)
+    let inside = in_window(ptr, end, USER_DATA_VA, USER_DATA_BYTES)
         || in_window(ptr, end, USER_HEAP_VA, USER_HEAP_BYTES)
-        || in_window(ptr, end, USER_STACK_VA, USER_STACK_BYTES)
+        || in_window(ptr, end, USER_STACK_VA, USER_STACK_BYTES);
+    inside && !crate::fault_log::user_range_hits_guard(crate::percpu::slot(), ptr, end)
 }
 
 fn checked_end(ptr: u64, len: u64) -> Option<u64> {
@@ -557,7 +584,10 @@ fn map_ram_blocks(layout: &Layout) {
 fn map_fine(layout: &Layout) {
     let mut pa = layout.fine_start;
     while pa < layout.fine_end {
-        if pa == layout.guard {
+        if pa == layout.guard
+            || crate::task::is_kstack_guard_pa(pa)
+            || crate::smp::is_stack_guard_pa(pa)
+        {
             map_page(pa, 0);
         } else if let Some(flags) = flags_for(layout, pa) {
             map_page(pa, flags);

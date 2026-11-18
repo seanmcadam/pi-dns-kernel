@@ -235,14 +235,94 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
         index += 1;
     }
     let mut raw = [0u8; 80];
-    let n = crate::fault_log::write_kfault(&mut raw, kind, ec, iss, elr, far);
+    let overflow = kernel_stack_overflow(far);
+    let n = if overflow {
+        crate::fault_log::write_stack_overflow(&mut raw, "kern", 0, ec, elr, far)
+    } else {
+        crate::fault_log::write_kfault(&mut raw, kind, ec, iss, elr, far)
+    };
     if let Ok(line) = core::str::from_utf8(&raw[..n]) {
         put(line);
         put("\r\n");
         let _ = crate::logger::try_queue_fault(line);
     }
     put("halting\r\n");
-    halt();
+    pin_and_halt(kind, ec, elr, far);
+}
+
+/// Leave the fault on the pinned HDMI rows and stop. Does not reboot.
+fn kernel_stack_overflow(far: u64) -> bool {
+    let page = far & !0xfff;
+    page == guard_page()
+        || crate::task::is_kstack_guard_va(far)
+        || crate::smp::is_stack_guard_va(far)
+}
+
+fn pin_and_halt(kind: u64, ec: u64, elr: u64, far: u64) -> ! {
+    let mut raw = [0u8; 180];
+    let mut n = 0;
+    if kernel_stack_overflow(far) {
+        n = pin_push(&mut raw, n, b"STACK OVERFLOW kern");
+    } else {
+        n = pin_push(&mut raw, n, b"kern fault v=");
+        n = pin_dec(&mut raw, n, kind);
+    }
+    n = pin_push(&mut raw, n, b"\nec=");
+    n = pin_hex2(&mut raw, n, (ec & 0x3f) as u8);
+    n = pin_push(&mut raw, n, b" elr ");
+    n = pin_hex16(&mut raw, n, elr);
+    n = pin_push(&mut raw, n, b"\nfar ");
+    n = pin_hex16(&mut raw, n, far);
+    let text = core::str::from_utf8(&raw[..n]).unwrap_or("kern fault");
+    #[cfg(feature = "board-pi4")]
+    crate::act::halt_with(text);
+    #[cfg(not(feature = "board-pi4"))]
+    {
+        let _ = text;
+        halt();
+    }
+}
+
+fn pin_push(buf: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
+    for byte in bytes {
+        if n >= buf.len() {
+            return n;
+        }
+        buf[n] = *byte;
+        n += 1;
+    }
+    n
+}
+
+fn pin_hex2(buf: &mut [u8], n: usize, value: u8) -> usize {
+    let digits = [hex_digit(value >> 4), hex_digit(value & 0xf)];
+    pin_push(buf, n, &digits)
+}
+
+fn pin_hex16(buf: &mut [u8], n: usize, mut value: u64) -> usize {
+    let mut tmp = [0u8; 16];
+    let mut i = 16;
+    while i > 0 {
+        i -= 1;
+        tmp[i] = hex_digit((value & 0xf) as u8);
+        value >>= 4;
+    }
+    pin_push(buf, n, &tmp)
+}
+
+fn pin_dec(buf: &mut [u8], n: usize, mut value: u64) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut i = 20;
+    if value == 0 {
+        i -= 1;
+        tmp[i] = b'0';
+    }
+    while value > 0 && i > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    pin_push(buf, n, &tmp[i..])
 }
 
 fn halt() -> ! {

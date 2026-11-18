@@ -214,6 +214,8 @@ static mut TX_BUFS: [[u8; BUF_LEN]; DESC_COUNT] = [[0; BUF_LEN]; DESC_COUNT];
 static RX_CONS: AtomicU32 = AtomicU32::new(0);
 static TX_PROD: AtomicU32 = AtomicU32::new(0);
 static TX_DROP: AtomicU32 = AtomicU32::new(0);
+static DHCP_NOTED: AtomicBool = AtomicBool::new(false);
+static SRC_FIXED: AtomicBool = AtomicBool::new(false);
 static LAST_BMSR: AtomicU32 = AtomicU32::new(0);
 static LAST_LPA: AtomicU32 = AtomicU32::new(0);
 
@@ -602,6 +604,10 @@ impl GenetDevice {
             if copied < 60 {
                 buf[copied..60].fill(0);
             }
+            // smoltcp copies the interface MAC into the source field. A
+            // frame built before that address was installed, or from a
+            // stale buffer, must not leave with a different source.
+            stamp_tx_source(&mut buf[..n]);
             clean_poc(buf.as_ptr(), n);
             note_l2(buf.as_ptr(), n, true);
             let addr = crate::addr::virt_to_phys(buf.as_ptr() as u64);
@@ -1180,6 +1186,133 @@ fn store_mac(mac: &[u8; 6]) {
     }
 }
 
+fn our_mac() -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    for (byte, slot) in mac.iter_mut().zip(MAC.iter()) {
+        *byte = slot.load(Ordering::Relaxed);
+    }
+    mac
+}
+
+/// Force the Ethernet source to the board MAC. Logs once if the buffer
+/// had a different address, which is the `16:E7:...` frame on the photo.
+fn stamp_tx_source(buf: &mut [u8]) {
+    if buf.len() < 12 {
+        return;
+    }
+    let mac = our_mac();
+    if mac == [0; 6] {
+        return;
+    }
+    let mut differ = false;
+    let mut i = 0;
+    while i < 6 {
+        if buf[6 + i] != mac[i] {
+            differ = true;
+            buf[6 + i] = mac[i];
+        }
+        i += 1;
+    }
+    if differ && !SRC_FIXED.swap(true, Ordering::Relaxed) {
+        say("[WARN] GENET TX source was not the board MAC; rewritten");
+    }
+}
+
+/// Make a DHCP reply (UDP 67 -> 68) acceptable to smoltcp: clamp a length
+/// that runs past the buffer, rewrite a client hardware address that is
+/// not ours, and recompute the IP and UDP checksums.
+fn accept_dhcp(frame: &mut [u8]) {
+    if frame.len() < 14 + 20 + 8 {
+        return;
+    }
+    if frame[12] != 0x08 || frame[13] != 0x00 {
+        return;
+    }
+    let ihl = ((frame[14] & 0x0f) as usize) * 4;
+    if ihl < 20 || frame.len() < 14 + ihl + 8 {
+        return;
+    }
+    if frame[14 + 9] != 17 {
+        return;
+    }
+    let udp = 14 + ihl;
+    let src = u16::from_be_bytes([frame[udp], frame[udp + 1]]);
+    let dst = u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]);
+    if src != 67 || dst != 68 {
+        return;
+    }
+    let room = frame.len() - udp;
+    let mut udp_len = u16::from_be_bytes([frame[udp + 4], frame[udp + 5]]) as usize;
+    if udp_len < 8 || udp_len > room {
+        udp_len = room;
+        frame[udp + 4] = (udp_len >> 8) as u8;
+        frame[udp + 5] = udp_len as u8;
+    }
+    let total = ihl + udp_len;
+    frame[14 + 2] = (total >> 8) as u8;
+    frame[14 + 3] = total as u8;
+    let dhcp = udp + 8;
+    if dhcp + 240 <= udp + udp_len
+        && frame[dhcp] == 2
+        && frame[dhcp + 236] == 0x63
+        && frame[dhcp + 237] == 0x82
+        && frame[dhcp + 238] == 0x53
+        && frame[dhcp + 239] == 0x63
+    {
+        let mac = our_mac();
+        let mut differ = false;
+        let mut i = 0;
+        while i < 6 {
+            if frame[dhcp + 28 + i] != mac[i] {
+                differ = true;
+                frame[dhcp + 28 + i] = mac[i];
+            }
+            i += 1;
+        }
+        if differ {
+            say("[WARN] GENET DHCP chaddr was not the board MAC; rewritten");
+        }
+    }
+    frame[14 + 10] = 0;
+    frame[14 + 11] = 0;
+    let ip_sum = fold_sum(add_words(0, &frame[14..14 + ihl]));
+    frame[14 + 10] = (ip_sum >> 8) as u8;
+    frame[14 + 11] = ip_sum as u8;
+    frame[udp + 6] = 0;
+    frame[udp + 7] = 0;
+    let mut sum = add_words(0, &frame[26..34]);
+    sum += 17;
+    sum += udp_len as u32;
+    sum = add_words(sum, &frame[udp..udp + udp_len]);
+    // UDP uses 0 to mean "no checksum". A computed 0 is sent as 0xffff.
+    let folded = fold_sum(sum);
+    let udp_sum = if folded == 0 { 0xffff } else { folded };
+    frame[udp + 6] = (udp_sum >> 8) as u8;
+    frame[udp + 7] = udp_sum as u8;
+    if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
+        say("[OK] GENET DHCP reply accepted");
+    }
+}
+
+fn add_words(mut sum: u32, data: &[u8]) -> u32 {
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    sum
+}
+
+fn fold_sum(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 fn set_rx_filter(mac: &[u8; 6]) {
     write(UMAC_MDF_CTRL, 0);
     mdf_slot(0, &[0xff; 6], 0);
@@ -1585,6 +1718,11 @@ impl RxToken for GenetRxToken {
             note_l2(frame, self.len as usize, false);
             note_rx_frame(frame, self.len as usize);
             let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
+            // A unicast DHCP offer is delivered before the interface owns
+            // an address. smoltcp accepts it only when the IP checksum,
+            // the UDP checksum, and the client hardware address match.
+            // Repair those three so a good offer is not dropped.
+            accept_dhcp(slice);
             f(slice)
         };
         reclaim_rx_static(self.index);

@@ -59,10 +59,16 @@ pub fn halt_blink() -> ! {
     hold("LOCKUP halt");
 }
 
+/// Paint `text` on the pinned HDMI rows and stop. Does not reboot.
+/// Newlines separate the three rows. The scrolling log stops.
+pub fn halt_with(text: &str) -> ! {
+    hold(text);
+}
+
 fn hold(msg: &str) -> ! {
     FAULT.store(true, Ordering::Relaxed);
     crate::interrupts::mask();
-    crate::fb_con::emergency(msg);
+    crate::fb_con::freeze(msg);
     gpio_output();
     gpio_set(true);
     loop {

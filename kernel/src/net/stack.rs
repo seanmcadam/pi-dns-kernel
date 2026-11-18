@@ -14,7 +14,13 @@ impl NetworkStack {
         let mac = device.mac_address();
         let ethernet_addr = EthernetAddress::from_bytes(&mac);
         
-        let config = Config::new(ethernet_addr.into());
+        let mut config = Config::new(ethernet_addr.into());
+        // A zero seed makes every board pick the same DHCP xid and TCP ISN.
+        let mut seed = 0xA5A5_u64;
+        for (shift, byte) in mac.iter().enumerate() {
+            seed |= (*byte as u64) << (shift * 8);
+        }
+        config.random_seed = seed;
         let iface = Interface::new(config, device, Instant::ZERO);
         
         let sockets = SocketSet::new(Vec::new());

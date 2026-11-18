@@ -116,75 +116,93 @@ struct UserMem {
 }
 
 const KSTACK_BYTES: usize = 64 * 1024;
+const CTX_BYTES: usize = 800;
+const _: () = assert!(core::mem::size_of::<TaskContext>() == CTX_BYTES);
 
-// Context, then a gap, then the stack. Without the gap the 32 KiB stack
-// ended on the first byte of the context, so an EL1 IRQ frame or a kernel
-// spill sat on the registers ERET restores. A fault there aborts at EL1
-// and halts the kernel.
-#[repr(C, align(16))]
+// The context occupies the first page. The next page is the overflow guard
+// and stays unmapped. The stack grows down from the page after that, and
+// one more unmapped page sits at the initial SP. The frames stay in this
+// struct; the MMU does not return them to the heap.
+#[repr(C, align(4096))]
 struct Task {
     ctx: TaskContext,
-    _gap: [u8; 4096],
+    _pad: [u8; 4096 - CTX_BYTES],
+    guard_below: [u8; 4096],
     kstack: [u8; KSTACK_BYTES],
+    guard_above: [u8; 4096],
 }
 
-static mut LOG_TASK: Task = Task {
-    ctx: TaskContext {
-        x: [0; 31],
-        sp_el0: 0,
-        elr: 0,
-        spsr: 0,
-        fpsr: 0,
-        fpcr: 0,
-        q: [0; 64],
-    },
-    _gap: [0; 4096],
-    kstack: [0; KSTACK_BYTES],
-};
+const _: () = assert!(core::mem::offset_of!(Task, guard_below) == 4096);
+const _: () = assert!(core::mem::offset_of!(Task, kstack) == 8192);
+const _: () = assert!(core::mem::offset_of!(Task, guard_above) == 8192 + KSTACK_BYTES);
 
-static mut SPIN_TASK: Task = Task {
-    ctx: TaskContext {
-        x: [0; 31],
-        sp_el0: 0,
-        elr: 0,
-        spsr: 0,
-        fpsr: 0,
-        fpcr: 0,
-        q: [0; 64],
-    },
-    _gap: [0; 4096],
-    kstack: [0; KSTACK_BYTES],
-};
+const fn blank_task() -> Task {
+    Task {
+        ctx: TaskContext {
+            x: [0; 31],
+            sp_el0: 0,
+            elr: 0,
+            spsr: 0,
+            fpsr: 0,
+            fpcr: 0,
+            q: [0; 64],
+        },
+        _pad: [0; 4096 - CTX_BYTES],
+        guard_below: [0; 4096],
+        kstack: [0; KSTACK_BYTES],
+        guard_above: [0; 4096],
+    }
+}
 
-static mut HTTP_TASK: Task = Task {
-    ctx: TaskContext {
-        x: [0; 31],
-        sp_el0: 0,
-        elr: 0,
-        spsr: 0,
-        fpsr: 0,
-        fpcr: 0,
-        q: [0; 64],
-    },
-    _gap: [0; 4096],
-    kstack: [0; KSTACK_BYTES],
-};
+/// True when `va` falls in the unmapped page under or above an EL1 stack.
+pub fn is_kstack_guard_va(va: u64) -> bool {
+    let page = va & !4095;
+    unsafe {
+        if task_guard(addr_of!(TASK), page)
+            || task_guard(addr_of!(HTTP_TASK), page)
+            || task_guard(addr_of!(LOG_TASK), page)
+            || task_guard(addr_of!(SPIN_TASK), page)
+            || task_guard(addr_of!(TELNET_TASK), page)
+            || task_guard(addr_of!(VNC_TASK), page)
+            || task_guard(addr_of!(HDMI_TASK), page)
+        {
+            return true;
+        }
+        let mut index = 0;
+        while index < MAX_THREADS {
+            if task_guard(addr_of!(THREADS[index].task), page) {
+                return true;
+            }
+            index += 1;
+        }
+    }
+    false
+}
 
-static mut TASK: Task = Task {
-    ctx: TaskContext {
-        x: [0; 31],
-        sp_el0: 0,
-        elr: 0,
-        spsr: 0,
-        fpsr: 0,
-        fpcr: 0,
-        q: [0; 64],
-    },
-    _gap: [0; 4096],
-    kstack: [0; KSTACK_BYTES],
-};
+pub fn is_kstack_guard_pa(pa: u64) -> bool {
+    is_kstack_guard_va(crate::addr::phys_to_virt(pa & !4095))
+}
+
+unsafe fn task_guard(task: *const Task, page: u64) -> bool {
+    let below = addr_of!((*task).guard_below) as u64;
+    let above = addr_of!((*task).guard_above) as u64;
+    page == below || page == above
+}
+
+static mut LOG_TASK: Task = blank_task();
+
+static mut SPIN_TASK: Task = blank_task();
+
+static mut HTTP_TASK: Task = blank_task();
+
+static mut TASK: Task = blank_task();
 
 static mut SCENARIO: u64 = 0;
+/// Real-task EL0 faults. The boot self-test is not counted. Four faults
+/// freeze the HDMI rows and halt so a restart storm cannot scroll the
+/// evidence off the panel.
+#[cfg(feature = "board-pi4")]
+static EL0_FAULTS: AtomicU32 = AtomicU32::new(0);
 static mut EXIT_CODE: u64 = 0;
 static mut LOG_OK: bool = false;
 static mut YIELD_OK: bool = false;
@@ -195,6 +213,7 @@ static mut BAD_POINTER: bool = false;
 static mut KERN_KILLED: bool = false;
 static mut PRIV_KILLED: bool = false;
 static mut EXEC_KILLED: bool = false;
+static mut STACK_KILLED: bool = false;
 static mut PREEMPT_OK: bool = false;
 static EL0_IRQS: AtomicU64 = AtomicU64::new(0);
 static mut DNS_LIVE: bool = false;
@@ -216,15 +235,15 @@ const TASK_SLOTS: usize = 7;
 
 const LOG_CODE_BYTES: usize = 128 * 1024;
 const LOG_DATA_BYTES: usize = 4096;
-const LOG_STACK_BYTES: usize = 16 * 1024;
+const LOG_STACK_BYTES: usize = 64 * 1024;
 const TELNET_CODE_BYTES: usize = 128 * 1024;
 const TELNET_DATA_BYTES: usize = 4096;
-const TELNET_HEAP_BYTES: usize = 256 * 1024;
-const TELNET_STACK_BYTES: usize = 16 * 1024;
+const TELNET_HEAP_BYTES: usize = crate::fault_log::TELNET_HEAP_BYTES as usize;
+const TELNET_STACK_BYTES: usize = 64 * 1024;
 const VNC_CODE_BYTES: usize = 128 * 1024;
 const VNC_DATA_BYTES: usize = 4096;
 const VNC_HEAP_BYTES: usize = 1280 * 1024;
-const VNC_STACK_BYTES: usize = 16 * 1024;
+const VNC_STACK_BYTES: usize = 64 * 1024;
 
 /// `b .` — a task that never makes a syscall. Preemption is the only way out.
 const SPIN_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x14];
@@ -266,6 +285,7 @@ pub fn run_boot_tests() {
     run_scenario(4, 0);
     run_scenario(5, 0);
     run_scenario(6, 0);
+    run_scenario(7, 0);
     crate::mmu::set_user_asid(false);
     crate::mmu::flush_tlb();
     print_summary();
@@ -365,6 +385,12 @@ pub fn print_summary() {
     });
     put(", exec-data ");
     put(if unsafe { EXEC_KILLED } {
+        "killed"
+    } else {
+        "FAIL"
+    });
+    put(", stack-overflow ");
+    put(if unsafe { STACK_KILLED } {
         "killed"
     } else {
         "FAIL"
@@ -581,19 +607,39 @@ fn log_el0_fault(name: &str) {
     let iss = esr & 0x1ff_ffff;
     let elr = reg("elr_el1");
     let far = reg("far_el1");
+    let thread = crate::percpu::thread_index() as u32;
+    let overflow = crate::fault_log::is_user_stack_guard(crate::percpu::slot(), far);
     let mut raw = [0u8; 80];
-    let n = crate::fault_log::write_elfault(
-        &mut raw,
-        name,
-        crate::percpu::thread_index() as u32,
-        ec,
-        iss,
-        elr,
-        far,
-    );
+    let n = if overflow {
+        crate::fault_log::write_stack_overflow(&mut raw, name, thread, ec, elr, far)
+    } else {
+        crate::fault_log::write_elfault(&mut raw, name, thread, ec, iss, elr, far)
+    };
     // The formatter writes ASCII only.
     let line = unsafe { core::str::from_utf8_unchecked(&raw[..n]) };
     crate::logger::note_fault(line);
+    // The boot self-test plants faults on purpose. A real task that keeps
+    // faulting, including a guard-page stack overflow, freezes the line
+    // and stops. It does not reboot.
+    let mut pin = [0u8; 80];
+    let pin_n = if overflow {
+        crate::fault_log::write_stack_overflow_rows(&mut pin, name, thread, ec, elr, far)
+    } else {
+        0
+    };
+    #[cfg(feature = "board-pi4")]
+    if unsafe { SCENARIO } == 0xff && EL0_FAULTS.fetch_add(1, Ordering::Relaxed) >= 3 {
+        if overflow {
+            let text = unsafe { core::str::from_utf8_unchecked(&pin[..pin_n]) };
+            crate::act::halt_with(text);
+        } else {
+            crate::act::halt_with(line);
+        }
+    }
+    #[cfg(not(feature = "board-pi4"))]
+    {
+        let _ = pin_n;
+    }
 }
 
 fn kill(ec: u64) {
@@ -613,6 +659,11 @@ fn kill(ec: u64) {
             3 => KERN_KILLED = true,
             4 => PRIV_KILLED = true,
             5 => EXEC_KILLED = true,
+            7 => {
+                if crate::fault_log::is_user_stack_guard(crate::percpu::slot(), far) {
+                    STACK_KILLED = true;
+                }
+            }
             _ => {}
         }
     }
@@ -727,47 +778,11 @@ static mut VNC_MEM: VncMem = VncMem {
     stack: [0; VNC_STACK_BYTES],
 };
 
-static mut VNC_TASK: Task = Task {
-    ctx: TaskContext {
-        x: [0; 31],
-        sp_el0: 0,
-        elr: 0,
-        spsr: 0,
-        fpsr: 0,
-        fpcr: 0,
-        q: [0; 64],
-    },
-    _gap: [0; 4096],
-    kstack: [0; KSTACK_BYTES],
-};
+static mut VNC_TASK: Task = blank_task();
 
-static mut HDMI_TASK: Task = Task {
-    ctx: TaskContext {
-        x: [0; 31],
-        sp_el0: 0,
-        elr: 0,
-        spsr: 0,
-        fpsr: 0,
-        fpcr: 0,
-        q: [0; 64],
-    },
-    _gap: [0; 4096],
-    kstack: [0; KSTACK_BYTES],
-};
+static mut HDMI_TASK: Task = blank_task();
 
-static mut TELNET_TASK: Task = Task {
-    ctx: TaskContext {
-        x: [0; 31],
-        sp_el0: 0,
-        elr: 0,
-        spsr: 0,
-        fpsr: 0,
-        fpcr: 0,
-        q: [0; 64],
-    },
-    _gap: [0; 4096],
-    kstack: [0; KSTACK_BYTES],
-};
+static mut TELNET_TASK: Task = blank_task();
 
 static mut SPIN_MEM: SpinMem = SpinMem {
     code: [0; 4096],
@@ -869,6 +884,8 @@ pub fn start_log() -> Result<(), ()> {
     unsafe {
         let code = addr_of_mut!(LOG_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, LOG_CODE_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(LOG_MEM.data).cast::<u8>(), 0, LOG_DATA_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(LOG_MEM.stack).cast::<u8>(), 0, LOG_STACK_BYTES);
         core::ptr::copy_nonoverlapping(LOG_BIN.as_ptr(), code, LOG_BIN.len());
         if LOG_DATA_LEN > 0
             && LOG_DATA_OFF + LOG_DATA_LEN <= LOG_BIN.len()
@@ -936,10 +953,16 @@ pub fn start_telnet() -> Result<(), ()> {
     unsafe {
         let code = addr_of_mut!(TELNET_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, TELNET_CODE_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(TELNET_MEM.data).cast::<u8>(), 0, TELNET_DATA_BYTES);
         core::ptr::write_bytes(
             addr_of_mut!(TELNET_MEM.heap) as *mut u8,
             0,
             TELNET_HEAP_BYTES,
+        );
+        core::ptr::write_bytes(
+            addr_of_mut!(TELNET_MEM.stack).cast::<u8>(),
+            0,
+            TELNET_STACK_BYTES,
         );
         core::ptr::copy_nonoverlapping(TELNET_BIN.as_ptr(), code, TELNET_BIN.len());
         if TELNET_DATA_LEN > 0
@@ -1008,7 +1031,9 @@ pub fn start_vnc() -> Result<(), ()> {
     unsafe {
         let code = addr_of_mut!(VNC_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, VNC_CODE_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(VNC_MEM.data).cast::<u8>(), 0, VNC_DATA_BYTES);
         core::ptr::write_bytes(addr_of_mut!(VNC_MEM.heap) as *mut u8, 0, VNC_HEAP_BYTES);
+        core::ptr::write_bytes(addr_of_mut!(VNC_MEM.stack).cast::<u8>(), 0, VNC_STACK_BYTES);
         core::ptr::copy_nonoverlapping(VNC_BIN.as_ptr(), code, VNC_BIN.len());
         if VNC_DATA_LEN > 0
             && VNC_DATA_OFF + VNC_DATA_LEN <= VNC_BIN.len()
@@ -1821,19 +1846,7 @@ static mut MAIN_FUTEX: [u64; TASK_SLOTS] = [0; TASK_SLOTS];
 
 const fn blank_thread() -> PoolThread {
     PoolThread {
-        task: Task {
-            ctx: TaskContext {
-                x: [0; 31],
-                sp_el0: 0,
-                elr: 0,
-                spsr: 0,
-                fpsr: 0,
-                fpcr: 0,
-                q: [0; 64],
-            },
-            _gap: [0; 4096],
-            kstack: [0; KSTACK_BYTES],
-        },
+        task: blank_task(),
         slot: 0,
         asid: 0,
         state: ST_EMPTY,

@@ -151,7 +151,9 @@ static STATE_LOCK: AtomicU32 = AtomicU32::new(0);
 static RETRY_KICK: AtomicU32 = AtomicU32::new(0);
 
 fn thread_stack(index: u64) -> u64 {
-    0x1_000A_0000u64 + (1536 * 1024) - (index + 1) * (16 * 1024)
+    (crate::HEAP_VA + crate::HEAP_SIZE
+        - crate::PAGE
+        - (index as usize) * (crate::STACK_BYTES + crate::PAGE)) as u64
 }
 
 extern "C" fn upstream_worker(_index: u64) {

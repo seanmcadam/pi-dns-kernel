@@ -34,6 +34,11 @@ pub fn image() -> crate::board::HdmiImage {
             0,
             crate::board::HDMI_HEAP_BYTES,
         );
+        core::ptr::write_bytes(
+            addr_of_mut!(MEM.stack).cast::<u8>(),
+            0,
+            crate::board::HDMI_STACK_BYTES,
+        );
         let n = if BIN.len() < crate::board::HDMI_CODE_BYTES {
             BIN.len()
         } else {

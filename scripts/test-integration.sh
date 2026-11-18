@@ -812,7 +812,8 @@ if grep -q "DHCP configured 10.0.2.15" qemu/dhcp-serial.txt; then
     sleep 6
     kill $FALLBACK_PID 2>/dev/null || true
     wait $FALLBACK_PID 2>/dev/null || true
-    if grep -q "DHCP timeout, using static 10.0.2.15" qemu/dhcp-fallback.txt; then
+    if grep -q "DHCP timeout, using static 10.0.2.15" qemu/dhcp-fallback.txt \
+        || grep -q "DHCP timeout, static 10.0.2.15" qemu/dhcp-fallback.txt; then
         echo "✓ DHCP timeout fell back to static 10.0.2.15"
         grep "DHCP timeout" qemu/dhcp-fallback.txt
         TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -1700,6 +1701,7 @@ fault_case() {
     local path="$2"
     local marker="$3"
     local iss="$4"
+    local record="$5"
     local serial="qemu/fault-${name}.txt"
     rm -f "$serial"
     timeout 30 qemu-system-aarch64 \
@@ -1738,7 +1740,7 @@ fault_case() {
         && grep -q "halting" "$serial" \
         && grep -q "$marker" "$serial" \
         && grep -q "$iss" "$serial" \
-        && grep -q "kfault v=" "$serial" \
+        && grep -q "$record" "$serial" \
         && grep -q "elr=" "$serial" \
         && grep -q "far=" "$serial"; then
         echo "✓ Fault report for ${name}"
@@ -1753,11 +1755,11 @@ fault_case() {
 
 echo ""
 echo "Test 12: Data abort on the stack guard page"
-fault_case guard /debug/fault/guard "debug fault: read stack guard" "Translation fault"
+fault_case guard /debug/fault/guard "debug fault: read stack guard" "Translation fault" "STACK OVERFLOW kern"
 
 echo ""
 echo "Test 13: Write to kernel text is a permission fault"
-fault_case text /debug/fault/text "debug fault: write kernel text" "Permission fault"
+fault_case text /debug/fault/text "debug fault: write kernel text" "Permission fault" "kfault v="
 
 echo ""
 echo "Test 16: EL0 round trip, IRQ, and fault isolation"
@@ -1778,7 +1780,7 @@ kill $EL0_PID 2>/dev/null || true
 wait $EL0_PID 2>/dev/null || true
 EL0_LINE=$(grep "EL0 test:" qemu/el0-serial.txt | tail -1 || true)
 echo "$EL0_LINE"
-if echo "$EL0_LINE" | grep -q "log ok, yield ok, irq ok, exit 0, bad-syscall -1, bad-pointer rejected, kernel-read killed, priv killed, exec-data killed" \
+if echo "$EL0_LINE" | grep -q "log ok, yield ok, irq ok, exit 0, bad-syscall -1, bad-pointer rejected, kernel-read killed, priv killed, exec-data killed, stack-overflow killed" \
     && grep -q "user: hello from el0" qemu/el0-serial.txt \
     && grep -q "user: ticks advanced" qemu/el0-serial.txt \
     && grep -q "EL0 yield: back in kernel" qemu/el0-serial.txt \
@@ -1787,6 +1789,7 @@ if echo "$EL0_LINE" | grep -q "log ok, yield ok, irq ok, exit 0, bad-syscall -1,
     && grep -q "user: bad syscall survived" qemu/el0-serial.txt \
     && grep -q "user: bad pointer survived" qemu/el0-serial.txt \
     && grep -q "elfault boot" qemu/el0-serial.txt \
+    && grep -q "STACK OVERFLOW boot" qemu/el0-serial.txt \
     && grep -q "DNS Server ready" qemu/el0-serial.txt \
     && echo "$EL0_DNS" | grep -q "192.168.1.100"; then
     echo "✓ EL0 round trip, IRQ resume, bad syscall, bad pointer, and user faults"
