@@ -107,7 +107,10 @@ static MODE_H: AtomicU32 = AtomicU32::new(0);
 static FROZEN: AtomicBool = AtomicBool::new(false);
 
 const HEADER_CAP: usize = 640;
-const PINNED_ROWS: u32 = 3;
+/// NIC status uses the first three rows. The fourth is the per-core
+/// heartbeat and the A72 probe, painted without clearing the rows above.
+const STATUS_ROWS: u32 = 3;
+const PINNED_ROWS: u32 = 4;
 static mut HEADER: [u8; HEADER_CAP] = [0; HEADER_CAP];
 static mut HEADER_LEN: usize = 0;
 
@@ -245,10 +248,47 @@ pub fn push(text: &str) {
     if !held {
         return;
     }
+    // Once the idle loop is running, a painter that returns is progress.
+    // A painter that never returns leaves this checkpoint to go stale.
+    if crate::act::looping() && crate::percpu::live() {
+        crate::act::note_core(crate::percpu::id());
+    }
     if READY.load(Ordering::Relaxed) {
         paint(text.as_bytes());
     } else {
         stash(text.as_bytes());
+    }
+    unlock(held);
+}
+
+/// Draw `text` on one pinned row. The scrolling log is left alone. A refused
+/// lock skips this update. Used from the timer for the heartbeat row.
+pub fn paint_pinned_row(row: u32, text: &str) {
+    if FROZEN.load(Ordering::Relaxed) || row >= PINNED_ROWS {
+        return;
+    }
+    if !READY.load(Ordering::Relaxed) {
+        return;
+    }
+    let held = lock();
+    if !held {
+        return;
+    }
+    unsafe {
+        let screen = &mut *addr_of_mut!(SCREEN);
+        if !screen.ptr.is_null() {
+            clear_row(screen, row);
+            let color = ink(b"", screen.bgr);
+            let cols = columns(screen);
+            let mut col = 0usize;
+            for &ch in text.as_bytes() {
+                if ch == b'\n' || ch == b'\r' || col >= cols {
+                    break;
+                }
+                draw_glyph(screen, col as u32, row, ch, color);
+                col += 1;
+            }
+        }
     }
     unlock(held);
 }
@@ -639,6 +679,11 @@ fn replay() {
 }
 
 fn paint(bytes: &[u8]) {
+    // The caller held IRQs off for the whole copy. A multi-megabyte
+    // framebuffer scroll then stops this core's timer, so the other
+    // cores cannot see it as stalled. Give the timer back when the
+    // caller had IRQs enabled.
+    relax_irq();
     for byte in bytes {
         if *byte == b'\r' {
             continue;
@@ -707,7 +752,7 @@ fn draw_status(screen: &mut Screen) {
     };
     let pitch = screen.pitch as usize;
     let row_bytes = pitch * CELL_H as usize;
-    let rows_bytes = row_bytes * PINNED_ROWS as usize;
+    let rows_bytes = row_bytes * STATUS_ROWS as usize;
     let mut off = 0;
     while off + 4 <= rows_bytes {
         unsafe {
@@ -723,7 +768,7 @@ fn draw_status(screen: &mut Screen) {
         if ch == b'\n' || ch == b'\r' {
             row += 1;
             col = 0;
-            if row >= PINNED_ROWS {
+            if row >= STATUS_ROWS {
                 break;
             }
             continue;
@@ -847,6 +892,29 @@ fn ink(line: &[u8], bgr: bool) -> u32 {
 
 fn has_prefix(line: &[u8], prefix: &[u8]) -> bool {
     line.len() >= prefix.len() && &line[..prefix.len()] == prefix
+}
+
+fn clear_row(screen: &Screen, row: u32) {
+    let pitch = screen.pitch as usize;
+    let row_bytes = pitch * CELL_H as usize;
+    let mut off = row as usize * row_bytes;
+    let end = off + row_bytes;
+    while off + 4 <= end {
+        unsafe {
+            (screen.ptr.add(off) as *mut u32).write_volatile(0);
+        }
+        off += 4;
+    }
+}
+
+/// DAIF.I is bit 7. Clear it when the console caller had IRQs enabled.
+fn relax_irq() {
+    let saved = unsafe { *addr_of!(SAVED_DAIF) };
+    if saved & 0x80 == 0 {
+        unsafe {
+            core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+        }
+    }
 }
 
 fn lock() -> bool {

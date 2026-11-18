@@ -318,7 +318,8 @@ pub fn write_status(out: &mut [u8]) -> usize {
             line.push("H");
         }
     } else {
-        line.push(" DOWN");
+        line.push(" DOWN bmsr=");
+        line.hex32(LAST_BMSR.load(Ordering::Relaxed));
     }
     line.push(" ");
     for (index, slot) in MAC.iter().enumerate() {
@@ -348,7 +349,8 @@ pub fn write_diag(out: &mut [u8]) -> usize {
     line.dec(read(MIB_TX_POK));
     line.push(" tFcs=");
     line.dec(read(MIB_TX_FCS));
-    line.push(" e=");
+    // Ring END, not an error counter. 256 descriptors * 3 words - 1 is 0x2ff.
+    line.push(" end=");
     line.hex32(read(RDMA_RING + DMA_END_ADDR));
     line.push(" h=");
     line.hex32(read(HFB_CTRL));
@@ -955,17 +957,28 @@ fn start_phy() -> bool {
     if mdio_write(phy, MII_BMCR, BMCR_RESET).is_none() {
         return false;
     }
+    // Eight MDIO reads finish in well under a millisecond. The PHY reset
+    // bit stays set for longer than that, and the advertise / autoneg
+    // writes that follow are ignored while it is set, so the copper link
+    // never restarts and BMSR bit 2 stays clear.
     let start = crate::timer::millis();
     let mut spins = 0u32;
+    let mut clear = false;
     while crate::timer::millis().saturating_sub(start) < 50 {
         spins = spins.saturating_add(1);
-        if spins > 8 {
+        if spins > 100_000 {
             break;
         }
         match mdio_read(phy, MII_BMCR) {
-            Some(value) if value & BMCR_RESET == 0 => break,
+            Some(value) if value & BMCR_RESET == 0 => {
+                clear = true;
+                break;
+            }
             _ => core::hint::spin_loop(),
         }
+    }
+    if !clear {
+        say("[WARN] GENET PHY reset did not clear");
     }
     let cap = SPEED_CAP.load(Ordering::Relaxed);
     if cap == 100 {
@@ -1032,6 +1045,7 @@ pub fn service_link() {
     LAST_LINK_MS.store(now, Ordering::Relaxed);
     let phy = PHY_ADDR.load(Ordering::Relaxed);
     let Some(first) = mdio_read(phy, MII_BMSR) else {
+        LAST_BMSR.store(0xffff_ffff, Ordering::Relaxed);
         return;
     };
     let status = mdio_read(phy, MII_BMSR).unwrap_or(first);

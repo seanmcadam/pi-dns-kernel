@@ -49,6 +49,8 @@ const EMPTY: PerCpu = PerCpu {
 };
 
 static BOOTED: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "board-pi4")]
+static LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ASLEEP: [AtomicU8; NCPU] = [const { AtomicU8::new(0) }; NCPU];
 
 /// The timer IRQ reads this. Set it around `wfi` / `wfe` on this core only.
@@ -60,8 +62,19 @@ pub fn set_asleep(on: bool) {
 }
 
 pub fn asleep() -> bool {
-    let cpu = id();
+    asleep_on(id())
+}
+
+/// Another core's idle flag. The hang check uses this so a core sitting
+/// in `wfi` / `wfe` is not reported as stalled.
+pub fn asleep_on(cpu: usize) -> bool {
     cpu < NCPU && ASLEEP[cpu].load(Ordering::Relaxed) != 0
+}
+
+/// `TPIDR_EL1` points at this core's `PerCpu`. Before `init_bsp` it does not.
+#[cfg(feature = "board-pi4")]
+pub fn live() -> bool {
+    LIVE.load(Ordering::Acquire)
 }
 
 fn this() -> *mut PerCpu {
@@ -83,6 +96,8 @@ pub fn init_bsp() {
             options(nostack),
         );
     }
+    #[cfg(feature = "board-pi4")]
+    LIVE.store(true, Ordering::Release);
     mark_online(0);
 }
 

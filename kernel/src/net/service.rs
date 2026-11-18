@@ -314,6 +314,8 @@ pub fn owner_idle() {
     if !polling_here() {
         return;
     }
+    #[cfg(feature = "board-pi4")]
+    crate::act::note_core(crate::percpu::id());
     if work_pending() {
         drive();
         return;
@@ -328,6 +330,11 @@ pub fn owner_idle() {
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
         }
+        // Refresh the checkpoint before clearing the idle flag. The timer
+        // runs as soon as IRQs are unmasked, and it would otherwise see a
+        // stale mark on a core that was only asleep.
+        #[cfg(feature = "board-pi4")]
+        crate::act::note_core(crate::percpu::id());
         crate::percpu::set_asleep(false);
         IDLE_TICKS.fetch_add(crate::timer::get_ticks().wrapping_sub(t0), Ordering::Relaxed);
     }
