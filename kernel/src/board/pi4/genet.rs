@@ -632,14 +632,17 @@ impl GenetDevice {
             mark_text("TX stuck");
             return;
         }
-        // U-Boot `bcmgenet_gmac_eth_send`: program the 12-byte descriptor
-        // for `(prod & 0xff)`, then write `prod + 1` to TDMA_PROD_INDEX,
-        // and wait until the consumer catches it. The write pointer is
-        // left at the value init stored while DMA was off. Moving it
-        // after DMA is enabled points the engine at the next descriptor
-        // before that descriptor is valid; the following producer update
-        // is the access that locks the AXI fabric. Linux `bcmgenet_xmit`
-        // likewise publishes only the producer index.
+        // Descriptor layout matches Linux `dmadesc`: length/status at +0,
+        // address low at +4, address high at +8, 12 bytes apart. Slot 1's
+        // length word is GENET offset 0x400C. For a 304-byte frame the
+        // word is `(304 << 16) | SOP | EOP | APPEND_CRC | (0x3F << 7)`
+        // = 0x01307FC0. U-Boot writes that word with TDMA left enabled.
+        // After the discover, this silicon's TDMA cursor sits on the next
+        // slot's length word and the CPU store of that word never
+        // completes (breadcrumb froze on `TXw 4 0000400C=01307FC0`,
+        // producer index untouched). Stop TDMA, write the three words,
+        // enable TDMA, then publish `prod + 1`. The write pointer stays
+        // where init left it.
         TX_STEP.store(0, Ordering::Relaxed);
         TX_TRACE.store(true, Ordering::Release);
         let raw_prod = read(TDMA_RING + TDMA_PROD_INDEX);
@@ -657,7 +660,7 @@ impl GenetDevice {
         if n < 60 {
             n = 60;
         }
-        unsafe {
+        let (frame_ptr, addr, status) = unsafe {
             let buf = &mut TX_BUFS[slot];
             let copied = frame.len().min(BUF_LEN);
             buf[..copied].copy_from_slice(&frame[..copied]);
@@ -677,13 +680,21 @@ impl GenetDevice {
                 | DMA_EOP
                 | DMA_TX_APPEND_CRC
                 | (0x3f << DMA_TX_QTAG_SHIFT);
-            let desc = GENET_TX_OFF + desc_index * DMA_DESC_SIZE;
-            write(desc + DESC_ADDRESS_LO, addr as u32);
-            write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
-            barrier();
-            write(desc + DESC_LENGTH_STATUS, status);
-            note_tx_frame(buf.as_ptr(), n, status);
-        }
+            (buf.as_ptr(), addr, status)
+        };
+        let Some(ctrl) = tdma_quiesce() else {
+            TX_TRACE.store(false, Ordering::Release);
+            TX_STUCK.store(true, Ordering::Relaxed);
+            return;
+        };
+        let desc = GENET_TX_OFF + desc_index * DMA_DESC_SIZE;
+        write(desc + DESC_ADDRESS_LO, addr as u32);
+        write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
+        write(desc + DESC_LENGTH_STATUS, status);
+        barrier();
+        mark_text("TX desc wrote");
+        note_tx_frame(frame_ptr, n, status);
+        tdma_resume(ctrl);
         let next = prod.wrapping_add(1) & 0xffff;
         barrier();
         // Keep any high bits the register already held. U-Boot increments
@@ -913,13 +924,13 @@ fn init_rx_ring() {
 }
 
 fn init_tx_ring() {
-    wait_desc_ram(TDMA_REG_BASE);
+    note_tdma_status();
     // U-Boot's Pi 4 driver: one ring, descriptors 0..255, no high pointer
     // words, no arbiter write. END is the last word (256 * 3 - 1). The
     // size field is the descriptor count in the high half and the buffer
     // length in the low half. START, READ, END, and the consumer are
     // write-once after a BCM2711 reset, so the value that reads back is
-    // the one the engine will use.
+    // the one the engine will use. v5 uses 3 words per descriptor.
     let end = TX_RING_DESCS * WORDS_PER_BD - 1;
     let size = (TX_RING_DESCS << 16) | BUF_LEN as u32;
     write(TDMA_REG_BASE + DMA_SCB_BURST_SIZE, DMA_MAX_BURST_TX);
@@ -937,23 +948,142 @@ fn init_tx_ring() {
     if got_end != end || got_size != size {
         say("[WARN] GENET TDMA ring end or size did not stick");
     }
+    zero_tx_descriptors();
     say("[OK] GENET TDMA ring 16 uses 256 descriptors from 0");
 }
 
-fn wait_desc_ram(base: usize) {
-    let start = crate::timer::millis();
-    let mut spins = 0u32;
-    while crate::timer::millis().saturating_sub(start) < 20 {
-        spins = spins.saturating_add(1);
-        if spins > 100_000 {
-            break;
+/// Linux's header names bit 1 `DMA_DESC_RAM_INIT_BUSY`. v5 `bcmgenet.c`,
+/// U-Boot, FreeBSD, and OpenBSD never start an init and never poll the
+/// bit. On this Pi it stays set, so it is not a gate. The slots are
+/// written below while TDMA is still disabled.
+fn note_tdma_status() {
+    let status = read(TDMA_REG_BASE + DMA_STATUS);
+    say_hex("[OK] GENET TDMA status", status);
+    if status & DMA_DESC_RAM_INIT_BUSY != 0 {
+        say("[OK] GENET v5 leaves descriptor RAM init busy; TX slots zeroed in software");
+    }
+}
+
+/// Every TX length word is written before TDMA is enabled. Slot 1's
+/// length word (offset 0x400C) is the one the engine fetches after the
+/// first frame; it has to be a real value before that fetch.
+fn zero_tx_descriptors() {
+    mark_text("TX ram zero");
+    for index in 0..TX_RING_DESCS as usize {
+        let desc = GENET_TX_OFF + index * DMA_DESC_SIZE;
+        write_at(BASE + desc + DESC_ADDRESS_LO, 0);
+        write_at(BASE + desc + DESC_ADDRESS_HI, 0);
+        if index == 1 {
+            barrier();
+            mark_text("TX zero 400c");
         }
-        if read(base + DMA_STATUS) & DMA_DESC_RAM_INIT_BUSY == 0 {
+        write_at(BASE + desc + DESC_LENGTH_STATUS, 0);
+        if index == 1 {
+            barrier();
+            mark_text("TX zero ok");
+        }
+    }
+    barrier();
+}
+
+struct TxCursor {
+    ctrl: u32,
+    prod: u32,
+    cons: u32,
+    read_ptr: u32,
+    write_ptr: u32,
+    start: u32,
+    end: u32,
+    size: u32,
+    ring_cfg: u32,
+}
+
+fn read_tx_cursor() -> TxCursor {
+    TxCursor {
+        ctrl: read_at(BASE + TDMA_REG_BASE + DMA_CTRL),
+        prod: read_at(BASE + TDMA_RING + TDMA_PROD_INDEX),
+        cons: read_at(BASE + TDMA_RING + TDMA_CONS_INDEX),
+        read_ptr: read_at(BASE + TDMA_RING + DMA_READ_PTR),
+        write_ptr: read_at(BASE + TDMA_RING + DMA_WRITE_PTR),
+        start: read_at(BASE + TDMA_RING + DMA_START_ADDR),
+        end: read_at(BASE + TDMA_RING + DMA_END_ADDR),
+        size: read_at(BASE + TDMA_RING + DMA_RING_BUF_SIZE_REG),
+        ring_cfg: read_at(BASE + TDMA_REG_BASE + DMA_RING_CFG),
+    }
+}
+
+fn mark_tx_cursor(saved: &TxCursor) {
+    let mut buf = [0u8; 40];
+    let mut n = 0;
+    push_str(&mut buf, &mut n, "TX off rp ");
+    push_hex32(&mut buf, &mut n, saved.read_ptr);
+    push_str(&mut buf, &mut n, " c ");
+    push_hex32(&mut buf, &mut n, saved.cons & 0xffff);
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        mark_text(text);
+    }
+}
+
+fn put_tx_reg(offset: usize, saved: u32) -> bool {
+    if read_at(BASE + offset) == saved {
+        return false;
+    }
+    write_at(BASE + offset, saved);
+    true
+}
+
+/// Clearing `DMA_EN` can drop the ring cursor. Put back whatever
+/// changed, while TDMA is still stopped. Producer stays at the
+/// pre-packet value; the caller publishes the increment after resume.
+fn restore_tx_cursor(saved: &TxCursor) {
+    let mut changed = false;
+    changed |= put_tx_reg(TDMA_RING + DMA_START_ADDR, saved.start);
+    changed |= put_tx_reg(TDMA_RING + DMA_END_ADDR, saved.end);
+    changed |= put_tx_reg(TDMA_RING + DMA_RING_BUF_SIZE_REG, saved.size);
+    changed |= put_tx_reg(TDMA_RING + DMA_READ_PTR, saved.read_ptr);
+    changed |= put_tx_reg(TDMA_RING + DMA_WRITE_PTR, saved.write_ptr);
+    changed |= put_tx_reg(TDMA_RING + TDMA_PROD_INDEX, saved.prod);
+    changed |= put_tx_reg(TDMA_RING + TDMA_CONS_INDEX, saved.cons);
+    changed |= put_tx_reg(TDMA_REG_BASE + DMA_RING_CFG, saved.ring_cfg);
+    if changed {
+        mark_text("TX ptrs");
+    }
+}
+
+/// Linux `bcmgenet_dma_teardown` clears `DMA_EN` and polls
+/// `DMA_STATUS` for `DMA_DISABLED` before it touches DMA state again.
+/// RDMA stays up so receive keeps running.
+fn tdma_quiesce() -> Option<u32> {
+    let saved = read_tx_cursor();
+    write(TDMA_REG_BASE + DMA_CTRL, saved.ctrl & !DMA_EN);
+    let start = crate::timer::millis();
+    loop {
+        let status = read_at(BASE + TDMA_REG_BASE + DMA_STATUS);
+        if status & DMA_DISABLED != 0 {
+            mark_tx_cursor(&saved);
+            restore_tx_cursor(&saved);
+            return Some(saved.ctrl);
+        }
+        if crate::timer::millis().saturating_sub(start) > 10 {
+            mark_text("TX dma stuck");
+            write_at(BASE + TDMA_REG_BASE + DMA_CTRL, saved.ctrl);
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn tdma_resume(ctrl: u32) {
+    let enable = ctrl | DMA_EN | (1 << (DEFAULT_Q as u32 + DMA_RING_BUF_EN_SHIFT));
+    write(TDMA_REG_BASE + DMA_CTRL, enable);
+    let start = crate::timer::millis();
+    while crate::timer::millis().saturating_sub(start) < 10 {
+        if read_at(BASE + TDMA_REG_BASE + DMA_STATUS) & DMA_DISABLED == 0 {
             return;
         }
         core::hint::spin_loop();
     }
-    say("[WARN] GENET DMA descriptor RAM init still busy");
+    mark_text("TX dma slow");
 }
 
 fn program_irqs() {
