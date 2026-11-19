@@ -15,12 +15,17 @@
 //! The GPU bus address is the physical address with `0xC0000000` set. A
 //! refused call is tried once more with the raw physical address. A
 //! returned address whose top bits are a Pi 4 alias becomes an ARM
-//! address with `bus & 0x3FFFFFFF`. The reply is read twice and kept
-//! only when both copies match and the response code is success. Pixels
-//! are stored through the coarse map and the cache is cleaned, then the
-//! strict map moves them to a non-cacheable window. A mailbox that never
-//! answers gives up on a counter timeout and a spin budget and leaves
-//! the firmware scanout alone.
+//! address with `bus & 0x3FFFFFFF`. The reply is read twice and both
+//! copies are logged. A mismatch does not discard a reply: the copy a
+//! single read would have kept is the one that is used. GET is accepted
+//! the way the picture-producing path accepted it, on the response code
+//! and a width and height in range. If that GET is unusable, the same
+//! attempt runs the older exchange (message bytes only, one deciding
+//! read) and then keep or same-size SET_PHYS. Pixels are stored through
+//! the coarse map and the cache is cleaned, then the strict map moves
+//! them to a non-cacheable window. A mailbox that never answers gives up
+//! on a counter timeout and a spin budget and leaves the firmware
+//! scanout alone.
 //!
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
@@ -324,29 +329,23 @@ fn bring_up() -> bool {
     // loaded and no vc4-kms overlay, that scanout is the one to keep.
     // Setting another size, or the blank tag, made this board drop HDMI
     // to no signal. Take the existing buffer first. Set that same size
-    // only when the firmware answered but will not hand the buffer over.
-    // A silent mailbox is not a reason to send SET_PHYS: that call is
-    // what removes the signal. A made-up 1280x720 is not a fallback.
+    // when the firmware will not hand the buffer over. A made-up
+    // 1280x720 is not a fallback: it is the call that removes the signal.
+    // A GET the older path would have accepted must not stop here. If
+    // the checked GET has no usable size, the older exchange runs and
+    // then keep, then same-size SET_PHYS.
     note_prop();
     let mut attempt = 0u32;
     while attempt < 4 {
+        TRY_N.store(attempt, Ordering::Relaxed);
         clear_probe();
         if let Some((w, h)) = current_size() {
-            match keep_mode(w, h) {
-                Ok(mode) => {
-                    emit_probe(attempt);
-                    return finish(mode, attempt);
-                }
-                Err(KeepFail::Rejected) => {
-                    // Record why the firmware buffer was refused before
-                    // the same-size allocate overwrites that result.
-                    emit_probe(attempt);
-                    if let Some(mode) = allocate(w, h) {
-                        emit_probe(attempt);
-                        return finish(mode, attempt);
-                    }
-                }
-                Err(KeepFail::Silent) => {}
+            if finish_size(w, h, attempt, false) {
+                return true;
+            }
+        } else if let Some((w, h)) = current_size_pr50() {
+            if finish_size(w, h, attempt, true) {
+                return true;
             }
         }
         emit_probe(attempt);
@@ -354,6 +353,37 @@ fn bring_up() -> bool {
     }
     save_line("hdmi none retry 4");
     false
+}
+
+fn finish_size(w: u32, h: u32, attempt: u32, pr50: bool) -> bool {
+    if pr50 {
+        PR50.store(true, Ordering::Relaxed);
+    }
+    let kept = match keep_mode(w, h) {
+        Ok(mode) => {
+            emit_probe(attempt);
+            Some(mode)
+        }
+        Err(_) => {
+            emit_probe(attempt);
+            None
+        }
+    };
+    let mode = if let Some(mode) = kept {
+        Some(mode)
+    } else {
+        let mode = allocate(w, h);
+        if mode.is_some() {
+            emit_probe(attempt);
+        }
+        mode
+    };
+    PR50.store(false, Ordering::Relaxed);
+    if let Some(mode) = mode {
+        finish(mode, attempt)
+    } else {
+        false
+    }
 }
 
 struct Mode {
@@ -471,6 +501,7 @@ enum KeepFail {
 
 struct Probe {
     get_code: u32,
+    size_word: u32,
     width: u32,
     height: u32,
     step: u8,
@@ -481,6 +512,7 @@ struct Probe {
 
 static mut PROBE: Probe = Probe {
     get_code: 0,
+    size_word: 0,
     width: 0,
     height: 0,
     step: 0,
@@ -489,10 +521,19 @@ static mut PROBE: Probe = Probe {
     pitch: 0,
 };
 
+/// Which bring-up attempt is talking to the mailbox. The raw dump uses it.
+static TRY_N: AtomicU32 = AtomicU32::new(0);
+/// `g` checked GET, `p` older GET, `k` keep, `s` same-size set.
+static PHASE: AtomicU8 = AtomicU8::new(b'g');
+/// The older exchange: do not zero the property buffer, and clean only
+/// the message bytes before the send.
+static PR50: AtomicBool = AtomicBool::new(false);
+
 fn clear_probe() {
     unsafe {
         *addr_of_mut!(PROBE) = Probe {
             get_code: 0,
+            size_word: 0,
             width: 0,
             height: 0,
             step: 0,
@@ -503,10 +544,11 @@ fn clear_probe() {
     }
 }
 
-fn note_get(code: u32, width: u32, height: u32) {
+fn note_get(code: u32, size_word: u32, width: u32, height: u32) {
     unsafe {
         let probe = &mut *addr_of_mut!(PROBE);
         probe.get_code = code;
+        probe.size_word = size_word;
         probe.width = width;
         probe.height = height;
     }
@@ -543,12 +585,12 @@ fn emit_probe(try_n: u32) {
     line.dec(try_n as u64);
     line.push(" get ");
     line.hex32(probe.get_code);
-    if probe.width != 0 {
-        line.push(" ");
-        line.dec(probe.width as u64);
-        line.push("x");
-        line.dec(probe.height as u64);
-    }
+    line.push(" sz ");
+    line.hex32(probe.size_word);
+    line.push(" ");
+    line.dec(probe.width as u64);
+    line.push("x");
+    line.dec(probe.height as u64);
     if probe.get_code == 0 {
         line.push(" ");
         line.push(fail_name());
@@ -639,10 +681,25 @@ impl Line {
 }
 
 fn current_size() -> Option<(u32, u32)> {
+    PHASE.store(b'g', Ordering::Relaxed);
     if let Some(size) = current_size_at(true) {
         return Some(size);
     }
     current_size_at(false)
+}
+
+/// The exchange that produced a picture: the property buffer is not
+/// wiped, and only the message bytes are cleaned before the send.
+fn current_size_pr50() -> Option<(u32, u32)> {
+    PR50.store(true, Ordering::Relaxed);
+    PHASE.store(b'p', Ordering::Relaxed);
+    let size = if let Some(size) = current_size_at(true) {
+        Some(size)
+    } else {
+        current_size_at(false)
+    };
+    PR50.store(false, Ordering::Relaxed);
+    size
 }
 
 fn current_size_at(bus_alias: bool) -> Option<(u32, u32)> {
@@ -651,17 +708,17 @@ fn current_size_at(bus_alias: bool) -> Option<(u32, u32)> {
     msg[2] = TAG_GET_PHYS;
     msg[3] = 8;
     if !exchange(&mut msg, bus_alias) {
-        note_get(0, 0, 0);
+        note_get(0, 0, 0, 0);
         return None;
     }
-    if msg[0] != 32 || msg[1] != REQ_OK {
-        note_get(msg[1], 0, 0);
-        return None;
-    }
+    // The response code and the dimensions decide. A size word other
+    // than 32 used to zero the logged width and skip keep and set while
+    // the code was still success. The picture-producing path did not
+    // look at that word.
     let width = msg[5];
     let height = msg[6];
-    note_get(msg[1], width, height);
-    if (320..=3840).contains(&width) && (240..=2160).contains(&height) {
+    note_get(msg[1], msg[0], width, height);
+    if msg[1] == REQ_OK && (320..=3840).contains(&width) && (240..=2160).contains(&height) {
         Some((width, height))
     } else {
         None
@@ -684,6 +741,7 @@ fn keep_mode(width: u32, height: u32) -> Result<Mode, KeepFail> {
 }
 
 fn keep_mode_at(width: u32, height: u32, bus_alias: bool) -> Result<Mode, KeepFail> {
+    PHASE.store(b'k', Ordering::Relaxed);
     let mut msg = [0u32; 40];
     let mut n = 1usize;
     msg[n] = 0;
@@ -711,18 +769,10 @@ fn keep_mode_at(width: u32, height: u32, bus_alias: bool) -> Result<Mode, KeepFa
     let gpu_bytes = msg[alloc_at + 4] as u64;
     let pitch = msg[pitch_at + 3];
     note_step(1, msg[1], bus, pitch);
-    if msg[0] != sent {
-        return Err(KeepFail::Silent);
-    }
     if msg[1] != REQ_OK {
         return Err(KeepFail::Rejected);
     }
-    if depth != 32
-        || width < CELL_W
-        || pitch % 4 != 0
-        || pitch < width.saturating_mul(4)
-        || bus == 0
-    {
+    if depth != 32 || width < CELL_W || pitch < width.saturating_mul(4) || bus == 0 {
         return Err(KeepFail::Rejected);
     }
     let Some(bytes) = (pitch as u64).checked_mul(height as u64) else {
@@ -753,6 +803,7 @@ fn allocate(width: u32, height: u32) -> Option<Mode> {
 }
 
 fn allocate_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
+    PHASE.store(b's', Ordering::Relaxed);
     let mut msg = [0u32; 40];
     let mut n = 1usize;
     msg[n] = 0;
@@ -782,10 +833,10 @@ fn allocate_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
     let gpu_bytes = msg[alloc_at + 4] as u64;
     let pitch = msg[pitch_at + 3];
     note_step(2, msg[1], bus, pitch);
-    if msg[0] != sent || msg[1] != REQ_OK {
+    if msg[1] != REQ_OK {
         return None;
     }
-    if got_w < CELL_W || got_h < CELL_H || depth != 32 || pitch % 4 != 0 || pitch < got_w * 4 {
+    if got_w < CELL_W || got_h < CELL_H || depth != 32 || pitch < got_w * 4 {
         return None;
     }
     let bytes = (pitch as u64).checked_mul(got_h as u64)?;
@@ -831,26 +882,36 @@ fn exchange(msg: &mut [u32], bus_alias: bool) -> bool {
     MBOX_FAIL.store(0, Ordering::Relaxed);
     if msg.is_empty() || msg.len() > 48 {
         MBOX_FAIL.store(MBOX_TIMEOUT, Ordering::Relaxed);
+        log_mbox(bus_alias, "badlen");
         return false;
     }
     let start = crate::timer::get_ticks();
+    let pr50 = PR50.load(Ordering::Relaxed);
     unsafe {
         let prop = addr_of_mut!(PROP);
         let virt = prop as usize;
         if virt % 64 != 0 {
             MBOX_FAIL.store(MBOX_ALIGN, Ordering::Relaxed);
+            log_mbox(bus_alias, "align");
             return false;
         }
         let dst = addr_of_mut!((*prop).words).cast::<u32>();
         let words = core::mem::size_of::<Prop>() / 4;
-        for i in 0..words {
-            dst.add(i).write_volatile(0);
+        // The older path wrote the message over whatever was already in
+        // the buffer and cleaned only those bytes. Wiping all 192 bytes
+        // stays the first try. A GET that still has no size retries
+        // with the older write.
+        if !pr50 {
+            for i in 0..words {
+                dst.add(i).write_volatile(0);
+            }
         }
         for (i, word) in msg.iter().enumerate() {
             dst.add(i).write_volatile(*word);
         }
-        let bytes = core::mem::size_of::<Prop>();
-        civac(virt as *const u8, bytes);
+        let full = core::mem::size_of::<Prop>();
+        let clean = if pr50 { msg.len() * 4 } else { full };
+        civac(virt as *const u8, clean);
         let phys = crate::addr::virt_to_phys(virt as u64);
         let mut bus = phys as u32;
         if bus_alias {
@@ -858,32 +919,125 @@ fn exchange(msg: &mut [u32], bus_alias: bool) -> bool {
         }
         if !mbox_send((bus & !0xF) | 8, start) {
             MBOX_FAIL.store(MBOX_TIMEOUT, Ordering::Relaxed);
+            log_mbox(bus_alias, "timeout");
             return false;
         }
         // Invalidate only. dc civac would write a dirty line back on
-        // top of the GPU's reply. Read twice so a stale line cannot
-        // pass as a mode.
-        drop_lines(virt as *const u8, bytes);
+        // top of the GPU's reply. Both copies of the whole buffer are
+        // logged. A mismatch does not fail the call: the first copy is
+        // what one read would have returned, unless only the second
+        // copy has a usable GET size.
+        drop_lines(virt as *const u8, full);
         let mut first = [0u32; 48];
-        let n = msg.len();
-        for i in 0..n {
+        for i in 0..words {
             first[i] = dst.add(i).read_volatile();
         }
-        drop_lines(virt as *const u8, bytes);
+        drop_lines(virt as *const u8, full);
+        let mut second = [0u32; 48];
+        for i in 0..words {
+            second[i] = dst.add(i).read_volatile();
+        }
+        log_read(bus_alias, b'a', &first);
+        log_read(bus_alias, b'b', &second);
+        log_tags(bus_alias, &first);
+        let n = msg.len();
         let mut mismatch = false;
-        for i in 0..n {
-            let word = dst.add(i).read_volatile();
-            if word != first[i] {
+        let mut i = 0;
+        while i < words {
+            if first[i] != second[i] {
                 mismatch = true;
+                break;
             }
-            msg[i] = word;
+            i += 1;
         }
         if mismatch {
             MBOX_FAIL.store(MBOX_MISMATCH, Ordering::Relaxed);
-            return false;
+            log_mbox(bus_alias, "mismatch");
+        }
+        let phase = PHASE.load(Ordering::Relaxed);
+        let use_second = mismatch
+            && (phase == b'g' || phase == b'p')
+            && !dims_ok(&first)
+            && dims_ok(&second);
+        let chosen = if use_second { &second } else { &first };
+        let mut j = 0;
+        while j < n {
+            msg[j] = chosen[j];
+            j += 1;
         }
     }
     true
+}
+
+fn dims_ok(words: &[u32; 48]) -> bool {
+    words[1] == REQ_OK && (320..=3840).contains(&words[5]) && (240..=2160).contains(&words[6])
+}
+
+fn log_read(bus_alias: bool, which: u8, words: &[u32; 48]) {
+    let mut index = 0;
+    while index < words.len() {
+        let mut line = Line::new();
+        dump_prefix(&mut line, bus_alias, which);
+        let mut n = 0;
+        while n < 8 && index < words.len() {
+            if n != 0 {
+                line.push(" ");
+            }
+            line.hex32(words[index]);
+            index += 1;
+            n += 1;
+        }
+        save_line(line.text());
+    }
+}
+
+fn log_tags(bus_alias: bool, words: &[u32; 48]) {
+    let mut i = 2usize;
+    let mut guard = 0u32;
+    while i + 2 < words.len() && guard < 8 {
+        let tag = words[i];
+        if tag == 0 {
+            break;
+        }
+        let buf_len = words[i + 1];
+        let resp = words[i + 2];
+        let mut line = Line::new();
+        dump_prefix(&mut line, bus_alias, b't');
+        line.hex32(tag);
+        line.push(" n ");
+        line.hex32(buf_len);
+        line.push(" r ");
+        line.hex32(resp);
+        save_line(line.text());
+        let bytes = (buf_len & 0xffff) as usize;
+        let step = 3 + bytes.div_ceil(4);
+        let Some(next) = i.checked_add(step) else {
+            break;
+        };
+        if next >= words.len() {
+            break;
+        }
+        i = next;
+        guard += 1;
+    }
+}
+
+fn log_mbox(bus_alias: bool, name: &str) {
+    let mut line = Line::new();
+    dump_prefix(&mut line, bus_alias, b'x');
+    line.push(name);
+    save_line(line.text());
+}
+
+fn dump_prefix(line: &mut Line, bus_alias: bool, which: u8) {
+    line.push("t");
+    line.dec(TRY_N.load(Ordering::Relaxed) as u64);
+    let mut tag = [0u8; 3];
+    tag[0] = PHASE.load(Ordering::Relaxed);
+    tag[1] = if bus_alias { b'A' } else { b'R' };
+    tag[2] = which;
+    line.push(core::str::from_utf8(&tag).unwrap_or("gAx"));
+    line.push(" ");
 }
 
 fn mbox_send(msg: u32, start: u64) -> bool {

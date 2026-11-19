@@ -18,7 +18,7 @@ use log::{Level, LevelFilter, Metadata, Record};
 use spin::Mutex;
 
 const CAP: usize = 80;
-const QLEN: usize = 32;
+const QLEN: usize = 128;
 
 struct Slot {
     level: u8,
@@ -312,7 +312,7 @@ static FAN_HEAD: AtomicU64 = AtomicU64::new(0);
 /// Lines recorded before the log task exists. `flush_preface` posts them
 /// once, in order, so they occupy the front of the telnet ring. After the
 /// ring wraps, a new reader still receives them before the live lines.
-const PREFACE_LINES: usize = 8;
+const PREFACE_LINES: usize = 256;
 const PREFACE_CAP: usize = 80;
 const PREFACE_BIT: u64 = 1 << 63;
 
@@ -349,45 +349,51 @@ pub fn save_early(text: &str) {
 /// UART copy of the saved lines. Call after `init` and before the log task.
 #[cfg(feature = "board-pi4")]
 pub fn replay_early() {
-    let mut copied = [[0u8; PREFACE_CAP]; PREFACE_LINES];
-    let mut lens = [0u8; PREFACE_LINES];
     let n = {
         let pre = PREFACE.lock();
-        let n = pre.n.min(PREFACE_LINES);
-        for i in 0..n {
-            let len = pre.len[i] as usize;
-            copied[i][..len].copy_from_slice(&pre.data[i][..len]);
-            lens[i] = pre.len[i];
-        }
-        n
+        pre.n.min(PREFACE_LINES)
     };
-    for i in 0..n {
-        let len = lens[i] as usize;
-        if let Ok(text) = core::str::from_utf8(&copied[i][..len]) {
+    let mut i = 0;
+    while i < n {
+        let mut copied = [0u8; PREFACE_CAP];
+        let len = {
+            let pre = PREFACE.lock();
+            if i >= pre.n {
+                break;
+            }
+            let len = pre.len[i] as usize;
+            copied[..len].copy_from_slice(&pre.data[i][..len]);
+            len
+        };
+        if let Ok(text) = core::str::from_utf8(&copied[..len]) {
             log::info!("{text}");
         }
+        i += 1;
     }
 }
 
 /// Queue the saved lines at info level. The log task publishes them.
 pub fn flush_preface() {
-    let mut copied = [[0u8; PREFACE_CAP]; PREFACE_LINES];
-    let mut lens = [0u8; PREFACE_LINES];
     let n = {
         let pre = PREFACE.lock();
-        let n = pre.n.min(PREFACE_LINES);
-        for i in 0..n {
-            let len = pre.len[i] as usize;
-            copied[i][..len].copy_from_slice(&pre.data[i][..len]);
-            lens[i] = pre.len[i];
-        }
-        n
+        pre.n.min(PREFACE_LINES)
     };
-    for i in 0..n {
-        let len = lens[i] as usize;
+    let mut i = 0;
+    while i < n {
+        let mut copied = [0u8; PREFACE_CAP];
+        let len = {
+            let pre = PREFACE.lock();
+            if i >= pre.n {
+                break;
+            }
+            let len = pre.len[i] as usize;
+            copied[..len].copy_from_slice(&pre.data[i][..len]);
+            len
+        };
         if len > 0 {
-            post(1, 0, &copied[i][..len]);
+            post(1, 0, &copied[..len]);
         }
+        i += 1;
     }
 }
 

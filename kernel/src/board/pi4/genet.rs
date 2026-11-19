@@ -1500,6 +1500,9 @@ impl RxToken for GenetRxToken {
         if self.source == RX_ARP {
             let mut tmp = [0u8; 64];
             let n = crate::dhcp_rx::copy_arp(&mut tmp);
+            if n >= 42 {
+                log::info!("gateway arp injected");
+            }
             return f(&mut tmp[..n]);
         }
         let n = self.len as usize;
@@ -1529,6 +1532,7 @@ impl RxToken for GenetRxToken {
                         mac.copy_from_slice(&slice[6..12]);
                         crate::dhcp_rx::note_reply_mac(mac);
                     }
+                    crate::config_manager::note_dhcp_dns_frame(slice);
                     if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
                         say("[OK] GENET DHCP reply");
                     }

@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::net::NetworkMode;
 use alloc::string::{String, ToString};
@@ -407,20 +407,110 @@ pub fn write_records(out: &mut [u8]) -> Option<usize> {
 /// Nameservers from the DHCP ACK (option 6). The zone file is not
 /// rewritten. `write_upstreams` offers these first, then the configured
 /// list, so a forwarded query can reach the resolver on the lease subnet
-/// before 8.8.8.8.
-static DHCP_DNS: [AtomicU32; 3] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
+/// before 8.8.8.8. Eight slots: the stack's parser keeps only three.
+static DHCP_DNS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+/// Set when a BOOTREPLY's option 6 was stored. The stack's shorter list
+/// must not replace it.
+static DHCP_DNS_FRAME: AtomicBool = AtomicBool::new(false);
+/// Address installed for the lease, or zero before one exists.
+static LEASE_IP: AtomicU32 = AtomicU32::new(0);
+
+pub fn note_lease(ip: [u8; 4]) {
+    LEASE_IP.store(u32::from_be_bytes(ip), Ordering::Relaxed);
+}
+
+/// Option 6 from the raw BOOTREPLY. A fourth server is past the three
+/// the stack keeps, which is how 172.18.50.10 disappeared.
+#[allow(dead_code)]
+pub fn note_dhcp_dns_frame(frame: &[u8]) {
+    let mut servers = [[0u8; 4]; 8];
+    let n = crate::dhcp_rx::dns_from_bootreply(frame, &mut servers);
+    if n == 0 {
+        return;
+    }
+    note_dhcp_dns(&servers[..n]);
+    DHCP_DNS_FRAME.store(true, Ordering::Relaxed);
+    log_dhcp_dns(&servers[..n]);
+}
+
+/// The stack's list. Ignored once the frame parser stored option 6.
+pub fn note_dhcp_dns_from_stack(servers: &[[u8; 4]]) {
+    if DHCP_DNS_FRAME.load(Ordering::Relaxed) {
+        return;
+    }
+    note_dhcp_dns(servers);
+}
 
 pub fn note_dhcp_dns(servers: &[[u8; 4]]) {
+    if servers.is_empty() {
+        DHCP_DNS_FRAME.store(false, Ordering::Relaxed);
+    }
     let mut index = 0;
     while index < DHCP_DNS.len() {
         let ip = servers.get(index).copied().unwrap_or([0, 0, 0, 0]);
         DHCP_DNS[index].store(u32::from_be_bytes(ip), Ordering::Relaxed);
         index += 1;
     }
+}
+
+#[allow(dead_code)]
+fn log_dhcp_dns(servers: &[[u8; 4]]) {
+    let mut buf = [0u8; 80];
+    let mut n = 0usize;
+    for byte in b"dns dhcp " {
+        buf[n] = *byte;
+        n += 1;
+    }
+    let mut index = 0;
+    while index < servers.len() {
+        let ip = servers[index];
+        index += 1;
+        let mut tmp = [0u8; 16];
+        let mut t = 0usize;
+        if n != 9 {
+            tmp[t] = b' ';
+            t += 1;
+        }
+        t = push_dec(&mut tmp, t, ip[0]);
+        tmp[t] = b'.';
+        t += 1;
+        t = push_dec(&mut tmp, t, ip[1]);
+        tmp[t] = b'.';
+        t += 1;
+        t = push_dec(&mut tmp, t, ip[2]);
+        tmp[t] = b'.';
+        t += 1;
+        t = push_dec(&mut tmp, t, ip[3]);
+        if n + t > buf.len() {
+            break;
+        }
+        buf[n..n + t].copy_from_slice(&tmp[..t]);
+        n += t;
+    }
+    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+        log::info!("{text}");
+    }
+}
+
+#[allow(dead_code)]
+fn push_dec(buf: &mut [u8], mut n: usize, mut value: u8) -> usize {
+    let mut tmp = [0u8; 3];
+    let mut i = 3;
+    if value == 0 {
+        buf[n] = b'0';
+        return n + 1;
+    }
+    while value > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (value % 10);
+        value /= 10;
+    }
+    while i < 3 && n < buf.len() {
+        buf[n] = tmp[i];
+        n += 1;
+        i += 1;
+    }
+    n
 }
 
 pub fn write_upstreams(out: &mut [u8]) -> Option<usize> {
@@ -431,6 +521,7 @@ pub fn write_upstreams(out: &mut [u8]) -> Option<usize> {
     let mut used = 0;
     let mut seen = [[0u8; 4]; 8];
     let mut nseen = 0usize;
+    let lease = LEASE_IP.load(Ordering::Relaxed).to_be_bytes();
     let mut index = 0;
     while index < DHCP_DNS.len() {
         let raw = DHCP_DNS[index].load(Ordering::Relaxed);
@@ -439,7 +530,7 @@ pub fn write_upstreams(out: &mut [u8]) -> Option<usize> {
             continue;
         }
         let ip = raw.to_be_bytes();
-        if seen[..nseen].contains(&ip) {
+        if crate::dhcp_rx::omit_slirp_dns(ip, lease) || seen[..nseen].contains(&ip) {
             continue;
         }
         used = append_ip(out, used, ip)?;
@@ -450,7 +541,7 @@ pub fn write_upstreams(out: &mut [u8]) -> Option<usize> {
         }
     }
     for ip in &config.dns.upstreams {
-        if seen[..nseen].contains(ip) {
+        if crate::dhcp_rx::omit_slirp_dns(*ip, lease) || seen[..nseen].contains(ip) {
             continue;
         }
         used = append_ip(out, used, *ip)?;

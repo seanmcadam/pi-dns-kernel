@@ -85,6 +85,7 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
             gateway,
         } => {
             stack.configure_static(ip, netmask, gateway);
+            crate::config_manager::note_lease(ip);
             DHCP_PHASE.store(4, Ordering::Relaxed);
             DHCP_IP.store(u32::from_be_bytes(ip), Ordering::Relaxed);
             log::info!(
@@ -198,7 +199,7 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
                     dns[count] = server.0;
                     count += 1;
                 }
-                crate::config_manager::note_dhcp_dns(&dns[..count]);
+                crate::config_manager::note_dhcp_dns_from_stack(&dns[..count]);
                 let gateway = crate::dhcp_rx::lease_gateway(
                     ip,
                     mask,
@@ -222,6 +223,7 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
     match action {
         DhcpAction::Configured { ip, mask, gateway } => {
             state.stack.configure_static(ip, mask, gateway);
+            crate::config_manager::note_lease(ip);
             DHCP_PHASE.store(2, Ordering::Relaxed);
             DHCP_IP.store(u32::from_be_bytes(ip), Ordering::Relaxed);
             let prefix: u32 = mask.iter().map(|byte| byte.count_ones()).sum();
@@ -238,8 +240,13 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
                 gateway[3]
             );
             if let Some(mac) = crate::dhcp_rx::reply_mac() {
-                if crate::dhcp_rx::stage_gateway_arp(&state.device.mac_address(), ip, mask, &mac, gateway)
-                {
+                if crate::dhcp_rx::stage_gateway_arp(
+                    &state.device.mac_address(),
+                    ip,
+                    mask,
+                    &mac,
+                    gateway,
+                ) {
                     log::info!(
                         "gateway neighbor {}.{}.{}.{} via {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                         gateway[0],
@@ -253,6 +260,21 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
                         mac[4],
                         mac[5]
                     );
+                    // The seeded reply fills our cache, so the stack never
+                    // transmits a request. This gateway did not forward
+                    // until it had answered a real ARP. Send that request
+                    // before any DNS query, then let the seed in.
+                    if request_gateway(&mut state.device, ip, gateway) {
+                        log::info!(
+                            "gateway arp request {}.{}.{}.{}",
+                            gateway[0], gateway[1], gateway[2], gateway[3]
+                        );
+                    }
+                    let timestamp = Instant::from_millis(crate::timer::millis() as i64);
+                    state.stack.poll(timestamp, &mut state.device);
+                    if crate::dhcp_rx::arp_pending() {
+                        log::info!("gateway arp not consumed");
+                    }
                 }
             }
             console_line_ip("[OK] DHCP leased", ip);
@@ -264,6 +286,7 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
             state
                 .stack
                 .configure_static(fallback_ip, fallback_netmask, fallback_gateway);
+            crate::config_manager::note_lease(fallback_ip);
             DHCP_PHASE.store(3, Ordering::Relaxed);
             DHCP_IP.store(u32::from_be_bytes(fallback_ip), Ordering::Relaxed);
             log::info!(
@@ -324,6 +347,17 @@ fn maybe_announce(device: &mut EthernetDevice) {
             console_line("[OK] gratuitous ARP");
         }
     }
+}
+
+fn request_gateway(device: &mut EthernetDevice, our_ip: [u8; 4], gw_ip: [u8; 4]) -> bool {
+    let mac = device.mac_address();
+    let Some(token) = device.transmit(Instant::from_millis(crate::timer::millis() as i64)) else {
+        return false;
+    };
+    token.consume(60, |buf| {
+        crate::dhcp_rx::write_gateway_request(buf, &mac, our_ip, gw_ip);
+    });
+    true
 }
 
 fn announce(device: &mut EthernetDevice, ip: [u8; 4]) -> bool {
