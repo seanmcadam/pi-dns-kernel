@@ -33,6 +33,7 @@ const CACHE_PLANT: u64 = 54;
 const SET_DNS_TOP: u64 = 57;
 const SET_UPSTREAM_HEALTH: u64 = 60;
 const CONFIG_PROBE_SECS: u64 = 62;
+const NET_READY: u64 = 63;
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
@@ -75,7 +76,7 @@ impl ProbeSlot {
 struct ProbeJob {
     index: usize,
     ip: [u8; 4],
-    query: [u8; 17],
+    query: [u8; crate::health::PROBE_LEN],
 }
 
 struct Record {
@@ -576,12 +577,14 @@ fn take_upstream(
     let id = packet_id(packet);
     if crate::health::is_probe_id(id) {
         let index = crate::health::probe_index(id);
-        if index < probes.len() && probes[index].in_flight {
+        if index < probes.len() && probes[index].ip != [0, 0, 0, 0] {
             let ip = probes[index].ip;
+            // A late reply still proves the server answered. Clearing
+            // in_flight keeps the 2s timer from counting that same probe.
             probes[index].in_flight = false;
             let upstreams = load_upstreams();
             health.sync(&upstreams);
-            let change = health.mark_up_ip(ip, time_ms());
+            let change = health.note_success(ip, time_ms());
             if change.log {
                 note_state(true, ip);
             }
@@ -595,6 +598,17 @@ fn take_upstream(
         return;
     };
     let item = pending.remove(pos);
+    let upstreams = load_upstreams();
+    health.sync(&upstreams);
+    if let Some(ip) = item.walk.current_ip() {
+        let change = health.note_success(ip, time_ms());
+        if change.log {
+            note_state(true, ip);
+        }
+        if change.changed {
+            publish_health(health, &upstreams);
+        }
+    }
     let mut packet = packet.to_vec();
     set_id(&mut packet, item.client_id);
     remember(cache, &item.name, item.qtype, item.qclass, &packet);
@@ -775,6 +789,9 @@ extern "C" fn cache_reaper(_arg: u64) {
 /// Decide which upstreams need a probe. The send itself happens after
 /// the DNS lock is released, so a probe cannot stall a client lookup.
 fn plan_probes(shared: &mut Shared, now: u64, jobs: &mut [Option<ProbeJob>; crate::health::MAX]) {
+    if !crate::health::probes_allowed(sys(NET_READY, 0, 0, 0, 0, 0, 0) != 0) {
+        return;
+    }
     let secs = sys(CONFIG_PROBE_SECS, 0, 0, 0, 0, 0, 0);
     let interval = if (1..=3_600).contains(&secs) {
         secs as u64 * 1_000
@@ -799,7 +816,7 @@ fn plan_probes(shared: &mut Shared, now: u64, jobs: &mut [Option<ProbeJob>; crat
             && now.saturating_sub(shared.probes[i].sent_ms) >= UPSTREAM_WAIT_MS;
         if timed_out {
             shared.probes[i].in_flight = false;
-            let change = shared.health.mark_down(i, now);
+            let change = shared.health.note_failure(ip, now);
             if change.log {
                 note_state(false, ip);
             }

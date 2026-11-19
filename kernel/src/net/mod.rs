@@ -36,6 +36,13 @@ const LINK_HOLD_MS: u64 = 15_000;
 /// 0 absent, 1 waiting, 2 leased, 3 fallback, 4 static.
 static DHCP_PHASE: AtomicU8 = AtomicU8::new(0);
 static DHCP_IP: AtomicU32 = AtomicU32::new(0);
+
+/// True once a static address, a DHCP lease, or the DHCP fallback is
+/// installed. Health probes stay quiet until then: there is no route,
+/// and the pre-lease resolver list is not the one the lease will keep.
+pub fn has_address() -> bool {
+    DHCP_IP.load(Ordering::Relaxed) != 0
+}
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static ARP_PERIOD_MS: AtomicU64 = AtomicU64::new(0);
 static ARP_NEXT_MS: AtomicU64 = AtomicU64::new(0);

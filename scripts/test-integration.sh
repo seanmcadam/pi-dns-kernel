@@ -17,7 +17,7 @@ echo "Using host ports DNS ${DNS_HOST_PORT}, HTTP ${HTTP_HOST_PORT}, telnet ${TE
 # Start QEMU in background
 echo "Starting QEMU..."
 rm -f qemu/boot-output.txt
-timeout 120 qemu-system-aarch64 \
+timeout 180 qemu-system-aarch64 \
     -M virt,gic-version=2 \
     -cpu cortex-a72 \
     -smp 4 \
@@ -476,6 +476,37 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 2))
 fi
 
+# The first guest has no disk, so this only checks the boot log. The
+# dead-upstream load runs later, on the JSON guest that can store config.
+echo ""
+echo "Test 52: Probes wait until an address is configured"
+if python3 - <<'PY'
+text = open("qemu/boot-output.txt", errors="replace").read()
+ready_at = None
+for marker in (
+    "DHCP configured",
+    "DHCP timeout, using static",
+    "Network configured with static",
+):
+    i = text.find(marker)
+    if i >= 0 and (ready_at is None or i < ready_at):
+        ready_at = i
+if ready_at is None:
+    print("no address line in the boot log")
+    raise SystemExit(1)
+if "dns upstream down" in text[:ready_at]:
+    print("probe marked a server down before the address existed")
+    raise SystemExit(1)
+print("no probe down line before the address")
+PY
+then
+    echo "✓ No upstream was marked down before the address existed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ A probe ran before the address was configured"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Cleanup
 echo ""
 echo "Stopping QEMU..."
@@ -928,7 +959,7 @@ mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/json-disk.img >/dev/null
 printf 'record=legacy.local A 9.8.7.6 300\nmode=static\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\n' \
     > /tmp/legacy-config.txt
 mcopy -i qemu/json-disk.img@@${DISK_OFF} /tmp/legacy-config.txt ::CONFIG.TXT
-timeout 70 qemu-system-aarch64 \
+timeout 120 qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/json-a.txt \
@@ -1571,6 +1602,98 @@ curl -s -u admin:admin --max-time 5 -X POST \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data "vnc=0&vnc_port=5900&vnc_password=&hdmi=0" \
     "http://127.0.0.1:${HTTP_HOST_PORT}/display" >/dev/null || true
+
+echo ""
+echo "Test 53: Dead upstream drops out and queries keep resolving"
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import json, subprocess, sys, time, urllib.error, urllib.request
+http, dns = sys.argv[1], sys.argv[2]
+base = "http://127.0.0.1:%s" % http
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+
+def req(method, path, body=None, headers=None):
+    data = body.encode() if isinstance(body, str) else body
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if headers:
+        for k, v in headers.items():
+            r.add_header(k, v)
+    try:
+        resp = opener.open(r, timeout=8)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+status, kept = req("GET", "/config/file/config")
+if status != 200:
+    fail("config download %s" % status)
+doc = json.loads(kept)
+doc["dns"]["probe_interval_secs"] = 1
+doc["dns"]["upstreams"] = ["192.0.2.1", "10.0.2.3"]
+body = json.dumps(doc, separators=(",", ":"))
+status, applied = req("POST", "/config/file/config", body, {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in applied:
+    fail("upload %s %s" % (status, applied[:180]))
+
+deadline = time.time() + 15
+seen = None
+while time.time() < deadline:
+    status, page = req("GET", "/status")
+    if status == 200:
+        seen = json.loads(page).get("upstreams") or []
+        by_ip = {item["ip"]: item["up"] for item in seen}
+        if by_ip.get("192.0.2.1") is False and by_ip.get("10.0.2.3") is True:
+            break
+    time.sleep(0.4)
+else:
+    fail("upstream health %s" % seen)
+print("upstreams", seen)
+
+ok = 0
+for n in range(20):
+    name = "dead%d.example.com" % n
+    try:
+        proc = subprocess.run(
+            ["dig", "@127.0.0.1", "-p", dns, name, "A", "+time=2", "+tries=1"],
+            capture_output=True,
+            timeout=4,
+        )
+    except Exception:
+        continue
+    out = proc.stdout.decode(errors="replace")
+    if "SERVFAIL" not in out and ("NOERROR" in out or "NXDOMAIN" in out):
+        ok += 1
+print("answers", ok)
+status, restored = req(
+    "POST",
+    "/config/file/config",
+    kept.decode(),
+    {"Content-Type": "application/json"},
+)
+if status != 200 or b"applied" not in restored:
+    fail("restore %s %s" % (status, restored[:180]))
+if ok < 18:
+    fail("load lost %s of 20" % (20 - ok))
+log = open("qemu/json-a.txt", errors="replace").read()
+if "dns upstream down 192.0.2.1" not in log:
+    fail("dead server was not logged down")
+print("dead upstream left the rotation")
+PY
+then
+    echo "✓ A dead upstream left the rotation and 20 queries still resolved"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Dead-upstream load test failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 kill $JSON_PID 2>/dev/null || true
 wait $JSON_PID 2>/dev/null || true
 sync
