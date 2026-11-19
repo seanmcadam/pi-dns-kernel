@@ -2352,11 +2352,18 @@ fn futex_wake(addr: u64, n: u64) -> u64 {
     }
     let mut woke = 0u64;
     let limit = if n == 0 { 1 } else { n };
+    // Every task maps its data at the same virtual addresses. The waiter
+    // list is process-wide, so a wake must stay inside the caller's task
+    // or it steals a worker that is blocked on the other task's word.
+    let caller = crate::percpu::slot() as u8;
     let _guard = SCHED.lock();
     unsafe {
         let mut slot = 0;
         while slot < TASK_SLOTS && woke < limit {
-            if MAIN_BLOCKED[slot].load(Ordering::Acquire) && MAIN_FUTEX[slot] == addr {
+            if slot == caller as usize
+                && MAIN_BLOCKED[slot].load(Ordering::Acquire)
+                && MAIN_FUTEX[slot] == addr
+            {
                 MAIN_FUTEX[slot] = 0;
                 (&mut *main_ctx(slot)).x[0] = 0;
                 MAIN_BLOCKED[slot].store(false, Ordering::Release);
@@ -2370,7 +2377,10 @@ fn futex_wake(addr: u64, n: u64) -> u64 {
         while cur >= 0 && woke < limit {
             let index = cur as usize;
             let next = THREADS[index].futex_next;
-            if THREADS[index].futex_addr == addr && THREADS[index].state == ST_BLOCKED {
+            if THREADS[index].futex_addr == addr
+                && THREADS[index].state == ST_BLOCKED
+                && THREADS[index].slot == caller
+            {
                 if prev < 0 {
                     FUTEX_HEAD = next;
                 } else {
