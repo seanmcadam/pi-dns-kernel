@@ -124,6 +124,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
 
     uart_write("[2] Initializing logger...\r\n");
     logger::init();
+    #[cfg(feature = "board-pi4")]
+    fb_con::report();
     uart_write("[OK] Logger initialized\r\n");
 
     uart_write("[3] Initializing timer...\r\n");

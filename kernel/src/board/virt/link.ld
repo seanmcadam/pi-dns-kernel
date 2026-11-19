@@ -58,6 +58,9 @@ SECTIONS
     .dma ALIGN(4096) (NOLOAD) :
     {
         __dma_start = .;
+        . = ALIGN(64);
+        *(.dma.mbox)
+        . = ALIGN(64);
         *(.dma)
         *(.dma.*)
         . = ALIGN(4096);

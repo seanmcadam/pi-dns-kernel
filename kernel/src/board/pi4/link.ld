@@ -54,9 +54,16 @@ SECTIONS
 
     /* Virtio rings are not linked into the Pi 4 image. The symbols stay so
        the MMU code can describe an empty DMA window. Untested on hardware. */
+    /* .dma.mbox is the HDMI property buffer. It is placed first, on its
+       own cache lines, so a later .dma object cannot share that line.
+       Cleaning a shared line after the GPU replies writes the neighbor
+       back over the answer. */
     .dma ALIGN(4096) (NOLOAD) :
     {
         __dma_start = .;
+        . = ALIGN(64);
+        *(.dma.mbox)
+        . = ALIGN(64);
         *(.dma)
         *(.dma.*)
         . = ALIGN(4096);

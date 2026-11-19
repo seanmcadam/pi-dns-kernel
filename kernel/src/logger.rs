@@ -309,6 +309,88 @@ const fn empty_fan() -> FanSlot {
 static FAN: [FanSlot; FAN_LINES] = [const { empty_fan() }; FAN_LINES];
 static FAN_HEAD: AtomicU64 = AtomicU64::new(0);
 
+/// Lines recorded before the log task exists. `flush_preface` posts them
+/// once, in order, so they occupy the front of the telnet ring. After the
+/// ring wraps, a new reader still receives them before the live lines.
+const PREFACE_LINES: usize = 8;
+const PREFACE_CAP: usize = 80;
+const PREFACE_BIT: u64 = 1 << 63;
+
+struct Preface {
+    n: usize,
+    len: [u8; PREFACE_LINES],
+    data: [[u8; PREFACE_CAP]; PREFACE_LINES],
+}
+
+static PREFACE: Mutex<Preface> = Mutex::new(Preface {
+    n: 0,
+    len: [0; PREFACE_LINES],
+    data: [[0; PREFACE_CAP]; PREFACE_LINES],
+});
+
+/// Keep one early line. The logger may not be installed yet, and the log
+/// task is not running, so this does not touch the queue.
+#[cfg(feature = "board-pi4")]
+pub fn save_early(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let mut pre = PREFACE.lock();
+    if pre.n >= PREFACE_LINES {
+        return;
+    }
+    let n = text.len().min(PREFACE_CAP);
+    let i = pre.n;
+    pre.data[i][..n].copy_from_slice(&text.as_bytes()[..n]);
+    pre.len[i] = n as u8;
+    pre.n += 1;
+}
+
+/// UART copy of the saved lines. Call after `init` and before the log task.
+#[cfg(feature = "board-pi4")]
+pub fn replay_early() {
+    let mut copied = [[0u8; PREFACE_CAP]; PREFACE_LINES];
+    let mut lens = [0u8; PREFACE_LINES];
+    let n = {
+        let pre = PREFACE.lock();
+        let n = pre.n.min(PREFACE_LINES);
+        for i in 0..n {
+            let len = pre.len[i] as usize;
+            copied[i][..len].copy_from_slice(&pre.data[i][..len]);
+            lens[i] = pre.len[i];
+        }
+        n
+    };
+    for i in 0..n {
+        let len = lens[i] as usize;
+        if let Ok(text) = core::str::from_utf8(&copied[i][..len]) {
+            log::info!("{text}");
+        }
+    }
+}
+
+/// Queue the saved lines at info level. The log task publishes them.
+pub fn flush_preface() {
+    let mut copied = [[0u8; PREFACE_CAP]; PREFACE_LINES];
+    let mut lens = [0u8; PREFACE_LINES];
+    let n = {
+        let pre = PREFACE.lock();
+        let n = pre.n.min(PREFACE_LINES);
+        for i in 0..n {
+            let len = pre.len[i] as usize;
+            copied[i][..len].copy_from_slice(&pre.data[i][..len]);
+            lens[i] = pre.len[i];
+        }
+        n
+    };
+    for i in 0..n {
+        let len = lens[i] as usize;
+        if len > 0 {
+            post(1, 0, &copied[i][..len]);
+        }
+    }
+}
+
 pub struct FanLine {
     pub next: u64,
     pub dropped: u64,
@@ -336,6 +418,60 @@ pub fn fan_publish(text: &[u8]) {
 }
 
 pub fn fan_read(cursor: u64) -> Option<FanLine> {
+    if cursor & PREFACE_BIT != 0 || cursor == 0 {
+        if let Some(line) = read_sticky(cursor) {
+            return Some(line);
+        }
+        if cursor & PREFACE_BIT != 0 {
+            let head = FAN_HEAD.load(Ordering::Acquire);
+            let join = if head > FAN_LINES as u64 {
+                head - FAN_LINES as u64
+            } else {
+                0
+            };
+            return read_fan(join);
+        }
+    }
+    read_fan(cursor)
+}
+
+fn read_sticky(cursor: u64) -> Option<FanLine> {
+    let index = if cursor & PREFACE_BIT != 0 {
+        (cursor & !PREFACE_BIT) as usize
+    } else if cursor == 0 && FAN_HEAD.load(Ordering::Acquire) > FAN_LINES as u64 {
+        0
+    } else {
+        return None;
+    };
+    let pre = PREFACE.lock();
+    if index >= pre.n {
+        return None;
+    }
+    let len = pre.len[index] as usize;
+    let mut bytes = [0u8; FAN_CAP];
+    let prefix = b"[INFO ] ";
+    let take = len.min(FAN_CAP - prefix.len());
+    bytes[..prefix.len()].copy_from_slice(prefix);
+    bytes[prefix.len()..prefix.len() + take].copy_from_slice(&pre.data[index][..take]);
+    let next = if index + 1 < pre.n {
+        PREFACE_BIT | (index as u64 + 1)
+    } else {
+        let head = FAN_HEAD.load(Ordering::Acquire);
+        if head > FAN_LINES as u64 {
+            head - FAN_LINES as u64
+        } else {
+            0
+        }
+    };
+    Some(FanLine {
+        next,
+        dropped: 0,
+        len: prefix.len() + take,
+        bytes,
+    })
+}
+
+fn read_fan(cursor: u64) -> Option<FanLine> {
     let head = FAN_HEAD.load(Ordering::Acquire);
     if cursor >= head {
         return None;

@@ -7,21 +7,26 @@
 //! already holds the console, or another core does, the extra copy is
 //! skipped. The UART write has already happened.
 //!
-//! The mailbox buffer is 16-byte aligned in `.dma`. The coarse map is
-//! write-back, so every mailbox word is cleaned and invalidated. The GPU
-//! bus address is the physical address with `0xC0000000` set. A refused
-//! call is tried once more with the raw physical address. A returned
-//! address whose top bits are a Pi 4 alias becomes an ARM address with
-//! `bus & 0x3FFFFFFF`. Pixels are stored through the coarse map and the
-//! cache is cleaned, then the strict map moves them to a non-cacheable
-//! window. A mailbox that never answers gives up on a counter timeout
-//! and a spin budget.
+//! The mailbox buffer is 64-byte aligned in `.dma.mbox`, which the linker
+//! places ahead of every other DMA object. The coarse map is write-back,
+//! so the whole buffer is cleaned before the call and invalidated after
+//! it. A clean after the reply would write a dirty neighbor back over
+//! the GPU's answer, which is why the buffer does not share a line.
+//! The GPU bus address is the physical address with `0xC0000000` set. A
+//! refused call is tried once more with the raw physical address. A
+//! returned address whose top bits are a Pi 4 alias becomes an ARM
+//! address with `bus & 0x3FFFFFFF`. The reply is read twice and kept
+//! only when both copies match and the response code is success. Pixels
+//! are stored through the coarse map and the cache is cleaned, then the
+//! strict map moves them to a non-cacheable window. A mailbox that never
+//! answers gives up on a counter timeout and a spin budget and leaves
+//! the firmware scanout alone.
 //!
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
 
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 mod glyphs {
     include!("../../display-console/src/font.rs");
@@ -64,8 +69,16 @@ struct Prop {
     words: [u32; 48],
 }
 
-#[link_section = ".dma"]
+const _: () = assert!(core::mem::align_of::<Prop>() == 64);
+const _: () = assert!(core::mem::size_of::<Prop>() % 64 == 0);
+
+#[link_section = ".dma.mbox"]
 static mut PROP: Prop = Prop { words: [0; 48] };
+
+const MBOX_TIMEOUT: u8 = 1;
+const MBOX_ALIGN: u8 = 2;
+const MBOX_MISMATCH: u8 = 3;
+static MBOX_FAIL: AtomicU8 = AtomicU8::new(0);
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 static mut SAVED_DAIF: u64 = 0;
@@ -144,6 +157,12 @@ pub fn announce() {
     }
 }
 
+/// Info lines for the mailbox result. Call after the logger is installed.
+/// The same text is posted when the log task starts, so telnet keeps it.
+pub fn report() {
+    crate::logger::replay_early();
+}
+
 /// Point the painter at the non-cacheable window. The strict map has to
 /// be installed first. A refused window keeps the write-back alias.
 pub fn switch_to_nc() {
@@ -158,6 +177,8 @@ pub fn switch_to_nc() {
             if let Some(va) = crate::mmu::map_framebuffer(screen.pa, screen.bytes) {
                 screen.ptr = va as *mut u8;
                 screen.clean = false;
+            } else {
+                save_line("hdmi nc map failed");
             }
         }
     }
@@ -303,20 +324,35 @@ fn bring_up() -> bool {
     // loaded and no vc4-kms overlay, that scanout is the one to keep.
     // Setting another size, or the blank tag, made this board drop HDMI
     // to no signal. Take the existing buffer first. Set that same size
-    // only when the firmware will not hand the buffer over. A made-up
-    // 1280x720 is not a fallback: it is the call that removes the signal.
-    let mut attempt = 0;
+    // only when the firmware answered but will not hand the buffer over.
+    // A silent mailbox is not a reason to send SET_PHYS: that call is
+    // what removes the signal. A made-up 1280x720 is not a fallback.
+    note_prop();
+    let mut attempt = 0u32;
     while attempt < 4 {
+        clear_probe();
         if let Some((w, h)) = current_size() {
-            if let Some(mode) = keep_mode(w, h) {
-                return finish(mode);
-            }
-            if let Some(mode) = allocate(w, h) {
-                return finish(mode);
+            match keep_mode(w, h) {
+                Ok(mode) => {
+                    emit_probe(attempt);
+                    return finish(mode, attempt);
+                }
+                Err(KeepFail::Rejected) => {
+                    // Record why the firmware buffer was refused before
+                    // the same-size allocate overwrites that result.
+                    emit_probe(attempt);
+                    if let Some(mode) = allocate(w, h) {
+                        emit_probe(attempt);
+                        return finish(mode, attempt);
+                    }
+                }
+                Err(KeepFail::Silent) => {}
             }
         }
+        emit_probe(attempt);
         attempt += 1;
     }
+    save_line("hdmi none retry 4");
     false
 }
 
@@ -329,8 +365,12 @@ struct Mode {
     bgr: bool,
 }
 
-fn finish(mode: Mode) -> bool {
+fn finish(mode: Mode, retry: u32) -> bool {
     if !fb_reachable(mode.pa, mode.bytes) {
+        let mut line = Line::new();
+        line.push("hdmi unreachable pa ");
+        line.hex32(mode.pa as u32);
+        save_line(line.text());
         return false;
     }
     unsafe {
@@ -357,6 +397,20 @@ fn finish(mode: Mode) -> bool {
     MODE_W.store(mode.width, Ordering::Relaxed);
     MODE_H.store(mode.height, Ordering::Relaxed);
     READY.store(true, Ordering::Release);
+    let mut line = Line::new();
+    line.push("hdmi fb ");
+    line.dec(mode.width as u64);
+    line.push("x");
+    line.dec(mode.height as u64);
+    line.push(" p");
+    line.dec(mode.pitch as u64);
+    line.push(" pa ");
+    line.hex32(mode.pa as u32);
+    line.push(" bytes ");
+    line.dec(mode.bytes);
+    line.push(" retry ");
+    line.dec(retry as u64);
+    save_line(line.text());
     true
 }
 
@@ -410,6 +464,180 @@ fn fb_reachable(pa: u64, bytes: u64) -> bool {
     true
 }
 
+enum KeepFail {
+    Silent,
+    Rejected,
+}
+
+struct Probe {
+    get_code: u32,
+    width: u32,
+    height: u32,
+    step: u8,
+    step_code: u32,
+    pa: u32,
+    pitch: u32,
+}
+
+static mut PROBE: Probe = Probe {
+    get_code: 0,
+    width: 0,
+    height: 0,
+    step: 0,
+    step_code: 0,
+    pa: 0,
+    pitch: 0,
+};
+
+fn clear_probe() {
+    unsafe {
+        *addr_of_mut!(PROBE) = Probe {
+            get_code: 0,
+            width: 0,
+            height: 0,
+            step: 0,
+            step_code: 0,
+            pa: 0,
+            pitch: 0,
+        };
+    }
+}
+
+fn note_get(code: u32, width: u32, height: u32) {
+    unsafe {
+        let probe = &mut *addr_of_mut!(PROBE);
+        probe.get_code = code;
+        probe.width = width;
+        probe.height = height;
+    }
+}
+
+fn note_step(step: u8, code: u32, bus: u32, pitch: u32) {
+    unsafe {
+        let probe = &mut *addr_of_mut!(PROBE);
+        probe.step = step;
+        probe.step_code = code;
+        probe.pa = bus & 0x3FFF_FFFF;
+        probe.pitch = pitch;
+    }
+}
+
+fn note_prop() {
+    let virt = addr_of!(PROP) as u64;
+    let phys = crate::addr::virt_to_phys(virt) as u32;
+    let mut line = Line::new();
+    line.push("hdmi prop ");
+    line.hex32(phys);
+    if (virt as usize) % 64 == 0 {
+        line.push(" align 64");
+    } else {
+        line.push(" misaligned");
+    }
+    save_line(line.text());
+}
+
+fn emit_probe(try_n: u32) {
+    let probe = unsafe { &*addr_of!(PROBE) };
+    let mut line = Line::new();
+    line.push("hdmi t");
+    line.dec(try_n as u64);
+    line.push(" get ");
+    line.hex32(probe.get_code);
+    if probe.width != 0 {
+        line.push(" ");
+        line.dec(probe.width as u64);
+        line.push("x");
+        line.dec(probe.height as u64);
+    }
+    if probe.get_code == 0 {
+        line.push(" ");
+        line.push(fail_name());
+    }
+    if probe.step == 1 {
+        line.push(" keep ");
+        line.hex32(probe.step_code);
+    } else if probe.step == 2 {
+        line.push(" set ");
+        line.hex32(probe.step_code);
+    }
+    if probe.pa != 0 {
+        line.push(" pa ");
+        line.hex32(probe.pa);
+        line.push(" p");
+        line.dec(probe.pitch as u64);
+    } else if probe.step != 0 && probe.step_code == 0 {
+        line.push(" ");
+        line.push(fail_name());
+    }
+    save_line(line.text());
+}
+
+fn fail_name() -> &'static str {
+    match MBOX_FAIL.load(Ordering::Relaxed) {
+        MBOX_ALIGN => "align",
+        MBOX_MISMATCH => "mismatch",
+        MBOX_TIMEOUT => "timeout",
+        _ => "no-reply",
+    }
+}
+
+fn save_line(text: &str) {
+    crate::logger::save_early(text);
+}
+
+struct Line {
+    buf: [u8; 80],
+    n: usize,
+}
+
+impl Line {
+    fn new() -> Self {
+        Self { buf: [0; 80], n: 0 }
+    }
+
+    fn push(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if self.n >= self.buf.len() {
+                break;
+            }
+            self.buf[self.n] = byte;
+            self.n += 1;
+        }
+    }
+
+    fn hex32(&mut self, value: u32) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut tmp = [0u8; 8];
+        let mut shift = 28i32;
+        let mut i = 0;
+        while i < 8 {
+            tmp[i] = HEX[((value >> shift) & 0xf) as usize];
+            shift -= 4;
+            i += 1;
+        }
+        self.push(core::str::from_utf8(&tmp).unwrap_or("00000000"));
+    }
+
+    fn dec(&mut self, mut value: u64) {
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        if value == 0 {
+            self.push("0");
+            return;
+        }
+        while value > 0 && i > 0 {
+            i -= 1;
+            tmp[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        self.push(core::str::from_utf8(&tmp[i..]).unwrap_or("0"));
+    }
+
+    fn text(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.n]).unwrap_or("hdmi log")
+    }
+}
+
 fn current_size() -> Option<(u32, u32)> {
     if let Some(size) = current_size_at(true) {
         return Some(size);
@@ -422,11 +650,17 @@ fn current_size_at(bus_alias: bool) -> Option<(u32, u32)> {
     msg[0] = 32;
     msg[2] = TAG_GET_PHYS;
     msg[3] = 8;
-    if !exchange(&mut msg, bus_alias) || msg[1] != REQ_OK {
+    if !exchange(&mut msg, bus_alias) {
+        note_get(0, 0, 0);
+        return None;
+    }
+    if msg[0] != 32 || msg[1] != REQ_OK {
+        note_get(msg[1], 0, 0);
         return None;
     }
     let width = msg[5];
     let height = msg[6];
+    note_get(msg[1], width, height);
     if (320..=3840).contains(&width) && (240..=2160).contains(&height) {
         Some((width, height))
     } else {
@@ -434,14 +668,22 @@ fn current_size_at(bus_alias: bool) -> Option<(u32, u32)> {
     }
 }
 
-fn keep_mode(width: u32, height: u32) -> Option<Mode> {
-    if let Some(mode) = keep_mode_at(width, height, true) {
-        return Some(mode);
+fn keep_mode(width: u32, height: u32) -> Result<Mode, KeepFail> {
+    let first = keep_mode_at(width, height, true);
+    if first.is_ok() {
+        return first;
     }
-    keep_mode_at(width, height, false)
+    let second = keep_mode_at(width, height, false);
+    if second.is_ok() {
+        return second;
+    }
+    match (&first, &second) {
+        (Err(KeepFail::Rejected), _) | (_, Err(KeepFail::Rejected)) => Err(KeepFail::Rejected),
+        _ => Err(KeepFail::Silent),
+    }
 }
 
-fn keep_mode_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
+fn keep_mode_at(width: u32, height: u32, bus_alias: bool) -> Result<Mode, KeepFail> {
     let mut msg = [0u32; 40];
     let mut n = 1usize;
     msg[n] = 0;
@@ -457,27 +699,43 @@ fn keep_mode_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
     n = tag1(&mut msg, n, TAG_GET_ORDER, 0);
     msg[n] = 0;
     n += 1;
-    msg[0] = (n * 4) as u32;
-    if !exchange(&mut msg[..n], bus_alias) || msg[1] != REQ_OK {
-        return None;
+    let sent = (n * 4) as u32;
+    msg[0] = sent;
+    if !exchange(&mut msg[..n], bus_alias) {
+        note_step(1, 0, 0, 0);
+        return Err(KeepFail::Silent);
     }
     let depth = msg[depth_at + 3];
     let order = msg[order_at + 3];
     let bus = msg[alloc_at + 3];
     let gpu_bytes = msg[alloc_at + 4] as u64;
     let pitch = msg[pitch_at + 3];
-    if depth != 32 || width < CELL_W || pitch < width.saturating_mul(4) || bus == 0 {
-        return None;
+    note_step(1, msg[1], bus, pitch);
+    if msg[0] != sent {
+        return Err(KeepFail::Silent);
     }
-    let bytes = (pitch as u64).checked_mul(height as u64)?;
+    if msg[1] != REQ_OK {
+        return Err(KeepFail::Rejected);
+    }
+    if depth != 32
+        || width < CELL_W
+        || pitch % 4 != 0
+        || pitch < width.saturating_mul(4)
+        || bus == 0
+    {
+        return Err(KeepFail::Rejected);
+    }
+    let Some(bytes) = (pitch as u64).checked_mul(height as u64) else {
+        return Err(KeepFail::Rejected);
+    };
     if gpu_bytes < bytes {
-        return None;
+        return Err(KeepFail::Rejected);
     }
     let pa = (bus & 0x3FFF_FFFF) as u64;
     if pa % 4096 != 0 {
-        return None;
+        return Err(KeepFail::Rejected);
     }
-    Some(Mode {
+    Ok(Mode {
         width,
         height,
         pitch,
@@ -510,11 +768,10 @@ fn allocate_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
     n = tag1(&mut msg, n, TAG_PITCH, 0);
     msg[n] = 0;
     n += 1;
-    msg[0] = (n * 4) as u32;
+    let sent = (n * 4) as u32;
+    msg[0] = sent;
     if !exchange(&mut msg[..n], bus_alias) {
-        return None;
-    }
-    if msg[1] != REQ_OK {
+        note_step(2, 0, 0, 0);
         return None;
     }
     let got_w = msg[5];
@@ -524,7 +781,11 @@ fn allocate_at(width: u32, height: u32, bus_alias: bool) -> Option<Mode> {
     let bus = msg[alloc_at + 3];
     let gpu_bytes = msg[alloc_at + 4] as u64;
     let pitch = msg[pitch_at + 3];
-    if got_w < CELL_W || got_h < CELL_H || depth != 32 || pitch < got_w * 4 {
+    note_step(2, msg[1], bus, pitch);
+    if msg[0] != sent || msg[1] != REQ_OK {
+        return None;
+    }
+    if got_w < CELL_W || got_h < CELL_H || depth != 32 || pitch % 4 != 0 || pitch < got_w * 4 {
         return None;
     }
     let bytes = (pitch as u64).checked_mul(got_h as u64)?;
@@ -567,31 +828,59 @@ fn tag1(msg: &mut [u32], n: usize, tag: u32, value: u32) -> usize {
 }
 
 fn exchange(msg: &mut [u32], bus_alias: bool) -> bool {
-    if msg.len() > 48 {
+    MBOX_FAIL.store(0, Ordering::Relaxed);
+    if msg.is_empty() || msg.len() > 48 {
+        MBOX_FAIL.store(MBOX_TIMEOUT, Ordering::Relaxed);
         return false;
     }
     let start = crate::timer::get_ticks();
     unsafe {
         let prop = addr_of_mut!(PROP);
+        let virt = prop as usize;
+        if virt % 64 != 0 {
+            MBOX_FAIL.store(MBOX_ALIGN, Ordering::Relaxed);
+            return false;
+        }
         let dst = addr_of_mut!((*prop).words).cast::<u32>();
+        let words = core::mem::size_of::<Prop>() / 4;
+        for i in 0..words {
+            dst.add(i).write_volatile(0);
+        }
         for (i, word) in msg.iter().enumerate() {
             dst.add(i).write_volatile(*word);
         }
-        let virt = prop as u64;
-        civac(virt as *const u8, msg.len() * 4);
-        let phys = crate::addr::virt_to_phys(virt);
+        let bytes = core::mem::size_of::<Prop>();
+        civac(virt as *const u8, bytes);
+        let phys = crate::addr::virt_to_phys(virt as u64);
         let mut bus = phys as u32;
         if bus_alias {
             bus |= 0xC000_0000;
         }
         if !mbox_send((bus & !0xF) | 8, start) {
+            MBOX_FAIL.store(MBOX_TIMEOUT, Ordering::Relaxed);
             return false;
         }
         // Invalidate only. dc civac would write a dirty line back on
-        // top of the GPU's reply.
-        drop_lines(virt as *const u8, msg.len() * 4);
-        for (i, word) in msg.iter_mut().enumerate() {
-            *word = dst.add(i).read_volatile();
+        // top of the GPU's reply. Read twice so a stale line cannot
+        // pass as a mode.
+        drop_lines(virt as *const u8, bytes);
+        let mut first = [0u32; 48];
+        let n = msg.len();
+        for i in 0..n {
+            first[i] = dst.add(i).read_volatile();
+        }
+        drop_lines(virt as *const u8, bytes);
+        let mut mismatch = false;
+        for i in 0..n {
+            let word = dst.add(i).read_volatile();
+            if word != first[i] {
+                mismatch = true;
+            }
+            msg[i] = word;
+        }
+        if mismatch {
+            MBOX_FAIL.store(MBOX_MISMATCH, Ordering::Relaxed);
+            return false;
         }
     }
     true

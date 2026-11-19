@@ -918,6 +918,9 @@ pub fn start_log() -> Result<(), ()> {
         let ksp = addr_of!(LOG_TASK.kstack) as u64 + KSTACK_BYTES as u64;
         crate::percpu::set_slot(LOG_SLOT);
         crate::percpu::set_thread_index(0);
+        // Display init ran before this task existed. Post those lines
+        // first so they are the oldest records in the telnet ring.
+        crate::logger::flush_preface();
         LOG_LIVE = true;
         run_until_yield(LOG_SLOT, ctx, ksp)
     }
