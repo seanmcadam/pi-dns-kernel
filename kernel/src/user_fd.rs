@@ -45,6 +45,7 @@
 //!  60  set_upstream_health(ptr, len). DNS task. count, then count*(ipv4, up).
 //!  61  upstream_health(buf, cap) -> len of that blob. Empty until the first publish.
 //!  62  config_probe_secs. Upstream health-probe interval, 1..=3600.
+//!  63  net_ready. 1 once the interface has an address, else 0.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -102,6 +103,7 @@ const SET_DNS_TOP: u64 = 57;
 const SET_UPSTREAM_HEALTH: u64 = 60;
 const UPSTREAM_HEALTH: u64 = 61;
 const CONFIG_PROBE_SECS: u64 = 62;
+const NET_READY: u64 = 63;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -206,6 +208,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         SET_UPSTREAM_HEALTH => set_upstream_health(args[0], args[1]),
         UPSTREAM_HEALTH => upstream_health(args[0], args[1]),
         CONFIG_PROBE_SECS => crate::config_manager::probe_interval_secs() as i64,
+        NET_READY => i64::from(crate::net::has_address()),
         _ => -1,
     };
     value as u64

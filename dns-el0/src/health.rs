@@ -1,15 +1,24 @@
 //! Which configured upstreams are in the lookup rotation.
 //!
-//! Every server starts up. A probe timeout, or a forwarded query timing
-//! out, marks that server down and the next lookup skips it. A probe that
-//! gets any reply marks it up again. When every server is down the
-//! rotation is the full list, so a total outage still tries them instead
-//! of failing every query. Client forward ids stay below `0x8000`. Probe
-//! ids use that bit, so a probe reply cannot be returned to a client.
+//! Every server starts up. A probe timeout or a forwarded query timing
+//! out counts as one failure. Three failures in a row, with no reply in
+//! between, mark that server down and the next lookup skips it. Any
+//! reply, probe or forwarded, clears the streak and marks the server up.
+//! One queued timeout is not enough: under load a healthy server still
+//! answers the next query. When every server is down the rotation is the
+//! full list, so a total outage still tries them instead of failing every
+//! query. Probes stay off until the interface has an address. Client
+//! forward ids stay below `0x8000`. Probe ids use that bit, so a probe
+//! reply cannot be returned to a client.
 
 pub const MAX: usize = 8;
 pub const LOG_GAP_MS: u64 = 5_000;
 pub const PROBE_ID_BASE: u16 = 0x8000;
+/// Consecutive misses before a server leaves the rotation.
+pub const FAIL_LIMIT: u8 = 3;
+/// `health.invalid` A, a short NXDOMAIN or REFUSED. A root NS answer is
+/// hundreds of bytes and was dropped on the shared upstream socket.
+pub const PROBE_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Transition {
@@ -22,7 +31,9 @@ pub struct Health {
     up: [bool; MAX],
     ip: [[u8; 4]; MAX],
     logged: [bool; MAX],
+    log_up: [bool; MAX],
     log_ms: [u64; MAX],
+    fail: [u8; MAX],
     len: usize,
 }
 
@@ -32,7 +43,9 @@ impl Health {
             up: [true; MAX],
             ip: [[0; 4]; MAX],
             logged: [false; MAX],
+            log_up: [false; MAX],
             log_ms: [0; MAX],
+            fail: [0; MAX],
             len: if len > MAX { MAX } else { len },
         }
     }
@@ -45,31 +58,48 @@ impl Health {
         index < self.len && self.up[index]
     }
 
-    /// Keep the up/down bit of an address that is still configured.
-    /// A new address starts up.
+    /// Keep the up/down bit and failure streak of an address that is
+    /// still configured. A new address starts up. The old table is
+    /// matched by copy: writing each new address into `self.ip` during
+    /// the search made a later slot miss its old entry and come back up.
     pub fn sync(&mut self, ips: &[[u8; 4]]) {
         let n = if ips.len() > MAX { MAX } else { ips.len() };
+        let old_len = self.len;
+        let old_ip = self.ip;
+        let old_up = self.up;
+        let old_logged = self.logged;
+        let old_log_up = self.log_up;
+        let old_log_ms = self.log_ms;
+        let old_fail = self.fail;
         let mut up = [true; MAX];
         let mut logged = [false; MAX];
+        let mut log_up = [false; MAX];
         let mut log_ms = [0u64; MAX];
+        let mut fail = [0u8; MAX];
+        let mut ip = [[0u8; 4]; MAX];
         let mut i = 0;
         while i < n {
             let mut j = 0;
-            while j < self.len {
-                if self.ip[j] == ips[i] {
-                    up[i] = self.up[j];
-                    logged[i] = self.logged[j];
-                    log_ms[i] = self.log_ms[j];
+            while j < old_len {
+                if old_ip[j] == ips[i] {
+                    up[i] = old_up[j];
+                    logged[i] = old_logged[j];
+                    log_up[i] = old_log_up[j];
+                    log_ms[i] = old_log_ms[j];
+                    fail[i] = old_fail[j];
                     break;
                 }
                 j += 1;
             }
-            self.ip[i] = ips[i];
+            ip[i] = ips[i];
             i += 1;
         }
+        self.ip = ip;
         self.up = up;
         self.logged = logged;
+        self.log_up = log_up;
         self.log_ms = log_ms;
+        self.fail = fail;
         self.len = n;
     }
 
@@ -83,7 +113,7 @@ impl Health {
         self.up[index] = false;
         Transition {
             changed: true,
-            log: self.should_log(index, now_ms),
+            log: self.should_log(index, now_ms, false),
         }
     }
 
@@ -97,8 +127,52 @@ impl Health {
         self.up[index] = true;
         Transition {
             changed: true,
-            log: self.should_log(index, now_ms),
+            log: self.should_log(index, now_ms, true),
         }
+    }
+
+    /// One miss. The server stays up until `FAIL_LIMIT` misses in a row.
+    pub fn note_failure(&mut self, ip: [u8; 4], now_ms: u64) -> Transition {
+        let Some(index) = self.find(ip) else {
+            return Transition {
+                changed: false,
+                log: false,
+            };
+        };
+        if self.fail[index] < FAIL_LIMIT {
+            self.fail[index] += 1;
+        }
+        if self.fail[index] >= FAIL_LIMIT {
+            self.mark_down(index, now_ms)
+        } else {
+            Transition {
+                changed: false,
+                log: false,
+            }
+        }
+    }
+
+    /// Any reply from this server. Clears the miss streak and marks it up.
+    pub fn note_success(&mut self, ip: [u8; 4], now_ms: u64) -> Transition {
+        let Some(index) = self.find(ip) else {
+            return Transition {
+                changed: false,
+                log: false,
+            };
+        };
+        self.fail[index] = 0;
+        self.mark_up(index, now_ms)
+    }
+
+    fn find(&self, ip: [u8; 4]) -> Option<usize> {
+        let mut i = 0;
+        while i < self.len {
+            if self.ip[i] == ip {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 
     pub fn mark_up_ip(&mut self, ip: [u8; 4], now_ms: u64) -> Transition {
@@ -175,14 +249,27 @@ impl Health {
         need
     }
 
-    fn should_log(&mut self, index: usize, now_ms: u64) -> bool {
-        if self.logged[index] && now_ms.saturating_sub(self.log_ms[index]) < LOG_GAP_MS {
+    fn should_log(&mut self, index: usize, now_ms: u64, now_up: bool) -> bool {
+        // A repeat of the same edge inside the gap stays quiet. The
+        // opposite edge is the line operators look for, so a recovery
+        // is logged even when the down line was a few seconds ago.
+        if self.logged[index]
+            && self.log_up[index] == now_up
+            && now_ms.saturating_sub(self.log_ms[index]) < LOG_GAP_MS
+        {
             return false;
         }
         self.logged[index] = true;
+        self.log_up[index] = now_up;
         self.log_ms[index] = now_ms;
         true
     }
+}
+
+/// Probes need a route. Until the interface has an address they only
+/// time out and condemn servers that are about to be replaced.
+pub fn probes_allowed(network_ready: bool) -> bool {
+    network_ready
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,8 +358,10 @@ impl Walk {
         }
     }
 
-    /// Mark the server we just timed out down, then step to the next
-    /// address in this snapshot. `next` is `None` when the snapshot is done.
+    /// Count one timeout against the server we just asked, then step to
+    /// the next address in this snapshot. The server leaves the rotation
+    /// only after `FAIL_LIMIT` misses. `next` is `None` when the snapshot
+    /// is done.
     pub fn on_timeout(&mut self, health: &mut Health, now_ms: u64) -> Step {
         let pos = self.pos as usize;
         if pos >= self.live_len as usize {
@@ -283,7 +372,7 @@ impl Walk {
             };
         }
         let failed = self.ips[pos];
-        let change = health.mark_down_ip(failed, now_ms);
+        let change = health.note_failure(failed, now_ms);
         let Some(choice) = crate::failover::after_timeout(
             self.live_len as usize,
             self.origin as usize,
@@ -331,17 +420,22 @@ pub fn next_client_id(next: &mut u16) -> u16 {
     id
 }
 
-/// A query for the root NS. Any reply, including REFUSED, means the
-/// server is up. Only a timeout marks it down.
-pub fn probe_query(id: u16) -> [u8; 17] {
-    let mut packet = [0u8; 17];
+/// A recursive A query for `health.invalid`. Any reply, including
+/// NXDOMAIN or REFUSED, means the server is up. The name is reserved, so
+/// the answer is a short packet instead of a root-NS referral.
+pub fn probe_query(id: u16) -> [u8; PROBE_LEN] {
+    let mut packet = [0u8; PROBE_LEN];
     let bytes = id.to_be_bytes();
     packet[0] = bytes[0];
     packet[1] = bytes[1];
     packet[2] = 0x01;
     packet[5] = 0x01;
-    packet[14] = 0x02;
-    packet[16] = 0x01;
+    packet[12] = 6;
+    packet[13..19].copy_from_slice(b"health");
+    packet[19] = 7;
+    packet[20..27].copy_from_slice(b"invalid");
+    packet[29] = 0x01;
+    packet[31] = 0x01;
     packet
 }
 
@@ -357,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn down_server_leaves_rotation_until_a_probe_marks_it_up() {
+    fn down_server_leaves_rotation_until_a_reply_marks_it_up() {
         let (mut health, ips) = three();
         assert_eq!(health.rotation().indices(), &[0, 1, 2]);
         let down = health.mark_down(1, 1_000);
@@ -369,22 +463,60 @@ mod tests {
         let mut walk = start_walk(&health, &ips, 0).unwrap();
         assert_eq!(walk.current_ip(), Some([1, 1, 1, 1]));
         let step = walk.on_timeout(&mut health, 2_000);
-        assert!(step.log_down);
+        assert!(!step.log_down);
+        assert!(health.is_up(0));
         assert_eq!(step.next, Some([3, 3, 3, 3]));
-        let done = walk.on_timeout(&mut health, 2_100);
-        assert!(done.next.is_none());
-        assert!(health.rotation().all_down);
-        assert_eq!(health.rotation().indices(), &[0, 1, 2]);
+        assert_eq!(health.rotation().indices(), &[0, 2]);
 
         let up = health.mark_up(1, 3_000);
-        assert!(up.changed);
-        assert!(!up.log);
-        assert_eq!(health.rotation().indices(), &[1]);
+        assert!(up.changed && up.log);
+        assert_eq!(health.rotation().indices(), &[0, 1, 2]);
         let later = health.mark_down(1, 1_000 + LOG_GAP_MS);
         assert!(later.changed && later.log);
         let back = health.mark_up(1, 1_000 + LOG_GAP_MS * 2);
         assert!(back.changed && back.log);
         assert!(health.is_up(1));
+    }
+
+    #[test]
+    fn one_forward_timeout_does_not_mark_a_healthy_server_down() {
+        let (mut health, ips) = three();
+        let mut walk = start_walk(&health, &ips, 0).unwrap();
+        let step = walk.on_timeout(&mut health, 1_000);
+        assert!(!step.log_down);
+        assert!(health.is_up(0));
+        assert_eq!(health.rotation().indices(), &[0, 1, 2]);
+        assert_eq!(step.next, Some([2, 2, 2, 2]));
+        assert!(!health.note_failure(ips[0], 1_500).changed);
+        assert!(health.is_up(0));
+        let down = health.note_failure(ips[0], 2_000);
+        assert!(down.changed && down.log);
+        assert!(!health.is_up(0));
+        assert_eq!(health.rotation().indices(), &[1, 2]);
+    }
+
+    #[test]
+    fn a_forwarded_reply_marks_the_server_up_and_clears_the_streak() {
+        let (mut health, ips) = three();
+        assert!(!health.note_failure(ips[1], 1_000).changed);
+        assert!(!health.note_failure(ips[1], 2_000).changed);
+        let down = health.note_failure(ips[1], 3_000);
+        assert!(down.changed && down.log);
+        assert!(!health.is_up(1));
+        let up = health.note_success(ips[1], 3_100);
+        assert!(up.changed && up.log);
+        assert!(health.is_up(1));
+        assert_eq!(health.rotation().indices(), &[0, 1, 2]);
+        assert!(!health.note_failure(ips[1], 4_000).changed);
+        assert!(!health.note_failure(ips[1], 5_000).changed);
+        assert!(health.is_up(1));
+        assert!(!health.note_success(ips[1], 6_000).changed);
+    }
+
+    #[test]
+    fn probes_wait_until_the_network_is_configured() {
+        assert!(!probes_allowed(false));
+        assert!(probes_allowed(true));
     }
 
     #[test]
@@ -424,6 +556,19 @@ mod tests {
         assert_eq!(&packed[1..5], &[2, 2, 2, 2]);
         assert_eq!(packed[5], 0);
         assert_eq!(packed[10], 1);
+
+        // Writing the new address into the table mid-search used to hide
+        // the old address, so a down server that moved later came back up.
+        let mut swapped = Health::new(0);
+        swapped.sync(&[[1, 1, 1, 1], [2, 2, 2, 2]]);
+        assert!(swapped.mark_down(0, 0).changed);
+        assert!(!swapped.note_failure([2, 2, 2, 2], 10).changed);
+        assert!(!swapped.note_failure([2, 2, 2, 2], 20).changed);
+        swapped.sync(&[[2, 2, 2, 2], [1, 1, 1, 1]]);
+        assert!(swapped.is_up(0));
+        assert!(!swapped.is_up(1));
+        assert!(swapped.note_failure([2, 2, 2, 2], 30).changed);
+        assert!(!swapped.is_up(0));
     }
 
     #[test]
@@ -437,10 +582,12 @@ mod tests {
         assert_eq!(probe_id(3), 0x8003);
         assert_eq!(probe_index(0x8003), 3);
         let query = probe_query(probe_id(3));
+        assert_eq!(query.len(), PROBE_LEN);
         assert_eq!(u16::from_be_bytes([query[0], query[1]]), 0x8003);
         assert_eq!(query[5], 1);
-        assert_eq!(query[12], 0);
-        assert_eq!(&query[13..17], &[0, 2, 0, 1]);
+        assert_eq!(&query[12..20], b"\x06health\x07");
+        assert_eq!(&query[20..28], b"invalid\x00");
+        assert_eq!(&query[28..32], &[0, 1, 0, 1]);
     }
 
     #[test]
