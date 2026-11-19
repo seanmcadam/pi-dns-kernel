@@ -5,7 +5,7 @@
 //! claim, and patching the live DMA buffer is what the old path did before
 //! handing the frame to the stack.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Ethernet source on the frozen Pi 4 frame. A VRRP gateway.
 pub const VRRP_MAC: [u8; 6] = [0x00, 0x00, 0x5e, 0x00, 0x01, 0x01];
@@ -20,6 +20,17 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static LEN: AtomicUsize = AtomicUsize::new(0);
 #[allow(dead_code)]
 static mut FRAME: [u8; FRAME_MAX] = [0; FRAME_MAX];
+
+/// Ethernet source of the last BOOTREPLY whose chaddr was ours. Bit 63
+/// means a MAC has been stored. The low 48 bits are that MAC.
+#[allow(dead_code)]
+static REPLY_MAC: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)]
+static ARP_ARMED: AtomicBool = AtomicBool::new(false);
+#[allow(dead_code)]
+static ARP_LEN: AtomicUsize = AtomicUsize::new(0);
+#[allow(dead_code)]
+static mut ARP_FRAME: [u8; 64] = [0; 64];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
@@ -59,6 +70,112 @@ pub fn copy_out(dst: &mut [u8]) -> usize {
     let n = LEN.load(Ordering::Relaxed).min(dst.len());
     unsafe {
         core::ptr::copy_nonoverlapping(core::ptr::addr_of!(FRAME).cast(), dst.as_mut_ptr(), n);
+    }
+    n
+}
+
+/// Remember the Ethernet source of a DHCP reply that belongs to this board.
+/// The on-link relay (the gateway) is that source. A later neighbor install
+/// uses it when an ARP reply for the gateway does not arrive.
+#[allow(dead_code)]
+pub fn note_reply_mac(mac: [u8; 6]) {
+    if mac == [0; 6] || mac == [0xff; 6] || mac[0] & 1 != 0 {
+        return;
+    }
+    let mut packed = 1u64 << 63;
+    for (index, byte) in mac.iter().enumerate() {
+        packed |= (*byte as u64) << (index * 8);
+    }
+    REPLY_MAC.store(packed, Ordering::Release);
+}
+
+#[allow(dead_code)]
+pub fn reply_mac() -> Option<[u8; 6]> {
+    let packed = REPLY_MAC.load(Ordering::Acquire);
+    if packed & (1 << 63) == 0 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (index, byte) in mac.iter_mut().enumerate() {
+        *byte = (packed >> (index * 8)) as u8;
+    }
+    Some(mac)
+}
+
+/// One unicast ARP reply, `gw_ip` is at `gw_mac`, aimed at `our_mac`.
+/// smoltcp learns neighbors only from ARP, so this is how the gateway
+/// MAC on the DHCP frame becomes a route next hop.
+pub fn write_gateway_arp(
+    dst: &mut [u8],
+    our_mac: &[u8; 6],
+    our_ip: [u8; 4],
+    gw_mac: &[u8; 6],
+    gw_ip: [u8; 4],
+) -> usize {
+    const LEN: usize = 60;
+    if dst.len() < LEN {
+        return 0;
+    }
+    dst[..LEN].fill(0);
+    dst[..6].copy_from_slice(our_mac);
+    dst[6..12].copy_from_slice(gw_mac);
+    dst[12] = 0x08;
+    dst[13] = 0x06;
+    dst[14] = 0x00;
+    dst[15] = 0x01;
+    dst[16] = 0x08;
+    dst[17] = 0x00;
+    dst[18] = 6;
+    dst[19] = 4;
+    dst[20] = 0x00;
+    dst[21] = 0x02;
+    dst[22..28].copy_from_slice(gw_mac);
+    dst[28..32].copy_from_slice(&gw_ip);
+    dst[32..38].copy_from_slice(our_mac);
+    dst[38..42].copy_from_slice(&our_ip);
+    LEN
+}
+
+#[allow(dead_code)]
+pub fn stage_gateway_arp(
+    our_mac: &[u8; 6],
+    our_ip: [u8; 4],
+    mask: [u8; 4],
+    gw_mac: &[u8; 6],
+    gw_ip: [u8; 4],
+) -> bool {
+    if gw_ip == our_ip || !on_link(our_ip, mask, gw_ip) {
+        return false;
+    }
+    if *gw_mac == [0; 6] || gw_mac[0] & 1 != 0 {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    let n = write_gateway_arp(&mut buf, our_mac, our_ip, gw_mac, gw_ip);
+    if n == 0 {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), core::ptr::addr_of_mut!(ARP_FRAME).cast(), n);
+    }
+    ARP_LEN.store(n, Ordering::Relaxed);
+    ARP_ARMED.store(true, Ordering::Release);
+    true
+}
+
+#[allow(dead_code)]
+pub fn take_arp_len() -> Option<u16> {
+    if !ARP_ARMED.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    Some(ARP_LEN.load(Ordering::Relaxed) as u16)
+}
+
+#[allow(dead_code)]
+pub fn copy_arp(dst: &mut [u8]) -> usize {
+    let n = ARP_LEN.load(Ordering::Relaxed).min(dst.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(ARP_FRAME).cast(), dst.as_mut_ptr(), n);
     }
     n
 }
@@ -399,6 +516,78 @@ mod tests {
             dev.tx[before..].iter().all(|frame| dhcp_type(frame) != Some(3)),
             "a foreign chaddr produced a REQUEST"
         );
+    }
+
+    #[test]
+    fn gateway_arp_reply_is_unicast_and_fills_the_neighbor() {
+        note_reply_mac(VRRP_MAC);
+        assert_eq!(reply_mac(), Some(VRRP_MAC));
+        note_reply_mac([0xff; 6]);
+        assert_eq!(reply_mac(), Some(VRRP_MAC));
+
+        let mac = PHOTO_MAC;
+        let our_ip = [172, 18, 3, 137];
+        let gw_ip = [172, 18, 3, 1];
+        let mask = [255, 255, 255, 0];
+        assert!(stage_gateway_arp(&mac, our_ip, mask, &VRRP_MAC, gw_ip));
+        let n = take_arp_len().expect("staged") as usize;
+        let mut frame = [0u8; 64];
+        assert_eq!(copy_arp(&mut frame), n);
+        assert_eq!(&frame[..6], &mac);
+        assert_eq!(&frame[6..12], &VRRP_MAC);
+        assert_eq!(&frame[12..14], &[0x08, 0x06]);
+        assert_eq!(&frame[20..22], &[0x00, 0x02]);
+        assert_eq!(&frame[28..32], &gw_ip);
+        assert!(!stage_gateway_arp(&mac, our_ip, mask, &VRRP_MAC, [8, 8, 8, 8]));
+
+        let mut dev = Pipe::default();
+        let eth = smoltcp::wire::EthernetAddress::from_bytes(&mac);
+        let mut config = smoltcp::iface::Config::new(eth.into());
+        config.random_seed = 1;
+        let mut iface =
+            smoltcp::iface::Interface::new(config, &mut dev, smoltcp::time::Instant::from_millis(0));
+        let ip = smoltcp::wire::Ipv4Address::from_bytes(&our_ip);
+        iface.update_ip_addrs(|addrs| {
+            addrs.clear();
+            addrs.push(smoltcp::wire::IpCidr::new(ip.into(), 24)).unwrap();
+        });
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::from_bytes(&gw_ip))
+            .unwrap();
+        dev.rx.push(frame[..n].to_vec());
+        let mut sockets = smoltcp::iface::SocketSet::new(Vec::new());
+        let _ = iface.poll(smoltcp::time::Instant::from_millis(1), &mut dev, &mut sockets);
+
+        let rx = smoltcp::socket::udp::PacketBuffer::new(
+            vec![smoltcp::storage::PacketMetadata::EMPTY; 2],
+            vec![0u8; 256],
+        );
+        let tx = smoltcp::socket::udp::PacketBuffer::new(
+            vec![smoltcp::storage::PacketMetadata::EMPTY; 2],
+            vec![0u8; 256],
+        );
+        let mut sock = smoltcp::socket::udp::Socket::new(rx, tx);
+        sock.bind(53535).unwrap();
+        let handle = sockets.add(sock);
+        sockets
+            .get_mut::<smoltcp::socket::udp::Socket>(handle)
+            .send_slice(
+                b"hi",
+                smoltcp::wire::IpEndpoint::new(
+                    smoltcp::wire::Ipv4Address::new(8, 8, 8, 8).into(),
+                    53,
+                ),
+            )
+            .unwrap();
+        let before = dev.tx.len();
+        let _ = iface.poll(smoltcp::time::Instant::from_millis(2), &mut dev, &mut sockets);
+        let sent = dev.tx[before..]
+            .iter()
+            .find(|pkt| pkt.len() >= 34 && pkt[12] == 0x08 && pkt[13] == 0x00)
+            .expect("off-link udp was not sent");
+        assert_eq!(&sent[..6], &VRRP_MAC, "udp did not use the gateway mac");
+        assert_eq!(&sent[30..34], &[8, 8, 8, 8]);
     }
 
     fn dhcp_type(frame: &[u8]) -> Option<u8> {

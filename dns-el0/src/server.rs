@@ -4,7 +4,7 @@
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use dns_cache::DnsCache;
 use dns_protocol::{DnsPacket, QueryType, RData, RecordClass, RecordType, ResourceRecord};
 
@@ -46,6 +46,8 @@ struct PendingQuery {
     qclass: u16,
     sent_ms: u64,
     upstream_idx: usize,
+    origin: usize,
+    tries: u8,
     original: Vec<u8>,
 }
 
@@ -149,6 +151,13 @@ static mut SHARED: *mut Shared = core::ptr::null_mut();
 static UPSTREAM_FD: AtomicI64 = AtomicI64::new(0);
 static STATE_LOCK: AtomicU32 = AtomicU32::new(0);
 static RETRY_KICK: AtomicU32 = AtomicU32::new(0);
+/// One plus the index of the upstream that last answered. Zero means none
+/// yet. A non-zero initializer would land in `.data` and the raw image
+/// would include the gap out to that section, which does not fit the
+/// 512 KiB code window.
+static PREFERRED: AtomicU32 = AtomicU32::new(0);
+static FAILOVER_KEY: AtomicU32 = AtomicU32::new(0);
+static FAILOVER_MS: AtomicU64 = AtomicU64::new(0);
 
 fn thread_stack(index: u64) -> u64 {
     (crate::HEAP_VA + crate::HEAP_SIZE
@@ -355,7 +364,9 @@ fn handle_client(
         udp_send(dns, &bytes, to_ip, to_port);
     }
     for (bytes, dest) in forwards {
-        udp_send(upstream, &bytes, dest, 53);
+        if !udp_send(upstream, &bytes, dest, 53) {
+            note_busy(dest);
+        }
     }
 }
 
@@ -414,7 +425,20 @@ fn handle_bytes(
     }
 
     let upstreams = load_upstreams();
-    if !remember_client || upstreams.is_empty() || pending.len() >= MAX_PENDING {
+    let preferred = PREFERRED.load(Ordering::Relaxed);
+    let preferred = if preferred == 0 {
+        0
+    } else {
+        preferred as usize - 1
+    };
+    let Some(choice) = crate::failover::first(upstreams.len(), preferred)
+    else {
+        if let Some(bytes) = error_response(&query, 2) {
+            replies.push((bytes, ip, port));
+        }
+        return;
+    };
+    if !remember_client || pending.len() >= MAX_PENDING {
         if let Some(bytes) = error_response(&query, 2) {
             replies.push((bytes, ip, port));
         }
@@ -424,7 +448,7 @@ fn handle_bytes(
     let upstream_id = next_upstream_id(next_id);
     let mut forwarded = packet.to_vec();
     set_id(&mut forwarded, upstream_id);
-    let dest = upstreams[0];
+    let dest = upstreams[choice.index];
     pending.push(PendingQuery {
         client_id: query.header.id,
         upstream_id,
@@ -434,7 +458,9 @@ fn handle_bytes(
         qtype,
         qclass,
         sent_ms: now_ms,
-        upstream_idx: 0,
+        upstream_idx: choice.index,
+        origin: choice.index,
+        tries: choice.tries,
         original: packet.to_vec(),
     });
     forwards.push((forwarded, dest));
@@ -453,19 +479,28 @@ fn retry_expired(upstream_fd: i64, dns_fd: i64, pending: &mut Vec<PendingQuery>,
             index += 1;
             continue;
         }
-        let next = pending[index].upstream_idx + 1;
-        if next < upstreams.len() {
+        let origin = pending[index].origin;
+        let tries = pending[index].tries;
+        let failed = pending[index].upstream_idx;
+        if let Some(choice) = crate::failover::after_timeout(upstreams.len(), origin, tries) {
             let id = next_upstream_id(next_id);
             let mut forwarded = pending[index].original.clone();
             set_id(&mut forwarded, id);
-            let dest = upstreams[next];
+            let dest = upstreams[choice.index];
+            note_failover(upstreams.get(failed).copied(), dest);
             pending[index].upstream_id = id;
-            pending[index].upstream_idx = next;
+            pending[index].upstream_idx = choice.index;
+            pending[index].tries = choice.tries;
             pending[index].sent_ms = now;
-            udp_send(upstream_fd, &forwarded, dest, 53);
+            if !udp_send(upstream_fd, &forwarded, dest, 53) {
+                note_busy(dest);
+            }
             index += 1;
         } else {
             let item = pending.remove(index);
+            if let Some(failed_ip) = upstreams.get(item.upstream_idx).copied() {
+                note_exhausted(failed_ip);
+            }
             if let Some(bytes) = servfail_from_query(&item.original) {
                 udp_send(dns_fd, &bytes, item.client_ip, item.client_port);
             }
@@ -485,6 +520,13 @@ fn take_upstream(packet: &[u8], dns_fd: i64, cache: &mut DnsCache, pending: &mut
     let mut packet = packet.to_vec();
     set_id(&mut packet, item.client_id);
     remember(cache, &item.name, item.qtype, item.qclass, &packet);
+    let remembered = item.upstream_idx as u32 + 1;
+    let previous = PREFERRED.swap(remembered, Ordering::Relaxed);
+    if previous != remembered {
+        if let Some(ip) = load_upstreams().get(item.upstream_idx).copied() {
+            post_upstream(b"dns upstream ", ip, b"");
+        }
+    }
     udp_send(dns_fd, &packet, item.client_ip, item.client_port);
 }
 
@@ -822,6 +864,100 @@ fn yield_now() {
 fn exit(code: u64) -> ! {
     let _ = sys(EXIT, code, 0, 0, 0, 0, 0);
     loop {}
+}
+
+fn note_failover(from: Option<[u8; 4]>, to: [u8; 4]) {
+    let Some(from) = from else {
+        return;
+    };
+    let key = u32::from_be_bytes(from) ^ u32::from_be_bytes(to).rotate_left(1);
+    if !failover_due(key) {
+        return;
+    }
+    let mut buf = [0u8; 80];
+    let mut n = 0;
+    let head = b"dns upstream timeout ";
+    copy_bytes(&mut buf, &mut n, head);
+    push_ip(&mut buf, &mut n, from);
+    copy_bytes(&mut buf, &mut n, b" -> ");
+    push_ip(&mut buf, &mut n, to);
+    post_bytes(&buf[..n]);
+}
+
+fn note_exhausted(ip: [u8; 4]) {
+    let key = u32::from_be_bytes(ip) ^ 0x4558_0000;
+    if !failover_due(key) {
+        return;
+    }
+    post_upstream(b"dns upstream exhausted ", ip, b"");
+}
+
+fn note_busy(ip: [u8; 4]) {
+    let key = u32::from_be_bytes(ip) ^ 0x4255_0000;
+    if !failover_due(key) {
+        return;
+    }
+    post_upstream(b"dns upstream busy ", ip, b"");
+}
+
+fn failover_due(key: u32) -> bool {
+    let now = time_ms();
+    let prev = FAILOVER_KEY.load(Ordering::Relaxed);
+    let then = FAILOVER_MS.load(Ordering::Relaxed);
+    if prev == key && now.saturating_sub(then) < 5_000 {
+        return false;
+    }
+    FAILOVER_KEY.store(key, Ordering::Relaxed);
+    FAILOVER_MS.store(now, Ordering::Relaxed);
+    true
+}
+
+fn post_upstream(prefix: &[u8], ip: [u8; 4], suffix: &[u8]) {
+    let mut buf = [0u8; 80];
+    let mut n = 0;
+    copy_bytes(&mut buf, &mut n, prefix);
+    push_ip(&mut buf, &mut n, ip);
+    copy_bytes(&mut buf, &mut n, suffix);
+    post_bytes(&buf[..n]);
+}
+
+fn copy_bytes(buf: &mut [u8], n: &mut usize, bytes: &[u8]) {
+    for &byte in bytes {
+        if *n >= buf.len() {
+            return;
+        }
+        buf[*n] = byte;
+        *n += 1;
+    }
+}
+
+fn push_ip(buf: &mut [u8], n: &mut usize, ip: [u8; 4]) {
+    for (index, octet) in ip.iter().enumerate() {
+        if index > 0 {
+            copy_bytes(buf, n, b".");
+        }
+        push_dec(buf, n, *octet as u32);
+    }
+}
+
+fn push_dec(buf: &mut [u8], n: &mut usize, mut value: u32) {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    if value == 0 {
+        copy_bytes(buf, n, b"0");
+        return;
+    }
+    while value > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    copy_bytes(buf, n, &tmp[i..]);
+}
+
+fn post_bytes(bytes: &[u8]) {
+    let len = bytes.len().min(80);
+    let _ = sys(LOG_POST, bytes.as_ptr() as u64, len as u64, 0, 0, 0, 0);
 }
 
 fn post_query(name: &str) {

@@ -9,3 +9,6 @@ mod fault_log;
 
 #[path = "../../kernel/src/dhcp_rx.rs"]
 mod dhcp_rx;
+
+#[path = "../../dns-el0/src/failover.rs"]
+mod failover;
