@@ -339,6 +339,7 @@ fn bring_up() -> bool {
     while attempt < 4 {
         TRY_N.store(attempt, Ordering::Relaxed);
         clear_probe();
+        begin_capture();
         if let Some((w, h)) = current_size() {
             if finish_size(w, h, attempt, false) {
                 return true;
@@ -349,6 +350,7 @@ fn bring_up() -> bool {
             }
         }
         emit_probe(attempt);
+        dump_capture();
         attempt += 1;
     }
     save_line("hdmi none retry 4");
@@ -523,6 +525,15 @@ static mut PROBE: Probe = Probe {
 
 /// Which bring-up attempt is talking to the mailbox. The raw dump uses it.
 static TRY_N: AtomicU32 = AtomicU32::new(0);
+/// Raw mailbox words for the attempt in progress. Dumped only when that
+/// attempt does not produce a framebuffer. A picture keeps the one-line
+/// summary and leaves these unread.
+static mut SHOT_FIRST: [[u32; 48]; 8] = [[0; 48]; 8];
+static mut SHOT_SECOND: [[u32; 48]; 8] = [[0; 48]; 8];
+static mut SHOT_TRY: [u32; 8] = [0; 8];
+static mut SHOT_PHASE: [u8; 8] = [0; 8];
+static mut SHOT_ALIAS: [bool; 8] = [false; 8];
+static SHOT_N: AtomicU32 = AtomicU32::new(0);
 /// `g` checked GET, `p` older GET, `k` keep, `s` same-size set.
 static PHASE: AtomicU8 = AtomicU8::new(b'g');
 /// The older exchange: do not zero the property buffer, and clean only
@@ -937,9 +948,7 @@ fn exchange(msg: &mut [u32], bus_alias: bool) -> bool {
         for i in 0..words {
             second[i] = dst.add(i).read_volatile();
         }
-        log_read(bus_alias, b'a', &first);
-        log_read(bus_alias, b'b', &second);
-        log_tags(bus_alias, &first);
+        stash_exchange(bus_alias, &first, &second);
         let n = msg.len();
         let mut mismatch = false;
         let mut i = 0;
@@ -973,11 +982,48 @@ fn dims_ok(words: &[u32; 48]) -> bool {
     words[1] == REQ_OK && (320..=3840).contains(&words[5]) && (240..=2160).contains(&words[6])
 }
 
-fn log_read(bus_alias: bool, which: u8, words: &[u32; 48]) {
+fn begin_capture() {
+    SHOT_N.store(0, Ordering::Relaxed);
+}
+
+fn stash_exchange(bus_alias: bool, first: &[u32; 48], second: &[u32; 48]) {
+    let n = SHOT_N.load(Ordering::Relaxed) as usize;
+    if n >= 8 {
+        return;
+    }
+    unsafe {
+        *addr_of_mut!(SHOT_FIRST[n]) = *first;
+        *addr_of_mut!(SHOT_SECOND[n]) = *second;
+        *addr_of_mut!(SHOT_TRY[n]) = TRY_N.load(Ordering::Relaxed);
+        *addr_of_mut!(SHOT_PHASE[n]) = PHASE.load(Ordering::Relaxed);
+        *addr_of_mut!(SHOT_ALIAS[n]) = bus_alias;
+    }
+    SHOT_N.store((n + 1) as u32, Ordering::Relaxed);
+}
+
+fn dump_capture() {
+    let n = SHOT_N.load(Ordering::Relaxed) as usize;
+    let mut i = 0;
+    while i < n && i < 8 {
+        unsafe {
+            let try_n = *addr_of!(SHOT_TRY[i]);
+            let phase = *addr_of!(SHOT_PHASE[i]);
+            let alias = *addr_of!(SHOT_ALIAS[i]);
+            let first = &*addr_of!(SHOT_FIRST[i]);
+            let second = &*addr_of!(SHOT_SECOND[i]);
+            log_read(try_n, phase, alias, b'a', first);
+            log_read(try_n, phase, alias, b'b', second);
+            log_tags(try_n, phase, alias, first);
+        }
+        i += 1;
+    }
+}
+
+fn log_read(try_n: u32, phase: u8, bus_alias: bool, which: u8, words: &[u32; 48]) {
     let mut index = 0;
     while index < words.len() {
         let mut line = Line::new();
-        dump_prefix(&mut line, bus_alias, which);
+        dump_prefix(&mut line, try_n, phase, bus_alias, which);
         let mut n = 0;
         while n < 8 && index < words.len() {
             if n != 0 {
@@ -991,7 +1037,7 @@ fn log_read(bus_alias: bool, which: u8, words: &[u32; 48]) {
     }
 }
 
-fn log_tags(bus_alias: bool, words: &[u32; 48]) {
+fn log_tags(try_n: u32, phase: u8, bus_alias: bool, words: &[u32; 48]) {
     let mut i = 2usize;
     let mut guard = 0u32;
     while i + 2 < words.len() && guard < 8 {
@@ -1002,7 +1048,7 @@ fn log_tags(bus_alias: bool, words: &[u32; 48]) {
         let buf_len = words[i + 1];
         let resp = words[i + 2];
         let mut line = Line::new();
-        dump_prefix(&mut line, bus_alias, b't');
+        dump_prefix(&mut line, try_n, phase, bus_alias, b't');
         line.hex32(tag);
         line.push(" n ");
         line.hex32(buf_len);
@@ -1024,16 +1070,22 @@ fn log_tags(bus_alias: bool, words: &[u32; 48]) {
 
 fn log_mbox(bus_alias: bool, name: &str) {
     let mut line = Line::new();
-    dump_prefix(&mut line, bus_alias, b'x');
+    dump_prefix(
+        &mut line,
+        TRY_N.load(Ordering::Relaxed),
+        PHASE.load(Ordering::Relaxed),
+        bus_alias,
+        b'x',
+    );
     line.push(name);
     save_line(line.text());
 }
 
-fn dump_prefix(line: &mut Line, bus_alias: bool, which: u8) {
+fn dump_prefix(line: &mut Line, try_n: u32, phase: u8, bus_alias: bool, which: u8) {
     line.push("t");
-    line.dec(TRY_N.load(Ordering::Relaxed) as u64);
+    line.dec(try_n as u64);
     let mut tag = [0u8; 3];
-    tag[0] = PHASE.load(Ordering::Relaxed);
+    tag[0] = phase;
     tag[1] = if bus_alias { b'A' } else { b'R' };
     tag[2] = which;
     line.push(core::str::from_utf8(&tag).unwrap_or("gAx"));

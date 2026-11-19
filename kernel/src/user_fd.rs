@@ -42,6 +42,9 @@
 //!  57  set_dns_top(ptr, len). DNS task publishes the fixed top-N blob.
 //!  58  power(action). HTTP task. 0 queries, 1 queues shutdown, 2 queues reboot.
 //!  59  vnc_ctrl(op). HTTP task. 0 queries the live process, 1 queues start, 2 queues stop.
+//!  60  set_upstream_health(ptr, len). DNS task. count, then count*(ipv4, up).
+//!  61  upstream_health(buf, cap) -> len of that blob. Empty until the first publish.
+//!  62  config_probe_secs. Upstream health-probe interval, 1..=3600.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -96,6 +99,9 @@ const CACHE_PLANT: u64 = 54;
 const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
 const SET_DNS_TOP: u64 = 57;
+const SET_UPSTREAM_HEALTH: u64 = 60;
+const UPSTREAM_HEALTH: u64 = 61;
+const CONFIG_PROBE_SECS: u64 = 62;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -197,6 +203,9 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         DISPLAY_IO => display_io(args[0], args[1], args[2], args[3]),
         DISPLAY_SET => display_set(args[0], args[1], args[2], args[3], args[4], args[5]),
         SET_DNS_TOP => set_dns_top(args[0], args[1]),
+        SET_UPSTREAM_HEALTH => set_upstream_health(args[0], args[1]),
+        UPSTREAM_HEALTH => upstream_health(args[0], args[1]),
+        CONFIG_PROBE_SECS => crate::config_manager::probe_interval_secs() as i64,
         _ => -1,
     };
     value as u64
@@ -1200,6 +1209,35 @@ fn config_set_cache(slots: u64, reap: u64, err: u64, err_cap: u64) -> i64 {
             let _ = write_err(err, err_cap, &message);
             EINVAL
         }
+    }
+}
+
+fn set_upstream_health(ptr: u64, len: u64) -> i64 {
+    if slot() != crate::task::DNS_SLOT || len == 0 || len > 41 {
+        return EINVAL;
+    }
+    let mut raw = [0u8; 41];
+    let n = len as usize;
+    if !copy_user(ptr, &mut raw[..n]) {
+        return EFAULT;
+    }
+    crate::dns::set_upstream_health(&raw[..n]);
+    0
+}
+
+fn upstream_health(ptr: u64, cap: u64) -> i64 {
+    if cap == 0 || cap > 41 || !crate::mmu::user_write_ok(ptr, cap) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 41];
+    let n = crate::dns::copy_upstream_health(&mut raw[..cap as usize]);
+    if n == 0 {
+        return 0;
+    }
+    if write_user(ptr, &raw[..n]) {
+        n as i64
+    } else {
+        EFAULT
     }
 }
 

@@ -31,6 +31,8 @@ const TIMER_FREQ: u64 = 52;
 const SET_CACHE_STATS: u64 = 53;
 const CACHE_PLANT: u64 = 54;
 const SET_DNS_TOP: u64 = 57;
+const SET_UPSTREAM_HEALTH: u64 = 60;
+const CONFIG_PROBE_SECS: u64 = 62;
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
@@ -46,9 +48,34 @@ struct PendingQuery {
     qclass: u16,
     sent_ms: u64,
     upstream_idx: usize,
-    origin: usize,
-    tries: u8,
+    walk: crate::health::Walk,
     original: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct ProbeSlot {
+    ip: [u8; 4],
+    sent_ms: u64,
+    last_ms: u64,
+    in_flight: bool,
+}
+
+impl ProbeSlot {
+    const fn empty() -> Self {
+        Self {
+            ip: [0; 4],
+            sent_ms: 0,
+            last_ms: 0,
+            in_flight: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProbeJob {
+    index: usize,
+    ip: [u8; 4],
+    query: [u8; 17],
 }
 
 struct Record {
@@ -94,6 +121,8 @@ pub fn run() -> ! {
         tcp_fd,
         tcp_buf,
         traffic: dns_cache::top::Traffic::new(),
+        health: crate::health::Health::new(0),
+        probes: [ProbeSlot::empty(); crate::health::MAX],
     });
     unsafe {
         SHARED = Box::into_raw(shared);
@@ -124,6 +153,7 @@ pub fn run() -> ! {
                         &mut shared.pending,
                         &mut shared.next_id,
                         &mut shared.traffic,
+                        &mut shared.health,
                     );
                     publish(&shared.cache);
                 }
@@ -145,6 +175,8 @@ struct Shared {
     tcp_fd: i64,
     tcp_buf: Vec<u8>,
     traffic: dns_cache::top::Traffic,
+    health: crate::health::Health,
+    probes: [ProbeSlot; crate::health::MAX],
 }
 
 static mut SHARED: *mut Shared = core::ptr::null_mut();
@@ -179,7 +211,14 @@ extern "C" fn upstream_worker(_index: u64) {
         crate::thread::mutex_lock(&STATE_LOCK);
         unsafe {
             if let Some(shared) = SHARED.as_mut() {
-                take_upstream(&packet, shared.dns, &mut shared.cache, &mut shared.pending);
+                take_upstream(
+                    &packet,
+                    shared.dns,
+                    &mut shared.cache,
+                    &mut shared.pending,
+                    &mut shared.health,
+                    &mut shared.probes,
+                );
                 publish(&shared.cache);
             }
         }
@@ -199,6 +238,7 @@ extern "C" fn retry_worker(_index: u64) {
                         shared.dns,
                         &mut shared.pending,
                         &mut shared.next_id,
+                        &mut shared.health,
                     );
                     busy = !shared.pending.is_empty();
                 }
@@ -294,6 +334,7 @@ fn take_tcp_query(shared: &mut Shared) -> bool {
         &mut forwards,
         false,
         &mut shared.traffic,
+        &mut shared.health,
     );
     publish(&shared.cache);
     for (bytes, ip) in forwards {
@@ -345,6 +386,7 @@ fn handle_client(
     pending: &mut Vec<PendingQuery>,
     next_id: &mut u16,
     traffic: &mut dns_cache::top::Traffic,
+    health: &mut crate::health::Health,
 ) {
     let mut replies = Vec::new();
     let mut forwards = Vec::new();
@@ -359,6 +401,7 @@ fn handle_client(
         &mut forwards,
         true,
         traffic,
+        health,
     );
     for (bytes, to_ip, to_port) in replies {
         udp_send(dns, &bytes, to_ip, to_port);
@@ -381,6 +424,7 @@ fn handle_bytes(
     forwards: &mut Vec<(Vec<u8>, [u8; 4])>,
     remember_client: bool,
     traffic: &mut dns_cache::top::Traffic,
+    health: &mut crate::health::Health,
 ) {
     let now_ms = time_ms();
     let query = match DnsPacket::parse(packet) {
@@ -425,14 +469,20 @@ fn handle_bytes(
     }
 
     let upstreams = load_upstreams();
+    health.sync(&upstreams);
     let preferred = PREFERRED.load(Ordering::Relaxed);
     let preferred = if preferred == 0 {
         0
     } else {
         preferred as usize - 1
     };
-    let Some(choice) = crate::failover::first(upstreams.len(), preferred)
-    else {
+    let Some(walk) = crate::health::start_walk(health, &upstreams, preferred) else {
+        if let Some(bytes) = error_response(&query, 2) {
+            replies.push((bytes, ip, port));
+        }
+        return;
+    };
+    let Some(dest) = walk.current_ip() else {
         if let Some(bytes) = error_response(&query, 2) {
             replies.push((bytes, ip, port));
         }
@@ -448,7 +498,7 @@ fn handle_bytes(
     let upstream_id = next_upstream_id(next_id);
     let mut forwarded = packet.to_vec();
     set_id(&mut forwarded, upstream_id);
-    let dest = upstreams[choice.index];
+    let upstream_idx = upstreams.iter().position(|ip| *ip == dest).unwrap_or(0);
     pending.push(PendingQuery {
         client_id: query.header.id,
         upstream_id,
@@ -458,39 +508,44 @@ fn handle_bytes(
         qtype,
         qclass,
         sent_ms: now_ms,
-        upstream_idx: choice.index,
-        origin: choice.index,
-        tries: choice.tries,
+        upstream_idx,
+        walk,
         original: packet.to_vec(),
     });
     forwards.push((forwarded, dest));
     poke_retry();
 }
 
-fn retry_expired(upstream_fd: i64, dns_fd: i64, pending: &mut Vec<PendingQuery>, next_id: &mut u16) {
+fn retry_expired(
+    upstream_fd: i64,
+    dns_fd: i64,
+    pending: &mut Vec<PendingQuery>,
+    next_id: &mut u16,
+    health: &mut crate::health::Health,
+) {
     if pending.is_empty() {
         return;
     }
     let now = time_ms();
     let upstreams = load_upstreams();
+    health.sync(&upstreams);
     let mut index = 0;
     while index < pending.len() {
         if now.saturating_sub(pending[index].sent_ms) < UPSTREAM_WAIT_MS {
             index += 1;
             continue;
         }
-        let origin = pending[index].origin;
-        let tries = pending[index].tries;
-        let failed = pending[index].upstream_idx;
-        if let Some(choice) = crate::failover::after_timeout(upstreams.len(), origin, tries) {
+        let step = pending[index].walk.on_timeout(health, now);
+        if step.log_down {
+            note_state(false, step.failed);
+        }
+        if let Some(dest) = step.next {
             let id = next_upstream_id(next_id);
             let mut forwarded = pending[index].original.clone();
             set_id(&mut forwarded, id);
-            let dest = upstreams[choice.index];
-            note_failover(upstreams.get(failed).copied(), dest);
+            note_failover(Some(step.failed), dest);
             pending[index].upstream_id = id;
-            pending[index].upstream_idx = choice.index;
-            pending[index].tries = choice.tries;
+            pending[index].upstream_idx = upstreams.iter().position(|ip| *ip == dest).unwrap_or(0);
             pending[index].sent_ms = now;
             if !udp_send(upstream_fd, &forwarded, dest, 53) {
                 note_busy(dest);
@@ -498,21 +553,44 @@ fn retry_expired(upstream_fd: i64, dns_fd: i64, pending: &mut Vec<PendingQuery>,
             index += 1;
         } else {
             let item = pending.remove(index);
-            if let Some(failed_ip) = upstreams.get(item.upstream_idx).copied() {
-                note_exhausted(failed_ip);
-            }
+            note_exhausted(step.failed);
             if let Some(bytes) = servfail_from_query(&item.original) {
                 udp_send(dns_fd, &bytes, item.client_ip, item.client_port);
             }
         }
     }
+    publish_health(health, &upstreams);
 }
 
-fn take_upstream(packet: &[u8], dns_fd: i64, cache: &mut DnsCache, pending: &mut Vec<PendingQuery>) {
+fn take_upstream(
+    packet: &[u8],
+    dns_fd: i64,
+    cache: &mut DnsCache,
+    pending: &mut Vec<PendingQuery>,
+    health: &mut crate::health::Health,
+    probes: &mut [ProbeSlot],
+) {
     if packet.len() < 12 {
         return;
     }
     let id = packet_id(packet);
+    if crate::health::is_probe_id(id) {
+        let index = crate::health::probe_index(id);
+        if index < probes.len() && probes[index].in_flight {
+            let ip = probes[index].ip;
+            probes[index].in_flight = false;
+            let upstreams = load_upstreams();
+            health.sync(&upstreams);
+            let change = health.mark_up_ip(ip, time_ms());
+            if change.log {
+                note_state(true, ip);
+            }
+            if change.changed {
+                publish_health(health, &upstreams);
+            }
+        }
+        return;
+    }
     let Some(pos) = pending.iter().position(|item| item.upstream_id == id) else {
         return;
     };
@@ -623,15 +701,35 @@ extern "C" fn cache_reaper(_arg: u64) {
         if last_top == 0 || now_ms.saturating_sub(last_top) >= 200 {
             let mut raw = [0u8; 576];
             let mut n = 0;
+            let mut jobs = [None; crate::health::MAX];
             crate::thread::mutex_lock(&STATE_LOCK);
             unsafe {
                 if let Some(shared) = SHARED.as_mut() {
                     n = shared.traffic.write(now_ms, &mut raw);
+                    plan_probes(shared, now_ms, &mut jobs);
                 }
             }
             crate::thread::mutex_unlock(&STATE_LOCK);
             if n > 0 {
                 let _ = sys(SET_DNS_TOP, raw.as_ptr() as u64, n as u64, 0, 0, 0, 0);
+            }
+            let fd = UPSTREAM_FD.load(Ordering::Acquire);
+            let mut failed = [false; crate::health::MAX];
+            for (index, job) in jobs.iter().enumerate() {
+                if let Some(job) = job {
+                    if fd <= 0 || !udp_send(fd, &job.query, job.ip, 53) {
+                        failed[index] = true;
+                    }
+                }
+            }
+            if failed.iter().any(|item| *item) {
+                crate::thread::mutex_lock(&STATE_LOCK);
+                unsafe {
+                    if let Some(shared) = SHARED.as_mut() {
+                        clear_unsent(shared, &jobs, &failed);
+                    }
+                }
+                crate::thread::mutex_unlock(&STATE_LOCK);
             }
             last_top = now_ms;
         }
@@ -674,6 +772,75 @@ extern "C" fn cache_reaper(_arg: u64) {
     }
 }
 
+/// Decide which upstreams need a probe. The send itself happens after
+/// the DNS lock is released, so a probe cannot stall a client lookup.
+fn plan_probes(shared: &mut Shared, now: u64, jobs: &mut [Option<ProbeJob>; crate::health::MAX]) {
+    let secs = sys(CONFIG_PROBE_SECS, 0, 0, 0, 0, 0, 0);
+    let interval = if (1..=3_600).contains(&secs) {
+        secs as u64 * 1_000
+    } else {
+        5_000
+    };
+    let upstreams = load_upstreams();
+    shared.health.sync(&upstreams);
+    let count = upstreams.len().min(crate::health::MAX);
+    let mut i = 0;
+    while i < count {
+        let ip = upstreams[i];
+        if shared.probes[i].ip != ip {
+            shared.probes[i] = ProbeSlot {
+                ip,
+                sent_ms: 0,
+                last_ms: 0,
+                in_flight: false,
+            };
+        }
+        let timed_out = shared.probes[i].in_flight
+            && now.saturating_sub(shared.probes[i].sent_ms) >= UPSTREAM_WAIT_MS;
+        if timed_out {
+            shared.probes[i].in_flight = false;
+            let change = shared.health.mark_down(i, now);
+            if change.log {
+                note_state(false, ip);
+            }
+        }
+        let due = shared.probes[i].last_ms == 0
+            || now.saturating_sub(shared.probes[i].last_ms) >= interval;
+        if due && !shared.probes[i].in_flight {
+            shared.probes[i].in_flight = true;
+            shared.probes[i].sent_ms = now;
+            shared.probes[i].last_ms = now;
+            jobs[i] = Some(ProbeJob {
+                index: i,
+                ip,
+                query: crate::health::probe_query(crate::health::probe_id(i)),
+            });
+        }
+        i += 1;
+    }
+    while i < crate::health::MAX {
+        shared.probes[i] = ProbeSlot::empty();
+        i += 1;
+    }
+    publish_health(&shared.health, &upstreams);
+}
+
+fn clear_unsent(shared: &mut Shared, jobs: &[Option<ProbeJob>; crate::health::MAX], failed: &[bool; crate::health::MAX]) {
+    let mut i = 0;
+    while i < crate::health::MAX {
+        if failed[i] {
+            if let Some(job) = &jobs[i] {
+                if shared.probes[job.index].ip == job.ip {
+                    shared.probes[job.index].in_flight = false;
+                    shared.probes[job.index].last_ms = 0;
+                    note_busy(job.ip);
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
 fn servfail_from_query(original: &[u8]) -> Option<Vec<u8>> {
     let query = DnsPacket::parse(original).ok()?;
     error_response(&query, 2)
@@ -692,12 +859,7 @@ fn error_response(query: &DnsPacket, rcode: u8) -> Option<Vec<u8>> {
 }
 
 fn next_upstream_id(next: &mut u16) -> u16 {
-    let id = *next;
-    *next = id.wrapping_add(1);
-    if *next == 0 {
-        *next = 1;
-    }
-    if id == 0 { 1 } else { id }
+    crate::health::next_client_id(next)
 }
 
 fn packet_id(packet: &[u8]) -> u16 {
@@ -864,6 +1026,31 @@ fn yield_now() {
 fn exit(code: u64) -> ! {
     let _ = sys(EXIT, code, 0, 0, 0, 0, 0);
     loop {}
+}
+
+fn note_state(up: bool, ip: [u8; 4]) {
+    if up {
+        post_upstream(b"dns upstream up ", ip, b"");
+    } else {
+        post_upstream(b"dns upstream down ", ip, b"");
+    }
+}
+
+fn publish_health(health: &crate::health::Health, ips: &[[u8; 4]]) {
+    let mut buf = [0u8; 1 + crate::health::MAX * 5];
+    let n = health.pack(ips, &mut buf);
+    if n == 0 {
+        return;
+    }
+    let _ = sys(
+        SET_UPSTREAM_HEALTH,
+        buf.as_ptr() as u64,
+        n as u64,
+        0,
+        0,
+        0,
+        0,
+    );
 }
 
 fn note_failover(from: Option<[u8; 4]>, to: [u8; 4]) {

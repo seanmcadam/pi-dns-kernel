@@ -17,6 +17,21 @@ static PLANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new
 const TOP_CAP: usize = 576;
 static TOP_GEN: AtomicU32 = AtomicU32::new(0);
 static TOP_LEN: AtomicU32 = AtomicU32::new(0);
+/// Packed upstream health: count, then count times (ipv4, 0|1). The DNS
+/// task publishes it. `/status` reads it. Odd generation means a write
+/// is in progress.
+const HEALTH_CAP: usize = 1 + 8 * 5;
+static HEALTH_GEN: AtomicU32 = AtomicU32::new(0);
+static HEALTH_LEN: AtomicU32 = AtomicU32::new(0);
+static HEALTH_BUF: HealthBuf = HealthBuf {
+    bytes: UnsafeCell::new([0; HEALTH_CAP]),
+};
+
+struct HealthBuf {
+    bytes: UnsafeCell<[u8; HEALTH_CAP]>,
+}
+
+unsafe impl Sync for HealthBuf {}
 static TOP_BUF: TopBuf = TopBuf {
     bytes: UnsafeCell::new([0; TOP_CAP]),
 };
@@ -89,6 +104,50 @@ pub fn write_cache_stats(out: &mut [u8]) -> usize {
 /// Store the version-1 top-N blob from dns-el0. The writer is the DNS task.
 /// Readers retry if a publish is in progress. No lock, so this stays off the
 /// scheduler and the FD lock order.
+/// Replace the packed upstream health blob. `bytes` is `count` then
+/// `count` records of 4 address bytes and one up flag.
+pub fn set_upstream_health(bytes: &[u8]) {
+    if bytes.is_empty() || bytes.len() > HEALTH_CAP {
+        return;
+    }
+    let count = bytes[0] as usize;
+    if count > 8 || bytes.len() < 1 + count * 5 {
+        return;
+    }
+    let n = 1 + count * 5;
+    let gen = HEALTH_GEN.load(Ordering::Relaxed) & !1;
+    HEALTH_GEN.store(gen.wrapping_add(1), Ordering::Release);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), HEALTH_BUF.bytes.get().cast::<u8>(), n);
+    }
+    HEALTH_LEN.store(n as u32, Ordering::Release);
+    HEALTH_GEN.store(gen.wrapping_add(2), Ordering::Release);
+}
+
+/// Copy the packed health blob. Empty until the DNS task publishes it.
+pub fn copy_upstream_health(out: &mut [u8]) -> usize {
+    let mut spins = 0;
+    while spins < 4 {
+        let gen = HEALTH_GEN.load(Ordering::Acquire);
+        if gen & 1 != 0 {
+            spins += 1;
+            continue;
+        }
+        let n = HEALTH_LEN.load(Ordering::Acquire) as usize;
+        if n == 0 || n > out.len() || n > HEALTH_CAP {
+            return 0;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(HEALTH_BUF.bytes.get().cast::<u8>(), out.as_mut_ptr(), n);
+        }
+        if HEALTH_GEN.load(Ordering::Acquire) == gen {
+            return n;
+        }
+        spins += 1;
+    }
+    0
+}
+
 pub fn set_top(bytes: &[u8]) {
     let n = if bytes.len() < TOP_CAP { bytes.len() } else { TOP_CAP };
     let gen = TOP_GEN.load(Ordering::Relaxed) & !1;

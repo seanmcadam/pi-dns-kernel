@@ -12,3 +12,6 @@ mod dhcp_rx;
 
 #[path = "../../dns-el0/src/failover.rs"]
 mod failover;
+
+#[path = "../../dns-el0/src/health.rs"]
+mod health;
