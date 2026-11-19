@@ -221,7 +221,11 @@ static MAC: [AtomicU8; 6] = [
     AtomicU8::new(0),
 ];
 
-#[repr(C, align(16))]
+// 64 bytes so the following RX buffer cannot share this cache line.
+// A clean of that buffer would otherwise write RX bytes over a mailbox
+// reply still sitting in the same line. `guard` is not part of the
+// 32-byte property message the GPU reads.
+#[repr(C, align(64))]
 struct MacMsg {
     size: u32,
     code: u32,
@@ -231,7 +235,12 @@ struct MacMsg {
     mac: [u8; 6],
     pad: [u8; 2],
     end: u32,
+    #[allow(dead_code)]
+    guard: [u8; 32],
 }
+
+const _: () = assert!(core::mem::align_of::<MacMsg>() == 64);
+const _: () = assert!(core::mem::size_of::<MacMsg>() == 64);
 
 #[link_section = ".dma"]
 static mut MAC_MSG: MacMsg = MacMsg {
@@ -243,6 +252,7 @@ static mut MAC_MSG: MacMsg = MacMsg {
     mac: [0; 6],
     pad: [0; 2],
     end: 0,
+    guard: [0; 32],
 };
 
 pub fn link_is_up() -> bool {
@@ -1197,32 +1207,35 @@ fn board_mac() -> [u8; 6] {
 fn mailbox_mac() -> [u8; 6] {
     unsafe {
         let msg = &mut *core::ptr::addr_of_mut!(MAC_MSG);
-        msg.size = 32;
-        msg.code = 0;
-        msg.tag = 0x0001_0003;
-        msg.val_len = 6;
-        msg.req = 0;
-        msg.mac = [0; 6];
-        msg.pad = [0; 2];
-        msg.end = 0;
+        fill_mac_msg(msg);
+        let ptr = msg as *mut MacMsg as *const u8;
         let phys = crate::addr::virt_to_phys(msg as *mut MacMsg as u64) as u32;
+        // The buffer is Normal non-cacheable here, so the stores above
+        // reach RAM. Invalidate before the read so a stale write-back
+        // line cannot hide the GPU's reply.
         if !mailbox_call(phys | 0xC000_0000) {
-            msg.size = 32;
-            msg.code = 0;
-            msg.tag = 0x0001_0003;
-            msg.val_len = 6;
-            msg.req = 0;
-            msg.mac = [0; 6];
-            msg.end = 0;
+            fill_mac_msg(msg);
             if !mailbox_call(phys) {
                 return [0; 6];
             }
         }
+        invalidate_poc(ptr, core::mem::size_of::<MacMsg>());
         if msg.code != 0x8000_0000 {
             return [0; 6];
         }
         msg.mac
     }
+}
+
+fn fill_mac_msg(msg: &mut MacMsg) {
+    msg.size = 32;
+    msg.code = 0;
+    msg.tag = 0x0001_0003;
+    msg.val_len = 6;
+    msg.req = 0;
+    msg.mac = [0; 6];
+    msg.pad = [0; 2];
+    msg.end = 0;
 }
 
 fn mailbox_call(addr: u32) -> bool {

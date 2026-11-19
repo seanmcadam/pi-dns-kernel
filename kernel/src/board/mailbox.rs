@@ -1,19 +1,28 @@
 // VideoCore property mailbox, channel 8.
 //
 // The caller picks the register base. This file does not know which board
-// it is on. The buffer lives in .dma (Normal non-cacheable, 16-byte
-// aligned). A faulting status read returns -1 and does not write the device.
-// The property tags themselves are built by the HDMI process.
+// it is on. The buffer lives in .dma (Normal non-cacheable, 64-byte
+// aligned) so it does not share a cache line with the next object. A
+// faulting status read returns -1 and does not write the device. The
+// property tags themselves are built by the HDMI process.
 
-use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping};
+use core::ptr::{addr_of_mut, copy_nonoverlapping};
 
 const STATUS: u64 = 0x18;
 const WRITE: u64 = 0x20;
 const FULL: u32 = 0x8000_0000;
 const EMPTY: u32 = 0x4000_0000;
 
+#[repr(C, align(64))]
+struct MailboxProp {
+    words: [u32; 256],
+}
+
+const _: () = assert!(core::mem::align_of::<MailboxProp>() == 64);
+const _: () = assert!(core::mem::size_of::<MailboxProp>() % 64 == 0);
+
 #[link_section = ".dma"]
-static mut PROP: [u32; 256] = [0; 256];
+static mut PROP: MailboxProp = MailboxProp { words: [0; 256] };
 
 pub fn run(base: u64, words: &mut [u32]) -> i64 {
     if words.is_empty() || words.len() > 256 {
@@ -24,16 +33,21 @@ pub fn run(base: u64, words: &mut [u32]) -> i64 {
     }
     let start = crate::timer::get_ticks();
     unsafe {
-        copy_nonoverlapping(words.as_ptr(), addr_of_mut!(PROP).cast(), words.len());
-        let phys = crate::addr::virt_to_phys(addr_of!(PROP) as u64);
+        let prop = addr_of_mut!(PROP);
+        if (prop as usize) % 64 != 0 {
+            return -6;
+        }
+        let dst = addr_of_mut!((*prop).words);
+        copy_nonoverlapping(words.as_ptr(), dst.cast(), words.len());
+        let virt = prop as *const u8;
+        let phys = crate::addr::virt_to_phys(prop as u64);
         if !exchange(base, phys, start) {
             return -5;
         }
-        copy_nonoverlapping(
-            addr_of!(PROP).cast::<u32>(),
-            words.as_mut_ptr(),
-            words.len(),
-        );
+        // This runs after `.dma` is Normal non-cacheable. Drop a stale
+        // write-back line so the copy below is the GPU's reply.
+        drop_lines(virt, words.len() * 4);
+        copy_nonoverlapping(dst.cast::<u32>(), words.as_mut_ptr(), words.len());
     }
     0
 }
@@ -83,4 +97,19 @@ fn timed_out(start: u64) -> bool {
         return true;
     }
     crate::timer::get_ticks().wrapping_sub(start) > freq / 5
+}
+
+fn drop_lines(ptr: *const u8, len: usize) {
+    let start = (ptr as usize) & !63;
+    let end = (ptr as usize).saturating_add(len);
+    let mut line = start;
+    while line < end {
+        unsafe {
+            core::arch::asm!("dc ivac, {line}", line = in(reg) line, options(nostack));
+        }
+        line = line.saturating_add(64);
+    }
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
 }
