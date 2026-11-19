@@ -224,10 +224,37 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
             state.stack.configure_static(ip, mask, gateway);
             DHCP_PHASE.store(2, Ordering::Relaxed);
             DHCP_IP.store(u32::from_be_bytes(ip), Ordering::Relaxed);
+            let prefix: u32 = mask.iter().map(|byte| byte.count_ones()).sum();
             log::info!(
-                "DHCP configured {}.{}.{}.{} gateway {}.{}.{}.{}",
-                ip[0], ip[1], ip[2], ip[3], gateway[0], gateway[1], gateway[2], gateway[3]
+                "DHCP configured {}.{}.{}.{}/{} gateway {}.{}.{}.{}",
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                prefix,
+                gateway[0],
+                gateway[1],
+                gateway[2],
+                gateway[3]
             );
+            if let Some(mac) = crate::dhcp_rx::reply_mac() {
+                if crate::dhcp_rx::stage_gateway_arp(&state.device.mac_address(), ip, mask, &mac, gateway)
+                {
+                    log::info!(
+                        "gateway neighbor {}.{}.{}.{} via {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        gateway[0],
+                        gateway[1],
+                        gateway[2],
+                        gateway[3],
+                        mac[0],
+                        mac[1],
+                        mac[2],
+                        mac[3],
+                        mac[4],
+                        mac[5]
+                    );
+                }
+            }
             console_line_ip("[OK] DHCP leased", ip);
             console_line_ip("[OK] DHCP gateway", gateway);
         }

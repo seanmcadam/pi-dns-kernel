@@ -587,7 +587,12 @@ fn udp_send_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
     let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
     match socket.send_slice(&service::body(id).buf[..len], endpoint) {
         Ok(_) => service::Step::Done(0),
-        Err(_) => service::Step::Pending,
+        // A full queue used to sleep the caller forever. The DNS task holds
+        // its state lock across this syscall, so a neighbor that never
+        // resolves also stopped failover and hid the timeout. The caller
+        // retries on its own clock.
+        Err(udp::SendError::BufferFull) => service::Step::Done(EAGAIN),
+        Err(_) => service::Step::Done(EIO),
     }
 }
 

@@ -188,6 +188,9 @@ static RX_CONS: AtomicU32 = AtomicU32::new(0);
 static TX_PROD: AtomicU32 = AtomicU32::new(0);
 /// Set when the consumer does not catch the producer. Further transmits stop.
 static TX_STUCK: AtomicBool = AtomicBool::new(false);
+static DESC_MISMATCH: AtomicBool = AtomicBool::new(false);
+static ARP_TX_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static ARP_RX_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static DHCP_NOTED: AtomicBool = AtomicBool::new(false);
 /// CPU copy of one received frame. The owner is the only caller of
 /// `consume`, so this is not shared. The DMA buffer is returned before
@@ -472,20 +475,15 @@ impl GenetDevice {
             (addr, status)
         };
         let desc = GENET_TX_OFF + desc_index * DMA_DESC_SIZE;
-        write(desc + DESC_ADDRESS_LO, addr as u32);
-        write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
-        write(desc + DESC_LENGTH_STATUS, status);
-        // Publish the descriptor before the producer index. dsb sy can
-        // retire at an intermediate bridge while descriptor RAM still
-        // holds the previous word. The hang trace read this status word
-        // and the ring registers back before every kick; those loads
-        // are what drained the stores. The UART and panel text around
-        // them were not.
-        barrier();
-        let _status = read(desc + DESC_LENGTH_STATUS);
-        let _cons = read(TDMA_RING + TDMA_CONS_INDEX);
-        let _ctrl = read(TDMA_REG_BASE + DMA_CTRL);
-        barrier();
+        // The image that forwarded (c057543) read the descriptor status
+        // and the whole ring-16 block back after the three stores and
+        // before the producer store. Each of those loads was wrapped in
+        // a data barrier. A later image kept only status, consumer, and
+        // DMA_CTRL; off-link traffic still died while on-link TX did not.
+        // The producer store stays last, and only after the same registers
+        // have been read back.
+        publish_tx_descriptor(desc, addr, status);
+        note_tx_arp(frame);
         let posted = raw_prod.wrapping_add(1);
         write_at(BASE + TDMA_RING + TDMA_PROD_INDEX, posted);
         let next = posted & 0xffff;
@@ -507,6 +505,98 @@ impl GenetDevice {
             }
         }
     }
+}
+
+fn publish_tx_descriptor(desc: usize, addr: u64, status: u32) {
+    let mut spins = 0;
+    loop {
+        write(desc + DESC_ADDRESS_LO, addr as u32);
+        write(desc + DESC_ADDRESS_HI, (addr >> 32) as u32);
+        write(desc + DESC_LENGTH_STATUS, status);
+        barrier();
+        let got = read(desc + DESC_LENGTH_STATUS);
+        let lo = read(desc + DESC_ADDRESS_LO);
+        let hi = read(desc + DESC_ADDRESS_HI);
+        if got == status && lo == addr as u32 && hi == (addr >> 32) as u32 {
+            break;
+        }
+        spins += 1;
+        if spins >= 4 {
+            if !DESC_MISMATCH.swap(true, Ordering::Relaxed) {
+                log::info!("genet tx descriptor readback mismatch");
+            }
+            break;
+        }
+    }
+    barrier();
+    let _ = read(TDMA_RING + DMA_READ_PTR);
+    let _ = read(TDMA_RING + DMA_WRITE_PTR);
+    let _ = read(TDMA_RING + TDMA_PROD_INDEX);
+    let _ = read(TDMA_RING + TDMA_CONS_INDEX);
+    let _ = read(TDMA_RING + DMA_START_ADDR);
+    let _ = read(TDMA_RING + DMA_END_ADDR);
+    let _ = read(TDMA_RING + DMA_RING_BUF_SIZE_REG);
+    let _ = read(TDMA_REG_BASE + DMA_RING_CFG);
+    let _ = read(TDMA_REG_BASE + DMA_CTRL);
+    let _ = read(TDMA_REG_BASE + DMA_STATUS);
+    barrier();
+}
+
+/// One line when we ask for a neighbor that is not ourselves. Gratuitous
+/// announcements are requests whose target is our own address and are not
+/// logged. At most one line every two seconds.
+fn note_tx_arp(frame: &[u8]) {
+    if frame.len() < 42 || frame[12] != 0x08 || frame[13] != 0x06 {
+        return;
+    }
+    if frame[20] != 0 || frame[21] != 1 {
+        return;
+    }
+    let spa = [frame[28], frame[29], frame[30], frame[31]];
+    let tpa = [frame[38], frame[39], frame[40], frame[41]];
+    if tpa == spa || !arp_log_due(&ARP_TX_LOG_MS) {
+        return;
+    }
+    log::info!(
+        "arp who-has {}.{}.{}.{}",
+        tpa[0], tpa[1], tpa[2], tpa[3]
+    );
+}
+
+fn note_rx_arp(frame: &[u8]) {
+    if frame.len() < 42 || frame[12] != 0x08 || frame[13] != 0x06 {
+        return;
+    }
+    if frame[20] != 0 || frame[21] != 2 || !arp_log_due(&ARP_RX_LOG_MS) {
+        return;
+    }
+    let mac = [
+        frame[22], frame[23], frame[24], frame[25], frame[26], frame[27],
+    ];
+    let spa = [frame[28], frame[29], frame[30], frame[31]];
+    log::info!(
+        "arp reply {}.{}.{}.{} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        spa[0],
+        spa[1],
+        spa[2],
+        spa[3],
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+}
+
+fn arp_log_due(slot: &AtomicU64) -> bool {
+    let now = crate::timer::millis();
+    let prev = slot.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 2_000 {
+        return false;
+    }
+    slot.store(now, Ordering::Relaxed);
+    true
 }
 
 fn tx_ring_has_room() -> bool {
@@ -1327,7 +1417,17 @@ impl Device for GenetDevice {
                 GenetRxToken {
                     index: 0,
                     len,
-                    probe: true,
+                    source: RX_PROBE,
+                },
+                GenetTxToken { device: self },
+            ));
+        }
+        if let Some(len) = crate::dhcp_rx::take_arp_len() {
+            return Some((
+                GenetRxToken {
+                    index: 0,
+                    len,
+                    source: RX_ARP,
                 },
                 GenetTxToken { device: self },
             ));
@@ -1337,7 +1437,7 @@ impl Device for GenetDevice {
             GenetRxToken {
                 index,
                 len,
-                probe: false,
+                source: RX_HW,
             },
             GenetTxToken { device: self },
         ))
@@ -1362,10 +1462,14 @@ impl Device for GenetDevice {
     }
 }
 
+const RX_HW: u8 = 0;
+const RX_PROBE: u8 = 1;
+const RX_ARP: u8 = 2;
+
 pub struct GenetRxToken {
     index: u16,
     len: u16,
-    probe: bool,
+    source: u8,
 }
 
 impl RxToken for GenetRxToken {
@@ -1373,12 +1477,17 @@ impl RxToken for GenetRxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        if self.probe {
+        if self.source == RX_PROBE {
             let mut tmp = [0u8; 384];
             let n = crate::dhcp_rx::copy_out(&mut tmp);
             let result = f(&mut tmp[..n]);
             say("[OK] DHCP offer probe delivered");
             return result;
+        }
+        if self.source == RX_ARP {
+            let mut tmp = [0u8; 64];
+            let n = crate::dhcp_rx::copy_arp(&mut tmp);
+            return f(&mut tmp[..n]);
         }
         let n = self.len as usize;
         let result = unsafe {
@@ -1402,12 +1511,20 @@ impl RxToken for GenetRxToken {
                     f(&mut [])
                 }
                 crate::dhcp_rx::Verdict::Pass => {
+                    if slice.len() >= 12 {
+                        let mut mac = [0u8; 6];
+                        mac.copy_from_slice(&slice[6..12]);
+                        crate::dhcp_rx::note_reply_mac(mac);
+                    }
                     if !DHCP_NOTED.swap(true, Ordering::Relaxed) {
                         say("[OK] GENET DHCP reply");
                     }
                     f(slice)
                 }
-                crate::dhcp_rx::Verdict::Ignore => f(slice),
+                crate::dhcp_rx::Verdict::Ignore => {
+                    note_rx_arp(slice);
+                    f(slice)
+                }
             }
         };
         result
