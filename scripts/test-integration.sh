@@ -1155,6 +1155,8 @@ if not raw.startswith(b"{\n  \"version\": 1,\n") or b"\n    \"mode\":" not in ra
     fail("default CONFIG.JSN is not pretty %s" % raw[:180])
 if b"legacy.local" not in raw or b'"vnc": 0' not in raw or b'"hdmi": 0' not in raw:
     fail("default CONFIG.JSN values %s" % raw[:180])
+if doc["dns"].get("probe_interval_secs") != 5:
+    fail("probe interval default %s" % raw[:240])
 if len(raw) > 4096:
     fail("default CONFIG.JSN exceeds 4096")
 cases = []
@@ -1163,6 +1165,12 @@ bad["dns"]["cache_reap_interval_secs"] = 0
 cases.append((bad, b"out of bounds"))
 bad = json.loads(raw)
 bad["dns"]["cache_reap_interval_secs"] = 3601
+cases.append((bad, b"out of bounds"))
+bad = json.loads(raw)
+bad["dns"]["probe_interval_secs"] = 0
+cases.append((bad, b"out of bounds"))
+bad = json.loads(raw)
+bad["dns"]["probe_interval_secs"] = 3601
 cases.append((bad, b"out of bounds"))
 bad = json.loads(raw)
 bad["dns"]["cache_size"] = 2048

@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod failover;
+mod health;
 mod server;
 
 use core::alloc::{GlobalAlloc, Layout};

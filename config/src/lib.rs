@@ -41,6 +41,10 @@ pub const CACHE_DEFAULT: u64 = 1024;
 pub const REAP_MIN: u64 = 1;
 pub const REAP_MAX: u64 = 3_600;
 pub const REAP_DEFAULT: u64 = 5;
+/// How often the DNS task probes each upstream. A missing key keeps 5.
+pub const PROBE_MIN: u64 = 1;
+pub const PROBE_MAX: u64 = 3_600;
+pub const PROBE_DEFAULT: u64 = 5;
 pub const RECORD_MAX: usize = 64;
 pub const UPSTREAM_MAX: usize = 8;
 pub const BLOCK_MAX: usize = 32;
@@ -316,6 +320,14 @@ const DNS_FIELDS: &[Field] = &[
         kind: FieldKind::U64 {
             min: REAP_MIN,
             max: REAP_MAX,
+        },
+    },
+    Field {
+        name: "probe_interval_secs",
+        required: false,
+        kind: FieldKind::U64 {
+            min: PROBE_MIN,
+            max: PROBE_MAX,
         },
     },
     Field {
@@ -986,5 +998,40 @@ mod tests {
         assert!(parse(r#"{"version":"\u12"}"#).is_err());
         assert!(parse(r#"{"version":"\uXXXX"}"#).is_err());
         assert!(parse("{\"version\":\"\n\"}").is_err());
+    }
+
+    fn sample_config(probe: &str) -> String {
+        alloc::format!(
+            r#"{{"version":1,"network":{{"mode":"dhcp","ip":"10.0.2.15","netmask":"255.255.255.0","gateway":"10.0.2.2","timeout_ms":3000}},"dns":{{"cache_size":1024,"cache_reap_interval_secs":5,{probe}"upstreams":["8.8.8.8"],"blocklist":[],"records":[]}},"http":{{"port":80,"username":"admin","password":"admin"}},"display":{{"vnc":0,"vnc_port":5900,"vnc_password":"","hdmi":0}}}}"#
+        )
+    }
+
+    #[test]
+    fn probe_interval_is_optional_and_bounded() {
+        let missing = parse(&sample_config("")).unwrap();
+        check(&missing, main_fields()).unwrap();
+        let present = parse(&sample_config(r#""probe_interval_secs":5,"#)).unwrap();
+        check(&present, main_fields()).unwrap();
+        assert_eq!(
+            present
+                .get("dns")
+                .and_then(|dns| dns.get("probe_interval_secs"))
+                .and_then(Value::as_u64),
+            Some(PROBE_DEFAULT)
+        );
+        let low = parse(&sample_config(r#""probe_interval_secs":0,"#)).unwrap();
+        assert!(check(&low, main_fields())
+            .unwrap_err()
+            .message
+            .contains("out of bounds"));
+        let high = parse(&sample_config(r#""probe_interval_secs":3601,"#)).unwrap();
+        assert!(check(&high, main_fields())
+            .unwrap_err()
+            .message
+            .contains("out of bounds"));
+        let formatted = format_document(&present).unwrap();
+        assert!(formatted.starts_with("{\n"));
+        assert!(formatted.contains("\"probe_interval_secs\": 5"));
+        assert_eq!(parse(&formatted).unwrap(), present);
     }
 }

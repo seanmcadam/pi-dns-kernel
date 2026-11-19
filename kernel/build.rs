@@ -133,7 +133,14 @@ fn build_user(out_dir: &Path, manifest_dir: &Path) {
 
 fn build_dns(out_dir: &Path, manifest_dir: &Path) {
     let dir = manifest_dir.join("../dns-el0");
-    for rel in ["src/main.rs", "src/server.rs", "src/failover.rs", "src/start.s", "link.ld"] {
+    for rel in [
+        "src/main.rs",
+        "src/server.rs",
+        "src/failover.rs",
+        "src/health.rs",
+        "src/start.s",
+        "link.ld",
+    ] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     println!(

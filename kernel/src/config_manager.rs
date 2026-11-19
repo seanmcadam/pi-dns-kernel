@@ -41,6 +41,8 @@ pub struct DnsConfig {
     pub blocklist: Vec<String>,
     pub cache_size: usize,
     pub cache_reap_secs: u64,
+    /// Seconds between health probes of each upstream. 1..=3600, default 5.
+    pub probe_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +230,21 @@ pub fn cache_reap_secs() -> u64 {
         .as_ref()
         .map(|config| config.dns.cache_reap_secs)
         .unwrap_or(config::REAP_DEFAULT)
+}
+
+/// Probe interval in seconds. Read on each pass. A missing or stored-out-of-range
+/// value stays at the default so an older `CONFIG.JSN` keeps forwarding.
+pub fn probe_interval_secs() -> u64 {
+    let secs = CURRENT
+        .lock()
+        .as_ref()
+        .map(|config| config.dns.probe_secs)
+        .unwrap_or(config::PROBE_DEFAULT);
+    if (config::PROBE_MIN..=config::PROBE_MAX).contains(&secs) {
+        secs
+    } else {
+        config::PROBE_DEFAULT
+    }
 }
 
 /// Update the two DNS cache fields and rewrite `CONFIG.JSN`. `Ok(true)` means
@@ -706,6 +723,7 @@ fn default_config() -> Config {
             blocklist: Vec::new(),
             cache_size: config::CACHE_DEFAULT as usize,
             cache_reap_secs: config::REAP_DEFAULT,
+            probe_secs: config::PROBE_DEFAULT,
         },
         http: HttpConfig {
             port: 80,
@@ -895,6 +913,17 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         .get("cache_reap_interval_secs")
         .and_then(Value::as_u64)
         .unwrap_or(config::REAP_DEFAULT);
+    let probe_secs = match dns.get("probe_interval_secs").and_then(Value::as_u64) {
+        None => config::PROBE_DEFAULT,
+        Some(secs) if (config::PROBE_MIN..=config::PROBE_MAX).contains(&secs) => secs,
+        Some(_) => {
+            return Err(alloc::format!(
+                "dns.probe_interval_secs: out of bounds ({}..={})",
+                config::PROBE_MIN,
+                config::PROBE_MAX
+            ))
+        }
+    };
     let mut upstreams = Vec::new();
     if let Some(items) = dns.get("upstreams").and_then(Value::as_array) {
         for (index, item) in items.iter().enumerate() {
@@ -979,6 +1008,7 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
             blocklist,
             cache_size,
             cache_reap_secs,
+            probe_secs,
         },
         http: HttpConfig {
             port,
@@ -1218,6 +1248,10 @@ fn config_value(config: &Config) -> Value {
                 (
                     String::from("cache_reap_interval_secs"),
                     Value::Number(config.dns.cache_reap_secs),
+                ),
+                (
+                    String::from("probe_interval_secs"),
+                    Value::Number(config.dns.probe_secs),
                 ),
                 (String::from("upstreams"), Value::Array(upstreams)),
                 (String::from("blocklist"), Value::Array(blocklist)),

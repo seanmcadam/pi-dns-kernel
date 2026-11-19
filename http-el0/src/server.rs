@@ -53,6 +53,7 @@ const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
 const POWER: u64 = 58;
 const VNC_CTRL: u64 = 59;
+const UPSTREAM_HEALTH: u64 = 61;
 
 const EAGAIN: i64 = -11;
 
@@ -760,15 +761,55 @@ fn handle_index() -> HttpResponse {
 
 fn handle_status() -> HttpResponse {
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
-        sys(CACHE_ENTRIES, 0, 0, 0, 0, 0, 0)
+        sys(CACHE_ENTRIES, 0, 0, 0, 0, 0, 0),
+        upstream_status()
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
     response
+}
+
+/// `[{"ip":"a.b.c.d","up":true}, ...]`. Empty until the DNS task publishes.
+fn upstream_status() -> String {
+    let mut buf = [0u8; 41];
+    let n = sys(
+        UPSTREAM_HEALTH,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    if n <= 0 {
+        return String::from("[]");
+    }
+    let n = n as usize;
+    let count = buf[0] as usize;
+    let mut json = String::from("[");
+    let mut i = 0;
+    while i < count && 1 + (i + 1) * 5 <= n.min(buf.len()) {
+        if i != 0 {
+            json.push(',');
+        }
+        let off = 1 + i * 5;
+        let up = if buf[off + 4] != 0 { "true" } else { "false" };
+        json.push_str(&format!(
+            "{{\"ip\":\"{}.{}.{}.{}\",\"up\":{}}}",
+            buf[off],
+            buf[off + 1],
+            buf[off + 2],
+            buf[off + 3],
+            up
+        ));
+        i += 1;
+    }
+    json.push(']');
+    json
 }
 
 fn handle_config(request: &HttpRequest) -> HttpResponse {
