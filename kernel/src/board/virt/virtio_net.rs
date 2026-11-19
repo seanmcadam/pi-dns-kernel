@@ -318,6 +318,18 @@ impl Device for VirtioNetDevice {
                     idx: 0,
                     len,
                     probe: true,
+                    arp: false,
+                },
+                VirtioTxToken { device: self },
+            ));
+        }
+        if let Some(len) = crate::dhcp_rx::take_arp_len() {
+            return Some((
+                VirtioRxToken {
+                    idx: 0,
+                    len,
+                    probe: false,
+                    arp: true,
                 },
                 VirtioTxToken { device: self },
             ));
@@ -334,6 +346,7 @@ impl Device for VirtioNetDevice {
                 idx,
                 len,
                 probe: false,
+                arp: false,
             },
             VirtioTxToken { device: self },
         ))
@@ -361,6 +374,7 @@ pub struct VirtioRxToken {
     idx: u16,
     len: u16,
     probe: bool,
+    arp: bool,
 }
 
 impl RxToken for VirtioRxToken {
@@ -368,6 +382,14 @@ impl RxToken for VirtioRxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        if self.arp {
+            let mut tmp = [0u8; 64];
+            let n = crate::dhcp_rx::copy_arp(&mut tmp);
+            if n >= 42 {
+                log::info!("gateway arp injected");
+            }
+            return f(&mut tmp[..n]);
+        }
         if self.probe {
             let mut tmp = [0u8; 384];
             let n = crate::dhcp_rx::copy_out(&mut tmp);
@@ -377,9 +399,9 @@ impl RxToken for VirtioRxToken {
                 let mut mac = [0u8; 6];
                 mac.copy_from_slice(&tmp[..6]);
                 match crate::dhcp_rx::verdict(&tmp[..n], &mac) {
-                crate::dhcp_rx::Verdict::DropChaddr => f(&mut []),
-                _ => f(&mut tmp[..n]),
-            }
+                    crate::dhcp_rx::Verdict::DropChaddr => f(&mut []),
+                    _ => f(&mut tmp[..n]),
+                }
             };
             crate::console::write_str("[OK] DHCP offer probe delivered\r\n");
             return result;
@@ -388,6 +410,7 @@ impl RxToken for VirtioRxToken {
             let bufs = &mut *addr_of_mut!(RX_BUFS);
             let frame = bufs.bufs[self.idx as usize].as_mut_ptr().add(HDR_LEN);
             let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
+            crate::config_manager::note_dhcp_dns_frame(slice);
             f(slice)
         };
         // Hand the buffer back. `repost` needs a device, so do it through the

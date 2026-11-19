@@ -180,6 +180,103 @@ pub fn copy_arp(dst: &mut [u8]) -> usize {
     n
 }
 
+/// The staged reply is still waiting for `Device::receive`.
+#[allow(dead_code)]
+pub fn arp_pending() -> bool {
+    ARP_ARMED.load(Ordering::Acquire)
+}
+
+/// Broadcast ARP request for `gw_ip`. A seeded unicast reply fills our
+/// cache and then the stack does not transmit a request of its own. The
+/// gateway on this LAN did not forward until it had answered one.
+pub fn write_gateway_request(
+    dst: &mut [u8],
+    our_mac: &[u8; 6],
+    our_ip: [u8; 4],
+    gw_ip: [u8; 4],
+) -> usize {
+    const LEN: usize = 60;
+    if dst.len() < LEN {
+        return 0;
+    }
+    dst[..LEN].fill(0);
+    dst[..6].fill(0xff);
+    dst[6..12].copy_from_slice(our_mac);
+    dst[12] = 0x08;
+    dst[13] = 0x06;
+    dst[14] = 0x00;
+    dst[15] = 0x01;
+    dst[16] = 0x08;
+    dst[17] = 0x00;
+    dst[18] = 6;
+    dst[19] = 4;
+    dst[20] = 0x00;
+    dst[21] = 0x01;
+    dst[22..28].copy_from_slice(our_mac);
+    dst[28..32].copy_from_slice(&our_ip);
+    dst[38..42].copy_from_slice(&gw_ip);
+    LEN
+}
+
+/// Option 6 addresses from a BOOTREPLY, in order, up to `out.len()`.
+/// The stack's DHCP parser keeps three and drops the rest.
+#[allow(dead_code)]
+pub fn dns_from_bootreply(frame: &[u8], out: &mut [[u8; 4]]) -> usize {
+    if !boot_reply(frame) || out.is_empty() {
+        return 0;
+    }
+    let ihl = (frame[14] & 0x0f) as usize * 4;
+    let mut o = 14 + ihl + 8 + 240;
+    let mut nout = 0usize;
+    while o < frame.len() && nout < out.len() {
+        let kind = frame[o];
+        if kind == 255 {
+            break;
+        }
+        if kind == 0 {
+            o += 1;
+            continue;
+        }
+        if o + 1 >= frame.len() {
+            break;
+        }
+        let n = frame[o + 1] as usize;
+        if o + 2 + n > frame.len() {
+            break;
+        }
+        if kind == 6 {
+            let mut p = 0;
+            while p + 4 <= n && nout < out.len() {
+                let ip = [
+                    frame[o + 2 + p],
+                    frame[o + 2 + p + 1],
+                    frame[o + 2 + p + 2],
+                    frame[o + 2 + p + 3],
+                ];
+                if ip != [0, 0, 0, 0] {
+                    out[nout] = ip;
+                    nout += 1;
+                }
+                p += 4;
+            }
+        }
+        o += 2 + n;
+    }
+    nout
+}
+
+/// `10.0.2.3` is the QEMU user-mode resolver. Keep it on a 10.0.2.0/24
+/// lease and before any lease is known. Drop it on any other lease.
+pub fn omit_slirp_dns(server: [u8; 4], lease: [u8; 4]) -> bool {
+    if server != [10, 0, 2, 3] {
+        return false;
+    }
+    if lease == [0, 0, 0, 0] {
+        return false;
+    }
+    !(lease[0] == 10 && lease[1] == 0 && lease[2] == 2)
+}
+
 /// Boot-time check used on virt, raspi4b, and the Pi boards. The line is
 /// the serial marker the integration test greps for.
 pub fn self_check_line() -> &'static str {
@@ -540,6 +637,15 @@ mod tests {
         assert_eq!(&frame[28..32], &gw_ip);
         assert!(!stage_gateway_arp(&mac, our_ip, mask, &VRRP_MAC, [8, 8, 8, 8]));
 
+        let mut request = [0u8; 60];
+        assert_eq!(write_gateway_request(&mut request, &mac, our_ip, gw_ip), 60);
+        assert_eq!(&request[..6], &[0xff; 6]);
+        assert_eq!(&request[6..12], &mac);
+        assert_eq!(&request[20..22], &[0x00, 0x01]);
+        assert_eq!(&request[28..32], &our_ip);
+        assert_eq!(&request[32..38], &[0; 6]);
+        assert_eq!(&request[38..42], &gw_ip);
+
         let mut dev = Pipe::default();
         let eth = smoltcp::wire::EthernetAddress::from_bytes(&mac);
         let mut config = smoltcp::iface::Config::new(eth.into());
@@ -588,6 +694,49 @@ mod tests {
             .expect("off-link udp was not sent");
         assert_eq!(&sent[..6], &VRRP_MAC, "udp did not use the gateway mac");
         assert_eq!(&sent[30..34], &[8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn option6_keeps_the_fourth_server() {
+        let servers = [
+            [172, 18, 254, 4],
+            [172, 18, 254, 5],
+            [8, 8, 8, 8],
+            [172, 18, 50, 10],
+        ];
+        let frame = frame_with_dns(&servers);
+        let mut got = [[0u8; 4]; 8];
+        assert_eq!(dns_from_bootreply(&frame, &mut got), 4);
+        assert_eq!(&got[..4], &servers);
+    }
+
+    #[test]
+    fn slirp_resolver_is_only_for_the_qemu_subnet() {
+        assert!(omit_slirp_dns([10, 0, 2, 3], [172, 18, 3, 137]));
+        assert!(!omit_slirp_dns([10, 0, 2, 3], [10, 0, 2, 15]));
+        assert!(!omit_slirp_dns([10, 0, 2, 3], [0, 0, 0, 0]));
+        assert!(!omit_slirp_dns([8, 8, 8, 8], [172, 18, 3, 137]));
+        assert!(!omit_slirp_dns([172, 18, 50, 10], [172, 18, 3, 137]));
+    }
+
+    fn frame_with_dns(servers: &[[u8; 4]]) -> [u8; 384] {
+        let mut frame = [0u8; 384];
+        assert!(write_offer(&mut frame, &PHOTO_MAC, &PHOTO_MAC, 1) > 0);
+        let dhcp = 42;
+        for byte in &mut frame[dhcp + 240..] {
+            *byte = 0;
+        }
+        let mut flat = [0u8; 32];
+        let mut n = 0;
+        for ip in servers {
+            flat[n..n + 4].copy_from_slice(ip);
+            n += 4;
+        }
+        let mut o = dhcp + 240;
+        o = put_opt(&mut frame, o, 53, &[5]);
+        o = put_opt(&mut frame, o, 6, &flat[..n]);
+        frame[o] = 255;
+        frame
     }
 
     fn dhcp_type(frame: &[u8]) -> Option<u8> {
