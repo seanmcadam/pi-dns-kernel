@@ -181,6 +181,38 @@ impl Board for Pi4 {
     fn power(reset: bool) -> bool {
         watchdog_power(reset)
     }
+
+    fn power_tryboot() -> bool {
+        // Linux sets this with the mailbox tag SET_REBOOT_FLAGS (bit 0)
+        // before the watchdog reset. It is not a PM_RSTS partition bit.
+        // The bootloader consumes the flag and loads tryboot.txt once.
+        // A refused mailbox must not reset, or the machine would boot
+        // config.txt while the caller was told this was a tryboot.
+        if !set_reboot_flag(1) {
+            return true;
+        }
+        let refused = watchdog_power(true);
+        if refused {
+            let _ = set_reboot_flag(0);
+        }
+        refused
+    }
+}
+
+/// VideoCore property tag `RPI_FIRMWARE_SET_REBOOT_FLAGS`.
+fn set_reboot_flag(flag: u32) -> bool {
+    let mut words = [0u32; 8];
+    words[0] = 7 * 4;
+    words[1] = 0;
+    words[2] = 0x0003_8064;
+    words[3] = 4;
+    words[4] = 0;
+    words[5] = flag;
+    words[6] = 0;
+    if mbox::run(MBOX_BASE, &mut words) != 0 {
+        return false;
+    }
+    words[1] == 0x8000_0000 && words[4] & 0x8000_0000 != 0
 }
 
 /// BCM2711 power management at `0xFE100000` (bus `0x7E100000`).

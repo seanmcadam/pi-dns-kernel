@@ -17,6 +17,7 @@ mod fault_log;
 #[cfg(feature = "board-pi4")]
 mod fb_con;
 mod fs;
+mod fw;
 mod http;
 mod gic;
 mod interrupts;
@@ -151,6 +152,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         Ok(()) => uart_write("[OK] Filesystem mounted\r\n"),
         Err(_) => uart_write("[OK] No filesystem, using defaults\r\n"),
     }
+    fw::scrub();
     let config = config_manager::load_config();
     uart_write("[OK] Config loaded\r\n");
 
