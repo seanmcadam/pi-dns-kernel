@@ -167,6 +167,13 @@ pub fn polling_here() -> bool {
 }
 
 pub(crate) fn poll_device(state: &mut NetworkState) {
+    poll_device_inner(state);
+    // The handler masks the GENET line. Arm it only after the receive
+    // above has drained frames that arrived while it was masked.
+    crate::board::arm_nic();
+}
+
+fn poll_device_inner(state: &mut NetworkState) {
     crate::board::service_nic();
     maybe_announce(&mut state.device);
     let timestamp = Instant::from_millis(crate::timer::millis() as i64);

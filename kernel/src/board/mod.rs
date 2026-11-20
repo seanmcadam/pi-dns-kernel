@@ -98,6 +98,11 @@ pub trait Board {
     /// Boards with a PHY refresh link state here. Others do nothing.
     fn service_nic() {}
 
+    /// Re-enable a NIC IRQ the handler masked. Called after the poll has
+    /// drained the ring. Virtio acknowledges in the handler, so the default
+    /// is a no-op.
+    fn arm_nic() {}
+
     /// `false` holds a DHCP timer until the link comes up. Boards without
     /// that wait report the link as up.
     fn nic_link() -> bool {
@@ -230,6 +235,10 @@ pub fn handle_irq(id: u32) -> IrqHit {
 
 pub fn service_nic() {
     <Active as Board>::service_nic()
+}
+
+pub fn arm_nic() {
+    <Active as Board>::arm_nic()
 }
 
 pub fn nic_link() -> bool {

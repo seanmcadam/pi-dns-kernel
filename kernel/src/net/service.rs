@@ -266,6 +266,19 @@ pub fn note_kick() {
     KICK.store(true, Ordering::Release);
 }
 
+/// `note_kick`, and if this core is not the owner, SGI that core.
+///
+/// A GENET interrupt lands on whichever CPU the SPI targets. Until the
+/// line is moved, that is CPU 0, while core 1 owns the NIC and is in
+/// `wfi`. Setting `KICK` on the other core does not wake it.
+pub fn wake_owner() {
+    note_kick();
+    let owner = TURN.load(Ordering::Acquire);
+    if owner != crate::percpu::id() {
+        crate::gic::send_sgi(crate::gic::SGI_NET, owner);
+    }
+}
+
 pub fn kick_pending() -> bool {
     KICK.load(Ordering::Acquire)
 }
@@ -347,11 +360,7 @@ pub fn owner_idle() {
 }
 
 fn notify_owner() {
-    note_kick();
-    let owner = TURN.load(Ordering::Acquire);
-    if owner != crate::percpu::id() {
-        crate::gic::send_sgi(crate::gic::SGI_NET, owner);
-    }
+    wake_owner();
 }
 
 pub fn drive() {
@@ -427,6 +436,17 @@ fn arm_deadline(state: &mut super::NetworkState) {
     if let Some(at) = super::next_announce_ms() {
         if at < deadline {
             deadline = at;
+        }
+    }
+    // Pi 4's gratuitous ARP repeats every 2 s. Once the RX line is quiet
+    // that announce is the only deadline, so ICMP, DNS, and HTTP sit until
+    // it. Bound the sleep to one timer tick. A sooner DHCP or ARP time
+    // above is left alone.
+    #[cfg(feature = "board-pi4")]
+    {
+        let cap = now.saturating_add(10);
+        if deadline > cap {
+            deadline = cap;
         }
     }
     DEADLINE_MS.store(deadline, Ordering::Release);

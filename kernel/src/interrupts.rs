@@ -99,7 +99,9 @@ fn classify(id: u32) -> u64 {
     match crate::board::handle_irq(id) {
         crate::board::IrqHit::Net => {
             NIC_IRQS.fetch_add(1, Ordering::Relaxed);
-            crate::net::service::note_kick();
+            // The SPI may be aimed at a core that does not own the NIC.
+            // `KICK` alone does not leave that owner's `wfi`.
+            crate::net::service::wake_owner();
             return CLASS_NET;
         }
         crate::board::IrqHit::Block => {

@@ -809,6 +809,10 @@ fn init_rx_ring() {
     write(RDMA_RING + DMA_WRITE_PTR, 0);
     write(RDMA_RING + DMA_END_ADDR, end);
     write(RDMA_RING + DMA_RING_BUF_SIZE_REG, size);
+    // One completed buffer raises RXDMA_DONE. TX already programs this.
+    // A zero threshold does not, so an echo request never wakes the owner
+    // and the next look is the 2 s gratuitous ARP.
+    write(RDMA_RING + DMA_MBUF_DONE_THRESH, 1);
     write(RDMA_RING + DMA_FLOW_PERIOD, (5 << 16) | (RX_RING_DESCS as u32 >> 4));
     write(RDMA_REG_BASE + DMA_RING_CFG, 1 << DEFAULT_Q);
     let got_end = read(RDMA_RING + DMA_END_ADDR);
@@ -857,15 +861,26 @@ fn program_irqs() {
         INTRL2_0 + INTRL2_MASK_CLEAR,
         IRQ_RXDMA_DONE | IRQ_TXDMA_DONE,
     );
+    // Core 0 owns the NIC until core 1 claims it and retarget() moves these.
     crate::gic::arm_spi(GENET_IRQ0, 0x80, 1);
     crate::gic::arm_spi(GENET_IRQ1, 0x80, 1);
     say("[OK] GENET IRQ armed, data path is polled");
 }
 
+/// Point both GENET SPIs at the network owner. Bit 0 of the mask is CPU 0.
+pub fn retarget(cpu: usize) {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
+    let mask = 1u8 << (cpu & 7);
+    crate::gic::route_spi(GENET_IRQ0, mask);
+    crate::gic::route_spi(GENET_IRQ1, mask);
+}
+
 static IRQ_HELD: AtomicBool = AtomicBool::new(false);
 
-/// The handler masks the GIC line. Re-arm it only after the summary has
-/// gone quiet, so a level source cannot re-enter before the poll path runs.
+/// The handler masks the GIC line. The poll that follows clears any
+/// summary a frame left behind and enables the line again.
 pub fn note_irq_held() {
     IRQ_HELD.store(true, Ordering::Relaxed);
 }
@@ -874,18 +889,19 @@ pub fn rearm_irq() {
     if !PRESENT.load(Ordering::Relaxed) || !IRQ_HELD.load(Ordering::Relaxed) {
         return;
     }
-    if irq_pending(INTRL2_0) || irq_pending(INTRL2_1) {
-        return;
+    // A frame that arrives after the handler's clear and before this poll
+    // sets the summary again. Skipping the enable in that case left the
+    // GIC line masked for good: nothing else writes INTRL2_CLEAR, so every
+    // later packet waited for the 2 s ARP deadline.
+    for base in [INTRL2_0, INTRL2_1] {
+        let stat = read(base + INTRL2_STAT);
+        if stat != 0 {
+            write(base + INTRL2_CLEAR, stat);
+        }
     }
     crate::gic::enable_id(GENET_IRQ0);
     crate::gic::enable_id(GENET_IRQ1);
     IRQ_HELD.store(false, Ordering::Relaxed);
-}
-
-fn irq_pending(base: usize) -> bool {
-    let stat = read(base + INTRL2_STAT);
-    let mask = read(base + INTRL2_MASK_STATUS);
-    stat & !mask != 0
 }
 
 /// Clear the GENET interrupt summary. `false` means the line stayed

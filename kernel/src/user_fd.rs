@@ -46,6 +46,8 @@
 //!  61  upstream_health(buf, cap) -> len of that blob. Empty until the first publish.
 //!  62  config_probe_secs. Upstream health-probe interval, 1..=3600.
 //!  63  net_ready. 1 once the interface has an address, else 0.
+//!  64  net_counters(buf, cap) -> 40. Five little-endian u64s:
+//!      nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -104,6 +106,7 @@ const SET_UPSTREAM_HEALTH: u64 = 60;
 const UPSTREAM_HEALTH: u64 = 61;
 const CONFIG_PROBE_SECS: u64 = 62;
 const NET_READY: u64 = 63;
+const NET_COUNTERS: u64 = 64;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -209,6 +212,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         UPSTREAM_HEALTH => upstream_health(args[0], args[1]),
         CONFIG_PROBE_SECS => crate::config_manager::probe_interval_secs() as i64,
         NET_READY => i64::from(crate::net::has_address()),
+        NET_COUNTERS => net_counters(args[0], args[1]),
         _ => -1,
     };
     value as u64
@@ -1241,6 +1245,23 @@ fn set_upstream_health(ptr: u64, len: u64) -> i64 {
     }
     crate::dns::set_upstream_health(&raw[..n]);
     0
+}
+
+fn net_counters(ptr: u64, cap: u64) -> i64 {
+    const N: usize = 40;
+    if cap < N as u64 || !crate::mmu::user_write_ok(ptr, N as u64) {
+        return EFAULT;
+    }
+    let (rx, tx) = crate::board::packet_counts();
+    let (nic, _) = crate::interrupts::irq_counts();
+    let (busy, idle) = service::owner_time();
+    let words = [nic, u64::from(rx), u64::from(tx), busy, idle];
+    let mut raw = [0u8; N];
+    for (index, word) in words.iter().enumerate() {
+        let off = index * 8;
+        raw[off..off + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    if write_user(ptr, &raw) { N as i64 } else { EFAULT }
 }
 
 fn upstream_health(ptr: u64, cap: u64) -> i64 {
