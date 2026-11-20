@@ -8,6 +8,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use http_server::{parse_basic_auth, HttpMethod, HttpRequest, HttpResponse, ParseError};
 
+#[path = "firmware.rs"]
+mod firmware;
+
 const HTTP_WORKERS: usize = crate::WORKERS;
 static JOB: [AtomicU32; HTTP_WORKERS] = [
     AtomicU32::new(0),
@@ -208,6 +211,9 @@ fn content_length(request: &HttpRequest) -> Option<usize> {
 fn handle(request: &HttpRequest) -> HttpResponse {
     if !check_auth(request) {
         return HttpResponse::unauthorized();
+    }
+    if request.path == "/firmware" || request.path.starts_with("/firmware/") {
+        return firmware::handle(request);
     }
     match request.path.as_str() {
         "/" => handle_index(),
@@ -431,7 +437,7 @@ fn handle_power(request: &HttpRequest) -> HttpResponse {
     html_ok(&format!("{word} requested."))
 }
 
-fn bad_request(message: &str) -> HttpResponse {
+pub(super) fn bad_request(message: &str) -> HttpResponse {
     let mut response = HttpResponse::new(400, "Bad Request");
     response.set_body(message.as_bytes());
     response
@@ -746,6 +752,7 @@ fn handle_index() -> HttpResponse {
     <h2>Management</h2>
     <ul>
         <li><a href="/status">System Status (JSON)</a></li>
+        <li><a href="/firmware">Firmware update</a></li>
         <li><a href="/config">Configuration</a></li>
         <li><a href="/records">DNS Records (JSON)</a></li>
         <li><a href="/logs">Log</a></li>
@@ -766,7 +773,7 @@ fn handle_status() -> HttpResponse {
     let (arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses, dns_inflight, upstream_timeouts) =
         net_extra();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -782,7 +789,8 @@ fn handle_status() -> HttpResponse {
         arp_cache_hits,
         arp_cache_misses,
         dns_inflight,
-        upstream_timeouts
+        upstream_timeouts,
+        firmware::fields()
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
@@ -957,14 +965,14 @@ fn delete_record_from_body(request: &HttpRequest) -> HttpResponse {
     }
 }
 
-fn html_ok(text: &str) -> HttpResponse {
+pub(super) fn html_ok(text: &str) -> HttpResponse {
     let body = format!(
         "<!DOCTYPE html><html><body><p>{text}</p><p><a href=\"/\">Back</a></p></body></html>"
     );
     html_response(&body)
 }
 
-fn html_response(body: &str) -> HttpResponse {
+pub(super) fn html_response(body: &str) -> HttpResponse {
     let mut response = HttpResponse::ok(body);
     response.add_header("Content-Type", "text/html; charset=utf-8");
     response
@@ -1063,7 +1071,7 @@ fn exit(code: u64) -> ! {
     loop {}
 }
 
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+pub(super) fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     let ret: u64;
     unsafe {
         core::arch::asm!(

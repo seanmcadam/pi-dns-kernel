@@ -159,6 +159,12 @@ pub trait Board {
         let _ = reset;
         true
     }
+
+    /// Reboot through the Pi firmware one-shot tryboot flag.
+    /// `true` means this board cannot do that, and the guest is still running.
+    fn power_tryboot() -> bool {
+        true
+    }
 }
 
 pub const NAME: &str = <Active as Board>::NAME;
@@ -283,6 +289,10 @@ pub fn hdmi_code_bytes() -> usize {
 
 pub fn power(reset: bool) -> bool {
     <Active as Board>::power(reset)
+}
+
+pub fn power_tryboot() -> bool {
+    <Active as Board>::power_tryboot()
 }
 
 /// VideoCore bus address to ARM physical address.

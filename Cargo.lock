@@ -124,6 +124,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fwupd"
+version = "0.1.0"
+dependencies = [
+ "embedded-sdmmc",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -185,6 +192,7 @@ dependencies = [
  "cortex-a",
  "embedded-hal",
  "embedded-sdmmc",
+ "fwupd",
  "heapless",
  "log",
  "smoltcp",

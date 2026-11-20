@@ -53,6 +53,7 @@
 //!  66  net_extra(buf, cap) -> 48. Six little-endian u64s:
 //!      arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses,
 //!      dns_inflight, upstream_timeouts.
+//!  67  firmware(op, ...). Staged SD updates. See `fw::syscall`.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -114,6 +115,7 @@ const NET_READY: u64 = 63;
 const NET_COUNTERS: u64 = 64;
 const SET_DNS_LOAD: u64 = 65;
 const NET_EXTRA: u64 = 66;
+const FW: u64 = 67;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -222,6 +224,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         NET_COUNTERS => net_counters(args[0], args[1]),
         SET_DNS_LOAD => set_dns_load(args[0], args[1]),
         NET_EXTRA => net_extra(args[0], args[1]),
+        FW => crate::fw::syscall(args),
         _ => -1,
     };
     value as u64

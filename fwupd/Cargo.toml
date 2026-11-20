@@ -1,0 +1,13 @@
+[package]
+name = "fwupd"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+embedded-sdmmc = { path = "../vendor/embedded-sdmmc", default-features = false }

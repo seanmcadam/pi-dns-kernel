@@ -2010,6 +2010,304 @@ fi
 kill $JSON_PID 2>/dev/null || true
 wait $JSON_PID 2>/dev/null || true
 
+echo ""
+echo "Test 57: Firmware upload, readback, validation, and reboot"
+DISK_OFF=$((2048 * 512))
+rm -f qemu/fw-disk.img qemu/fw-a.txt /tmp/fw-live.bin /tmp/fw-test.bin /tmp/fw-kernel.bin
+dd if=/dev/zero of=qemu/fw-disk.img bs=1M count=64 status=none
+sfdisk --quiet qemu/fw-disk.img <<'EOF'
+label: dos
+start=2048, type=c
+EOF
+mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/fw-disk.img >/dev/null
+python3 -c 'open("/tmp/fw-live.bin","wb").write(b"K"*64)'
+mcopy -i qemu/fw-disk.img@@${DISK_OFF} /tmp/fw-live.bin ::KERNEL8.IMG
+timeout 180 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/fw-a.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/fw-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-fw.txt 2>&1 &
+FW_PID=$!
+FW_UP=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+    if curl -sf -u admin:admin --max-time 2 "http://127.0.0.1:${HTTP_HOST_PORT}/" >/dev/null; then
+        FW_UP=1
+        break
+    fi
+    sleep 0.5
+done
+FW_OK=0
+if [ "$FW_UP" = 1 ] && python3 - "$HTTP_HOST_PORT" qemu/fw-a.txt <<'PY'
+import hashlib, json, sys, time, urllib.error, urllib.request
+http_port, serial_path = sys.argv[1], sys.argv[2]
+base = "http://127.0.0.1:%s" % http_port
+MARKER = b"=== Pi4 DNS Server Kernel ==="
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def req(method, path, data=None, headers=None, auth=True, timeout=8):
+    body = data.encode() if isinstance(data, str) else data
+    r = urllib.request.Request(base + path, data=body, method=method)
+    for key, value in (headers or {}).items():
+        r.add_header(key, value)
+    handler = opener if auth else urllib.request.build_opener()
+    try:
+        with handler.open(r, timeout=timeout) as resp:
+            return resp.status, resp.read(), resp.headers
+    except urllib.error.HTTPError as err:
+        return err.code, err.read(), err.headers
+    except Exception as err:
+        return 0, str(err).encode(), {}
+
+def form(path, fields):
+    body = "&".join("%s=%s" % pair for pair in fields)
+    return req("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+
+def uptime():
+    status, page, _ = req("GET", "/status")
+    if status != 200:
+        fail("status %s %s" % (status, page[:200]))
+    return json.loads(page)
+
+status, home, _ = req("GET", "/")
+if status != 200 or b'href="/firmware"' not in home:
+    fail("home missing firmware link %s" % home[:300])
+status, page, _ = req("GET", "/firmware")
+if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
+    fail("firmware page %s %s" % (status, page[:300]))
+if b"tryboot hardware: no" not in page or b"confirm('Reboot this machine?')" not in page:
+    fail("firmware page flags %s" % page[:400])
+status, _, _ = req("GET", "/firmware", auth=False)
+if status != 401:
+    fail("firmware unauth %s" % status)
+status, _, _ = req("GET", "/firmware/reboot")
+if status != 405:
+    fail("GET reboot %s" % status)
+status, body, _ = form("/firmware/reboot", ())
+if status != 400 or b"Confirmation required" not in body:
+    fail("reboot confirm %s %s" % (status, body[:120]))
+
+doc = uptime()
+for key in ("fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_temp", "fw_sha256", "fw_result"):
+    if key not in doc:
+        fail("status missing %s" % key)
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_staged"] != 0:
+    fail("initial firmware status %s" % doc)
+
+before = doc["uptime"]
+status, body, _ = form("/firmware/reboot", (("confirm", "reboot"), ("tryboot", "1")))
+if status != 400 or b"tryboot is not supported on this board" not in body:
+    fail("tryboot %s %s" % (status, body[:160]))
+time.sleep(0.6)
+if uptime()["uptime"] < before:
+    fail("tryboot request rebooted the guest")
+
+status, body, _ = req("POST", "/firmware/config", "kernel=/etc/passwd\n", {"X-Fw-Kind": "boot", "X-Fw-Commit": "1", "Content-Type": "text/plain"})
+if status != 400 or b"kernel" not in body:
+    fail("bad boot %s %s" % (status, body[:160]))
+status, saved, _ = req("GET", "/config/file/config")
+if status != 200 or b"version" not in saved:
+    fail("config download %s" % status)
+open("/tmp/fw-config.json", "wb").write(saved)
+status, body, _ = req("POST", "/firmware/config", '{"version":1}', {"X-Fw-Kind": "json", "X-Fw-Commit": "1", "Content-Type": "text/plain"})
+if status != 400:
+    fail("bad json committed %s %s" % (status, body[:160]))
+status, after, _ = req("GET", "/config/file/config")
+if after != saved:
+    fail("invalid json changed CONFIG.JSN")
+status, body, _ = req("POST", "/firmware/config", saved.decode(), {"X-Fw-Kind": "json", "X-Fw-Commit": "0", "Content-Type": "text/plain"})
+if status != 200 or b'"status":"valid"' not in body:
+    fail("json validate %s %s" % (status, body[:160]))
+status, after, _ = req("GET", "/config/file/config")
+if after != saved:
+    fail("validate wrote CONFIG.JSN")
+status, body, _ = form("/firmware/config", (("preset", "1"), ("commit", "1")))
+if status != 200 or b'"status":"stored"' not in body:
+    fail("preset %s %s" % (status, body[:160]))
+if uptime()["fw_tryboot"] != 1:
+    fail("tryboot.txt not recorded")
+
+def chunks(kind, payload, sha=None, final_sha=True):
+    step = 1024
+    off = 0
+    while off < len(payload):
+        piece = payload[off:off + step]
+        final = off + len(piece) == len(payload)
+        fields = [
+            ("kind", kind),
+            ("offset", str(off)),
+            ("total", str(len(payload))),
+            ("final", "1" if final else "0"),
+            ("data", piece.hex()),
+        ]
+        if final and final_sha:
+            fields.append(("sha256", sha if sha is not None else hashlib.sha256(payload).hexdigest()))
+        status, body, _ = form("/firmware/chunk", fields)
+        if status != 200:
+            return status, body
+        off += len(piece)
+    return status, body
+
+status, body, _ = form("/firmware/chunk", (("kind", "kernel"), ("offset", "0"), ("total", "9000000"), ("final", "0"), ("data", "aa")))
+if status != 400 or b"too large" not in body:
+    fail("oversize %s %s" % (status, body[:120]))
+status, body, _ = form("/firmware/chunk", (("kind", "test"), ("offset", "5"), ("total", "10"), ("final", "0"), ("data", "abcd")))
+if status != 400 or b"bad offset" not in body:
+    fail("offset %s %s" % (status, body[:120]))
+
+scratch = bytes((i * 17) & 0xFF for i in range(5000))
+open("/tmp/fw-test.bin", "wb").write(scratch)
+status, body = chunks("test", scratch, sha="00" * 32)
+if status != 400 or b"checksum mismatch" not in body:
+    fail("bad checksum %s %s" % (status, body[:160]))
+status, _, _ = req("GET", "/firmware/read/test/0")
+if status != 404:
+    fail("bad checksum left the test file %s" % status)
+
+status, body = chunks("test", scratch)
+if status != 200 or b"staged" not in body:
+    fail("test upload %s %s" % (status, body[:160]))
+got = b""
+off = 0
+file_sha = None
+while off < len(scratch):
+    status, part, headers = req("GET", "/firmware/read/test/%d" % off)
+    if status != 200 or not part:
+        fail("readback %s %s at %s" % (status, part[:80], off))
+    file_sha = headers["X-Fw-Sha256"]
+    got += part
+    off += len(part)
+if got != scratch or file_sha != hashlib.sha256(scratch).hexdigest():
+    fail("readback mismatch %s %s" % (len(got), file_sha))
+
+blank = b"\xff" * 4096
+status, body = chunks("kernel", blank)
+if status != 400 or b"image rejected" not in body:
+    fail("blank image %s %s" % (status, body[:160]))
+elf = b"\x7fELF" + b"\x01" * 4092
+status, body = chunks("kernel", elf)
+if status != 400 or b"image rejected" not in body:
+    fail("elf image %s %s" % (status, body[:160]))
+kernel = bytes((i * 3) & 0xFF for i in range(4096))
+if kernel[0] == 0:
+    kernel = b"\x01" + kernel[1:]
+open("/tmp/fw-kernel.bin", "wb").write(kernel)
+status, body = chunks("kernel", kernel)
+if status != 200 or b"staged" not in body:
+    fail("kernel stage %s %s" % (status, body[:160]))
+doc = uptime()
+if doc["fw_staged"] != 1 or doc["fw_bytes"] != 4096 or doc["fw_backup"] != 1:
+    fail("staged status %s" % {k: doc[k] for k in ("fw_staged", "fw_bytes", "fw_backup", "fw_sha256", "fw_result")})
+if doc["fw_sha256"] != hashlib.sha256(kernel).hexdigest():
+    fail("staged sha %s" % doc["fw_sha256"])
+status, part, headers = req("GET", "/firmware/read/kernel/0")
+if status != 200 or headers["X-Fw-Sha256"] != doc["fw_sha256"] or part != kernel[:len(part)]:
+    fail("kernel read %s" % status)
+
+# QEMU does not clear CNTVCT on reset. Uptime is counted from the boot
+# sample of that counter, and the first /status after reset is often
+# already several seconds. Wait so that sample is still below `before`.
+entry = uptime()["uptime"]
+need = entry + 12
+before = entry
+deadline = time.time() + 40
+while time.time() < deadline and before < need:
+    time.sleep(0.4)
+    try:
+        before = uptime()["uptime"]
+    except SystemExit:
+        continue
+if before < need:
+    fail("uptime never advanced 12s past %s (now %s)" % (entry, before))
+old_n = open(serial_path, "rb").read().count(MARKER)
+status, body, _ = form("/firmware/reboot", (("confirm", "reboot"), ("tryboot", "0")))
+if status != 200 or b"Reboot requested." not in body:
+    fail("reboot %s %s" % (status, body[:160]))
+deadline = time.time() + 25
+samples = []
+while time.time() < deadline:
+    try:
+        doc = uptime()
+    except SystemExit:
+        time.sleep(0.3)
+        continue
+    samples.append(doc["uptime"])
+    new_n = open(serial_path, "rb").read().count(MARKER)
+    if doc["uptime"] < before and new_n > old_n and doc["fw_staged"] == 1:
+        status, part, headers = req("GET", "/firmware/read/test/0")
+        if status != 200 or headers["X-Fw-Sha256"] != hashlib.sha256(scratch).hexdigest():
+            fail("test file missing after reboot")
+        print("reboot", before, doc["uptime"], "banners", old_n, new_n)
+        break
+    time.sleep(0.3)
+else:
+    fail("firmware reboot did not come back %s" % samples[-8:])
+print("firmware ok")
+PY
+then
+    FW_OK=1
+fi
+kill "$FW_PID" 2>/dev/null || true
+wait "$FW_PID" 2>/dev/null || true
+sync
+if [ "$FW_OK" = 1 ]; then
+    if ! mcopy -i qemu/fw-disk.img@@${DISK_OFF} ::KERNEL8.IMG - > /tmp/fw-live-after.bin \
+        || ! mcopy -i qemu/fw-disk.img@@${DISK_OFF} ::FWTEST.BIN - > /tmp/fw-test-after.bin \
+        || ! mcopy -i qemu/fw-disk.img@@${DISK_OFF} ::KERNEL8.NEW - > /tmp/fw-kernel-after.bin \
+        || ! mcopy -i qemu/fw-disk.img@@${DISK_OFF} ::TRYBOOT.TXT - > /tmp/fw-tryboot.txt
+    then
+        echo "✗ firmware files missing on the FAT volume"
+        FW_OK=0
+    fi
+fi
+if [ "$FW_OK" = 1 ]; then
+    if ! cmp -s /tmp/fw-live.bin /tmp/fw-live-after.bin; then
+        echo "✗ KERNEL8.IMG changed"
+        FW_OK=0
+    fi
+    if ! cmp -s /tmp/fw-test.bin /tmp/fw-test-after.bin; then
+        echo "✗ FWTEST.BIN does not match the upload"
+        FW_OK=0
+    fi
+    if ! cmp -s /tmp/fw-kernel.bin /tmp/fw-kernel-after.bin; then
+        echo "✗ KERNEL8.NEW does not match the staged kernel"
+        FW_OK=0
+    fi
+    if ! grep -q "kernel=kernel8.new" /tmp/fw-tryboot.txt; then
+        echo "✗ tryboot.txt does not name the staged kernel"
+        FW_OK=0
+    fi
+    if mcopy -i qemu/fw-disk.img@@${DISK_OFF} ::CONFIG.TXT - >/dev/null 2>&1; then
+        echo "✗ CONFIG.TXT was created"
+        FW_OK=0
+    fi
+    if mcopy -i qemu/fw-disk.img@@${DISK_OFF} ::FWTEST.TMP - >/dev/null 2>&1; then
+        echo "✗ FWTEST.TMP was left behind"
+        FW_OK=0
+    fi
+    if mcopy -i qemu/fw-disk.img@@${DISK_OFF} ::KN8.TMP - >/dev/null 2>&1; then
+        echo "✗ KN8.TMP was left behind"
+        FW_OK=0
+    fi
+fi
+if [ "$FW_OK" = 1 ]; then
+    echo "✓ Firmware upload, readback, validation, and reboot"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Firmware upload, readback, validation, or reboot failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Test 12 and 13: exception report, and a write to .text must fault.
 fault_case() {
     local name="$1"

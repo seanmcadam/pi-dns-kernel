@@ -131,8 +131,18 @@ pub fn file_len(name: &str) -> Result<u32, FsError> {
 
 pub fn delete_file(name: &str) -> Result<(), FsError> {
     match with_dir(|mgr, dir| {
-        mgr.delete_file_in_dir(dir, name)
-            .map_err(|err| fs_err("delete", err))
+        mgr.delete_file_in_dir(dir, name).map_err(|err| {
+            // A missing file is the successful outcome of delete. Scrub of
+            // leftover temp names hits this on every boot.
+            if matches!(err, embedded_sdmmc::Error::NotFound) {
+                FsError::Io {
+                    op: "delete",
+                    detail: String::from("NotFound"),
+                }
+            } else {
+                fs_err("delete", err)
+            }
+        })
     }) {
         Err(FsError::Io { detail, .. }) if detail.contains("NotFound") => Ok(()),
         other => other,
@@ -143,6 +153,65 @@ pub fn rename_file(from: &str, to: &str) -> Result<(), FsError> {
     with_dir(|mgr, dir| {
         mgr.rename_file_in_dir(dir, from, to)
             .map_err(|err| fs_err("rename", err))
+    })
+}
+
+pub fn digest(name: &str) -> Result<fwupd::Digest, FsError> {
+    with_file(name, Mode::ReadOnly, |mgr, file| {
+        let mut sha = fwupd::Sha256::new();
+        let mut head = [0u8; 64];
+        let mut len = 0u32;
+        let mut buf = [0u8; 512];
+        loop {
+            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
+            if n == 0 {
+                break;
+            }
+            if len < 64 {
+                let want = (64 - len as usize).min(n);
+                head[len as usize..len as usize + want].copy_from_slice(&buf[..want]);
+            }
+            sha.update(&buf[..n]);
+            len = len.saturating_add(n as u32);
+        }
+        Ok(fwupd::Digest {
+            len,
+            sha: sha.finish(),
+            head,
+        })
+    })
+}
+
+/// Read `out.len()` bytes starting at `offset`. A short file returns a short
+/// slice. The file is not loaded into the heap.
+pub fn read_at(name: &str, offset: u32, out: &mut [u8]) -> Result<usize, FsError> {
+    if out.is_empty() {
+        return Ok(0);
+    }
+    with_file(name, Mode::ReadOnly, |mgr, file| {
+        let mut pos = 0u32;
+        let mut buf = [0u8; 512];
+        let mut filled = 0usize;
+        while filled < out.len() {
+            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
+            if n == 0 {
+                break;
+            }
+            let mut start = 0usize;
+            if pos < offset {
+                let skip = (offset - pos) as usize;
+                if skip >= n {
+                    pos = pos.saturating_add(n as u32);
+                    continue;
+                }
+                start = skip;
+            }
+            let copy = (n - start).min(out.len() - filled);
+            out[filled..filled + copy].copy_from_slice(&buf[start..start + copy]);
+            filled += copy;
+            pos = pos.saturating_add(n as u32);
+        }
+        Ok(filled)
     })
 }
 

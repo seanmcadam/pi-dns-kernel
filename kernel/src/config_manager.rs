@@ -167,6 +167,27 @@ pub fn copy_config_file(which: u8, out: &mut [u8]) -> Result<usize, String> {
     Ok(text.len())
 }
 
+/// Same checks as `store_config_file`, without writing.
+pub fn check_config_text(which: u8, text: &str) -> Result<(), String> {
+    if text.len() > config::UPLOAD_MAX {
+        return Err(String::from("upload exceeds 4096 bytes"));
+    }
+    let value = config::parse(text).map_err(|err| err.text())?;
+    match which {
+        0 => {
+            config::check(&value, config::main_fields()).map_err(|err| err.text())?;
+            config_from_value(&value)?;
+            Ok(())
+        }
+        1 => {
+            config::check(&value, config::log_fields()).map_err(|err| err.text())?;
+            log_numbers(&value)?;
+            Ok(())
+        }
+        _ => Err(String::from("unknown config")),
+    }
+}
+
 /// Validate the whole document, then replace the file. Nothing is written
 /// when validation fails. `Ok(true)` means the NIC or the HTTP port changed
 /// and a reboot is required before that part takes effect.

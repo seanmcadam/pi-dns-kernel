@@ -9,6 +9,7 @@ members = [
     "edid",
     "display-console",
     "fault-log",
+    "fwupd",
 ]
 exclude = ["user-test", "dns-el0", "http-el0", "log-el0"]
 resolver = "2"
