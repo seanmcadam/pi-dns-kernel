@@ -169,6 +169,49 @@ else
     echo "⚠ curl not available, skipping HTTP test"
 fi
 
+echo ""
+echo "Test 55: /status publishes NIC counters"
+if timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-nic-a.txt \
+    && timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local A +short +time=3 +tries=1 >/dev/null \
+    && timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-nic-b.txt \
+    && python3 - qemu/status-nic-a.txt qemu/status-nic-b.txt <<'PY'
+import json, sys
+need = (
+    "status", "uptime", "ticks", "tick_hz", "dns_port", "http_port",
+    "cache_entries", "upstreams", "nic_irqs", "rx_packets", "tx_packets",
+    "net_busy_ms", "net_idle_ms",
+)
+counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+for doc in (a, b):
+    for key in need:
+        if key not in doc:
+            print("missing", key)
+            sys.exit(1)
+    for key in counts:
+        if not isinstance(doc[key], int) or isinstance(doc[key], bool) or doc[key] < 0:
+            print("bad", key, doc[key])
+            sys.exit(1)
+print(
+    "rx", a["rx_packets"], "->", b["rx_packets"],
+    "tx", b["tx_packets"], "nic", b["nic_irqs"],
+    "busy", b["net_busy_ms"], "idle", b["net_idle_ms"],
+)
+if b["rx_packets"] <= a["rx_packets"] or b["tx_packets"] < 1 or b["nic_irqs"] < 1:
+    sys.exit(1)
+sys.exit(0)
+PY
+then
+    echo "✓ /status keeps its fields and the NIC counters move"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ /status NIC counters missing or stuck"
+    echo "--- first ---"; cat qemu/status-nic-a.txt 2>/dev/null || true
+    echo "--- second ---"; cat qemu/status-nic-b.txt 2>/dev/null || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # Test 6: HTTP root endpoint
 echo ""
 echo "Test 6: HTTP GET / (HTML dashboard)"

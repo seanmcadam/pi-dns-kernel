@@ -54,6 +54,7 @@ const DISPLAY_SET: u64 = 56;
 const POWER: u64 = 58;
 const VNC_CTRL: u64 = 59;
 const UPSTREAM_HEALTH: u64 = 61;
+const NET_COUNTERS: u64 = 64;
 
 const EAGAIN: i64 = -11;
 
@@ -760,17 +761,48 @@ fn handle_index() -> HttpResponse {
 }
 
 fn handle_status() -> HttpResponse {
+    let (nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms) = net_counters();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
         sys(CACHE_ENTRIES, 0, 0, 0, 0, 0, 0),
-        upstream_status()
+        upstream_status(),
+        nic_irqs,
+        rx_packets,
+        tx_packets,
+        net_busy_ms,
+        net_idle_ms
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
     response
+}
+
+/// nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms.
+/// Zeros if the kernel did not return the 40-byte counter block.
+fn net_counters() -> (u64, u64, u64, u64, u64) {
+    let mut buf = [0u8; 40];
+    let n = sys(
+        NET_COUNTERS,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    if n != 40 {
+        return (0, 0, 0, 0, 0);
+    }
+    let word = |index: usize| {
+        let off = index * 8;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&buf[off..off + 8]);
+        u64::from_le_bytes(raw)
+    };
+    (word(0), word(1), word(2), word(3), word(4))
 }
 
 /// `[{"ip":"a.b.c.d","up":true}, ...]`. Empty until the DNS task publishes.

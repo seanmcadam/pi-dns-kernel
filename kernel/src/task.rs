@@ -80,6 +80,7 @@ const SET_UPSTREAM_HEALTH: u64 = 60;
 const UPSTREAM_HEALTH: u64 = 61;
 const CONFIG_PROBE_SECS: u64 = 62;
 const NET_READY: u64 = 63;
+const NET_COUNTERS: u64 = 64;
 const POWER: u64 = 58;
 const VNC_CTRL: u64 = 59;
 const THREAD_CREATE: u64 = 34;
@@ -542,7 +543,8 @@ fn syscall() -> u64 {
         | SET_UPSTREAM_HEALTH
         | UPSTREAM_HEALTH
         | CONFIG_PROBE_SECS
-        | NET_READY => {
+        | NET_READY
+        | NET_COUNTERS => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME

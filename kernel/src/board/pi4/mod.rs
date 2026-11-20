@@ -93,7 +93,9 @@ impl Board for Pi4 {
         genet::packet_bytes()
     }
 
-    fn retarget_nic(_cpu: usize) {}
+    fn retarget_nic(cpu: usize) {
+        genet::retarget(cpu);
+    }
 
     fn probe_disk() -> bool {
         emmc::probe()
@@ -105,6 +107,9 @@ impl Board for Pi4 {
 
     fn service_nic() {
         genet::service_link();
+    }
+
+    fn arm_nic() {
         genet::rearm_irq();
     }
 
@@ -121,8 +126,9 @@ impl Board for Pi4 {
     }
 
     fn handle_irq(id: u32) -> IrqHit {
-        // Packet data is polled. These lines are armed so the status counter
-        // moves. A summary that stays set after the clear is masked here.
+        // Packet data is polled. Mask the level line here; the poll rearms
+        // it after the ring is drained. The summary is cleared there too,
+        // including a frame that landed while the line was masked.
         if id == GENET_IRQ0 || id == GENET_IRQ1 {
             let which = if id == GENET_IRQ0 { 0 } else { 1 };
             let _ = genet::ack_irq(which);
