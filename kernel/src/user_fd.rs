@@ -155,7 +155,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
     let value = match num {
         TIME_MS => crate::timer::millis() as i64,
         UDP_BIND => udp_bind(args[0]),
-        UDP_RECV => udp_recv(args[0], args[1], args[2], args[3]),
+        UDP_RECV => udp_recv(args[0], args[1], args[2], args[3], args[4]),
         UDP_SEND => udp_send(args[0], args[1], args[2], args[3], args[4]),
         TCP_LISTEN => tcp_listen(args[0]),
         TCP_ACCEPT => tcp_accept(args[0]),
@@ -255,7 +255,7 @@ fn udp_bind(port: u64) -> i64 {
     0
 }
 
-fn udp_recv(fd: u64, buf: u64, cap: u64, addr: u64) -> i64 {
+fn udp_recv(fd: u64, buf: u64, cap: u64, addr: u64, try_once: u64) -> i64 {
     let Some(fd) = fd_index(fd) else {
         return EBADF;
     };
@@ -276,6 +276,9 @@ fn udp_recv(fd: u64, buf: u64, cap: u64, addr: u64) -> i64 {
         body.cap = cap as u32;
         body.user_ptr = buf;
         body.user_aux = addr;
+        // port is unused by recv. 1 means return EAGAIN instead of sleeping
+        // when the socket is empty, so a worker can drain a burst.
+        body.port = u16::from(try_once != 0);
     })
     .is_none()
     {
@@ -555,6 +558,9 @@ fn udp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
     }
     let socket = stack.sockets_mut().get_mut::<udp::Socket>(handle);
     if !socket.can_recv() {
+        if service::body(id).port != 0 {
+            return service::Step::Done(EAGAIN);
+        }
         return service::Step::Pending;
     }
     match socket.recv() {
@@ -575,7 +581,13 @@ fn udp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
             service::body(id).aux_len = 8;
             service::Step::Done(n as i64)
         }
-        Err(_) => service::Step::Pending,
+        Err(_) => {
+            if service::body(id).port != 0 {
+                service::Step::Done(EAGAIN)
+            } else {
+                service::Step::Pending
+            }
+        }
     }
 }
 
@@ -982,8 +994,11 @@ fn take_udp(stack: &mut crate::net::NetworkStack) -> SocketHandle {
             }
         }
     }
-    let rx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
-    let tx = udp::PacketBuffer::new(meta(16), vec![0u8; 4096]);
+    // 16 slots of 4096 bytes dropped DNS replies once probes and client
+    // forwards shared the socket. 64 slots and 32 KiB keep a 512-byte
+    // answer contiguous while a burst is waiting to be drained.
+    let rx = udp::PacketBuffer::new(meta(64), vec![0u8; 32 * 1024]);
+    let tx = udp::PacketBuffer::new(meta(64), vec![0u8; 32 * 1024]);
     stack.sockets_mut().add(udp::Socket::new(rx, tx))
 }
 

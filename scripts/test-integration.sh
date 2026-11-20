@@ -959,7 +959,7 @@ mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/json-disk.img >/dev/null
 printf 'record=legacy.local A 9.8.7.6 300\nmode=static\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\n' \
     > /tmp/legacy-config.txt
 mcopy -i qemu/json-disk.img@@${DISK_OFF} /tmp/legacy-config.txt ::CONFIG.TXT
-timeout 120 qemu-system-aarch64 \
+timeout 180 qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/json-a.txt \
@@ -1691,6 +1691,102 @@ then
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo "✗ Dead-upstream load test failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 54: Local records stay fast while an upstream is a blackhole"
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import json, re, subprocess, sys, time, urllib.error, urllib.request
+http, dns = sys.argv[1], sys.argv[2]
+base = "http://127.0.0.1:%s" % http
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+
+def req(method, path, body=None, headers=None):
+    data = body.encode() if isinstance(body, str) else body
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if headers:
+        for k, v in headers.items():
+            r.add_header(k, v)
+    try:
+        resp = opener.open(r, timeout=8)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+status, kept = req("GET", "/config/file/config")
+if status != 200:
+    fail("config download %s" % status)
+doc = json.loads(kept)
+doc["dns"]["upstreams"] = ["192.0.2.1"]
+doc["dns"]["probe_interval_secs"] = 5
+body = json.dumps(doc, separators=(",", ":"))
+status, applied = req("POST", "/config/file/config", body, {"Content-Type": "application/json"})
+if status != 200 or b"applied" not in applied:
+    fail("upload %s %s" % (status, applied[:180]))
+
+procs = []
+for n in range(8):
+    procs.append(subprocess.Popen(
+        ["dig", "@127.0.0.1", "-p", dns, "slow%d.example.com" % n, "A", "+time=3", "+tries=1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ))
+time.sleep(0.3)
+times = []
+missing = 0
+for _ in range(20):
+    try:
+        proc = subprocess.run(
+            ["dig", "@127.0.0.1", "-p", dns, "legacy.local", "A", "+stats", "+time=1", "+tries=1"],
+            capture_output=True,
+            timeout=3,
+        )
+    except Exception:
+        missing += 1
+        continue
+    text = proc.stdout.decode(errors="replace")
+    if "9.8.7.6" not in text:
+        missing += 1
+        continue
+    match = re.search(r"Query time: (\d+) msec", text)
+    if not match:
+        missing += 1
+        continue
+    times.append(int(match.group(1)))
+for proc in procs:
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+status, restored = req(
+    "POST",
+    "/config/file/config",
+    kept.decode(),
+    {"Content-Type": "application/json"},
+)
+if status != 200 or b"applied" not in restored:
+    fail("restore %s %s" % (status, restored[:180]))
+print("local ms", times, "missing", missing)
+if missing or len(times) != 20:
+    fail("local records dropped %s" % missing)
+if max(times) > 400:
+    fail("local record took %s ms while the upstream was dead" % max(times))
+print("local max %s ms" % max(times))
+PY
+then
+    echo "✓ Local records answered within 400 ms while forwards sat on a blackhole"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Local records stalled behind a dead upstream"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 

@@ -406,6 +406,12 @@ pub fn is_probe_id(id: u16) -> bool {
     id & PROBE_ID_BASE != 0
 }
 
+/// A datagram the forward path may match. Queries, truncated headers, and
+/// packets that did not come from port 53 are not replies.
+pub fn is_dns_response(packet: &[u8], from_port: u16) -> bool {
+    packet.len() >= 12 && from_port == 53 && packet[2] & 0x80 != 0
+}
+
 /// Forwarded client queries never use an id a probe would use.
 pub fn next_client_id(next: &mut u16) -> u16 {
     let mut id = *next & 0x7fff;
@@ -588,6 +594,12 @@ mod tests {
         assert_eq!(&query[12..20], b"\x06health\x07");
         assert_eq!(&query[20..28], b"invalid\x00");
         assert_eq!(&query[28..32], &[0, 1, 0, 1]);
+        let mut response = query;
+        assert!(!is_dns_response(&response, 53));
+        response[2] |= 0x80;
+        assert!(is_dns_response(&response, 53));
+        assert!(!is_dns_response(&response, 53535));
+        assert!(!is_dns_response(&response[..11], 53));
     }
 
     #[test]
