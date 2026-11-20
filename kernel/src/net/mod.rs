@@ -47,6 +47,26 @@ static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static ARP_PERIOD_MS: AtomicU64 = AtomicU64::new(0);
 static ARP_NEXT_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Wire ARP requests that are not gratuitous announcements, replies we
+/// actually received, IPv4 unicasts sent with a resolved neighbor, and
+/// requests sent because the neighbor was missing. The telnet line is
+/// limited to one per two seconds, so these are the real rates.
+static ARP_REQUESTS_TX: AtomicU64 = AtomicU64::new(0);
+static ARP_REPLIES_RX: AtomicU64 = AtomicU64::new(0);
+static ARP_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static ARP_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Gateway we already learned from the DHCP reply. Refreshed locally so
+/// smoltcp's 60 s neighbor lifetime does not put a who-has on the wire.
+static GW_OUR: AtomicU32 = AtomicU32::new(0);
+static GW_MASK: AtomicU32 = AtomicU32::new(0);
+static GW_IP: AtomicU32 = AtomicU32::new(0);
+static GW_MAC: AtomicU64 = AtomicU64::new(0);
+static GW_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+/// Shorter than smoltcp's 60 s `ENTRY_LIFETIME`. A lookup does not move
+/// that stamp, so a quiet link would solicit the gateway every minute.
+const GATEWAY_HOLD_MS: u64 = 20_000;
+
 #[derive(Debug, Clone, Copy)]
 pub enum NetworkMode {
     Static {
@@ -175,6 +195,7 @@ pub(crate) fn poll_device(state: &mut NetworkState) {
 
 fn poll_device_inner(state: &mut NetworkState) {
     crate::board::service_nic();
+    refresh_gateway(&mut state.device);
     maybe_announce(&mut state.device);
     let timestamp = Instant::from_millis(crate::timer::millis() as i64);
     state.stack.poll(timestamp, &mut state.device);
@@ -284,6 +305,7 @@ fn poll_device_inner(state: &mut NetworkState) {
                             gateway[0], gateway[1], gateway[2], gateway[3]
                         );
                     }
+                    remember_gateway(ip, mask, gateway, mac);
                     let timestamp = Instant::from_millis(crate::timer::millis() as i64);
                     state.stack.poll(timestamp, &mut state.device);
                     if crate::dhcp_rx::arp_pending() {
@@ -291,6 +313,13 @@ fn poll_device_inner(state: &mut NetworkState) {
                     }
                 }
             }
+            // The lease is applied above. The DHCP socket would keep
+            // unicasting renewals at the server (often the gateway). A
+            // renew whose timer is already due and whose emit fails stays
+            // at PollAt in the past, which is a zero poll delay, and it
+            // solicits the gateway again every silent interval. The kernel
+            // never reads the socket again once `finished` is set.
+            state.stack.sockets_mut().remove(handle);
             console_line_ip("[OK] DHCP leased", ip);
             console_line_ip("[OK] DHCP gateway", gateway);
         }
@@ -315,6 +344,117 @@ fn poll_device_inner(state: &mut NetworkState) {
     }
     maybe_announce(&mut state.device);
     refresh_banner();
+}
+
+/// requests, replies, hits, misses.
+pub fn arp_counters() -> (u64, u64, u64, u64) {
+    (
+        ARP_REQUESTS_TX.load(Ordering::Relaxed),
+        ARP_REPLIES_RX.load(Ordering::Relaxed),
+        ARP_CACHE_HITS.load(Ordering::Relaxed),
+        ARP_CACHE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+/// Count one transmitted Ethernet frame. Gratuitous ARP (target equals
+/// source) is the `network.arp_secs` announce and is not a cache miss.
+pub fn note_tx_frame(frame: &[u8]) {
+    match classify_frame(frame) {
+        FrameKind::ArpRequest => {
+            ARP_REQUESTS_TX.fetch_add(1, Ordering::Relaxed);
+            ARP_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+        FrameKind::Ipv4Unicast => {
+            ARP_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        FrameKind::ArpReply | FrameKind::Other => {}
+    }
+}
+
+/// Count one received Ethernet frame. The synthetic gateway reply is not
+/// passed here; it did not arrive on the wire.
+pub fn note_rx_frame(frame: &[u8]) {
+    if classify_frame(frame) == FrameKind::ArpReply {
+        ARP_REPLIES_RX.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    ArpRequest,
+    ArpReply,
+    Ipv4Unicast,
+    Other,
+}
+
+fn classify_frame(frame: &[u8]) -> FrameKind {
+    if frame.len() >= 42 && frame[12] == 0x08 && frame[13] == 0x06 {
+        let spa = [frame[28], frame[29], frame[30], frame[31]];
+        let tpa = [frame[38], frame[39], frame[40], frame[41]];
+        if frame[20] == 0 && frame[21] == 1 && tpa != spa {
+            return FrameKind::ArpRequest;
+        }
+        if frame[20] == 0 && frame[21] == 2 {
+            return FrameKind::ArpReply;
+        }
+        return FrameKind::Other;
+    }
+    if frame.len() >= 14 && frame[12] == 0x08 && frame[13] == 0x00 && unicast_mac(&frame[..6]) {
+        return FrameKind::Ipv4Unicast;
+    }
+    FrameKind::Other
+}
+
+fn unicast_mac(mac: &[u8]) -> bool {
+    mac.len() == 6 && mac[0] & 1 == 0 && mac != [0xff; 6]
+}
+
+fn remember_gateway(our: [u8; 4], mask: [u8; 4], gw: [u8; 4], mac: [u8; 6]) {
+    GW_OUR.store(u32::from_be_bytes(our), Ordering::Relaxed);
+    GW_MASK.store(u32::from_be_bytes(mask), Ordering::Relaxed);
+    GW_IP.store(u32::from_be_bytes(gw), Ordering::Relaxed);
+    let mut packed = 0u64;
+    for (shift, byte) in mac.iter().enumerate() {
+        packed |= (*byte as u64) << (shift * 8);
+    }
+    GW_MAC.store(packed, Ordering::Relaxed);
+    GW_REFRESH_MS.store(crate::timer::millis(), Ordering::Relaxed);
+}
+
+/// Re-seed the neighbor we already trust. smoltcp drops a reply whose
+/// target is not our address (a gratuitous announcement from the router
+/// is logged and then ignored), and it does not extend an entry just
+/// because we used it. The logged `arp who-has` is that lookup missing,
+/// not the 2 s gratuitous announce (`network.arp_secs`), which sets the
+/// target to our own address and is not logged.
+fn refresh_gateway(device: &mut EthernetDevice) {
+    let gw = GW_IP.load(Ordering::Relaxed);
+    if gw == 0 || crate::dhcp_rx::arp_pending() {
+        return;
+    }
+    let now = crate::timer::millis();
+    let prev = GW_REFRESH_MS.load(Ordering::Relaxed);
+    if prev != 0 && now.saturating_sub(prev) < GATEWAY_HOLD_MS {
+        return;
+    }
+    let mac_word = GW_MAC.load(Ordering::Relaxed);
+    let mac = [
+        mac_word as u8,
+        (mac_word >> 8) as u8,
+        (mac_word >> 16) as u8,
+        (mac_word >> 24) as u8,
+        (mac_word >> 32) as u8,
+        (mac_word >> 40) as u8,
+    ];
+    if crate::dhcp_rx::stage_gateway_arp(
+        &device.mac_address(),
+        GW_OUR.load(Ordering::Relaxed).to_be_bytes(),
+        GW_MASK.load(Ordering::Relaxed).to_be_bytes(),
+        &mac,
+        gw.to_be_bytes(),
+    ) {
+        GW_REFRESH_MS.store(now, Ordering::Relaxed);
+    }
 }
 
 /// When the next gratuitous ARP is due. The owner sleeps on this so a

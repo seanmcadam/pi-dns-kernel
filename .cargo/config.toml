@@ -1,6 +1,12 @@
 [build]
 # Default to native for library crates
 
+# smoltcp's default neighbor table is 4. A chatty LAN evicts the gateway
+# (the oldest expiry goes first, and a lookup does not refresh it), which
+# is a new who-has for the gateway on the next off-link send.
+[env]
+SMOLTCP_IFACE_NEIGHBOR_CACHE_COUNT = "32"
+
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "link-arg=-Tlink.ld",

@@ -34,6 +34,7 @@ const SET_DNS_TOP: u64 = 57;
 const SET_UPSTREAM_HEALTH: u64 = 60;
 const CONFIG_PROBE_SECS: u64 = 62;
 const NET_READY: u64 = 63;
+const SET_DNS_LOAD: u64 = 65;
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
@@ -173,6 +174,7 @@ pub fn run() -> ! {
                     );
                 }
                 publish(&shared.cache);
+                publish_load(shared.pending.len());
                 poke_send();
             }
         }
@@ -211,6 +213,9 @@ static SEND_KICK: AtomicU32 = AtomicU32::new(0);
 static PREFERRED: AtomicU32 = AtomicU32::new(0);
 static FAILOVER_KEY: AtomicU32 = AtomicU32::new(0);
 static FAILOVER_MS: AtomicU64 = AtomicU64::new(0);
+/// Upstream attempts that waited `UPSTREAM_WAIT_MS` and were retired.
+/// Published with the pending-table length. Must stay zero-initialized.
+static UPSTREAM_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 fn thread_stack(index: u64) -> u64 {
     (crate::HEAP_VA + crate::HEAP_SIZE
@@ -253,6 +258,7 @@ extern "C" fn upstream_worker(_index: u64) {
                     );
                 }
                 publish(&shared.cache);
+                publish_load(shared.pending.len());
                 poke_send();
             }
         }
@@ -616,6 +622,7 @@ fn retry_expired(
             continue;
         }
         let step = pending[index].walk.on_timeout(health, now);
+        UPSTREAM_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         if step.log_down {
             note_state(false, step.failed);
         }
@@ -815,6 +822,7 @@ extern "C" fn cache_reaper(_arg: u64) {
                     poke_send();
                     queued = true;
                 }
+                publish_load(shared.pending.len());
             }
         }
         crate::thread::mutex_unlock(&STATE_LOCK);
@@ -1178,6 +1186,18 @@ fn note_state(up: bool, ip: [u8; 4]) {
     } else {
         post_upstream(b"dns upstream down ", ip, b"");
     }
+}
+
+fn publish_load(pending: usize) {
+    let _ = sys(
+        SET_DNS_LOAD,
+        pending as u64,
+        UPSTREAM_TIMEOUTS.load(Ordering::Relaxed),
+        0,
+        0,
+        0,
+        0,
+    );
 }
 
 fn publish_health(health: &crate::health::Health, ips: &[[u8; 4]]) {

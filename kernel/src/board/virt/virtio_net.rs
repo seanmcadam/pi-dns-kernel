@@ -385,7 +385,7 @@ impl RxToken for VirtioRxToken {
         if self.arp {
             let mut tmp = [0u8; 64];
             let n = crate::dhcp_rx::copy_arp(&mut tmp);
-            if n >= 42 {
+            if n >= 42 && crate::dhcp_rx::log_inject() {
                 log::info!("gateway arp injected");
             }
             return f(&mut tmp[..n]);
@@ -410,6 +410,7 @@ impl RxToken for VirtioRxToken {
             let bufs = &mut *addr_of_mut!(RX_BUFS);
             let frame = bufs.bufs[self.idx as usize].as_mut_ptr().add(HDR_LEN);
             let slice = core::slice::from_raw_parts_mut(frame, self.len as usize);
+            crate::net::note_rx_frame(slice);
             crate::config_manager::note_dhcp_dns_frame(slice);
             f(slice)
         };
@@ -439,6 +440,7 @@ impl<'a> TxToken for VirtioTxToken<'a> {
             buf[..HDR_LEN].fill(0);
             let frame = &mut buf[HDR_LEN..HDR_LEN + len];
             let result = f(frame);
+            crate::net::note_tx_frame(frame);
             result
         };
         self.device.submit_tx(idx, (HDR_LEN + len) as u32);

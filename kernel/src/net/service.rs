@@ -116,6 +116,10 @@ static KICK: AtomicBool = AtomicBool::new(false);
 static DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 static BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
 static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Pi 4 only. Set once a zero `poll_delay` has already been given an
+/// immediate second look. The next zero sleeps instead of spinning.
+#[cfg(feature = "board-pi4")]
+static ZERO_DELAY_HELD: AtomicBool = AtomicBool::new(false);
 /// Millisecond when the current `drive` entered the stack. Zero when the
 /// owner is not inside it. The Pi 4 main loop halts if this stays set.
 #[cfg(feature = "board-pi4")]
@@ -401,23 +405,45 @@ pub fn drive() {
     IN_STACK.store(false, Ordering::Release);
 }
 
+/// A zero delay means the stack wants another look.
+///
+/// While the link is down that look cannot send, and 50 ms is what lets
+/// the owner reach `wfi`. Once the link is up, virt and Pi 5 poll again
+/// immediately so a discover or a queued datagram is not held.
+///
+/// On Pi 4 that immediate retry is allowed once. A socket that stays at
+/// `PollAt::Now` (a DHCP renew whose timer is still in the past, a TCP
+/// session that always has an ACK to send) would otherwise set the
+/// deadline to `now` on every return and the owner would never `wfi`.
+/// The 10 ms cap below does not apply to a deadline that is already
+/// `now`. RX still arrives through the GENET line. TX completion does
+/// not kick, so the retry's own transmit cannot cancel this sleep.
+fn zero_delay_deadline(now: u64) -> u64 {
+    if !crate::board::nic_link() {
+        #[cfg(feature = "board-pi4")]
+        ZERO_DELAY_HELD.store(false, Ordering::Relaxed);
+        return now.saturating_add(50);
+    }
+    #[cfg(feature = "board-pi4")]
+    {
+        if ZERO_DELAY_HELD.swap(true, Ordering::Relaxed) {
+            return now.saturating_add(10);
+        }
+    }
+    now
+}
+
 fn arm_deadline(state: &mut super::NetworkState) {
     let now = crate::timer::millis();
     let timestamp = smoltcp::time::Instant::from_millis(now as i64);
     let mut deadline = match state.stack.poll_delay(timestamp) {
         Some(delay) => {
             let ms = delay.total_millis();
-            // A zero delay means the stack wants another look. While the
-            // link is down that look cannot send, and sleeping 50 ms is
-            // what lets the owner reach `wfi`. Once the link is up, a zero
-            // delay is a discover or a request that should go out now.
             if ms == 0 {
-                if crate::board::nic_link() {
-                    now
-                } else {
-                    now.saturating_add(50)
-                }
+                zero_delay_deadline(now)
             } else {
+                #[cfg(feature = "board-pi4")]
+                ZERO_DELAY_HELD.store(false, Ordering::Relaxed);
                 now.saturating_add(ms)
             }
         }

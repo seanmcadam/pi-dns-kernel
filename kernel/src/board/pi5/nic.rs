@@ -41,6 +41,7 @@ impl RxToken for Rp1Rx {
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut empty = [];
+        crate::net::note_rx_frame(&empty);
         f(&mut empty)
     }
 }
@@ -51,7 +52,9 @@ impl TxToken for Rp1Tx {
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut empty = [];
-        f(&mut empty)
+        let result = f(&mut empty);
+        crate::net::note_tx_frame(&empty);
+        result
     }
 }
 

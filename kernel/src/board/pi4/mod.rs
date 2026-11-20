@@ -131,10 +131,17 @@ impl Board for Pi4 {
         // including a frame that landed while the line was masked.
         if id == GENET_IRQ0 || id == GENET_IRQ1 {
             let which = if id == GENET_IRQ0 { 0 } else { 1 };
-            let _ = genet::ack_irq(which);
-            genet::note_irq_held();
-            crate::gic::disable_id(id);
-            return IrqHit::Net;
+            // RX masks the level line until the poll drains and rearms.
+            // TX done is cleared here and left enabled. Waking on it made
+            // every transmit schedule another poll, so the owner never slept.
+            match genet::take_irq(which) {
+                genet::NicIrq::Wake => {
+                    genet::note_irq_held();
+                    crate::gic::disable_id(id);
+                    return IrqHit::Net;
+                }
+                genet::NicIrq::TxOnly => return IrqHit::None,
+            }
         }
         if id == EMMC_IRQ {
             crate::gic::disable_id(id);

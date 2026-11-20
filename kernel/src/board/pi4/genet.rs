@@ -11,9 +11,9 @@
 //!
 //! The PHY is external, address 1, RGMII with the receive delay in the PHY
 //! (`rgmii-rxid`). Packet data is polled. The GIC lines are armed so the
-//! status counter can move, then masked in the handler and re-armed from
-//! the poll path only while the summary is clear, so a level line cannot
-//! livelock the core.
+//! status counter can move. RX masks the line until the poll drains and
+//! rearms it. TX done is cleared in the handler and does not wake the
+//! owner, so a transmit cannot cancel the idle sleep.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -493,6 +493,7 @@ impl GenetDevice {
         // The producer store stays last, and only after the same registers
         // have been read back.
         publish_tx_descriptor(desc, addr, status);
+        crate::net::note_tx_frame(frame);
         note_tx_arp(frame);
         let posted = raw_prod.wrapping_add(1);
         write_at(BASE + TDMA_RING + TDMA_PROD_INDEX, posted);
@@ -904,20 +905,37 @@ pub fn rearm_irq() {
     IRQ_HELD.store(false, Ordering::Relaxed);
 }
 
-/// Clear the GENET interrupt summary. `false` means the line stayed
-/// asserted, and the caller should mask it in the GIC.
-pub fn ack_irq(which: u32) -> bool {
+/// What the GENET summary was asking for, after it has been cleared.
+pub enum NicIrq {
+    /// RX, or a summary that did not drop. Mask the line and wake the owner.
+    Wake,
+    /// Transmit done, and the summary is clear. Leave the line enabled and
+    /// do not wake. The send path already waited for the consumer. Waking
+    /// here made every transmit another poll, so a socket that stayed at
+    /// `PollAt::Now` never reached `wfi`.
+    TxOnly,
+}
+
+/// Clear the GENET interrupt summary and say whether the owner must run.
+pub fn take_irq(which: u32) -> NicIrq {
     let base = if which == 0 { INTRL2_0 } else { INTRL2_1 };
     let stat_addr = (BASE + base + INTRL2_STAT) as *const u32;
     let Some(stat) = crate::exception::read_u32_catching(stat_addr) else {
-        return false;
+        return NicIrq::Wake;
     };
     write(base + INTRL2_CLEAR, stat);
     let Some(left) = crate::exception::read_u32_catching(stat_addr) else {
-        return false;
+        return NicIrq::Wake;
     };
     let mask = read(base + INTRL2_MASK_STATUS);
-    left & !mask == 0
+    let stuck = left & !mask != 0;
+    let rx = stat & IRQ_RXDMA_DONE != 0;
+    let tx = stat & IRQ_TXDMA_DONE != 0;
+    if rx || !tx || stuck {
+        NicIrq::Wake
+    } else {
+        NicIrq::TxOnly
+    }
 }
 
 fn start_phy() -> bool {
@@ -1516,7 +1534,7 @@ impl RxToken for GenetRxToken {
         if self.source == RX_ARP {
             let mut tmp = [0u8; 64];
             let n = crate::dhcp_rx::copy_arp(&mut tmp);
-            if n >= 42 {
+            if n >= 42 && crate::dhcp_rx::log_inject() {
                 log::info!("gateway arp injected");
             }
             return f(&mut tmp[..n]);
@@ -1555,6 +1573,7 @@ impl RxToken for GenetRxToken {
                     f(slice)
                 }
                 crate::dhcp_rx::Verdict::Ignore => {
+                    crate::net::note_rx_frame(slice);
                     note_rx_arp(slice);
                     f(slice)
                 }
