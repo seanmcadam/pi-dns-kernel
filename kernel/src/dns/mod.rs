@@ -11,6 +11,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::config_manager::DnsConfig;
 
 static CACHE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+static DNS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+static DNS_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static CACHE_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static PLANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -101,9 +103,19 @@ pub fn write_cache_stats(out: &mut [u8]) -> usize {
     cursor
 }
 
-/// Store the version-1 top-N blob from dns-el0. The writer is the DNS task.
-/// Readers retry if a publish is in progress. No lock, so this stays off the
-/// scheduler and the FD lock order.
+/// Pending forwards and cumulative upstream timeouts, from the DNS task.
+pub fn set_load(inflight: u64, timeouts: u64) {
+    DNS_INFLIGHT.store(inflight, Ordering::Relaxed);
+    DNS_TIMEOUTS.store(timeouts, Ordering::Relaxed);
+}
+
+pub fn load() -> (u64, u64) {
+    (
+        DNS_INFLIGHT.load(Ordering::Relaxed),
+        DNS_TIMEOUTS.load(Ordering::Relaxed),
+    )
+}
+
 /// Replace the packed upstream health blob. `bytes` is `count` then
 /// `count` records of 4 address bytes and one up flag.
 pub fn set_upstream_health(bytes: &[u8]) {
@@ -148,6 +160,9 @@ pub fn copy_upstream_health(out: &mut [u8]) -> usize {
     0
 }
 
+/// Store the version-1 top-N blob from dns-el0. The writer is the DNS task.
+/// Readers retry if a publish is in progress. No lock, so this stays off the
+/// scheduler and the FD lock order.
 pub fn set_top(bytes: &[u8]) {
     let n = if bytes.len() < TOP_CAP { bytes.len() } else { TOP_CAP };
     let gen = TOP_GEN.load(Ordering::Relaxed) & !1;

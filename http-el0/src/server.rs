@@ -55,6 +55,7 @@ const POWER: u64 = 58;
 const VNC_CTRL: u64 = 59;
 const UPSTREAM_HEALTH: u64 = 61;
 const NET_COUNTERS: u64 = 64;
+const NET_EXTRA: u64 = 66;
 
 const EAGAIN: i64 = -11;
 
@@ -762,8 +763,10 @@ fn handle_index() -> HttpResponse {
 
 fn handle_status() -> HttpResponse {
     let (nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms) = net_counters();
+    let (arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses, dns_inflight, upstream_timeouts) =
+        net_extra();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -773,7 +776,13 @@ fn handle_status() -> HttpResponse {
         rx_packets,
         tx_packets,
         net_busy_ms,
-        net_idle_ms
+        net_idle_ms,
+        arp_requests_tx,
+        arp_replies_rx,
+        arp_cache_hits,
+        arp_cache_misses,
+        dns_inflight,
+        upstream_timeouts
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
@@ -803,6 +812,32 @@ fn net_counters() -> (u64, u64, u64, u64, u64) {
         u64::from_le_bytes(raw)
     };
     (word(0), word(1), word(2), word(3), word(4))
+}
+
+/// arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses,
+/// dns_inflight, upstream_timeouts. Zeros if the kernel did not return
+/// the 48-byte block.
+fn net_extra() -> (u64, u64, u64, u64, u64, u64) {
+    let mut buf = [0u8; 48];
+    let n = sys(
+        NET_EXTRA,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    if n != 48 {
+        return (0, 0, 0, 0, 0, 0);
+    }
+    let word = |index: usize| {
+        let off = index * 8;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&buf[off..off + 8]);
+        u64::from_le_bytes(raw)
+    };
+    (word(0), word(1), word(2), word(3), word(4), word(5))
 }
 
 /// `[{"ip":"a.b.c.d","up":true}, ...]`. Empty until the DNS task publishes.

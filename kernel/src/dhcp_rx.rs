@@ -186,6 +186,16 @@ pub fn arp_pending() -> bool {
     ARP_ARMED.load(Ordering::Acquire)
 }
 
+/// The boot injection is logged once. Later refreshes of the same reply
+/// would otherwise scroll the telnet log every refresh period.
+#[allow(dead_code)]
+static INJECT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub fn log_inject() -> bool {
+    !INJECT_LOGGED.swap(true, Ordering::Relaxed)
+}
+
 /// Broadcast ARP request for `gw_ip`. A seeded unicast reply fills our
 /// cache and then the stack does not transmit a request of its own. The
 /// gateway on this LAN did not forward until it had answered one.

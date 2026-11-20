@@ -180,8 +180,14 @@ need = (
     "status", "uptime", "ticks", "tick_hz", "dns_port", "http_port",
     "cache_entries", "upstreams", "nic_irqs", "rx_packets", "tx_packets",
     "net_busy_ms", "net_idle_ms",
+    "arp_requests_tx", "arp_replies_rx", "arp_cache_hits", "arp_cache_misses",
+    "dns_inflight", "upstream_timeouts",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
+extra = (
+    "arp_requests_tx", "arp_replies_rx", "arp_cache_hits", "arp_cache_misses",
+    "dns_inflight", "upstream_timeouts",
+)
 a = json.load(open(sys.argv[1]))
 b = json.load(open(sys.argv[2]))
 for doc in (a, b):
@@ -189,7 +195,7 @@ for doc in (a, b):
         if key not in doc:
             print("missing", key)
             sys.exit(1)
-    for key in counts:
+    for key in counts + extra:
         if not isinstance(doc[key], int) or isinstance(doc[key], bool) or doc[key] < 0:
             print("bad", key, doc[key])
             sys.exit(1)
@@ -209,6 +215,48 @@ else
     echo "✗ /status NIC counters missing or stuck"
     echo "--- first ---"; cat qemu/status-nic-a.txt 2>/dev/null || true
     echo "--- second ---"; cat qemu/status-nic-b.txt 2>/dev/null || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 56: idle owner sleeps, and gateway ARP stays bounded"
+if timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-idle-a.txt \
+    && sleep 3 \
+    && timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-idle-b.txt \
+    && { timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local A +short +time=3 +tries=1 >/dev/null || true; } \
+    && { timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} example.com A +short +time=3 +tries=1 >/dev/null || true; } \
+    && timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-idle-c.txt \
+    && python3 - qemu/status-idle-a.txt qemu/status-idle-b.txt qemu/status-idle-c.txt <<'PY'
+import json, sys
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+c = json.load(open(sys.argv[3]))
+idle = b["net_idle_ms"] - a["net_idle_ms"]
+busy = b["net_busy_ms"] - a["net_busy_ms"]
+arp_idle = b["arp_requests_tx"] - a["arp_requests_tx"]
+arp_load = c["arp_requests_tx"] - a["arp_requests_tx"]
+print(
+    "idle_d", idle, "busy_d", busy,
+    "arp_idle", arp_idle, "arp_load", arp_load,
+    "hits", c["arp_cache_hits"], "misses", c["arp_cache_misses"],
+    "inflight", c["dns_inflight"],
+)
+# Three quiet seconds. The owner should spend them in wfi, and a resolved
+# gateway should not be solicited again. A handful of requests covers the
+# one slirp neighbor learning at the edge of the window. The two digs are
+# included in arp_load.
+if idle < 1500 or idle <= busy * 4 or arp_idle > 2 or arp_load > 4:
+    sys.exit(1)
+sys.exit(0)
+PY
+then
+    echo "✓ idle time dominates and gateway ARP stays bounded"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ idle owner busy, or gateway ARP ran away"
+    echo "--- idle a ---"; cat qemu/status-idle-a.txt 2>/dev/null || true
+    echo "--- idle b ---"; cat qemu/status-idle-b.txt 2>/dev/null || true
+    echo "--- idle c ---"; cat qemu/status-idle-c.txt 2>/dev/null || true
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
