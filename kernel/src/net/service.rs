@@ -26,6 +26,8 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+#[cfg(feature = "board-pi4")]
+use core::sync::atomic::AtomicU32;
 
 use smoltcp::iface::SocketHandle;
 
@@ -120,6 +122,22 @@ static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 /// immediate second look. The next zero sleeps instead of spinning.
 #[cfg(feature = "board-pi4")]
 static ZERO_DELAY_HELD: AtomicBool = AtomicBool::new(false);
+/// Last rx/tx counts, so a poll that moved no frame can sleep longer
+/// than one that just did. Pi 4 only.
+#[cfg(feature = "board-pi4")]
+static SEEN_RX: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "board-pi4")]
+static SEEN_TX: AtomicU32 = AtomicU32::new(0);
+/// A poll that sent or received something may run again on the next tick.
+/// RX still wakes the owner, so this is only the backup.
+#[cfg(feature = "board-pi4")]
+const ACTIVE_POLL_MS: u64 = 10;
+/// Nothing moved. Sleeping a full timer tick was most of the idle CPU:
+/// each poll cost about as much as the 10 ms cap, so `net_busy_ms` tracked
+/// wall clock. 200 ms still bounds a missed RX IRQ well inside the 2 s
+/// gratuitous ARP, and the owner spends that wait in `wfi`.
+#[cfg(feature = "board-pi4")]
+const QUIET_POLL_MS: u64 = 200;
 /// Millisecond when the current `drive` entered the stack. Zero when the
 /// owner is not inside it. The Pi 4 main loop halts if this stays set.
 #[cfg(feature = "board-pi4")]
@@ -411,14 +429,12 @@ pub fn drive() {
 /// the owner reach `wfi`. Once the link is up, virt and Pi 5 poll again
 /// immediately so a discover or a queued datagram is not held.
 ///
-/// On Pi 4 that immediate retry is allowed once. A socket that stays at
-/// `PollAt::Now` (a DHCP renew whose timer is still in the past, a TCP
-/// session that always has an ACK to send) would otherwise set the
-/// deadline to `now` on every return and the owner would never `wfi`.
-/// The 10 ms cap below does not apply to a deadline that is already
-/// `now`. RX still arrives through the GENET line. TX completion does
-/// not kick, so the retry's own transmit cannot cancel this sleep.
-fn zero_delay_deadline(now: u64) -> u64 {
+/// On Pi 4 that immediate retry is allowed once (`deadline == now`). A
+/// socket that stays at `PollAt::Now` would otherwise ask again on every
+/// return and the owner would never `wfi`. The retry's own transmit does
+/// not cancel the following sleep: TX completion does not kick. RX still
+/// arrives through the GENET line.
+fn zero_delay_deadline(now: u64, quiet: bool) -> u64 {
     if !crate::board::nic_link() {
         #[cfg(feature = "board-pi4")]
         ZERO_DELAY_HELD.store(false, Ordering::Relaxed);
@@ -427,20 +443,36 @@ fn zero_delay_deadline(now: u64) -> u64 {
     #[cfg(feature = "board-pi4")]
     {
         if ZERO_DELAY_HELD.swap(true, Ordering::Relaxed) {
-            return now.saturating_add(10);
+            let pause = if quiet { QUIET_POLL_MS } else { ACTIVE_POLL_MS };
+            return now.saturating_add(pause);
         }
     }
+    let _ = quiet;
     now
+}
+
+/// Pi 4: this poll neither received nor transmitted. The next quiet sleep
+/// can then be longer than the backup poll that follows a frame.
+#[cfg(feature = "board-pi4")]
+fn frames_quiet() -> bool {
+    let (rx, tx) = crate::board::packet_counts();
+    let prev_rx = SEEN_RX.swap(rx, Ordering::Relaxed);
+    let prev_tx = SEEN_TX.swap(tx, Ordering::Relaxed);
+    prev_rx == rx && prev_tx == tx
 }
 
 fn arm_deadline(state: &mut super::NetworkState) {
     let now = crate::timer::millis();
+    #[cfg(feature = "board-pi4")]
+    let quiet = frames_quiet();
+    #[cfg(not(feature = "board-pi4"))]
+    let quiet = false;
     let timestamp = smoltcp::time::Instant::from_millis(now as i64);
     let mut deadline = match state.stack.poll_delay(timestamp) {
         Some(delay) => {
             let ms = delay.total_millis();
             if ms == 0 {
-                zero_delay_deadline(now)
+                zero_delay_deadline(now, quiet)
             } else {
                 #[cfg(feature = "board-pi4")]
                 ZERO_DELAY_HELD.store(false, Ordering::Relaxed);
@@ -464,14 +496,24 @@ fn arm_deadline(state: &mut super::NetworkState) {
             deadline = at;
         }
     }
-    // Pi 4's gratuitous ARP repeats every 2 s. Once the RX line is quiet
-    // that announce is the only deadline, so ICMP, DNS, and HTTP sit until
-    // it. Bound the sleep to one timer tick. A sooner DHCP or ARP time
-    // above is left alone.
+    // Pi 4 used to clip every sleep to 10 ms so a missed RX IRQ could not
+    // wait out the 2 s gratuitous ARP. The line wakes the owner now, and
+    // that clip made `drive` run on every timer tick. A quiet poll was
+    // most of the tick, so `net_busy_ms` tracked wall clock while
+    // `net_idle_ms` only counted the sliver inside `wfi`.
+    //
+    // A frame just moved: keep the short backup. Nothing moved: 200 ms.
+    // `deadline == now` is the one immediate retry and is left alone. A
+    // past announce (ARP_NEXT still 0) is not; storing it would make
+    // `work_pending` true on every return.
     #[cfg(feature = "board-pi4")]
     {
-        let cap = now.saturating_add(10);
+        let cap_ms = if quiet { QUIET_POLL_MS } else { ACTIVE_POLL_MS };
+        let cap = now.saturating_add(cap_ms);
         if deadline > cap {
+            deadline = cap;
+        }
+        if deadline < now {
             deadline = cap;
         }
     }
