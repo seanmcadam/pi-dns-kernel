@@ -84,6 +84,7 @@ const NET_COUNTERS: u64 = 64;
 const SET_DNS_LOAD: u64 = 65;
 const NET_EXTRA: u64 = 66;
 const FW: u64 = 67;
+const SD_STATUS: u64 = 68;
 const POWER: u64 = 58;
 const VNC_CTRL: u64 = 59;
 const THREAD_CREATE: u64 = 34;
@@ -550,7 +551,8 @@ fn syscall() -> u64 {
         | NET_COUNTERS
         | SET_DNS_LOAD
         | NET_EXTRA
-        | FW => {
+        | FW
+        | SD_STATUS => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME

@@ -28,6 +28,10 @@ pub fn run(base: u64, words: &mut [u32]) -> i64 {
     if words.is_empty() || words.len() > 256 {
         return -4;
     }
+    // Callers pass the physical mailbox. After the MMU is on, a load of
+    // that address is a translation fault, not an external abort, so the
+    // probe helper does not catch it.
+    let base = crate::addr::phys_to_virt(base);
     if crate::exception::read_u32_catching((base + STATUS) as *const u32).is_none() {
         return -1;
     }

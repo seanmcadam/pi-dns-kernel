@@ -329,8 +329,9 @@ static PREFACE: Mutex<Preface> = Mutex::new(Preface {
 });
 
 /// Keep one early line. The logger may not be installed yet, and the log
-/// task is not running, so this does not touch the queue.
-#[cfg(feature = "board-pi4")]
+/// task is not running, so this does not touch the queue. The telnet
+/// reader returns these lines before the live ring, including after that
+/// ring has wrapped.
 pub fn save_early(text: &str) {
     if text.is_empty() {
         return;

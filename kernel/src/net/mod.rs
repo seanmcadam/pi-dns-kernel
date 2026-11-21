@@ -618,6 +618,11 @@ pub fn refresh_banner() {
         push(&mut buf, &mut n, crate::act::led_label());
         push(&mut buf, &mut n, "\n");
         n += crate::board::write_nic_diag(&mut buf[n..]);
+        if n < buf.len() {
+            buf[n] = b'\n';
+            n += 1;
+        }
+        n += crate::disklog::write_summary(&mut buf[n..]);
         if let Ok(text) = core::str::from_utf8(&buf[..n]) {
             crate::fb_con::set_status(text);
         }

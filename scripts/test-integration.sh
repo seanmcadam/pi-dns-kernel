@@ -182,6 +182,7 @@ need = (
     "net_busy_ms", "net_idle_ms",
     "arp_requests_tx", "arp_replies_rx", "arp_cache_hits", "arp_cache_misses",
     "dns_inflight", "upstream_timeouts",
+    "sd_state", "sd_error", "sd_blocks", "fs_mounted",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
 extra = (
@@ -199,6 +200,18 @@ for doc in (a, b):
         if not isinstance(doc[key], int) or isinstance(doc[key], bool) or doc[key] < 0:
             print("bad", key, doc[key])
             sys.exit(1)
+    if not isinstance(doc["sd_state"], str) or not isinstance(doc["sd_error"], str):
+        print("sd strings", doc["sd_state"], doc["sd_error"])
+        sys.exit(1)
+    if not isinstance(doc["sd_blocks"], int) or isinstance(doc["sd_blocks"], bool) or doc["sd_blocks"] < 0:
+        print("sd blocks", doc["sd_blocks"])
+        sys.exit(1)
+    if doc["fs_mounted"] not in (0, 1):
+        print("fs mounted", doc["fs_mounted"])
+        sys.exit(1)
+    if doc["sd_state"] != "absent" or doc["fs_mounted"] != 0:
+        print("diskless guest", doc["sd_state"], doc["fs_mounted"], doc["sd_error"])
+        sys.exit(1)
 print(
     "rx", a["rx_packets"], "->", b["rx_packets"],
     "tx", b["tx_packets"], "nic", b["nic_irqs"],
@@ -2103,6 +2116,8 @@ for key in ("fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw",
         fail("status missing %s" % key)
 if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_staged"] != 0:
     fail("initial firmware status %s" % doc)
+if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "":
+    fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted")})
 
 before = doc["uptime"]
 status, body, _ = form("/firmware/reboot", (("confirm", "reboot"), ("tryboot", "1")))
