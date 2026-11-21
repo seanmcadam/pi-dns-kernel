@@ -175,6 +175,10 @@ const AUX_RGMII_SKEW: u16 = 0x0100;
 
 static RX_COUNT: AtomicU32 = AtomicU32::new(0);
 static RX_ERR: AtomicU32 = AtomicU32::new(0);
+/// Frames the MAC wrote past the unread end of the ring. Those buffers
+/// were reused, so the bytes are gone. `poll_rx` skips them and continues
+/// with the frames that are still intact.
+static RX_OVERRUN: AtomicU32 = AtomicU32::new(0);
 static TX_COUNT: AtomicU32 = AtomicU32::new(0);
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -392,6 +396,35 @@ pub fn packet_counts() -> (u32, u32) {
         RX_COUNT.load(Ordering::Relaxed),
         TX_COUNT.load(Ordering::Relaxed),
     )
+}
+
+/// Producer is ahead of the software consumer. The owner must poll.
+pub fn rx_pending() -> bool {
+    rx_gap().is_some_and(|gap| gap != 0)
+}
+
+/// Descriptor errors, lapped-ring frames, and how many are waiting now.
+pub fn rx_load() -> (u64, u64, u64) {
+    let queued = rx_gap().unwrap_or(0);
+    let queued = if queued > RX_RING_DESCS as u32 {
+        RX_RING_DESCS as u32
+    } else {
+        queued
+    };
+    (
+        u64::from(RX_ERR.load(Ordering::Relaxed)),
+        u64::from(RX_OVERRUN.load(Ordering::Relaxed)),
+        u64::from(queued),
+    )
+}
+
+fn rx_gap() -> Option<u32> {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return None;
+    }
+    let prod = read(RDMA_RING + RDMA_PROD_INDEX) & 0xffff;
+    let cons = RX_CONS.load(Ordering::Relaxed) & 0xffff;
+    Some(prod.wrapping_sub(cons) & 0xffff)
 }
 
 impl GenetDevice {
@@ -1503,7 +1536,10 @@ impl Device for GenetDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1514;
-        caps.max_burst_size = Some(8);
+        // One poll used to stop after 8 frames. With the owner asleep
+        // between polls, a 50 qps stream filled the ring and the unread
+        // tail was overwritten. 64 covers that burst in one wakeup.
+        caps.max_burst_size = Some(64);
         caps.medium = Medium::Ethernet;
         caps
     }
@@ -1584,6 +1620,7 @@ impl RxToken for GenetRxToken {
 }
 
 fn poll_rx() -> Option<(u16, u16)> {
+    recover_rx_overrun();
     let mut seen = 0;
     while seen < RX_RING_DESCS {
         seen += 1;
@@ -1612,6 +1649,25 @@ fn poll_rx() -> Option<(u16, u16)> {
         return Some((index as u16, (length - RX_ALIGN) as u16));
     }
     None
+}
+
+/// The producer index is a free-running 16-bit counter. More than one
+/// ring of unread frames means the MAC reused those buffers. Advance the
+/// consumer to the oldest frame that is still intact and count the rest.
+fn recover_rx_overrun() {
+    let Some(gap) = rx_gap() else {
+        return;
+    };
+    if gap <= RX_RING_DESCS as u32 {
+        return;
+    }
+    let skip = gap - RX_RING_DESCS as u32;
+    if RX_OVERRUN.fetch_add(skip, Ordering::Relaxed) == 0 {
+        say("[WARN] GENET RX ring overrun");
+    }
+    let cons = RX_CONS.load(Ordering::Relaxed).wrapping_add(skip) & 0xffff;
+    RX_CONS.store(cons, Ordering::Relaxed);
+    write(RDMA_RING + RDMA_CONS_INDEX, cons);
 }
 
 fn reclaim_rx_static(index: u16) {

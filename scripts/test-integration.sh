@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.65" qemu/boot-output.txt && \
+   grep -q "version 0.1.66" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.65"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.66"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -184,12 +184,14 @@ need = (
     "net_busy_ms", "net_idle_ms",
     "arp_requests_tx", "arp_replies_rx", "arp_cache_hits", "arp_cache_misses",
     "dns_inflight", "upstream_timeouts",
+    "rx_drops", "rx_overruns", "rx_queued", "forward_full", "reply_drops",
     "sd_state", "sd_error", "sd_blocks", "fs_mounted",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
 extra = (
     "arp_requests_tx", "arp_replies_rx", "arp_cache_hits", "arp_cache_misses",
     "dns_inflight", "upstream_timeouts",
+    "rx_drops", "rx_overruns", "rx_queued", "forward_full", "reply_drops",
 )
 a = json.load(open(sys.argv[1]))
 b = json.load(open(sys.argv[2]))
@@ -610,6 +612,27 @@ then
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo "✗ A probe ran before the address was configured"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 58: DNS load keeps local names"
+if python3 scripts/dns_stress.py \
+    --server 127.0.0.1 \
+    --port "${DNS_HOST_PORT}" \
+    --http-port "${HTTP_HOST_PORT}" \
+    --duration 8 \
+    --qps 20 \
+    --timeout 2 \
+    --a-only \
+    --fail-local-loss 5 \
+    --require-counters \
+    --seed 1
+then
+    echo "✓ Local names stayed up under the QEMU load"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ DNS load lost local names or /status counters were missing"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -2095,12 +2118,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.65" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.66" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot hardware: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.65" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot hardware: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.66" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2116,7 +2139,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.65" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.66" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "":
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted")})
@@ -2359,12 +2382,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.65":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.66":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.65" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.66" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break

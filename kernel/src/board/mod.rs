@@ -90,6 +90,14 @@ pub trait Board {
     fn packet_bytes() -> (u64, u64) {
         (0, 0)
     }
+    /// The receive ring still holds a frame the stack has not taken.
+    fn rx_pending() -> bool {
+        false
+    }
+    /// Descriptor drops, ring overruns, and frames still sitting in the ring.
+    fn rx_load() -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
     fn retarget_nic(cpu: usize);
     fn probe_disk() -> bool;
     fn disk() -> Self::Disk;
@@ -228,6 +236,14 @@ pub fn packet_counts() -> (u32, u32) {
 
 pub fn packet_bytes() -> (u64, u64) {
     <Active as Board>::packet_bytes()
+}
+
+pub fn rx_pending() -> bool {
+    <Active as Board>::rx_pending()
+}
+
+pub fn rx_load() -> (u64, u64, u64) {
+    <Active as Board>::rx_load()
 }
 
 pub fn retarget_nic(cpu: usize) {
