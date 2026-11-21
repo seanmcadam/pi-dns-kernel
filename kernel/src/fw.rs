@@ -60,6 +60,10 @@ struct Names {
     config_kernel: &'static str,
     address: u32,
     uart: bool,
+    /// Pi 4 firmware only. Tryboot replaces `config.txt` for that boot,
+    /// so the hotplug line has to be in the preset or a soft reboot
+    /// loses the display. Virt and Pi 5 leave it off.
+    hotplug: bool,
 }
 
 fn kernel_names() -> Names {
@@ -72,6 +76,7 @@ fn kernel_names() -> Names {
             config_kernel: "k2712.new",
             address: 0x200000,
             uart: false,
+            hotplug: false,
         }
     } else {
         Names {
@@ -82,6 +87,7 @@ fn kernel_names() -> Names {
             config_kernel: "kernel8.new",
             address: 0x80000,
             uart: true,
+            hotplug: cfg!(feature = "board-pi4"),
         }
     }
 }
@@ -820,7 +826,13 @@ fn config(kind: u64, ptr: u64, len: u64, commit: u64, err_ptr: u64) -> i64 {
 fn preset(commit: u64) -> i64 {
     let names = kernel_names();
     let mut buf = [0u8; 256];
-    let n = match fwupd::fill_tryboot(&mut buf, names.config_kernel, names.address, names.uart) {
+    let n = match fwupd::fill_tryboot(
+        &mut buf,
+        names.config_kernel,
+        names.address,
+        names.uart,
+        names.hotplug,
+    ) {
         Ok(n) => n,
         Err(_) => {
             note("config rejected");
@@ -984,6 +996,7 @@ fn upload_names(kind: u8) -> Names {
             config_kernel: "kernel8.new",
             address: 0,
             uart: false,
+            hotplug: false,
         }
     } else {
         kernel_names()

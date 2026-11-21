@@ -184,13 +184,18 @@ arm_64bit=1
 kernel=kernel8.img
 kernel_address=0x80000
 enable_uart=1
+hdmi_force_hotplug=1
 ```
 
 `kernel_address=0x80000` is the link address. `enable_uart=1` turns the
-PL011 on. These lines stay out until the image is known to start:
-`os_check=0`, `uart_2ndstage=1`, `core_freq=250`,
-`init_uart_clock=48000000`, `hdmi_force_hotplug=1`,
-`disable_overscan=1`, `arm_boost=1`, and `dtoverlay=vc4-kms-v3d`.
+PL011 on. `hdmi_force_hotplug=1` tells the firmware a display is
+attached. After a software or watchdog reset the hotplug detect can
+come back empty, and the framebuffer mailbox then returns 0x0 until a
+hard power cycle. The console is output-only: this does not enable a
+keyboard, a mouse, or the KMS overlay. These lines stay out until the
+image is known to start: `os_check=0`, `uart_2ndstage=1`,
+`core_freq=250`, `init_uart_clock=48000000`, `disable_overscan=1`,
+`arm_boost=1`, and `dtoverlay=vc4-kms-v3d`.
 After the LED blinks, add `init_uart_clock=48000000` and `core_freq=250`
 before trusting the serial baud. The PL011 divisor assumes 48 MHz.
 
@@ -227,5 +232,6 @@ before the first off write.
 ### DNS kernel
 
 `./scripts/build-pi4.sh`, then `./scripts/fetch-pi4-boot.sh kernel`, then
-the same copy. `boot/pi4/config.txt` is the same four lines. The ACT
+the same copy. `boot/pi4/config.txt` is those five lines, including
+`hdmi_force_hotplug=1`. The ACT
 counts in the table above apply only after the firmware enters the image.
