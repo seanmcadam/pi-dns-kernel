@@ -780,10 +780,21 @@ fn handle_index() -> HttpResponse {
 
 fn handle_status() -> HttpResponse {
     let (nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms) = net_counters();
-    let (arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses, dns_inflight, upstream_timeouts) =
-        net_extra();
+    let (
+        arp_requests_tx,
+        arp_replies_rx,
+        arp_cache_hits,
+        arp_cache_misses,
+        dns_inflight,
+        upstream_timeouts,
+        rx_drops,
+        rx_overruns,
+        rx_queued,
+        forward_full,
+        reply_drops,
+    ) = net_extra();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -800,6 +811,11 @@ fn handle_status() -> HttpResponse {
         arp_cache_misses,
         dns_inflight,
         upstream_timeouts,
+        rx_drops,
+        rx_overruns,
+        rx_queued,
+        forward_full,
+        reply_drops,
         firmware::fields(),
         sd_fields()
     );
@@ -834,10 +850,11 @@ fn net_counters() -> (u64, u64, u64, u64, u64) {
 }
 
 /// arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses,
-/// dns_inflight, upstream_timeouts. Zeros if the kernel did not return
-/// the 48-byte block.
-fn net_extra() -> (u64, u64, u64, u64, u64, u64) {
-    let mut buf = [0u8; 48];
+/// dns_inflight, upstream_timeouts, rx_drops, rx_overruns, rx_queued,
+/// forward_full, reply_drops. Zeros if the kernel did not return the
+/// 88-byte block. `dns_inflight` is the forward-table depth.
+fn net_extra() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    let mut buf = [0u8; 88];
     let n = sys(
         NET_EXTRA,
         buf.as_mut_ptr() as u64,
@@ -847,8 +864,8 @@ fn net_extra() -> (u64, u64, u64, u64, u64, u64) {
         0,
         0,
     );
-    if n != 48 {
-        return (0, 0, 0, 0, 0, 0);
+    if n != 88 {
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
     let word = |index: usize| {
         let off = index * 8;
@@ -856,7 +873,10 @@ fn net_extra() -> (u64, u64, u64, u64, u64, u64) {
         raw.copy_from_slice(&buf[off..off + 8]);
         u64::from_le_bytes(raw)
     };
-    (word(0), word(1), word(2), word(3), word(4), word(5))
+    (
+        word(0), word(1), word(2), word(3), word(4), word(5), word(6), word(7), word(8), word(9),
+        word(10),
+    )
 }
 
 /// SD probe outcome. The kernel records this before the log task exists,

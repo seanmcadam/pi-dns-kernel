@@ -13,6 +13,8 @@ use crate::config_manager::DnsConfig;
 static CACHE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 static DNS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static DNS_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static DNS_FORWARD_FULL: AtomicU64 = AtomicU64::new(0);
+static DNS_REPLY_DROPS: AtomicU64 = AtomicU64::new(0);
 static CACHE_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static PLANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -103,16 +105,21 @@ pub fn write_cache_stats(out: &mut [u8]) -> usize {
     cursor
 }
 
-/// Pending forwards and cumulative upstream timeouts, from the DNS task.
-pub fn set_load(inflight: u64, timeouts: u64) {
+/// Pending forwards, upstream timeouts, times the forward table was full,
+/// and client replies that could not be queued. From the DNS task.
+pub fn set_load(inflight: u64, timeouts: u64, forward_full: u64, reply_drops: u64) {
     DNS_INFLIGHT.store(inflight, Ordering::Relaxed);
     DNS_TIMEOUTS.store(timeouts, Ordering::Relaxed);
+    DNS_FORWARD_FULL.store(forward_full, Ordering::Relaxed);
+    DNS_REPLY_DROPS.store(reply_drops, Ordering::Relaxed);
 }
 
-pub fn load() -> (u64, u64) {
+pub fn load() -> (u64, u64, u64, u64) {
     (
         DNS_INFLIGHT.load(Ordering::Relaxed),
         DNS_TIMEOUTS.load(Ordering::Relaxed),
+        DNS_FORWARD_FULL.load(Ordering::Relaxed),
+        DNS_REPLY_DROPS.load(Ordering::Relaxed),
     )
 }
 

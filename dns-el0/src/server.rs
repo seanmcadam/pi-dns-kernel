@@ -38,7 +38,12 @@ const SET_DNS_LOAD: u64 = 65;
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
-const MAX_PENDING: usize = 8;
+/// In-flight forwards. A 50 qps mix is a bit over half upstream, and each
+/// one can sit here for `UPSTREAM_WAIT_MS`, so eight slots SERVFAIL almost
+/// every new forward while the table is busy. 128 covers that mix with
+/// room for a slow resolver. Past this, the query gets SERVFAIL and
+/// `FORWARD_FULL` counts it. Local and cached names never take a slot.
+const MAX_PENDING: usize = 128;
 
 struct PendingQuery {
     client_id: u16,
@@ -216,6 +221,10 @@ static FAILOVER_MS: AtomicU64 = AtomicU64::new(0);
 /// Upstream attempts that waited `UPSTREAM_WAIT_MS` and were retired.
 /// Published with the pending-table length. Must stay zero-initialized.
 static UPSTREAM_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// Forwards refused because `pending` was already `MAX_PENDING`.
+static FORWARD_FULL: AtomicU64 = AtomicU64::new(0);
+/// Client replies `udp_send` would not queue. The bytes are dropped.
+static REPLY_DROPS: AtomicU64 = AtomicU64::new(0);
 
 fn thread_stack(index: u64) -> u64 {
     (crate::HEAP_VA + crate::HEAP_SIZE
@@ -276,6 +285,7 @@ fn flush_outbound() {
     let mut forwards = Vec::new();
     let mut dns = -1i64;
     let mut upstream = -1i64;
+    let mut pending = 0usize;
     crate::thread::mutex_lock(&STATE_LOCK);
     unsafe {
         if let Some(shared) = SHARED.as_mut() {
@@ -283,17 +293,21 @@ fn flush_outbound() {
             core::mem::swap(&mut forwards, &mut shared.out_forwards);
             dns = shared.dns;
             upstream = shared.upstream;
+            pending = shared.pending.len();
         }
     }
     crate::thread::mutex_unlock(&STATE_LOCK);
     for (bytes, ip, port) in replies {
-        udp_send(dns, &bytes, ip, port);
+        if !udp_send(dns, &bytes, ip, port) {
+            REPLY_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     for (bytes, ip) in forwards {
         if !udp_send(upstream, &bytes, ip, 53) {
             note_busy(ip);
         }
     }
+    publish_load(pending);
 }
 
 extern "C" fn send_worker(_index: u64) {
@@ -559,7 +573,10 @@ fn handle_bytes(
         }
         return;
     };
-    if !remember_client || pending.len() >= MAX_PENDING {
+    if !remember_client || !forward_room(pending.len()) {
+        if remember_client {
+            FORWARD_FULL.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(bytes) = error_response(&query, 2) {
             replies.push((bytes, ip, port));
         }
@@ -1188,13 +1205,17 @@ fn note_state(up: bool, ip: [u8; 4]) {
     }
 }
 
+fn forward_room(pending: usize) -> bool {
+    pending < MAX_PENDING
+}
+
 fn publish_load(pending: usize) {
     let _ = sys(
         SET_DNS_LOAD,
         pending as u64,
         UPSTREAM_TIMEOUTS.load(Ordering::Relaxed),
-        0,
-        0,
+        FORWARD_FULL.load(Ordering::Relaxed),
+        REPLY_DROPS.load(Ordering::Relaxed),
         0,
         0,
     );
@@ -1333,6 +1354,19 @@ fn log_line(text: &str) -> i64 {
     let bytes = text.as_bytes();
     let len = bytes.len().min(120);
     sys(LOG, bytes.as_ptr() as u64, len as u64, 0, 0, 0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forward_room;
+
+    #[test]
+    fn forward_table_accepts_until_it_is_full() {
+        assert!(forward_room(0));
+        assert!(forward_room(super::MAX_PENDING - 1));
+        assert!(!forward_room(super::MAX_PENDING));
+        assert_eq!(super::MAX_PENDING, 128);
+    }
 }
 
 fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {

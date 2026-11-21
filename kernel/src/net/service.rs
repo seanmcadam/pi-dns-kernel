@@ -128,14 +128,24 @@ static ZERO_DELAY_HELD: AtomicBool = AtomicBool::new(false);
 static SEEN_RX: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "board-pi4")]
 static SEEN_TX: AtomicU32 = AtomicU32::new(0);
+/// Millisecond of the last poll that moved a frame or still had one queued.
+#[cfg(feature = "board-pi4")]
+static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 /// A poll that sent or received something may run again on the next tick.
 /// RX still wakes the owner, so this is only the backup.
 #[cfg(feature = "board-pi4")]
 const ACTIVE_POLL_MS: u64 = 10;
-/// Nothing moved. Sleeping a full timer tick was most of the idle CPU:
-/// each poll cost about as much as the 10 ms cap, so `net_busy_ms` tracked
-/// wall clock. 200 ms still bounds a missed RX IRQ well inside the 2 s
-/// gratuitous ARP, and the owner spends that wait in `wfi`.
+/// How long after the last frame the short backup stays in force. One
+/// empty poll is not an idle link: at 50 qps the gap is 20 ms. Treating
+/// that gap as quiet slept 200 ms, which was the 187 ms median in the
+/// first window of the PR59 stress run, and the ring then fell behind.
+#[cfg(feature = "board-pi4")]
+const IDLE_HOLD_MS: u64 = 100;
+/// Nothing has moved for `IDLE_HOLD_MS`. Sleeping a full timer tick was
+/// most of the idle CPU: each poll cost about as much as the 10 ms cap,
+/// so `net_busy_ms` tracked wall clock. 200 ms still bounds a missed RX
+/// IRQ on a link that is actually idle, well inside the 2 s gratuitous
+/// ARP, and the owner spends that wait in `wfi`.
 #[cfg(feature = "board-pi4")]
 const QUIET_POLL_MS: u64 = 200;
 /// Millisecond when the current `drive` entered the stack. Zero when the
@@ -451,20 +461,25 @@ fn zero_delay_deadline(now: u64, quiet: bool) -> u64 {
     now
 }
 
-/// Pi 4: this poll neither received nor transmitted. The next quiet sleep
-/// can then be longer than the backup poll that follows a frame.
+/// Pi 4: no frame has moved for `IDLE_HOLD_MS`. A single empty poll used
+/// to take the long sleep immediately, so a steady query stream waited
+/// out `QUIET_POLL_MS` whenever the RX line did not wake the owner.
 #[cfg(feature = "board-pi4")]
-fn frames_quiet() -> bool {
+fn frames_quiet(now: u64) -> bool {
     let (rx, tx) = crate::board::packet_counts();
     let prev_rx = SEEN_RX.swap(rx, Ordering::Relaxed);
     let prev_tx = SEEN_TX.swap(tx, Ordering::Relaxed);
-    prev_rx == rx && prev_tx == tx
+    if prev_rx != rx || prev_tx != tx || crate::board::rx_pending() {
+        LAST_FRAME_MS.store(now, Ordering::Relaxed);
+        return false;
+    }
+    now.saturating_sub(LAST_FRAME_MS.load(Ordering::Relaxed)) >= IDLE_HOLD_MS
 }
 
 fn arm_deadline(state: &mut super::NetworkState) {
     let now = crate::timer::millis();
     #[cfg(feature = "board-pi4")]
-    let quiet = frames_quiet();
+    let quiet = frames_quiet(now);
     #[cfg(not(feature = "board-pi4"))]
     let quiet = false;
     let timestamp = smoltcp::time::Instant::from_millis(now as i64);
@@ -502,10 +517,12 @@ fn arm_deadline(state: &mut super::NetworkState) {
     // most of the tick, so `net_busy_ms` tracked wall clock while
     // `net_idle_ms` only counted the sliver inside `wfi`.
     //
-    // A frame just moved: keep the short backup. Nothing moved: 200 ms.
-    // `deadline == now` is the one immediate retry and is left alone. A
-    // past announce (ARP_NEXT still 0) is not; storing it would make
-    // `work_pending` true on every return.
+    // Recent traffic keeps the short backup. A real idle streak uses
+    // 200 ms. `deadline == now` is the one immediate retry and is left
+    // alone unless the receive ring still holds a frame: sleeping then
+    // is how the ring overruns when the GENET line does not wake us.
+    // A past announce (ARP_NEXT still 0) is not left in the past; storing
+    // it would make `work_pending` true on every return.
     #[cfg(feature = "board-pi4")]
     {
         let cap_ms = if quiet { QUIET_POLL_MS } else { ACTIVE_POLL_MS };
@@ -516,6 +533,11 @@ fn arm_deadline(state: &mut super::NetworkState) {
         if deadline < now {
             deadline = cap;
         }
+    }
+    // Virt and Pi 5 report no backlog. On Pi 4 a non-empty ring is polled
+    // again immediately, including when the quiet cap would have slept.
+    if crate::board::rx_pending() {
+        deadline = now;
     }
     DEADLINE_MS.store(deadline, Ordering::Release);
 }

@@ -48,11 +48,13 @@
 //!  63  net_ready. 1 once the interface has an address, else 0.
 //!  64  net_counters(buf, cap) -> 40. Five little-endian u64s:
 //!      nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms.
-//!  65  set_dns_load(inflight, timeouts). DNS task. Current pending count
-//!      and the cumulative upstream-timeout count.
-//!  66  net_extra(buf, cap) -> 48. Six little-endian u64s:
+//!  65  set_dns_load(inflight, timeouts, forward_full, reply_drops). DNS task.
+//!      Pending count, upstream timeouts, forward-table full events, and
+//!      client replies that the UDP queue would not take.
+//!  66  net_extra(buf, cap) -> 88. Eleven little-endian u64s:
 //!      arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses,
-//!      dns_inflight, upstream_timeouts.
+//!      dns_inflight, upstream_timeouts, rx_drops, rx_overruns, rx_queued,
+//!      forward_full, reply_drops. `dns_inflight` is the forward queue depth.
 //!  67  firmware(op, ...). Staged SD updates. Op 10 promotes, op 11 rolls back. See `fw::syscall`.
 //!  68  sd_status(buf, cap) -> 64. state[16], error[32], blocks u32, mounted u32.
 //!
@@ -224,7 +226,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         CONFIG_PROBE_SECS => crate::config_manager::probe_interval_secs() as i64,
         NET_READY => i64::from(crate::net::has_address()),
         NET_COUNTERS => net_counters(args[0], args[1]),
-        SET_DNS_LOAD => set_dns_load(args[0], args[1]),
+        SET_DNS_LOAD => set_dns_load(args[0], args[1], args[2], args[3]),
         NET_EXTRA => net_extra(args[0], args[1]),
         FW => crate::fw::syscall(args),
         SD_STATUS => sd_status(args[0], args[1]),
@@ -1292,22 +1294,35 @@ fn net_counters(ptr: u64, cap: u64) -> i64 {
     if write_user(ptr, &raw) { N as i64 } else { EFAULT }
 }
 
-fn set_dns_load(inflight: u64, timeouts: u64) -> i64 {
+fn set_dns_load(inflight: u64, timeouts: u64, forward_full: u64, reply_drops: u64) -> i64 {
     if slot() != crate::task::DNS_SLOT {
         return EINVAL;
     }
-    crate::dns::set_load(inflight, timeouts);
+    crate::dns::set_load(inflight, timeouts, forward_full, reply_drops);
     0
 }
 
 fn net_extra(ptr: u64, cap: u64) -> i64 {
-    const N: usize = 48;
+    const N: usize = 88;
     if cap < N as u64 || !crate::mmu::user_write_ok(ptr, N as u64) {
         return EFAULT;
     }
     let (requests, replies, hits, misses) = crate::net::arp_counters();
-    let (inflight, timeouts) = crate::dns::load();
-    let words = [requests, replies, hits, misses, inflight, timeouts];
+    let (inflight, timeouts, forward_full, reply_drops) = crate::dns::load();
+    let (rx_drops, rx_overruns, rx_queued) = crate::board::rx_load();
+    let words = [
+        requests,
+        replies,
+        hits,
+        misses,
+        inflight,
+        timeouts,
+        rx_drops,
+        rx_overruns,
+        rx_queued,
+        forward_full,
+        reply_drops,
+    ];
     let mut raw = [0u8; N];
     for (index, word) in words.iter().enumerate() {
         let off = index * 8;

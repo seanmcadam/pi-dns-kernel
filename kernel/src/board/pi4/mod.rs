@@ -93,6 +93,14 @@ impl Board for Pi4 {
         genet::packet_bytes()
     }
 
+    fn rx_pending() -> bool {
+        genet::rx_pending()
+    }
+
+    fn rx_load() -> (u64, u64, u64) {
+        genet::rx_load()
+    }
+
     fn retarget_nic(cpu: usize) {
         genet::retarget(cpu);
     }
