@@ -637,6 +637,7 @@ pub fn fill_tryboot(
     kernel: &str,
     address: u32,
     uart: bool,
+    hotplug: bool,
 ) -> Result<usize, &'static str> {
     if !kernel_value_ok(kernel) {
         return Err("kernel");
@@ -646,10 +647,14 @@ pub fn fill_tryboot(
     push(out, &mut n, kernel.as_bytes())?;
     push(out, &mut n, b"\nkernel_address=0x")?;
     push_hex(out, &mut n, address)?;
+    push(out, &mut n, b"\n")?;
     if uart {
-        push(out, &mut n, b"\nenable_uart=1\n")?;
-    } else {
-        push(out, &mut n, b"\n")?;
+        push(out, &mut n, b"enable_uart=1\n")?;
+    }
+    // Pi 4 only. Tryboot replaces config.txt, so a soft reboot would
+    // otherwise boot with no display detected. Output-only.
+    if hotplug {
+        push(out, &mut n, b"hdmi_force_hotplug=1\n")?;
     }
     let text = core::str::from_utf8(&out[..n]).map_err(|_| "utf8")?;
     validate_boot(text)?;
@@ -797,13 +802,19 @@ mod tests {
     #[test]
     fn boot_config_rules() {
         let mut buf = [0u8; 128];
-        let n = fill_tryboot(&mut buf, "kernel8.new", 0x80000, true).unwrap();
+        let n = fill_tryboot(&mut buf, "kernel8.new", 0x80000, true, true).unwrap();
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        assert_eq!(
+            text,
+            "arm_64bit=1\nkernel=kernel8.new\nkernel_address=0x80000\nenable_uart=1\nhdmi_force_hotplug=1\n"
+        );
+        let n = fill_tryboot(&mut buf, "kernel8.new", 0x80000, true, false).unwrap();
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
             text,
             "arm_64bit=1\nkernel=kernel8.new\nkernel_address=0x80000\nenable_uart=1\n"
         );
-        let n = fill_tryboot(&mut buf, "k2712.new", 0x200000, false).unwrap();
+        let n = fill_tryboot(&mut buf, "k2712.new", 0x200000, false, false).unwrap();
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
             text,

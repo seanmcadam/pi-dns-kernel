@@ -1,6 +1,9 @@
 # Raspberry Pi 4 Boot Configuration
+# hdmi_force_hotplug=1 forces display detection for the output-only
+# console. A soft reboot otherwise sees no screen.
 arm_64bit=1
 kernel=kernel8.img
 disable_commandline_tags=1
 enable_uart=1
 uart_2ndstage=1
+hdmi_force_hotplug=1
