@@ -98,6 +98,11 @@ pub trait Board {
     fn rx_load() -> (u64, u64, u64) {
         (0, 0, 0)
     }
+    /// IRQ re-arms, transmits refused because the ring was full, and
+    /// transmits whose DMA did not retire inside the short budget.
+    fn nic_faults() -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
     fn retarget_nic(cpu: usize);
     fn probe_disk() -> bool;
     fn disk() -> Self::Disk;
@@ -244,6 +249,10 @@ pub fn rx_pending() -> bool {
 
 pub fn rx_load() -> (u64, u64, u64) {
     <Active as Board>::rx_load()
+}
+
+pub fn nic_faults() -> (u64, u64, u64) {
+    <Active as Board>::nic_faults()
 }
 
 pub fn retarget_nic(cpu: usize) {

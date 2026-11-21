@@ -118,6 +118,9 @@ static KICK: AtomicBool = AtomicBool::new(false);
 static DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 static BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
 static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
+static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
+static POLL_LAST_US: AtomicU64 = AtomicU64::new(0);
+static POLL_MAX_US: AtomicU64 = AtomicU64::new(0);
 /// Pi 4 only. Set once a zero `poll_delay` has already been given an
 /// immediate second look. The next zero sleeps instead of spinning.
 #[cfg(feature = "board-pi4")]
@@ -145,7 +148,9 @@ const IDLE_HOLD_MS: u64 = 100;
 /// most of the idle CPU: each poll cost about as much as the 10 ms cap,
 /// so `net_busy_ms` tracked wall clock. 200 ms still bounds a missed RX
 /// IRQ on a link that is actually idle, well inside the 2 s gratuitous
-/// ARP, and the owner spends that wait in `wfi`.
+/// ARP, and the owner spends that wait in `wfi`. It is not a substitute
+/// for the RX line: with that line left masked, an idle ping waits out
+/// this whole interval.
 #[cfg(feature = "board-pi4")]
 const QUIET_POLL_MS: u64 = 200;
 /// Millisecond when the current `drive` entered the stack. Zero when the
@@ -328,6 +333,34 @@ pub fn owner_time() -> (u64, u64) {
     )
 }
 
+/// Polls, the last one in microseconds, and the longest one.
+pub fn poll_stats() -> (u64, u64, u64) {
+    (
+        POLL_COUNT.load(Ordering::Relaxed),
+        POLL_LAST_US.load(Ordering::Relaxed),
+        POLL_MAX_US.load(Ordering::Relaxed),
+    )
+}
+
+fn note_poll(ticks: u64) {
+    let freq = crate::timer::frequency().max(1);
+    let us = ticks.saturating_mul(1_000_000) / freq;
+    POLL_COUNT.fetch_add(1, Ordering::Relaxed);
+    POLL_LAST_US.store(us, Ordering::Relaxed);
+    let mut cur = POLL_MAX_US.load(Ordering::Relaxed);
+    while us > cur {
+        match POLL_MAX_US.compare_exchange_weak(
+            cur,
+            us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
 /// How long the current `drive` has been inside the stack, or 0 if it is
 /// not. A multi-second age means `poll` did not return (the RX callback
 /// is still running) and the owner will never reach `wfi`.
@@ -429,7 +462,9 @@ pub fn drive() {
     }
     #[cfg(feature = "board-pi4")]
     DRIVE_ENTER.store(0, Ordering::Release);
-    BUSY_TICKS.fetch_add(crate::timer::get_ticks().wrapping_sub(t0), Ordering::Relaxed);
+    let elapsed = crate::timer::get_ticks().wrapping_sub(t0);
+    BUSY_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+    note_poll(elapsed);
     IN_STACK.store(false, Ordering::Release);
 }
 

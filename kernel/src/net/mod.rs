@@ -1,3 +1,4 @@
+pub(crate) mod rearm;
 pub mod service;
 mod stack;
 

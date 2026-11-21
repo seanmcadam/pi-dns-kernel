@@ -98,6 +98,12 @@ def main():
                     help="exit 1 when local-name loss exceeds this percent")
     ap.add_argument("--require-counters", action="store_true",
                     help="exit 1 unless /status publishes the load counters")
+    ap.add_argument("--max-p99", type=float, default=None,
+                    help="exit 1 when overall p99 latency exceeds this many milliseconds")
+    ap.add_argument("--max-busy-ratio", type=float, default=None,
+                    help="exit 1 when net_busy_ms grows by more than this fraction of wall time")
+    ap.add_argument("--irq-moves", action="store_true",
+                    help="exit 1 unless nic_irqs increases through the second half of the run")
     a = ap.parse_args()
     if a.seed is not None:
         random.seed(a.seed)
@@ -120,8 +126,12 @@ def main():
         last_uptime, last_uptime_t = st.get("uptime", 0), time.time()
         log(f"start: device status={st.get('status')} uptime={last_uptime}s; {a.qps} qps for {a.duration:.0f}s")
         log("start: " + counter_text(st))
+        start_irqs = st.get("nic_irqs")
+        start_busy = st.get("net_busy_ms")
     except Exception as e:
         last_uptime, last_uptime_t = None, time.time()
+        start_irqs = None
+        start_busy = None
         log(f"start: /status unreachable ({e}); continuing with DNS only")
 
     start = time.time()
@@ -129,6 +139,8 @@ def main():
     next_send = start
     next_report = start + a.interval
     next_status = start + 60
+    mid_at = start + a.duration / 2
+    mid_irqs = None
     reboots = 0
     gap = 1.0 / a.qps
 
@@ -179,6 +191,12 @@ def main():
             now = time.time()
             for qid in [q for q, (t0, _) in pending.items() if now - t0 > a.timeout]:
                 pending.pop(qid); tot["lost"] += 1; win["lost"] += 1
+            if a.irq_moves and mid_irqs is None and now >= mid_at:
+                try:
+                    mid_irqs = status(a.server, a.http_port, a.user, a.password).get("nic_irqs")
+                    log(f"mid: nic_irqs={mid_irqs}")
+                except Exception as e:
+                    log(f"mid: /status unreachable ({e})")
             if now >= next_status:
                 next_status = now + 60
                 try:
@@ -228,6 +246,30 @@ def main():
         missing = [key for key in COUNTERS if end_status is None or key not in end_status]
         if missing:
             log("missing counters " + " ".join(missing))
+            return 1
+    if a.max_p99 is not None:
+        p99 = pct(lat_all, 0.99)
+        if p99 > a.max_p99:
+            log(f"p99 {p99:.1f}ms exceeds {a.max_p99:.0f}ms")
+            return 1
+    if a.irq_moves:
+        end_irqs = None if end_status is None else end_status.get("nic_irqs")
+        if not isinstance(start_irqs, int) or not isinstance(mid_irqs, int) or not isinstance(end_irqs, int):
+            log(f"nic_irqs samples start={start_irqs} mid={mid_irqs} end={end_irqs}")
+            return 1
+        if not (end_irqs > mid_irqs >= start_irqs):
+            log(f"nic_irqs stalled start={start_irqs} mid={mid_irqs} end={end_irqs}")
+            return 1
+        log(f"nic_irqs {start_irqs} -> {mid_irqs} -> {end_irqs}")
+    if a.max_busy_ratio is not None:
+        end_busy = None if end_status is None else end_status.get("net_busy_ms")
+        if not isinstance(start_busy, int) or not isinstance(end_busy, int):
+            log(f"net_busy_ms samples start={start_busy} end={end_busy}")
+            return 1
+        ratio = (end_busy - start_busy) / max(el * 1000.0, 1.0)
+        log(f"net_busy_ms {start_busy} -> {end_busy} ({ratio:.2f} of wall)")
+        if ratio > a.max_busy_ratio:
+            log(f"network core busy ratio {ratio:.2f} exceeds {a.max_busy_ratio:.2f}")
             return 1
     return 0
 

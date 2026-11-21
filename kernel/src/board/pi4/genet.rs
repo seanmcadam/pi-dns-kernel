@@ -10,10 +10,12 @@
 //! 0 or `0xffffffff` is accepted either way. The raw word is logged.
 //!
 //! The PHY is external, address 1, RGMII with the receive delay in the PHY
-//! (`rgmii-rxid`). Packet data is polled. The GIC lines are armed so the
-//! status counter can move. RX masks the line until the poll drains and
-//! rearms it. TX done is cleared in the handler and does not wake the
-//! owner, so a transmit cannot cancel the idle sleep.
+//! (`rgmii-rxid`). Packet data is polled. RX masks the GENET summary so the
+//! level line drops, and the poll unmasks it. The GIC line stays enabled.
+//! TX done is cleared in the handler and does not wake the owner, so a
+//! transmit cannot cancel the idle sleep. A posted transmit is not waited
+//! out: the ring holds 256 frames, and blocking the owner until the MAC
+//! retired each one kept the core busy and the UDP socket full.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -192,6 +194,13 @@ static RX_CONS: AtomicU32 = AtomicU32::new(0);
 static TX_PROD: AtomicU32 = AtomicU32::new(0);
 /// Set when the consumer does not catch the producer. Further transmits stop.
 static TX_STUCK: AtomicBool = AtomicBool::new(false);
+/// Transmits refused because the ring still held every descriptor.
+static TX_FULL: AtomicU64 = AtomicU64::new(0);
+/// Transmits whose consumer had not caught up after a short budget.
+/// The frame stays posted. This does not stop later transmits.
+static TX_SLOW: AtomicU64 = AtomicU64::new(0);
+/// Times the poll unmasked an RX line the handler had masked.
+static IRQ_REARMS: AtomicU64 = AtomicU64::new(0);
 static DESC_MISMATCH: AtomicBool = AtomicBool::new(false);
 static ARP_TX_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static ARP_RX_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -404,6 +413,15 @@ pub fn rx_pending() -> bool {
 }
 
 /// Descriptor errors, lapped-ring frames, and how many are waiting now.
+/// Re-arms, ring-full refuses, and slow DMA completions.
+pub fn nic_faults() -> (u64, u64, u64) {
+    (
+        IRQ_REARMS.load(Ordering::Relaxed),
+        TX_FULL.load(Ordering::Relaxed),
+        TX_SLOW.load(Ordering::Relaxed),
+    )
+}
+
 pub fn rx_load() -> (u64, u64, u64) {
     let queued = rx_gap().unwrap_or(0);
     let queued = if queued > RX_RING_DESCS as u32 {
@@ -489,6 +507,7 @@ impl GenetDevice {
         let prod = raw_prod & 0xffff;
         let cons = read(TDMA_RING + TDMA_CONS_INDEX) & 0xffff;
         if prod.wrapping_sub(cons) & 0xffff >= DESC_COUNT as u32 {
+            TX_FULL.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let desc_index = (prod as usize) & 0xff;
@@ -534,17 +553,21 @@ impl GenetDevice {
         TX_PROD.store(next, Ordering::Relaxed);
         TX_COUNT.fetch_add(1, Ordering::Relaxed);
         TX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-        let start = crate::timer::millis();
+        // One read of the consumer used to be a wait of up to 20 ms, and
+        // a miss set TX_STUCK for the rest of the boot. The MAC retires
+        // the descriptor on its own. 50 us is long enough to notice a
+        // completion that is already done and short enough that a slow
+        // one cannot fill the poll. The frame stays posted either way.
+        let posted_n = next.wrapping_sub(prod) & 0xffff;
+        let start = crate::timer::get_ticks();
+        let budget = (crate::timer::frequency() / 20_000).max(1);
         loop {
             let got = read_at(BASE + TDMA_RING + TDMA_CONS_INDEX) & 0xffff;
-            let advanced = got.wrapping_sub(prod) & 0xffff;
-            let posted = next.wrapping_sub(prod) & 0xffff;
-            if advanced >= posted {
+            if got.wrapping_sub(prod) & 0xffff >= posted_n {
                 return;
             }
-            if crate::timer::millis().saturating_sub(start) > 20 {
-                say("[WARN] GENET TX consumer did not catch the producer");
-                TX_STUCK.store(true, Ordering::Relaxed);
+            if budget == 0 || crate::timer::get_ticks().wrapping_sub(start) > budget {
+                TX_SLOW.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
@@ -911,31 +934,33 @@ pub fn retarget(cpu: usize) {
     crate::gic::route_spi(GENET_IRQ1, mask);
 }
 
-static IRQ_HELD: AtomicBool = AtomicBool::new(false);
+/// The handler has masked the GENET summary. The poll unmasks it.
+static IRQ_MASKED: AtomicBool = AtomicBool::new(false);
 
-/// The handler masks the GIC line. The poll that follows clears any
-/// summary a frame left behind and enables the line again.
-pub fn note_irq_held() {
-    IRQ_HELD.store(true, Ordering::Relaxed);
-}
-
-pub fn rearm_irq() {
-    if !PRESENT.load(Ordering::Relaxed) || !IRQ_HELD.load(Ordering::Relaxed) {
-        return;
-    }
-    // A frame that arrives after the handler's clear and before this poll
-    // sets the summary again. Skipping the enable in that case left the
-    // GIC line masked for good: nothing else writes INTRL2_CLEAR, so every
-    // later packet waited for the 2 s ARP deadline.
+fn unmask_irq_line() {
     for base in [INTRL2_0, INTRL2_1] {
         let stat = read(base + INTRL2_STAT);
         if stat != 0 {
             write(base + INTRL2_CLEAR, stat);
         }
+        write(base + INTRL2_MASK_CLEAR, IRQ_RXDMA_DONE | IRQ_TXDMA_DONE);
     }
     crate::gic::enable_id(GENET_IRQ0);
     crate::gic::enable_id(GENET_IRQ1);
-    IRQ_HELD.store(false, Ordering::Relaxed);
+}
+
+pub fn rearm_irq() {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
+    // Always unmask. A flag cleared after the enable used to forget a
+    // handler that had just masked the summary, and the GIC line then
+    // stayed disabled. Later packets only moved on the quiet poll.
+    let was_masked = IRQ_MASKED.load(Ordering::Acquire);
+    let passes = crate::net::rearm::until_clear(&IRQ_MASKED, unmask_irq_line);
+    if was_masked || passes > 1 {
+        IRQ_REARMS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// What the GENET summary was asking for, after it has been cleared.
@@ -954,20 +979,35 @@ pub fn take_irq(which: u32) -> NicIrq {
     let base = if which == 0 { INTRL2_0 } else { INTRL2_1 };
     let stat_addr = (BASE + base + INTRL2_STAT) as *const u32;
     let Some(stat) = crate::exception::read_u32_catching(stat_addr) else {
+        mask_rx(base);
         return NicIrq::Wake;
     };
-    write(base + INTRL2_CLEAR, stat);
-    let Some(left) = crate::exception::read_u32_catching(stat_addr) else {
-        return NicIrq::Wake;
-    };
-    let mask = read(base + INTRL2_MASK_STATUS);
-    let stuck = left & !mask != 0;
     let rx = stat & IRQ_RXDMA_DONE != 0;
     let tx = stat & IRQ_TXDMA_DONE != 0;
-    if rx || !tx || stuck {
-        NicIrq::Wake
-    } else {
-        NicIrq::TxOnly
+    if !rx && tx {
+        write(base + INTRL2_CLEAR, stat);
+        let Some(left) = crate::exception::read_u32_catching(stat_addr) else {
+            mask_rx(base);
+            return NicIrq::Wake;
+        };
+        let mask = read(base + INTRL2_MASK_STATUS);
+        // Cleared, and no unmasked bit came back. Leave the line enabled.
+        if left & !mask == 0 {
+            return NicIrq::TxOnly;
+        }
+    }
+    // Mask before the rest of the clear so a still-done DMA cannot
+    // reassert the level between this handler and the GIC end-of-interrupt.
+    mask_rx(base);
+    NicIrq::Wake
+}
+
+fn mask_rx(base: usize) {
+    IRQ_MASKED.store(true, Ordering::Release);
+    write(base + INTRL2_MASK_SET, IRQ_RXDMA_DONE | IRQ_TXDMA_DONE);
+    let stat = read(base + INTRL2_STAT);
+    if stat != 0 {
+        write(base + INTRL2_CLEAR, stat);
     }
 }
 
