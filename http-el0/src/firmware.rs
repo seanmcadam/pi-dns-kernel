@@ -1,5 +1,6 @@
-//! Firmware page. Uploads are split so each body stays under the 4096 byte
-//! limit. The kernel writes a temp file, reads it back, then renames.
+//! Firmware page. The page posts raw 16 KiB chunks. A hex form post is
+//! still accepted for the small tests, and that body stays under 4096.
+//! The kernel writes a temp file, reads it back, then renames.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -19,6 +20,9 @@ struct View {
     result: String,
     staged_name: String,
     live_name: String,
+    phase: String,
+    progress: u32,
+    total: u32,
 }
 
 pub(super) fn handle(request: &HttpRequest) -> HttpResponse {
@@ -58,7 +62,7 @@ pub(super) fn handle(request: &HttpRequest) -> HttpResponse {
 pub(super) fn fields() -> String {
     match view() {
         Some(view) => format!(
-            "\"fw_staged\":{},\"fw_bytes\":{},\"fw_backup\":{},\"fw_tryboot\":{},\"fw_tryboot_hw\":{},\"fw_temp\":{},\"fw_sha256\":\"{}\",\"fw_result\":\"{}\"",
+            "\"fw_staged\":{},\"fw_bytes\":{},\"fw_backup\":{},\"fw_tryboot\":{},\"fw_tryboot_hw\":{},\"fw_temp\":{},\"fw_sha256\":\"{}\",\"fw_result\":\"{}\",\"fw_phase\":\"{}\",\"fw_progress\":{},\"fw_total\":{}",
             view.staged,
             view.bytes,
             view.backup,
@@ -66,17 +70,20 @@ pub(super) fn fields() -> String {
             view.hw,
             view.temp,
             view.sha,
-            json_text(&view.result)
+            json_text(&view.result),
+            json_text(&view.phase),
+            view.progress,
+            view.total
         ),
         None => String::from(
-            "\"fw_staged\":0,\"fw_bytes\":0,\"fw_backup\":0,\"fw_tryboot\":0,\"fw_tryboot_hw\":0,\"fw_temp\":0,\"fw_sha256\":\"\",\"fw_result\":\"unavailable\"",
+            "\"fw_staged\":0,\"fw_bytes\":0,\"fw_backup\":0,\"fw_tryboot\":0,\"fw_tryboot_hw\":0,\"fw_temp\":0,\"fw_sha256\":\"\",\"fw_result\":\"unavailable\",\"fw_phase\":\"idle\",\"fw_progress\":0,\"fw_total\":0",
         ),
     }
 }
 
 fn page() -> HttpResponse {
     let view = view();
-    let (hw, name, live, bytes, backup, tryboot, temp, sha, result) = match view {
+    let (hw, name, live, bytes, backup, tryboot, temp, sha, result, phase) = match view {
         Some(view) => (
             if view.hw == 1 { "yes" } else { "no" },
             view.staged_name,
@@ -87,8 +94,20 @@ fn page() -> HttpResponse {
             view.temp,
             view.sha,
             json_text(&view.result),
+            json_text(&view.phase),
         ),
-        None => ("no", String::from("KERNEL8.NEW"), String::from("KERNEL8.IMG"), 0, 0, 0, 0, String::new(), String::from("unavailable")),
+        None => (
+            "no",
+            String::from("KERNEL8.NEW"),
+            String::from("KERNEL8.IMG"),
+            0,
+            0,
+            0,
+            0,
+            String::new(),
+            String::from("unavailable"),
+            String::from("idle"),
+        ),
     };
     let mut html = format!(
         "<!DOCTYPE html><html><body>\
@@ -100,9 +119,13 @@ The test file is <code>FWTEST.BIN</code>. The staged kernel is <code>{name}</cod
 <p>tryboot hardware: {hw}</p>\
 <p>sha256 {sha}</p>\
 <p>result {result}</p>\
+<p id=\"prog\">progress idle</p>\
 <p><a href=\"/firmware/status\">Firmware status JSON</a></p>"
     );
     html.push_str(PAGE);
+    html.push_str(&format!(
+        "<script>if (\"{phase}\" === \"verifying\" || \"{phase}\" === \"staging\" || \"{phase}\" === \"receiving\") {{ pollVerify(); }}</script>"
+    ));
     html.push_str("</body></html>");
     super::html_response(&html)
 }
@@ -149,38 +172,58 @@ const PAGE: &str = r#"
 </form>
 <pre id="out"></pre>
 <script>
-function hexOf(bytes) {
-  var out = "";
-  for (var i = 0; i < bytes.length; i++) {
-    var b = bytes[i].toString(16);
-    if (b.length < 2) b = "0" + b;
-    out += b;
-  }
-  return out;
+function setOut(text) {
+  document.getElementById("out").textContent = text;
+  var prog = document.getElementById("prog");
+  if (prog) prog.textContent = text;
 }
-function setOut(text) { document.getElementById("out").textContent = text; }
 function upload(kind, id) {
   var file = document.getElementById(id).files[0];
   if (!file) { setOut("choose a file"); return; }
   var reader = new FileReader();
   reader.onload = function() {
     var buf = new Uint8Array(reader.result);
-    sendChunks(kind, buf, 0);
+    sendChunks(kind, buf, 0, 0);
   };
   reader.readAsArrayBuffer(file);
 }
-function sendChunks(kind, buf, off) {
-  var step = 1024;
+function sendChunks(kind, buf, off, tries) {
+  var step = 16384;
   var piece = buf.subarray(off, Math.min(off + step, buf.length));
   var final = (off + piece.length === buf.length) ? "1" : "0";
-  var body = "kind=" + kind + "&offset=" + off + "&total=" + buf.length + "&final=" + final + "&data=" + hexOf(piece);
-  fetch("/firmware/chunk", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body: body})
+  setOut("upload " + off + "/" + buf.length);
+  fetch("/firmware/chunk", {method:"POST", headers:{"Content-Type":"application/octet-stream", "X-Fw-Kind":kind, "X-Fw-Offset":String(off), "X-Fw-Total":String(buf.length), "X-Fw-Final":final}, body: piece})
     .then(function(res) { return res.text().then(function(text) { return {ok: res.ok, text: text}; }); })
     .then(function(ans) {
-      if (!ans.ok) { setOut(ans.text); return; }
-      if (final === "1") { setOut(ans.text); return; }
-      sendChunks(kind, buf, off + piece.length);
+      if (!ans.ok) {
+        if (tries < 3) { setOut("retry " + off + "/" + buf.length); sendChunks(kind, buf, off, tries + 1); return; }
+        setOut(ans.text);
+        return;
+      }
+      if (final === "1") {
+        var doc = {};
+        try { doc = JSON.parse(ans.text); } catch (e) { doc = {}; }
+        if (doc.status === "verifying") { pollVerify(); return; }
+        setOut(ans.text);
+        return;
+      }
+      sendChunks(kind, buf, off + piece.length, 0);
+    })
+    .catch(function() {
+      if (tries < 3) sendChunks(kind, buf, off, tries + 1);
+      else setOut("upload failed");
     });
+}
+function pollVerify() {
+  fetch("/firmware/status").then(function(res) { return res.json(); }).then(function(doc) {
+    var phase = doc.fw_phase || "";
+    var prog = doc.fw_progress || 0;
+    var total = doc.fw_total || 0;
+    setOut(phase + " " + prog + "/" + total);
+    if (phase === "verifying" || phase === "staging" || phase === "receiving") {
+      setTimeout(pollVerify, 50);
+    }
+  }).catch(function() { setTimeout(pollVerify, 200); });
 }
 function readback() {
   readFrom(0, []);
@@ -223,6 +266,12 @@ fn chunk(request: &HttpRequest) -> HttpResponse {
     if request.method != HttpMethod::POST {
         return method_not();
     }
+    if request
+        .get_header("Content-Type")
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/octet-stream"))
+    {
+        return chunk_raw(request);
+    }
     let body = core::str::from_utf8(&request.body).unwrap_or("");
     let kind = match form_value(body, "kind") {
         Some("test") => 1,
@@ -238,13 +287,64 @@ fn chunk(request: &HttpRequest) -> HttpResponse {
         None => return super::bad_request("total required"),
     };
     let data_hex = form_value(body, "data").unwrap_or("");
-    let mut data = [0u8; 1024];
+    let mut data = [0u8; 1792];
     let Some(n) = decode_hex(data_hex, &mut data) else {
         return super::bad_request("data must be hex");
     };
     if n == 0 {
         return super::bad_request("empty chunk");
     }
+    store_chunk(
+        kind,
+        offset,
+        total,
+        &data[..n],
+        form_value(body, "final") == Some("1"),
+        form_value(body, "sha256"),
+    )
+}
+
+fn chunk_raw(request: &HttpRequest) -> HttpResponse {
+    let kind = match request.get_header("X-Fw-Kind") {
+        Some("test") => 1,
+        Some("kernel") => 2,
+        _ => return super::bad_request("kind must be test or kernel"),
+    };
+    let offset: u64 = match request
+        .get_header("X-Fw-Offset")
+        .and_then(|text| text.parse().ok())
+    {
+        Some(value) => value,
+        None => return super::bad_request("offset required"),
+    };
+    let total: u64 = match request
+        .get_header("X-Fw-Total")
+        .and_then(|text| text.parse().ok())
+    {
+        Some(value) => value,
+        None => return super::bad_request("total required"),
+    };
+    if request.body.is_empty() {
+        return super::bad_request("empty chunk");
+    }
+    store_chunk(
+        kind,
+        offset,
+        total,
+        &request.body,
+        request.get_header("X-Fw-Final") == Some("1"),
+        request.get_header("X-Fw-Sha256"),
+    )
+}
+
+fn store_chunk(
+    kind: u64,
+    offset: u64,
+    total: u64,
+    data: &[u8],
+    final_chunk: bool,
+    sha_hex: Option<&str>,
+) -> HttpResponse {
     let rc = super::sys(
         FW,
         1,
@@ -252,29 +352,41 @@ fn chunk(request: &HttpRequest) -> HttpResponse {
         offset,
         total,
         data.as_ptr() as u64,
-        n as u64,
+        data.len() as u64,
     );
     if rc < 0 {
         return fw_error(rc);
     }
-    if form_value(body, "final") == Some("1") {
-        let rc = if let Some(hexed) = form_value(body, "sha256") {
-            let mut sha = [0u8; 32];
-            if decode_hex(hexed, &mut sha) != Some(32) {
-                return super::bad_request("sha256 must be 32 bytes of hex");
-            }
-            super::sys(FW, 2, kind, sha.as_ptr() as u64, 0, 0, 0)
-        } else {
-            super::sys(FW, 9, kind, 0, 0, 0, 0)
-        };
-        if rc < 0 {
-            return fw_error(rc);
-        }
-        let mut response = HttpResponse::ok("{\"status\":\"staged\"}\n");
+    if !final_chunk {
+        let mut response = HttpResponse::ok("{\"status\":\"ok\"}\n");
         response.add_header("Content-Type", "application/json");
         return response;
     }
-    let mut response = HttpResponse::ok("{\"status\":\"ok\"}\n");
+    let rc = if let Some(hexed) = sha_hex {
+        let mut sha = [0u8; 32];
+        if decode_hex(hexed, &mut sha) != Some(32) {
+            return super::bad_request("sha256 must be 32 bytes of hex");
+        }
+        super::sys(FW, 2, kind, sha.as_ptr() as u64, 0, 0, 0)
+    } else {
+        super::sys(FW, 9, kind, 0, 0, 0, 0)
+    };
+    if rc < 0 {
+        return fw_error(rc);
+    }
+    if rc == 1 {
+        let view = view();
+        let (progress, total) = match view {
+            Some(view) => (view.progress, view.total),
+            None => (0, 0),
+        };
+        let mut response = HttpResponse::ok(&format!(
+            "{{\"status\":\"verifying\",\"progress\":{progress},\"total\":{total}}}\n"
+        ));
+        response.add_header("Content-Type", "application/json");
+        return response;
+    }
+    let mut response = HttpResponse::ok("{\"status\":\"staged\"}\n");
     response.add_header("Content-Type", "application/json");
     response
 }
@@ -410,15 +522,7 @@ fn read_file(kind: u64, offset: u64) -> HttpResponse {
 
 fn view() -> Option<View> {
     let mut raw = [0u8; 160];
-    let n = super::sys(
-        FW,
-        3,
-        raw.as_mut_ptr() as u64,
-        raw.len() as u64,
-        0,
-        0,
-        0,
-    );
+    let n = super::sys(FW, 3, raw.as_mut_ptr() as u64, raw.len() as u64, 0, 0, 0);
     if n < 160 {
         return None;
     }
@@ -438,6 +542,9 @@ fn view() -> Option<View> {
         result: cstr(&raw[56..104]).into(),
         staged_name: cstr(&raw[105..121]).into(),
         live_name: cstr(&raw[121..137]).into(),
+        phase: cstr(&raw[137..152]).into(),
+        progress: u32_at(&raw, 152),
+        total: u32_at(&raw, 156),
     })
 }
 

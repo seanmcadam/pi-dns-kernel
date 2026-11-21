@@ -138,19 +138,23 @@ impl BlockDevice for DiskDev {
         start_block_idx: BlockIdx,
         _reason: &str,
     ) -> Result<(), Self::Error> {
-        for (index, block) in blocks.iter_mut().enumerate() {
-            let lba = start_block_idx.0 as u64 + index as u64;
-            read_sector(lba, &mut block.contents)?;
-        }
-        Ok(())
+        crate::interrupts::with_irqs(|| {
+            for (index, block) in blocks.iter_mut().enumerate() {
+                let lba = start_block_idx.0 as u64 + index as u64;
+                read_sector(lba, &mut block.contents)?;
+            }
+            Ok(())
+        })
     }
 
     fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        for (index, block) in blocks.iter().enumerate() {
-            let lba = start_block_idx.0 as u64 + index as u64;
-            write_sector(lba, &block.contents)?;
-        }
-        Ok(())
+        crate::interrupts::with_irqs(|| {
+            for (index, block) in blocks.iter().enumerate() {
+                let lba = start_block_idx.0 as u64 + index as u64;
+                write_sector(lba, &block.contents)?;
+            }
+            Ok(())
+        })
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
@@ -231,9 +235,8 @@ fn read_capacity(rca: u32) -> Option<u32> {
         Some((c_size + 1).saturating_mul(1024))
     } else if structure == 0 {
         let read_bl_len = (csd[5] & 0x0f) as u32;
-        let c_size = (((csd[6] & 0x03) as u32) << 10)
-            | ((csd[7] as u32) << 2)
-            | ((csd[8] as u32) >> 6);
+        let c_size =
+            (((csd[6] & 0x03) as u32) << 10) | ((csd[7] as u32) << 2) | ((csd[8] as u32) >> 6);
         let c_size_mult = (((csd[9] & 0x03) as u32) << 1) | ((csd[10] as u32) >> 7);
         let block_len = 1u32 << read_bl_len;
         let mult = 1u32 << (c_size_mult + 2);

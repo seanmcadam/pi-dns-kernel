@@ -15,12 +15,18 @@
 //! virt reboot does not execute the staged file. The files are still on
 //! the FAT volume for the test to read back.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use spin::Mutex;
 
 use fwupd::{self, Card, CommitError};
 
-const CHUNK: usize = 1024;
+/// Raw firmware chunks are 16 KiB. The hex form used by the small tests
+/// stays under the 4096 byte body limit at 1024 bytes of payload.
+const CHUNK: usize = 16 * 1024;
+/// Read-back work one syscall will do. Small files finish in one call.
+/// A multi-megabyte kernel takes several calls so `/status` keeps answering.
+const PUMP_BYTES: usize = 64 * 1024;
+const PUMP_MS: u64 = 40;
 const TEST_MAX: u32 = 64 * 1024;
 const KERNEL_MAX: u32 = 8 * 1024 * 1024;
 const STATUS_LEN: usize = 160;
@@ -65,9 +71,46 @@ fn kernel_names() -> Names {
     }
 }
 
-struct Xfer {
+const PH_IDLE: u8 = 0;
+const PH_RECV: u8 = 1;
+const PH_VERIFY: u8 = 2;
+const PH_STAGING: u8 = 3;
+const PH_STAGED: u8 = 4;
+
+struct Job {
     kind: u8,
     xfer: fwupd::Transfer,
+    phase: u8,
+    verified: u32,
+    verify: fwupd::Sha256,
+    head: [u8; 64],
+    expect: [u8; 32],
+}
+
+static PHASE: AtomicU8 = AtomicU8::new(PH_IDLE);
+static PROG: AtomicU32 = AtomicU32::new(0);
+static TOTAL: AtomicU32 = AtomicU32::new(0);
+
+/// Phase name for the stall line and `/status`. Lock-free.
+pub fn phase_word() -> &'static str {
+    match PHASE.load(Ordering::Acquire) {
+        PH_RECV => "receiving",
+        PH_VERIFY => "verifying",
+        PH_STAGING => "staging",
+        PH_STAGED => "staged",
+        _ => "idle",
+    }
+}
+
+/// Bytes finished in the current phase, and the file size.
+pub fn progress_pair() -> (u32, u32) {
+    (PROG.load(Ordering::Acquire), TOTAL.load(Ordering::Acquire))
+}
+
+fn publish(phase: u8, prog: u32, total: u32) {
+    PHASE.store(phase, Ordering::Release);
+    PROG.store(prog, Ordering::Release);
+    TOTAL.store(total, Ordering::Release);
 }
 
 struct Note {
@@ -75,7 +118,7 @@ struct Note {
     len: u8,
 }
 
-static XFER: Mutex<Option<Xfer>> = Mutex::new(None);
+static JOB: Mutex<Option<Job>> = Mutex::new(None);
 static RESULT: Mutex<Note> = Mutex::new(Note {
     text: [0; 47],
     len: 0,
@@ -119,7 +162,7 @@ pub fn scrub() {
         let _ = crate::fs::delete_file(name);
     }
     if let Ok(text) = crate::fs::read_text("FWRES.TXT") {
-        if text.trim() == "receiving" {
+        if text.trim() == "receiving" || text.trim() == "verifying" {
             note("interrupted");
         }
     }
@@ -150,52 +193,118 @@ fn chunk(kind: u64, offset: u64, total: u64, ptr: u64, len: u64) -> i64 {
     let max = if kind == 1 { TEST_MAX } else { KERNEL_MAX };
     if total == 0 || total > max as u64 {
         note("too large");
+        publish(PH_IDLE, 0, 0);
         return -11;
     }
+    let offset = offset as u32;
+    let total = total as u32;
+    let len_n = len as u32;
     let mut data = [0u8; CHUNK];
     if !copy_in(ptr, &mut data[..len as usize]) {
         return -2;
     }
-    let names = upload_names(kind);
-    let mut slot = XFER.lock();
     if offset == 0 {
-        let _ = crate::fs::delete_file("FWTEST.TMP");
-        let _ = crate::fs::delete_file(kernel_names().temp);
-        match fwupd::Transfer::start(total as u32) {
-            Ok(xfer) => *slot = Some(Xfer { kind, xfer }),
+        let names = upload_names(kind);
+        io(|| {
+            let _ = crate::fs::delete_file(names.temp);
+            let _ = crate::fs::delete_file(kernel_names().temp);
+            let _ = crate::fs::delete_file("FWTEST.TMP");
+        });
+        match fwupd::Transfer::start(total) {
+            Ok(xfer) => {
+                *JOB.lock() = Some(Job {
+                    kind,
+                    xfer,
+                    phase: PH_RECV,
+                    verified: 0,
+                    verify: fwupd::Sha256::new(),
+                    head: [0; 64],
+                    expect: [0; 32],
+                });
+                publish(PH_RECV, 0, total);
+                note("receiving");
+            }
             Err(_) => {
-                *slot = None;
+                *JOB.lock() = None;
                 return -4;
             }
         }
-        note("receiving");
     }
-    let ready = match slot.as_ref() {
-        Some(active) => active.kind == kind && active.xfer.got() == offset as u32,
-        None => false,
+    enum Step {
+        Write,
+        Skip,
+        Reject,
+    }
+    let step = {
+        let slot = JOB.lock();
+        match slot.as_ref() {
+            Some(job) if job.kind == kind && job.xfer.total() == total && job.phase != PH_RECV => {
+                Step::Skip
+            }
+            Some(job)
+                if job.kind == kind
+                    && job.phase == PH_RECV
+                    && job.xfer.total() == total
+                    && job.xfer.got() == offset =>
+            {
+                Step::Write
+            }
+            Some(job)
+                if job.kind == kind
+                    && job.phase == PH_RECV
+                    && job.xfer.total() == total
+                    && offset < job.xfer.got()
+                    && offset.saturating_add(len_n) == job.xfer.got() =>
+            {
+                Step::Skip
+            }
+            // The job is gone because the rename already finished. A retry of
+            // the last chunk must not look like a fresh gap, and it must not
+            // append the bytes again. `finish` reports the staged state.
+            None if offset != 0
+                && offset.saturating_add(len_n) == total
+                && file_len_or_zero(upload_names(kind).dest) == total =>
+            {
+                Step::Skip
+            }
+            _ => Step::Reject,
+        }
     };
-    if !ready {
-        let _ = crate::fs::delete_file(names.temp);
-        *slot = None;
-        note("bad offset");
-        return -10;
+    match step {
+        Step::Reject => {
+            note("bad offset");
+            return -10;
+        }
+        Step::Skip => return 0,
+        Step::Write => {}
     }
-    if crate::fs::write_named(names.temp, &data[..len as usize], offset != 0).is_err() {
-        let _ = crate::fs::delete_file(names.temp);
-        *slot = None;
+    let names = upload_names(kind);
+    let wrote = io(|| crate::fs::write_named(names.temp, &data[..len as usize], offset != 0));
+    if wrote.is_err() {
+        io(|| {
+            let _ = crate::fs::delete_file(names.temp);
+        });
+        *JOB.lock() = None;
+        publish(PH_IDLE, 0, 0);
         note("no card");
         return -5;
     }
-    let accepted = slot
-        .as_mut()
-        .map(|active| active.xfer.accept(offset as u32, &data[..len as usize]).is_ok())
-        .unwrap_or(false);
+    let accepted = {
+        let mut slot = JOB.lock();
+        match slot.as_mut() {
+            Some(job) if job.kind == kind && job.phase == PH_RECV && job.xfer.got() == offset => {
+                job.xfer.accept(offset, &data[..len as usize]).is_ok()
+            }
+            Some(job) if job.kind == kind && job.xfer.got() == offset.saturating_add(len_n) => true,
+            _ => false,
+        }
+    };
     if !accepted {
-        let _ = crate::fs::delete_file(names.temp);
-        *slot = None;
         note("bad offset");
         return -10;
     }
+    let got = JOB.lock().as_ref().map(|job| job.xfer.got()).unwrap_or(0);
+    publish(PH_RECV, got, total);
     0
 }
 
@@ -204,109 +313,264 @@ fn finish_user(kind: u64, sha_ptr: u64) -> i64 {
     if !copy_in(sha_ptr, &mut expect) {
         return -2;
     }
-    finish(kind, &expect)
+    finish(kind, Some(expect))
 }
 
 fn finish_running(kind: u64) -> i64 {
-    let Some(kind_u) = upload_kind(kind) else {
-        return -4;
-    };
-    let sha = {
-        let slot = XFER.lock();
-        match slot.as_ref() {
-            Some(active) if active.kind == kind_u => active.xfer.running_sha(),
-            _ => return -10,
-        }
-    };
-    finish(kind, &sha)
+    finish(kind, None)
 }
 
-fn finish(kind: u64, expect: &[u8; 32]) -> i64 {
+/// One slice of read-back, then the rename when the slice finishes the file.
+/// `1` means the check is still running. A repeat of the final chunk calls
+/// this again and gets the same real state.
+fn finish(kind: u64, expect: Option<[u8; 32]>) -> i64 {
     let Some(kind) = upload_kind(kind) else {
         return -4;
     };
     let names = upload_names(kind);
-    let mut slot = XFER.lock();
-    let (active_kind, got, total, running) = match slot.as_ref() {
-        Some(active) => (
-            active.kind,
-            active.xfer.got(),
-            active.xfer.total(),
-            active.xfer.running_sha(),
-        ),
-        None => {
-            note("bad offset");
+    let opened = {
+        let mut slot = JOB.lock();
+        match slot.as_mut() {
+            Some(job) if job.kind != kind => return -10,
+            Some(job) if job.phase == PH_STAGING => return 1,
+            Some(job) if job.phase == PH_STAGED => return 0,
+            Some(job) if job.phase == PH_VERIFY => {
+                if expect.is_some_and(|sha| sha != job.expect) {
+                    VerifyStart::Mismatch
+                } else {
+                    VerifyStart::Continue
+                }
+            }
+            Some(job) if job.xfer.got() != job.xfer.total() => return -10,
+            Some(job) => {
+                let running = job.xfer.running_sha();
+                let expect = expect.unwrap_or(running);
+                if running != expect {
+                    VerifyStart::Mismatch
+                } else {
+                    job.phase = PH_VERIFY;
+                    job.expect = expect;
+                    job.verified = 0;
+                    job.verify = fwupd::Sha256::new();
+                    job.head = [0; 64];
+                    let total = job.xfer.total();
+                    publish(PH_VERIFY, 0, total);
+                    VerifyStart::Began
+                }
+            }
+            None => VerifyStart::Absent,
+        }
+    };
+    match opened {
+        VerifyStart::Mismatch => {
+            drop_job(names.temp);
+            note("checksum mismatch");
+            return -6;
+        }
+        VerifyStart::Absent => {
+            return if staged_match(&names, expect) {
+                let len = file_len_or_zero(names.dest);
+                publish(PH_STAGED, len, len);
+                note("staged");
+                0
+            } else {
+                note("bad offset");
+                -10
+            };
+        }
+        VerifyStart::Began => note("verifying"),
+        VerifyStart::Continue => {}
+    }
+    pump(kind, &names)
+}
+
+enum VerifyStart {
+    Began,
+    Continue,
+    Mismatch,
+    Absent,
+}
+
+fn pump(kind: u8, names: &Names) -> i64 {
+    let start = crate::timer::millis();
+    let mut moved = 0usize;
+    let mut buf = [0u8; 4096];
+    while moved < PUMP_BYTES && crate::timer::millis().saturating_sub(start) < PUMP_MS {
+        let (offset, total) = {
+            let slot = JOB.lock();
+            let Some(job) = slot.as_ref() else {
+                return -10;
+            };
+            if job.kind != kind || job.phase != PH_VERIFY {
+                return -10;
+            }
+            if job.verified >= job.xfer.total() {
+                break;
+            }
+            (job.verified, job.xfer.total())
+        };
+        let want = (total - offset) as usize;
+        let want = want.min(buf.len()).min(PUMP_BYTES - moved);
+        if want == 0 {
+            break;
+        }
+        let read = io(|| crate::fs::read_at(names.temp, offset, &mut buf[..want]));
+        let n = match read {
+            Ok(0) => {
+                drop_job(names.temp);
+                note("checksum mismatch");
+                return -6;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                drop_job(names.temp);
+                note("no card");
+                return -5;
+            }
+        };
+        let mut slot = JOB.lock();
+        let Some(job) = slot.as_mut() else {
             return -10;
+        };
+        if job.verified != offset {
+            return 1;
         }
-    };
-    if active_kind != kind || got != total {
-        let _ = crate::fs::delete_file(names.temp);
-        *slot = None;
-        note("bad offset");
-        return -10;
+        if job.verified < 64 {
+            let have = job.verified as usize;
+            let take = (64 - have).min(n);
+            job.head[have..have + take].copy_from_slice(&buf[..take]);
+        }
+        job.verify.update(&buf[..n]);
+        job.verified = job.verified.saturating_add(n as u32);
+        publish(PH_VERIFY, job.verified, total);
+        moved += n;
+        if job.verified >= total {
+            break;
+        }
     }
-    if running != *expect {
-        let _ = crate::fs::delete_file(names.temp);
-        *slot = None;
+    let complete = JOB
+        .lock()
+        .as_ref()
+        .map(|job| job.kind == kind && job.phase == PH_VERIFY && job.verified >= job.xfer.total())
+        .unwrap_or(false);
+    if !complete {
+        return 1;
+    }
+    commit_verified(kind, names)
+}
+
+fn commit_verified(kind: u8, names: &Names) -> i64 {
+    let (total, expect, sha, head) = {
+        let mut slot = JOB.lock();
+        let Some(job) = slot.as_mut() else {
+            return -10;
+        };
+        if job.phase != PH_VERIFY {
+            return 1;
+        }
+        job.phase = PH_STAGING;
+        (job.xfer.total(), job.expect, job.verify.finish(), job.head)
+    };
+    publish(PH_STAGING, total, total);
+    if sha != expect {
+        drop_job(names.temp);
         note("checksum mismatch");
         return -6;
     }
-    let dig = match crate::fs::digest(names.temp) {
-        Ok(dig) => dig,
-        Err(_) => {
-            let _ = crate::fs::delete_file(names.temp);
-            *slot = None;
-            note("no card");
-            return -5;
-        }
+    let dig = fwupd::Digest {
+        len: total,
+        sha,
+        head,
     };
-    if dig.len != total || dig.sha != *expect {
-        let _ = crate::fs::delete_file(names.temp);
-        *slot = None;
-        note("checksum mismatch");
-        return -6;
-    }
     let image = kind == KIND_KERNEL as u8;
-    match fwupd::commit(
-        &mut Fat,
-        names.dest,
-        names.temp,
-        names.side,
-        total,
-        expect,
-        image,
-    ) {
+    let committed = io(|| {
+        fwupd::commit_digest(
+            &mut Fat, names.dest, names.temp, names.side, total, &expect, image, dig,
+        )
+    });
+    match committed {
         Ok(()) => {}
         Err(CommitError::Image) => {
-            *slot = None;
+            *JOB.lock() = None;
+            publish(PH_IDLE, 0, 0);
             note("image rejected");
             return -7;
         }
         Err(CommitError::Checksum) => {
-            *slot = None;
+            *JOB.lock() = None;
+            publish(PH_IDLE, 0, 0);
             note("checksum mismatch");
             return -6;
         }
         Err(_) => {
-            *slot = None;
+            *JOB.lock() = None;
+            publish(PH_IDLE, 0, 0);
             note("no card");
             return -5;
         }
     }
-    *slot = None;
-    if image && write_kstat(total, expect).is_err() {
-        let _ = crate::fs::delete_file(names.dest);
+    *JOB.lock() = None;
+    if image && io(|| write_kstat(total, &expect)).is_err() {
+        io(|| {
+            let _ = crate::fs::delete_file(names.dest);
+        });
+        publish(PH_IDLE, 0, 0);
         note("no card");
         return -5;
     }
+    publish(PH_STAGED, total, total);
     note("staged");
     0
+}
+
+fn staged_match(names: &Names, expect: Option<[u8; 32]>) -> bool {
+    let Ok(len) = io(|| crate::fs::file_len(names.dest)) else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    if names.dest == kernel_names().dest {
+        let Some((klen, sha)) = io(read_kstat) else {
+            return false;
+        };
+        if klen != len {
+            return false;
+        }
+        return expect.map(|want| want == sha).unwrap_or(true);
+    }
+    let Some(expect) = expect else {
+        return true;
+    };
+    match io(|| crate::fs::digest(names.dest)) {
+        Ok(dig) => dig.len == len && dig.sha == expect,
+        Err(_) => false,
+    }
+}
+
+fn file_len_or_zero(name: &str) -> u32 {
+    io(|| crate::fs::file_len(name)).unwrap_or(0)
+}
+
+fn drop_job(temp: &str) {
+    *JOB.lock() = None;
+    publish(PH_IDLE, 0, 0);
+    io(|| {
+        let _ = crate::fs::delete_file(temp);
+    });
+}
+
+fn io<R>(body: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "board-pi4")]
+    crate::act::note_core(crate::percpu::id());
+    crate::interrupts::with_irqs(body)
 }
 
 fn status_out(ptr: u64, cap: u64) -> i64 {
     if cap < STATUS_LEN as u64 {
         return -2;
     }
+    advance();
     let mut buf = [0u8; STATUS_LEN];
     fill_status(&mut buf);
     if copy_out(ptr, &buf) {
@@ -326,7 +590,7 @@ fn fill_status(out: &mut [u8]) {
     };
     let backup = exists(names.live);
     let tryboot = exists("TRYBOOT.TXT");
-    let temp = exists("FWTEST.TMP") || exists(names.temp) || XFER.lock().is_some();
+    let temp = exists("FWTEST.TMP") || exists(names.temp) || JOB.lock().is_some();
     put_u32(out, 0, u32::from(staged));
     put_u32(out, 4, bytes);
     put_u32(out, 8, u32::from(backup));
@@ -342,11 +606,41 @@ fn fill_status(out: &mut [u8]) {
         }
     }
     let result = result_bytes();
-    let n = result.iter().position(|byte| *byte == 0).unwrap_or(result.len());
+    let n = result
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(result.len());
     let n = n.min(47);
     out[56..56 + n].copy_from_slice(&result[..n]);
     copy_name(out, 105, names.dest);
     copy_name(out, 121, names.live);
+    let mut phase = phase_word();
+    let result_staged = result.starts_with(b"staged");
+    if phase == "idle" && result_staged {
+        phase = "staged";
+    }
+    let n = phase.len().min(14);
+    out[137..137 + n].copy_from_slice(&phase.as_bytes()[..n]);
+    let (mut prog, mut total) = progress_pair();
+    if phase == "staged" && total == 0 {
+        prog = bytes;
+        total = bytes;
+    }
+    put_u32(out, 152, prog);
+    put_u32(out, 156, total);
+}
+
+/// Keep a verify moving when the page polls status. One slice, then return.
+fn advance() {
+    let kind = {
+        let slot = JOB.lock();
+        match slot.as_ref() {
+            Some(job) if job.phase == PH_VERIFY => job.kind,
+            _ => return,
+        }
+    };
+    let names = upload_names(kind);
+    let _ = pump(kind, &names);
 }
 
 fn read_out(kind: u64, offset: u64, ptr: u64, cap: u64) -> i64 {

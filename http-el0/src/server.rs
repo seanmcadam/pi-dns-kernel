@@ -133,7 +133,9 @@ fn handoff(conn: u32) -> bool {
 fn serve(conn: i64) {
     let mut buf: Vec<u8> = Vec::new();
     loop {
-        if buf.len() >= 5120 {
+        // Firmware chunks are raw 16 KiB plus headers. Every other body
+        // stays at 4096, which `ready` enforces once the path is known.
+        if buf.len() >= 18 * 1024 {
             let mut response = HttpResponse::new(400, "Bad Request");
             response.set_body(b"upload exceeds 4096 bytes");
             send_response(conn, &response);
@@ -191,7 +193,12 @@ fn ready(buf: &[u8]) -> Ready {
         Err(_) => Ready::Bad,
         Ok(request) => {
             if let Some(length) = content_length(&request) {
-                if length > 4096 || request.body.len() > 4096 {
+                let max = if request.path == "/firmware/chunk" {
+                    16 * 1024
+                } else {
+                    4096
+                };
+                if length > max || request.body.len() > max {
                     return Ready::Oversize;
                 }
                 if request.body.len() < length {

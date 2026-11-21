@@ -2035,7 +2035,7 @@ EOF
 mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/fw-disk.img >/dev/null
 python3 -c 'open("/tmp/fw-live.bin","wb").write(b"K"*64)'
 mcopy -i qemu/fw-disk.img@@${DISK_OFF} /tmp/fw-live.bin ::KERNEL8.IMG
-timeout 180 qemu-system-aarch64 \
+timeout 400 qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/fw-a.txt \
@@ -2111,7 +2111,7 @@ if status != 400 or b"Confirmation required" not in body:
     fail("reboot confirm %s %s" % (status, body[:120]))
 
 doc = uptime()
-for key in ("fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_temp", "fw_sha256", "fw_result"):
+for key in ("fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total"):
     if key not in doc:
         fail("status missing %s" % key)
 if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_staged"] != 0:
@@ -2228,6 +2228,92 @@ if doc["fw_sha256"] != hashlib.sha256(kernel).hexdigest():
 status, part, headers = req("GET", "/firmware/read/kernel/0")
 if status != 200 or headers["X-Fw-Sha256"] != doc["fw_sha256"] or part != kernel[:len(part)]:
     fail("kernel read %s" % status)
+
+# A multi-megabyte stage must not hash the whole file inside one syscall.
+# The final chunk starts a bounded read-back, and /status keeps answering
+# while later polls finish it. The retry of that chunk reports staged.
+big = bytearray((i * 3 + 1) & 0xFF for i in range(2 * 1024 * 1024))
+big[0] = 0x11
+big = bytes(big)
+step = 16384
+def raw_chunk(off, piece, final, sha=None, timeout=8):
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Fw-Kind": "kernel",
+        "X-Fw-Offset": str(off),
+        "X-Fw-Total": str(len(big)),
+        "X-Fw-Final": "1" if final else "0",
+    }
+    if sha is not None:
+        headers["X-Fw-Sha256"] = sha
+    return req("POST", "/firmware/chunk", piece, headers, timeout=timeout)
+off = 0
+t0 = time.time()
+while off < len(big):
+    piece = big[off:off + step]
+    if off + len(piece) == len(big):
+        break
+    status, body, _ = raw_chunk(off, piece, False)
+    if status != 200 or b'"status":"ok"' not in body:
+        fail("large chunk %s at %s %s" % (status, off, body[:120]))
+    off += len(piece)
+write_s = time.time() - t0
+piece = big[off:]
+t1 = time.time()
+status, body, _ = raw_chunk(off, piece, True, hashlib.sha256(big).hexdigest(), timeout=3)
+final_s = time.time() - t1
+if status != 200 or b"verifying" not in body:
+    fail("large finalize %s in %.2fs %s" % (status, final_s, body[:180]))
+if final_s > 2.0:
+    fail("final chunk blocked for %.2fs" % final_s)
+last = -1
+moved = False
+samples = []
+deadline = time.time() + 90
+verify_t = time.time()
+while time.time() < deadline:
+    t2 = time.time()
+    doc = uptime()
+    if time.time() - t2 > 1.0:
+        fail("status blocked during verify after %.2fs" % (time.time() - t2))
+    t3 = time.time()
+    status, raw, _ = req("GET", "/firmware/status", timeout=2)
+    if time.time() - t3 > 1.0 or status != 200:
+        fail("firmware status blocked %s %.2fs" % (status, time.time() - t3))
+    fw = json.loads(raw)
+    prog = fw.get("fw_progress", 0)
+    samples.append(prog)
+    if prog > last:
+        moved = True
+        last = prog
+    phase = fw.get("fw_phase")
+    if phase == "staged" and doc.get("fw_result") == "staged" and doc.get("fw_bytes") == len(big):
+        break
+    if phase not in ("verifying", "staging", "receiving", "staged"):
+        fail("phase during verify %s" % fw)
+else:
+    fail("large verify did not finish %s" % samples[-6:])
+if not moved:
+    fail("verify progress did not advance %s" % samples[:8])
+verify_s = time.time() - verify_t
+status, body, _ = raw_chunk(off, piece, True, hashlib.sha256(big).hexdigest(), timeout=3)
+if status != 200 or b'"status":"staged"' not in body:
+    fail("final retry %s %s" % (status, body[:160]))
+doc = uptime()
+if doc["fw_sha256"] != hashlib.sha256(big).hexdigest() or doc["fw_bytes"] != len(big) or doc["fw_phase"] != "staged":
+    fail("large staged status %s" % {k: doc.get(k) for k in ("fw_bytes", "fw_sha256", "fw_phase", "fw_result")})
+open("/tmp/fw-kernel.bin", "wb").write(big)
+print(
+    "large kernel %d bytes write %.2fs (%.0f KB/s) finalize %.2fs verify %.2fs (%.0f KB/s)"
+    % (
+        len(big),
+        write_s,
+        (len(big) - len(piece)) / 1024 / max(write_s, 0.001),
+        final_s,
+        verify_s,
+        len(big) / 1024 / max(verify_s, 0.001),
+    )
+)
 
 # QEMU does not clear CNTVCT on reset. Uptime is counted from the boot
 # sample of that counter, and the first /status after reset is often

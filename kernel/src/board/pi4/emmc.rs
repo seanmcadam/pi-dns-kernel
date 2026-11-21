@@ -13,12 +13,14 @@
 //! raspi4b attaches `-drive if=sd` there. On a real Pi 4 that block is
 //! the WiFi SDIO, so it is tried only after EMMC2 fails.
 //!
-//! Writes are single-sector CMD24 from the FAT layer. This file never
-//! writes a sector on its own during probe.
+//! Writes are CMD24, or CMD25 when the FAT layer hands over more than
+//! one contiguous sector. This file never writes a sector on its own
+//! during probe.
 //!
 //! The GIC-400 line is SPI 126 (INTID 158). Transfers poll the status
-//! register and also enable that line so a level IRQ wakes the waiter.
-//! The status register is what decides success.
+//! register with IRQs unmasked so the timer still runs. The data line is
+//! not what wakes the waiter: a `wfe` with DAIF.I set sleeps through the
+//! completion and turns a 25 MHz bus into a few kilobytes per second.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -159,7 +161,11 @@ fn bring_up_emmc2() -> Result<(), &'static str> {
     line.push(" present=");
     line.hex(present);
     line.push(" cd=");
-    line.push(if present & CARD_INSERTED != 0 { "1" } else { "0" });
+    line.push(if present & CARD_INSERTED != 0 {
+        "1"
+    } else {
+        "0"
+    });
     line.emit();
     // The detect bit is not a reason to stop. The Pi 4 slot does not
     // drive it reliably, and the firmware may leave it clear.
@@ -178,25 +184,24 @@ fn bring_up_emmc2() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn usable_clock(hz: u32) -> bool {
+    (20_000_000..400_000_000).contains(&hz)
+}
+
 fn ensure_clock() -> u32 {
     let mailbox = mailbox_clock();
     let cap_mhz = (read(CAPABILITIES) >> 8) & 0xff;
-    let (hz, source) = if (1_000_000..400_000_000).contains(&mailbox) {
+    let (hz, source) = if usable_clock(mailbox) {
         (mailbox, "mbox")
-    } else if cap_mhz > 0 {
-        (cap_mhz.saturating_mul(1_000_000), "cap")
     } else {
-        if mailbox == 0 {
-            let programmed = mailbox_set_clock(FALLBACK_HZ);
-            if (1_000_000..400_000_000).contains(&programmed) {
-                let mut line = Buf::new();
-                line.push("sd emmc2 clock set ");
-                line.dec(programmed);
-                line.emit();
-                return programmed;
-            }
+        let programmed = mailbox_set_clock(FALLBACK_HZ);
+        if usable_clock(programmed) {
+            (programmed, "set")
+        } else if cap_mhz > 0 {
+            (cap_mhz.saturating_mul(1_000_000), "cap")
+        } else {
+            (FALLBACK_HZ, "fallback")
         }
-        (FALLBACK_HZ, "fallback")
     };
     let mut line = Buf::new();
     line.push("sd emmc2 clock ");
@@ -272,7 +277,7 @@ fn identify_sdhci(base_hz: u32) -> Result<(), &'static str> {
     }
     sd_command(16, 512, RESP_48, false, false, 200)?;
     sd_set_clock(base_hz, DATA_HZ)?;
-    crate::disklog::line("sd emmc2 data clock");
+    log_data_clock(base_hz);
     *CARD.lock() = Some(Card {
         high_capacity,
         blocks,
@@ -323,7 +328,11 @@ fn bring_up_legacy() -> Result<(), &'static str> {
     line.push(" present=");
     line.hex(present);
     line.push(" cd=");
-    line.push(if present & CARD_INSERTED != 0 { "1" } else { "0" });
+    line.push(if present & CARD_INSERTED != 0 {
+        "1"
+    } else {
+        "0"
+    });
     line.emit();
     // QEMU's legacy controller does drive this bit. An empty WiFi SDIO
     // slot on the Pi 4 must not spend the identification budget.
@@ -383,19 +392,36 @@ impl BlockDevice for DiskDev {
         start_block_idx: BlockIdx,
         _reason: &str,
     ) -> Result<(), Self::Error> {
-        for (index, block) in blocks.iter_mut().enumerate() {
-            let lba = start_block_idx.0 as u64 + index as u64;
-            read_sector(lba, &mut block.contents)?;
-        }
-        Ok(())
+        crate::interrupts::with_irqs(|| {
+            if blocks.len() > 1 && emmc2() && read_multi(start_block_idx.0 as u64, blocks).is_ok() {
+                return Ok(());
+            }
+            if blocks.len() > 1 && emmc2() {
+                let _ = stop_transfer();
+            }
+            for (index, block) in blocks.iter_mut().enumerate() {
+                let lba = start_block_idx.0 as u64 + index as u64;
+                read_sector(lba, &mut block.contents)?;
+            }
+            Ok(())
+        })
     }
 
     fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        for (index, block) in blocks.iter().enumerate() {
-            let lba = start_block_idx.0 as u64 + index as u64;
-            write_sector(lba, &block.contents)?;
-        }
-        Ok(())
+        crate::interrupts::with_irqs(|| {
+            if blocks.len() > 1 && emmc2() && write_multi(start_block_idx.0 as u64, blocks).is_ok()
+            {
+                return Ok(());
+            }
+            if blocks.len() > 1 && emmc2() {
+                let _ = stop_transfer();
+            }
+            for (index, block) in blocks.iter().enumerate() {
+                let lba = start_block_idx.0 as u64 + index as u64;
+                write_sector(lba, &block.contents)?;
+            }
+            Ok(())
+        })
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
@@ -414,7 +440,12 @@ fn read_capacity(rca: u32, sdhci: bool) -> Option<u32> {
         }
     };
     send(9, rca, RESP_136, false, false).ok()?;
-    let words = [read(RESP0), read(RESP0 + 4), read(RESP0 + 8), read(RESP0 + 12)];
+    let words = [
+        read(RESP0),
+        read(RESP0 + 4),
+        read(RESP0 + 8),
+        read(RESP0 + 12),
+    ];
     // SDHCI stores an R2 response with the first CSD byte in bits 23:16 of
     // the last response register. The CRC byte is not stored.
     let mut csd = [0u8; 16];
@@ -442,9 +473,8 @@ fn read_capacity(rca: u32, sdhci: bool) -> Option<u32> {
         Some((c_size + 1).saturating_mul(1024))
     } else if structure == 0 {
         let read_bl_len = (csd[5] & 0x0f) as u32;
-        let c_size = (((csd[6] & 0x03) as u32) << 10)
-            | ((csd[7] as u32) << 2)
-            | ((csd[8] as u32) >> 6);
+        let c_size =
+            (((csd[6] & 0x03) as u32) << 10) | ((csd[7] as u32) << 2) | ((csd[8] as u32) >> 6);
         let c_size_mult = (((csd[9] & 0x03) as u32) << 1) | ((csd[10] as u32) >> 7);
         let block_len = 1u32 << read_bl_len;
         let mult = 1u32 << (c_size_mult + 2);
@@ -455,16 +485,16 @@ fn read_capacity(rca: u32, sdhci: bool) -> Option<u32> {
     }
 }
 
+fn emmc2() -> bool {
+    HOST_PHYS.load(Ordering::Relaxed) == EMMC2_PHYS
+}
+
 fn read_sector(lba: u64, out: &mut [u8; 512]) -> Result<(), &'static str> {
     let arg = sector_arg(lba)?;
     write(BLKSIZECNT, (1 << 16) | 512);
     issue(17, arg, RESP_48, true, true)?;
     wait_interrupt(INT_READ_RDY, 500)?;
-    for word_index in 0..128 {
-        let word = read(DATA);
-        let offset = word_index * 4;
-        out[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
-    }
+    copy_words_in(out);
     wait_interrupt(INT_DATA_DONE, 500)?;
     Ok(())
 }
@@ -474,16 +504,82 @@ fn write_sector(lba: u64, data: &[u8; 512]) -> Result<(), &'static str> {
     write(BLKSIZECNT, (1 << 16) | 512);
     issue(24, arg, RESP_48, true, false)?;
     wait_interrupt(INT_WRITE_RDY, 500)?;
+    copy_words_out(data);
+    wait_interrupt(INT_DATA_DONE, 500)?;
+    Ok(())
+}
+
+/// CMD18 / CMD25 with the SDHCI block count and auto CMD12. One command
+/// covers the whole slice instead of a stop-and-start per sector.
+fn read_multi(lba: u64, blocks: &mut [Block]) -> Result<(), &'static str> {
+    let count = blocks.len() as u32;
+    let arg = sector_arg(lba)?;
+    write(BLKSIZECNT, (count << 16) | 512);
+    issue_multi(18, arg, true)?;
+    for block in blocks.iter_mut() {
+        wait_interrupt(INT_READ_RDY, 500)?;
+        copy_words_in(&mut block.contents);
+    }
+    wait_interrupt(INT_DATA_DONE, 500)?;
+    note_multi();
+    Ok(())
+}
+
+fn write_multi(lba: u64, blocks: &[Block]) -> Result<(), &'static str> {
+    let count = blocks.len() as u32;
+    let arg = sector_arg(lba)?;
+    write(BLKSIZECNT, (count << 16) | 512);
+    issue_multi(25, arg, false)?;
+    for block in blocks {
+        wait_interrupt(INT_WRITE_RDY, 500)?;
+        copy_words_out(&block.contents);
+    }
+    wait_interrupt(INT_DATA_DONE, 500)?;
+    note_multi();
+    Ok(())
+}
+
+fn copy_words_in(out: &mut [u8; 512]) {
+    for word_index in 0..128 {
+        let word = read(DATA);
+        let offset = word_index * 4;
+        out[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+fn copy_words_out(data: &[u8; 512]) {
     for word_index in 0..128 {
         let offset = word_index * 4;
         let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         write(DATA, word);
     }
-    wait_interrupt(INT_DATA_DONE, 500)?;
+}
+
+fn note_multi() {
+    use core::sync::atomic::AtomicBool;
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if ONCE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::disklog::line("sd emmc2 multiblock");
+}
+
+fn stop_transfer() -> Result<(), &'static str> {
+    let _ = sd_command(12, 0, RESP_48_BUSY, false, false, 200);
+    write8(SW_RESET, RESET_CMD | RESET_DATA);
+    if !wait_until(20, || read8(SW_RESET) & (RESET_CMD | RESET_DATA) == 0) {
+        return Err("reset timeout");
+    }
     Ok(())
 }
 
-fn issue(index: u32, arg: u32, resp: u32, data: bool, read_data: bool) -> Result<u32, &'static str> {
+fn issue(
+    index: u32,
+    arg: u32,
+    resp: u32,
+    data: bool,
+    read_data: bool,
+) -> Result<u32, &'static str> {
     if HOST_PHYS.load(Ordering::Relaxed) == EMMC2_PHYS {
         sd_command(index, arg, resp, data, read_data, 500)
     } else {
@@ -540,9 +636,10 @@ fn clock_div(base_hz: u32, target_hz: u32) -> u16 {
     if n > 0x3ff {
         n = 0x3ff;
     }
+    // Bits 15:8 are the low 8 divisor bits. Bits 7:6 are divisor bits 9:8.
     let low = ((n & 0xff) as u16) << 8;
-    let high = (((n & 0x300) >> 2) as u16) << 6;
-    low | high
+    let high = ((n & 0x300) >> 8) as u16;
+    low | (high << 6)
 }
 
 fn sd_command(
@@ -553,9 +650,13 @@ fn sd_command(
     read_data: bool,
     budget_ms: u64,
 ) -> Result<u32, &'static str> {
-    write8(SW_RESET, RESET_CMD | RESET_DATA);
-    if !wait_until(20, || read8(SW_RESET) & (RESET_CMD | RESET_DATA) == 0) {
-        return Err("reset timeout");
+    // A reset before every sector dominates the transfer. Reset only when
+    // the previous command left the inhibit bits set.
+    if read(PRESENT) & 3 != 0 {
+        write8(SW_RESET, RESET_CMD | RESET_DATA);
+        if !wait_until(20, || read8(SW_RESET) & (RESET_CMD | RESET_DATA) == 0) {
+            return Err("reset timeout");
+        }
     }
     write(INTERRUPT, 0xffff_ffff);
     write(ARG1, arg);
@@ -663,7 +764,9 @@ fn legacy_command(
 }
 
 fn wait_interrupt(bit: u32, budget_ms: u64) -> Result<u32, &'static str> {
-    crate::gic::enable_id(EMMC_IRQ);
+    // The checkpoint is what the hang check prints when this core's timer
+    // is not running. A transfer that polls for a command must keep it fresh.
+    crate::act::note_core(crate::percpu::id());
     let start = crate::timer::get_ticks();
     let budget = ticks_for_ms(budget_ms);
     let mut spins = 0u32;
@@ -687,10 +790,53 @@ fn wait_interrupt(bit: u32, budget_ms: u64) -> Result<u32, &'static str> {
             return Err("timeout");
         }
         spins = spins.wrapping_add(1);
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        if spins & 63 == 0 {
+            core::hint::spin_loop();
+            crate::act::note_core(crate::percpu::id());
         }
     }
+}
+
+fn issue_multi(index: u32, arg: u32, read_data: bool) -> Result<(), &'static str> {
+    if read(PRESENT) & 3 != 0 {
+        write8(SW_RESET, RESET_CMD | RESET_DATA);
+        if !wait_until(20, || read8(SW_RESET) & (RESET_CMD | RESET_DATA) == 0) {
+            return Err("reset timeout");
+        }
+    }
+    write(INTERRUPT, 0xffff_ffff);
+    write(ARG1, arg);
+    // Block-count enable, auto CMD12, multi-block, and the direction.
+    let mut mode = (1 << 1) | (1 << 2) | (1 << 5);
+    if read_data {
+        mode |= 1 << 4;
+    }
+    write16(XFER, mode);
+    let mut cmd = ((index as u16) & 0x3f) << 8;
+    cmd |= RESP_48 as u16;
+    cmd |= (1 << 3) | (1 << 4) | (1 << 5);
+    write16(COMMAND, cmd);
+    let done = wait_interrupt(INT_CMD_DONE, 500)?;
+    if done & INT_ERR != 0 || done & INT_CMD_TIMEOUT != 0 {
+        return Err(cmd_error(done));
+    }
+    Ok(())
+}
+
+fn log_data_clock(base_hz: u32) {
+    let reg = read16(CLOCK);
+    let n = ((reg >> 8) & 0xff) as u32 | (((reg as u32) >> 6) & 0x3) << 8;
+    let card = if n == 0 {
+        base_hz
+    } else {
+        base_hz / (2 * n.max(1))
+    };
+    let mut line = Buf::new();
+    line.push("sd emmc2 data hz ");
+    line.dec(card);
+    line.push(" base ");
+    line.dec(base_hz);
+    line.emit();
 }
 
 fn wait_until(budget_ms: u64, ready: impl Fn() -> bool) -> bool {
@@ -735,18 +881,22 @@ fn delay_ms(ms: u64) {
 }
 
 fn mailbox_clock() -> u32 {
+    // GET_CLOCK_RATE returns the id and the rate. A 4-byte buffer only
+    // echoes the id, which is why the previous boot logged the capability
+    // register instead of the mailbox.
     let mut words = [0u32; 8];
-    words[0] = 7 * 4;
+    words[0] = 8 * 4;
     words[1] = 0;
     words[2] = TAG_GET_CLOCK;
-    words[3] = 4;
+    words[3] = 8;
     words[4] = 0;
     words[5] = CLOCK_EMMC2;
     words[6] = 0;
+    words[7] = 0;
     if !mailbox(&mut words) {
         return 0;
     }
-    words[5]
+    words[6]
 }
 
 fn mailbox_set_clock(hz: u32) -> u32 {

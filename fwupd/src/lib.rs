@@ -92,6 +92,12 @@ impl Sha256 {
     }
 }
 
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
     let mut i = 0;
@@ -164,7 +170,7 @@ pub fn hex_encode(src: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 pub fn hex_decode(text: &[u8], out: &mut [u8]) -> Option<usize> {
-    if text.len() % 2 != 0 || text.len() / 2 > out.len() {
+    if !text.len().is_multiple_of(2) || text.len() / 2 > out.len() {
         return None;
     }
     let n = text.len() / 2;
@@ -250,6 +256,29 @@ pub fn commit<C: Card>(
             return Err(CommitError::Io(err));
         }
     };
+    commit_digest(card, dest, temp, side, expect_len, expect_sha, image, dig)
+}
+
+/// Same rename as [`commit`], using a digest the caller already computed
+/// by reading the temp file back. Does not read the file again.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_digest<C: Card>(
+    card: &mut C,
+    dest: &str,
+    temp: &str,
+    side: &str,
+    expect_len: u32,
+    expect_sha: &[u8; 32],
+    image: bool,
+    dig: Digest,
+) -> Result<(), CommitError<C::Error>> {
+    if !dest_allowed(dest)
+        || dest.eq_ignore_ascii_case(temp)
+        || dest.eq_ignore_ascii_case(side)
+        || temp.eq_ignore_ascii_case(side)
+    {
+        return Err(CommitError::Refused);
+    }
     if dig.len != expect_len || dig.sha != *expect_sha {
         let _ = card.remove(temp);
         return Err(CommitError::Checksum);
@@ -285,7 +314,7 @@ pub fn commit<C: Card>(
 pub fn image_ok(len: u32, head: &[u8]) -> bool {
     const MIN: u32 = 4096;
     const MAX: u32 = 8 * 1024 * 1024;
-    if len < MIN || len > MAX || head.len() < 64 {
+    if !(MIN..=MAX).contains(&len) || head.len() < 64 {
         return false;
     }
     if head.starts_with(b"\x7fELF") {
@@ -391,7 +420,12 @@ pub fn kernel_value_ok(value: &str) -> bool {
 
 /// The one-shot boot file. `kernel` is the staged 8.3 name for this board,
 /// so a second platform image can pass its own name later.
-pub fn fill_tryboot(out: &mut [u8], kernel: &str, address: u32, uart: bool) -> Result<usize, &'static str> {
+pub fn fill_tryboot(
+    out: &mut [u8],
+    kernel: &str,
+    address: u32,
+    uart: bool,
+) -> Result<usize, &'static str> {
     if !kernel_value_ok(kernel) {
         return Err("kernel");
     }
@@ -423,7 +457,7 @@ fn push_hex(out: &mut [u8], n: &mut usize, value: u32) -> Result<(), &'static st
     let digits = if value == 0 {
         1
     } else {
-        ((32 - value.leading_zeros() + 3) / 4) as usize
+        (32 - value.leading_zeros()).div_ceil(4) as usize
     };
     let mut i = digits;
     while i > 0 {
@@ -580,7 +614,9 @@ mod tests {
 #[cfg(test)]
 mod fat {
     use super::*;
-    use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, Mode, VolumeIdx, VolumeManager};
+    use embedded_sdmmc::{
+        Block, BlockCount, BlockDevice, BlockIdx, Mode, VolumeIdx, VolumeManager,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -723,9 +759,7 @@ mod fat {
         }
 
         fn rename(&mut self, from: &str, to: &str) -> Result<(), Self::Error> {
-            self.with_dir(|mgr, dir| {
-                mgr.rename_file_in_dir(dir, from, to).map_err(|_| "rename")
-            })
+            self.with_dir(|mgr, dir| mgr.rename_file_in_dir(dir, from, to).map_err(|_| "rename"))
         }
 
         fn exists(&mut self, name: &str) -> Result<bool, Self::Error> {
