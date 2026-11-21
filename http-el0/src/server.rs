@@ -722,6 +722,7 @@ fn handle_index() -> HttpResponse {
     }
     let vnc_block = vnc_block();
     let power_block = power_block();
+    let version = version::VERSION;
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -740,6 +741,7 @@ fn handle_index() -> HttpResponse {
     <h1>Raspberry Pi 4 DNS Server</h1>
     <div class="status">
         <p><strong>Status:</strong> Running</p>
+        <p><strong>Version:</strong> {version}</p>
         <p><strong>Kernel:</strong> Bare-metal Rust (no_std)</p>
     </div>
     <h2>DNS records</h2>

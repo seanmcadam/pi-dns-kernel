@@ -36,6 +36,7 @@ embedded-hal = { workspace = true }
 
 config = { path = "../config", default-features = false }
 fwupd = { path = "../fwupd", default-features = false }
+version = { path = "../version" }
 
 [[bin]]
 name = "kernel8"

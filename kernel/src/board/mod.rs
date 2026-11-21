@@ -165,6 +165,13 @@ pub trait Board {
     fn power_tryboot() -> bool {
         true
     }
+
+    /// Mailbox `GET_REBOOT_FLAGS` (`0x00030064`), or nothing on boards
+    /// that do not have that call. Bit 0 is the tryboot flag. The Pi
+    /// bootloader usually clears it before the kernel runs.
+    fn tryboot_flag() -> Option<u32> {
+        None
+    }
 }
 
 pub const NAME: &str = <Active as Board>::NAME;
@@ -293,6 +300,10 @@ pub fn power(reset: bool) -> bool {
 
 pub fn power_tryboot() -> bool {
     <Active as Board>::power_tryboot()
+}
+
+pub fn tryboot_flag() -> Option<u32> {
+    <Active as Board>::tryboot_flag()
 }
 
 /// VideoCore bus address to ARM physical address.

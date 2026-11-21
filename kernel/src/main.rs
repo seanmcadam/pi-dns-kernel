@@ -105,6 +105,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     fb_con::announce();
 
     uart_write("\r\n=== Pi4 DNS Server Kernel ===\r\n");
+    disklog::line(version::VERSION_LINE);
     uart_write("board ");
     uart_write(board::NAME);
     uart_write("\r\n");
@@ -154,6 +155,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         Err(_) => uart_write("[OK] No filesystem, using defaults\r\n"),
     }
     fw::scrub();
+    fw::boot_report();
     let config = config_manager::load_config();
     uart_write("[OK] Config loaded\r\n");
 
@@ -191,6 +193,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         Ok(()) => uart_write("[OK] Log task running\r\n"),
         Err(()) => uart_write("[ERROR] Log task failed\r\n"),
     }
+    log::info!("{}", version::VERSION_LINE);
+    log::info!("boot {}", fw::booted_name());
     if net_up {
         match supervisor::launch(task::DNS_SLOT) {
             Ok(()) => uart_write("[OK] DNS user program running\r\n"),
@@ -243,6 +247,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         let _ = task::schedule_one();
         net::poll();
         power::poll();
+        fw::poll();
         supervisor::tick();
 
         let now = timer::millis();

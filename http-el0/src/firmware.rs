@@ -23,6 +23,9 @@ struct View {
     phase: String,
     progress: u32,
     total: u32,
+    booted: String,
+    boot_sha: String,
+    bak: u32,
 }
 
 pub(super) fn handle(request: &HttpRequest) -> HttpResponse {
@@ -49,6 +52,12 @@ pub(super) fn handle(request: &HttpRequest) -> HttpResponse {
     if request.path == "/firmware/reboot" {
         return reboot(request);
     }
+    if request.path == "/firmware/promote" {
+        return promote(request);
+    }
+    if request.path == "/firmware/rollback" {
+        return rollback(request);
+    }
     if let Some((kind, offset)) = parse_read(&request.path) {
         return if request.method == HttpMethod::GET {
             read_file(kind, offset)
@@ -60,9 +69,10 @@ pub(super) fn handle(request: &HttpRequest) -> HttpResponse {
 }
 
 pub(super) fn fields() -> String {
+    let version = version::VERSION;
     match view() {
         Some(view) => format!(
-            "\"fw_staged\":{},\"fw_bytes\":{},\"fw_backup\":{},\"fw_tryboot\":{},\"fw_tryboot_hw\":{},\"fw_temp\":{},\"fw_sha256\":\"{}\",\"fw_result\":\"{}\",\"fw_phase\":\"{}\",\"fw_progress\":{},\"fw_total\":{}",
+            "\"version\":\"{version}\",\"fw_staged\":{},\"fw_bytes\":{},\"fw_backup\":{},\"fw_tryboot\":{},\"fw_tryboot_hw\":{},\"fw_temp\":{},\"fw_sha256\":\"{}\",\"fw_result\":\"{}\",\"fw_phase\":\"{}\",\"fw_progress\":{},\"fw_total\":{},\"fw_booted\":\"{}\",\"fw_boot_sha256\":\"{}\",\"fw_bak\":{}",
             view.staged,
             view.bytes,
             view.backup,
@@ -73,17 +83,20 @@ pub(super) fn fields() -> String {
             json_text(&view.result),
             json_text(&view.phase),
             view.progress,
-            view.total
+            view.total,
+            json_text(&view.booted),
+            view.boot_sha,
+            view.bak
         ),
-        None => String::from(
-            "\"fw_staged\":0,\"fw_bytes\":0,\"fw_backup\":0,\"fw_tryboot\":0,\"fw_tryboot_hw\":0,\"fw_temp\":0,\"fw_sha256\":\"\",\"fw_result\":\"unavailable\",\"fw_phase\":\"idle\",\"fw_progress\":0,\"fw_total\":0",
+        None => format!(
+            "\"version\":\"{version}\",\"fw_staged\":0,\"fw_bytes\":0,\"fw_backup\":0,\"fw_tryboot\":0,\"fw_tryboot_hw\":0,\"fw_temp\":0,\"fw_sha256\":\"\",\"fw_result\":\"unavailable\",\"fw_phase\":\"idle\",\"fw_progress\":0,\"fw_total\":0,\"fw_booted\":\"unknown\",\"fw_boot_sha256\":\"\",\"fw_bak\":0"
         ),
     }
 }
 
 fn page() -> HttpResponse {
     let view = view();
-    let (hw, name, live, bytes, backup, tryboot, temp, sha, result, phase) = match view {
+    let (hw, name, live, bytes, backup, tryboot, temp, sha, result, phase, booted) = match view {
         Some(view) => (
             if view.hw == 1 { "yes" } else { "no" },
             view.staged_name,
@@ -95,6 +108,7 @@ fn page() -> HttpResponse {
             view.sha,
             json_text(&view.result),
             json_text(&view.phase),
+            json_text(&view.booted),
         ),
         None => (
             "no",
@@ -107,11 +121,15 @@ fn page() -> HttpResponse {
             String::new(),
             String::from("unavailable"),
             String::from("idle"),
+            String::from("unknown"),
         ),
     };
+    let version = version::VERSION;
     let mut html = format!(
         "<!DOCTYPE html><html><body>\
 <h1>Firmware update</h1>\
+<p>version {version}</p>\
+<p>booted {booted}</p>\
 <p>Uploads go to a temp name, are read back, and then replace only the staged file. \
 <code>{live}</code> and <code>config.txt</code> are not written. \
 The test file is <code>FWTEST.BIN</code>. The staged kernel is <code>{name}</code>.</p>\
@@ -124,7 +142,7 @@ The test file is <code>FWTEST.BIN</code>. The staged kernel is <code>{name}</cod
     );
     html.push_str(PAGE);
     html.push_str(&format!(
-        "<script>if (\"{phase}\" === \"verifying\" || \"{phase}\" === \"staging\" || \"{phase}\" === \"receiving\") {{ pollVerify(); }}</script>"
+        "<script>if (\"{phase}\" === \"verifying\" || \"{phase}\" === \"staging\" || \"{phase}\" === \"receiving\" || \"{phase}\" === \"copying\") {{ pollVerify(); }}</script>"
     ));
     html.push_str("</body></html>");
     super::html_response(&html)
@@ -169,6 +187,17 @@ const PAGE: &str = r#"
 <label><input type="checkbox" name="confirm" value="reboot" required> Confirm tryboot reboot</label>
 <input type="hidden" name="tryboot" value="1">
 <button type="submit">Tryboot reboot</button>
+</form>
+<h2>Promote and rollback</h2>
+<p>Promote copies the live kernel to KERNEL8.BAK, then installs the staged kernel as the live file. It runs only after a tryboot boot, unless force is checked. Rollback restores KERNEL8.BAK.</p>
+<form method="POST" action="/firmware/promote" onsubmit="return confirm('Promote the staged kernel?');">
+<label><input type="checkbox" name="confirm" value="promote" required> Confirm promote</label>
+<label><input type="checkbox" name="force" value="1"> Force</label>
+<button type="submit">Promote</button>
+</form>
+<form method="POST" action="/firmware/rollback" onsubmit="return confirm('Roll back to KERNEL8.BAK?');">
+<label><input type="checkbox" name="confirm" value="rollback" required> Confirm rollback</label>
+<button type="submit">Rollback</button>
 </form>
 <pre id="out"></pre>
 <script>
@@ -220,7 +249,7 @@ function pollVerify() {
     var prog = doc.fw_progress || 0;
     var total = doc.fw_total || 0;
     setOut(phase + " " + prog + "/" + total);
-    if (phase === "verifying" || phase === "staging" || phase === "receiving") {
+    if (phase === "verifying" || phase === "staging" || phase === "receiving" || phase === "copying") {
       setTimeout(pollVerify, 50);
     }
   }).catch(function() { setTimeout(pollVerify, 200); });
@@ -520,14 +549,73 @@ fn read_file(kind: u64, offset: u64) -> HttpResponse {
     response
 }
 
+fn promote(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return method_not();
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    if form_value(body, "confirm") != Some("promote") {
+        return super::bad_request("Confirmation required");
+    }
+    let force: u64 = if form_value(body, "force") == Some("1") {
+        1
+    } else {
+        0
+    };
+    let rc = super::sys(FW, 10, force, 0, 0, 0, 0);
+    if rc < 0 {
+        return match rc {
+            -14 => super::bad_request("promote is not supported on this board"),
+            -12 => super::bad_request("promote needs a tryboot boot or force"),
+            -4 => super::bad_request("staged kernel is not ready"),
+            -3 => super::bad_request("a firmware copy is already running"),
+            -5 => super::bad_request("no card"),
+            _ => fw_error(rc),
+        };
+    }
+    if rc == 1 {
+        return super::html_ok("Promote is already running.");
+    }
+    super::html_ok("Promote started.")
+}
+
+fn rollback(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return method_not();
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    if form_value(body, "confirm") != Some("rollback") {
+        return super::bad_request("Confirmation required");
+    }
+    let rc = super::sys(FW, 11, 0, 0, 0, 0, 0);
+    if rc < 0 {
+        return match rc {
+            -14 => super::bad_request("rollback is not supported on this board"),
+            -13 => super::bad_request("rollback needs a backup"),
+            -3 => super::bad_request("a firmware copy is already running"),
+            -5 => super::bad_request("no card"),
+            _ => fw_error(rc),
+        };
+    }
+    if rc == 1 {
+        return super::html_ok("Rollback is already running.");
+    }
+    super::html_ok("Rollback started.")
+}
+
 fn view() -> Option<View> {
-    let mut raw = [0u8; 160];
+    let mut raw = [0u8; 224];
     let n = super::sys(FW, 3, raw.as_mut_ptr() as u64, raw.len() as u64, 0, 0, 0);
-    if n < 160 {
+    if n < 224 {
         return None;
     }
     let sha = if raw[104] == 1 {
         hex_encode(&raw[24..56])
+    } else {
+        String::new()
+    };
+    let boot_sha = if raw[176] == 1 {
+        hex_encode(&raw[177..209])
     } else {
         String::new()
     };
@@ -545,6 +633,9 @@ fn view() -> Option<View> {
         phase: cstr(&raw[137..152]).into(),
         progress: u32_at(&raw, 152),
         total: u32_at(&raw, 156),
+        booted: cstr(&raw[160..176]).into(),
+        boot_sha,
+        bak: u32_at(&raw, 212),
     })
 }
 
@@ -576,7 +667,7 @@ fn cstr(raw: &[u8]) -> &str {
 fn json_text(text: &str) -> String {
     let mut out = String::new();
     for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || ch == ' ' {
+        if ch.is_ascii_alphanumeric() || ch == ' ' || ch == '.' || ch == '-' || ch == '_' {
             out.push(ch);
         }
     }
@@ -662,6 +753,8 @@ fn parse_read(path: &str) -> Option<(u64, u64)> {
         "test" => 1,
         "kernel" => 2,
         "tryboot" => 3,
+        "live" => 6,
+        "bak" => 7,
         _ => return None,
     };
     let offset = offset.parse().ok()?;

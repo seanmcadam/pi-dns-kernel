@@ -2,6 +2,8 @@
 
 A purpose-built, bare-metal kernel written in Rust (no Linux, `no_std`) for the Raspberry Pi 4 (BCM2711, AArch64) that implements a complete DNS server appliance.
 
+**Version**: `0.1.<pull request>`, defined once in `version/src/lib.rs`. Bump that patch number to the PR number when opening a pull request. The boot banner, the telnet log, `/status`, and the firmware page print the same string.
+
 **Current Status**: QEMU virt image serves local DNS, forwards other names, answers HTTP, can take a DHCP lease, and stores records on a FAT32 virtio-blk disk. The DNS resolver runs at EL0. The kernel is linked in the upper half. Board code lives in `kernel/src/board/{virt,pi4,pi5}` and is selected with a Cargo feature (`board-virt` is the default). A separate Pi 4 image is linked at `0xFFFF000000080000` and the firmware still loads that raw file at physical `0x80000`. That image has not been tested on hardware. QEMU 9.0 or newer can boot it on `-M raspi4b` (UART, MMU, four cores, SD). That machine has no GENET. A Pi 5 image is linked at `0xFFFF000000200000` and named `kernel_2712.img`. QEMU has no Pi 5 machine, and that image has not been run on hardware. Its RP1 Ethernet is not driven.
 
 ## Quick Status

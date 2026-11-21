@@ -197,6 +197,10 @@ impl Board for Pi4 {
         }
         refused
     }
+
+    fn tryboot_flag() -> Option<u32> {
+        get_reboot_flag()
+    }
 }
 
 /// VideoCore property tag `RPI_FIRMWARE_SET_REBOOT_FLAGS` (`0x00038064`).
@@ -229,6 +233,25 @@ fn set_reboot_flag(flag: u32) -> bool {
         "power: mbox 00038064 refused"
     });
     ok
+}
+
+/// `GET_REBOOT_FLAGS`. `None` means the mailbox did not answer. The value
+/// is the flag word. Bit 0 set means the firmware still has tryboot armed.
+fn get_reboot_flag() -> Option<u32> {
+    checkpoint();
+    let mut words = [0u32; 8];
+    words[0] = 7 * 4;
+    words[2] = 0x0003_0064;
+    words[3] = 4;
+    let rc = crate::interrupts::with_irqs(|| {
+        checkpoint();
+        mbox::run(MBOX_BASE, &mut words)
+    });
+    checkpoint();
+    if rc != 0 || words[1] != 0x8000_0000 || words[4] & 0x8000_0000 == 0 {
+        return None;
+    }
+    Some(words[5])
 }
 
 /// BCM2711 power management at physical `0xFE100000` (bus `0x7E100000`).
