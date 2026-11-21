@@ -40,6 +40,20 @@ SECTIONS
         __data_start = .;
         *(.data*)
         . = ALIGN(4096);
+    }
+
+    /* Claim these so they stay ahead of the boot id. Otherwise the linker
+       drops them after .bootid and the id is no longer the file tail. */
+    .eh_frame_hdr : { *(.eh_frame_hdr) *(.eh_frame_hdr.*) }
+    .eh_frame : { *(.eh_frame) *(.eh_frame.*) }
+
+    /* Last bytes of the file. A Pi 4 boot reads this tail from KERNEL8.IMG
+       and KERNEL8.NEW to see which one is running. */
+    .bootid :
+    {
+        KEEP(*(.bootid))
+        KEEP(*(.bootid.*))
+        . = ALIGN(8);
         __data_end = .;
     }
 
