@@ -30,14 +30,15 @@ pub enum ParseError {
 
 impl HttpRequest {
     pub fn parse(data: &[u8]) -> Result<Self, ParseError> {
-        let text = core::str::from_utf8(data).map_err(|_| ParseError::Invalid)?;
-
-        // Find header/body split
-        let (header_part, body_part) = if let Some(pos) = text.find("\r\n\r\n") {
-            (&text[..pos], &text[pos + 4..])
-        } else {
-            return Err(ParseError::Incomplete);
-        };
+        // Headers are text. The body is raw bytes: a firmware chunk is not
+        // UTF-8, and requiring the whole request to be text rejected it.
+        let pos = data
+            .windows(4)
+            .position(|mark| mark == b"\r\n\r\n")
+            .ok_or(ParseError::Incomplete)?;
+        let text = core::str::from_utf8(&data[..pos]).map_err(|_| ParseError::Invalid)?;
+        let header_part = text;
+        let body = data[pos + 4..].to_vec();
 
         let mut lines = header_part.lines();
         let request_line = lines.next().ok_or(ParseError::Invalid)?;
@@ -68,8 +69,6 @@ impl HttpRequest {
                 headers.push((key, value));
             }
         }
-
-        let body = body_part.as_bytes().to_vec();
 
         Ok(HttpRequest {
             method,

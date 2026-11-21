@@ -58,6 +58,12 @@
 #![allow(unknown_lints)]
 #![allow(mismatched_lifetime_syntaxes)]
 #![allow(deprecated)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::legacy_numeric_constants)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::manual_ok_err)]
+#![allow(clippy::question_mark)]
+#![allow(clippy::useless_borrows_in_formatting)]
 
 // ****************************************************************************
 //

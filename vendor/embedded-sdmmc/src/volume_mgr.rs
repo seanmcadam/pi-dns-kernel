@@ -18,6 +18,23 @@ use crate::{
 };
 use heapless::Vec;
 
+/// Sectors moved by one CMD18/CMD25. Eight keeps the temporary buffer
+/// inside a 64 KiB kernel stack and still covers a 4 KiB cluster.
+const BURST: usize = 8;
+
+fn burst_blocks() -> [Block; BURST] {
+    [
+        Block::new(),
+        Block::new(),
+        Block::new(),
+        Block::new(),
+        Block::new(),
+        Block::new(),
+        Block::new(),
+        Block::new(),
+    ]
+}
+
 /// Wraps a block device and gives access to the FAT-formatted volumes within
 /// it.
 ///
@@ -710,6 +727,32 @@ where
                 self.open_files[file_idx].current_offset,
             )?;
             self.open_files[file_idx].current_cluster = current_cluster;
+            let file_left = self.open_files[file_idx].left() as usize;
+            let burst_n = self.contiguous_sectors(
+                volume_idx,
+                current_cluster.0,
+                self.open_files[file_idx].current_offset,
+                block_offset,
+                space.min(file_left),
+            );
+            if burst_n >= 2 {
+                let mut blocks = burst_blocks();
+                self.block_device
+                    .read(&mut blocks[..burst_n], block_idx, "read")
+                    .map_err(Error::DeviceError)?;
+                let bytes = burst_n * Block::LEN;
+                let mut at = read;
+                for block in &blocks[..burst_n] {
+                    buffer[at..at + Block::LEN].copy_from_slice(&block.contents);
+                    at += Block::LEN;
+                }
+                read += bytes;
+                space -= bytes;
+                self.open_files[file_idx]
+                    .seek_from_current(bytes as i32)
+                    .unwrap();
+                continue;
+            }
             let mut blocks = [Block::new()];
             self.block_device
                 .read(&mut blocks, block_idx, "read")
@@ -823,6 +866,38 @@ where
                 }
                 Err(e) => return Err(e),
             };
+            let remain = bytes_to_write - written;
+            let burst_n = self.contiguous_sectors(
+                volume_idx,
+                current_cluster.0,
+                self.open_files[file_idx].current_offset,
+                block_offset,
+                remain,
+            );
+            if burst_n >= 2 {
+                let mut blocks = burst_blocks();
+                let bytes = burst_n * Block::LEN;
+                let mut at = written;
+                for block in &mut blocks[..burst_n] {
+                    block
+                        .contents
+                        .copy_from_slice(&buffer[at..at + Block::LEN]);
+                    at += Block::LEN;
+                }
+                self.block_device
+                    .write(&blocks[..burst_n], block_idx)
+                    .map_err(Error::DeviceError)?;
+                written += bytes;
+                self.open_files[file_idx].current_cluster = current_cluster;
+                let new_offset = self.open_files[file_idx].current_offset + bytes as u32;
+                if new_offset > self.open_files[file_idx].entry.size {
+                    self.open_files[file_idx].update_length(new_offset);
+                }
+                self.open_files[file_idx]
+                    .seek_from_start(new_offset)
+                    .unwrap();
+                continue;
+            }
             let mut blocks = [Block::new()];
             let to_copy = core::cmp::min(block_avail, bytes_to_write - written);
             if block_offset != 0 || to_copy != block_avail {
@@ -1121,6 +1196,36 @@ where
             }
         }
         Err(Error::BadHandle)
+    }
+
+    /// How many full sectors can move in one device call.
+    /// Stays inside the current cluster. A partial sector returns 0
+    /// so the caller keeps the single-block path.
+    fn contiguous_sectors(
+        &self,
+        volume_idx: usize,
+        cluster_file_off: u32,
+        offset: u32,
+        block_offset: usize,
+        bytes: usize,
+    ) -> usize {
+        if block_offset != 0 || bytes < Block::LEN {
+            return 0;
+        }
+        let bpc = match &self.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.bytes_per_cluster(),
+        };
+        if bpc < Block::LEN_U32 {
+            return 0;
+        }
+        let cluster_off = offset.saturating_sub(cluster_file_off);
+        if cluster_off >= bpc {
+            return 0;
+        }
+        let cluster_left = (bpc - cluster_off) as usize;
+        (bytes / Block::LEN)
+            .min(cluster_left / Block::LEN)
+            .min(BURST)
     }
 
     /// This function turns `desired_offset` into an appropriate block to be

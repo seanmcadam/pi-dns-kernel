@@ -133,7 +133,8 @@ pub fn file_exists(name: &str) -> Result<bool, FsError> {
 
 pub fn file_len(name: &str) -> Result<u32, FsError> {
     with_file(name, Mode::ReadOnly, |mgr, file| {
-        mgr.file_length(file).map_err(|err| fs_err("file length", err))
+        mgr.file_length(file)
+            .map_err(|err| fs_err("file length", err))
     })
 }
 
@@ -171,7 +172,9 @@ pub fn digest(name: &str) -> Result<fwupd::Digest, FsError> {
         let mut len = 0u32;
         let mut buf = [0u8; 512];
         loop {
-            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
+            let n = mgr
+                .read(file, &mut buf)
+                .map_err(|err| fs_err("read", err))?;
             if n == 0 {
                 break;
             }
@@ -197,29 +200,11 @@ pub fn read_at(name: &str, offset: u32, out: &mut [u8]) -> Result<usize, FsError
         return Ok(0);
     }
     with_file(name, Mode::ReadOnly, |mgr, file| {
-        let mut pos = 0u32;
-        let mut buf = [0u8; 512];
-        let mut filled = 0usize;
-        while filled < out.len() {
-            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
-            if n == 0 {
-                break;
-            }
-            let mut start = 0usize;
-            if pos < offset {
-                let skip = (offset - pos) as usize;
-                if skip >= n {
-                    pos = pos.saturating_add(n as u32);
-                    continue;
-                }
-                start = skip;
-            }
-            let copy = (n - start).min(out.len() - filled);
-            out[filled..filled + copy].copy_from_slice(&buf[start..start + copy]);
-            filled += copy;
-            pos = pos.saturating_add(n as u32);
+        if offset > 0 {
+            mgr.file_seek_from_start(file, offset)
+                .map_err(|err| fs_err("seek", err))?;
         }
-        Ok(filled)
+        mgr.read(file, out).map_err(|err| fs_err("read", err))
     })
 }
 
@@ -234,7 +219,9 @@ pub fn read_named(name: &str, out: &mut [u8]) -> Result<usize, FsError> {
             if got >= out.len() {
                 break;
             }
-            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
+            let n = mgr
+                .read(file, &mut buf)
+                .map_err(|err| fs_err("read", err))?;
             if n == 0 {
                 break;
             }
@@ -363,7 +350,9 @@ fn read_file(name: &str) -> Result<Vec<u8>, FsError> {
         let mut out = Vec::new();
         let mut buf = [0u8; 512];
         loop {
-            let n = mgr.read(file, &mut buf).map_err(|err| fs_err("read", err))?;
+            let n = mgr
+                .read(file, &mut buf)
+                .map_err(|err| fs_err("read", err))?;
             if n == 0 || out.len() >= 16384 {
                 break;
             }
@@ -428,7 +417,9 @@ fn with_file<R>(
     }
 }
 
-fn with_dir<R>(f: impl FnOnce(&mut Mgr, embedded_sdmmc::RawDirectory) -> Result<R, FsError>) -> Result<R, FsError> {
+fn with_dir<R>(
+    f: impl FnOnce(&mut Mgr, embedded_sdmmc::RawDirectory) -> Result<R, FsError>,
+) -> Result<R, FsError> {
     let mut guard = FS.lock();
     let mgr = guard.as_mut().ok_or(FsError::NotInitialized)?;
     let volume = match mgr.open_raw_volume(VolumeIdx(0)) {

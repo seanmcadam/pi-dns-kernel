@@ -177,13 +177,27 @@ fn report_stall(cpu: usize, now: u64) -> ! {
         PROG_PC[cpu].load(Ordering::Relaxed)
     };
     let mark = PROG_PC[cpu].load(Ordering::Relaxed);
-    let mut buf = [0u8; 160];
+    let mut buf = [0u8; 192];
     let mut n = 0;
     push(&mut buf, &mut n, "STALL c");
     push_dec(&mut buf, &mut n, cpu as u64);
     push(&mut buf, &mut n, " pc=");
     push_hex(&mut buf, &mut n, pc);
-    push(&mut buf, &mut n, if irqs_on { " irqs=on\n" } else { " irqs=off\n" });
+    push(&mut buf, &mut n, " ");
+    push_symbol(&mut buf, &mut n, pc);
+    push(
+        &mut buf,
+        &mut n,
+        if irqs_on { " irqs=on\n" } else { " irqs=off\n" },
+    );
+    let (prog, total) = crate::fw::progress_pair();
+    push(&mut buf, &mut n, "fw=");
+    push(&mut buf, &mut n, crate::fw::phase_word());
+    push(&mut buf, &mut n, " ");
+    push_dec(&mut buf, &mut n, prog as u64);
+    push(&mut buf, &mut n, "/");
+    push_dec(&mut buf, &mut n, total as u64);
+    push(&mut buf, &mut n, "\n");
     push(&mut buf, &mut n, "mark=");
     push_hex(&mut buf, &mut n, mark);
     push(&mut buf, &mut n, "\n");
@@ -198,7 +212,11 @@ fn report_stall(cpu: usize, now: u64) -> ! {
         } else if PROG_MS[other].load(Ordering::Relaxed) == 0 {
             push(&mut buf, &mut n, "-");
         } else {
-            push_dec(&mut buf, &mut n, now.saturating_sub(PROG_MS[other].load(Ordering::Relaxed)));
+            push_dec(
+                &mut buf,
+                &mut n,
+                now.saturating_sub(PROG_MS[other].load(Ordering::Relaxed)),
+            );
         }
     }
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("STALL");
@@ -237,6 +255,69 @@ fn paint_heartbeat(now: u64, ages: &[u64; 4], asleep: &[bool; 4], started: &[boo
     if let Ok(text) = core::str::from_utf8(&buf[..n]) {
         crate::fb_con::paint_pinned_row(3, text);
     }
+}
+
+fn push_symbol(buf: &mut [u8], n: &mut usize, pc: u64) {
+    let mut best_at = 0u64;
+    let mut best = "unknown";
+    let mut consider = |addr: u64, name: &'static str| {
+        if addr != 0 && addr <= pc && addr >= best_at {
+            best_at = addr;
+            best = name;
+        }
+    };
+    consider(
+        (crate::smp::secondary_main as extern "C" fn(u64) -> !) as usize as u64,
+        "secondary_main",
+    );
+    consider(
+        (crate::task::schedule_one as fn() -> bool) as usize as u64,
+        "schedule_one",
+    );
+    consider(
+        (crate::net::service::owner_idle as fn()) as usize as u64,
+        "owner_idle",
+    );
+    consider(
+        (crate::task::el0_dispatch as extern "C" fn(u64) -> u64) as usize as u64,
+        "el0_dispatch",
+    );
+    consider(
+        (crate::fw::syscall as fn([u64; 6]) -> i64) as usize as u64,
+        "fw_syscall",
+    );
+    consider(
+        (crate::fs::digest as fn(&str) -> Result<fwupd::Digest, crate::fs::FsError>) as usize
+            as u64,
+        "fs_digest",
+    );
+    push(buf, n, best);
+    let delta = pc.wrapping_sub(best_at);
+    if best_at != 0 && delta < 0x10000 {
+        push(buf, n, "+");
+        push_hex_short(buf, n, delta);
+    }
+}
+
+fn push_hex_short(buf: &mut [u8], n: &mut usize, value: u64) {
+    if value == 0 {
+        push(buf, n, "0");
+        return;
+    }
+    let mut tmp = [0u8; 16];
+    let mut i = tmp.len();
+    let mut rest = value;
+    while rest > 0 && i > 0 {
+        i -= 1;
+        let nibble = (rest & 0xf) as u8;
+        tmp[i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        rest >>= 4;
+    }
+    push(buf, n, unsafe { core::str::from_utf8_unchecked(&tmp[i..]) });
 }
 
 fn push(buf: &mut [u8], n: &mut usize, text: &str) {

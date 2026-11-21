@@ -117,10 +117,7 @@ pub fn probe() -> bool {
         return false;
     };
     let mut sector = [0u8; 512];
-    if dev.read_sector(0, &mut sector).is_ok()
-        && sector[510] == 0x55
-        && sector[511] == 0xAA
-    {
+    if dev.read_sector(0, &mut sector).is_ok() && sector[510] == 0x55 && sector[511] == 0xAA {
         log::info!("VirtIO blk MBR ok, {} sectors", dev.capacity);
     } else {
         log::info!("VirtIO blk ready, {} sectors", dev.capacity);
@@ -140,23 +137,27 @@ impl BlockDevice for DiskDev {
         start_block_idx: BlockIdx,
         _reason: &str,
     ) -> Result<(), Self::Error> {
-        let mut disk = DISK.lock();
-        let disk = disk.as_mut().ok_or("no disk")?;
-        for (index, block) in blocks.iter_mut().enumerate() {
-            let sector = start_block_idx.0 as u64 + index as u64;
-            disk.read_sector(sector, &mut block.contents)?;
-        }
-        Ok(())
+        crate::interrupts::with_irqs(|| {
+            let mut disk = DISK.lock();
+            let disk = disk.as_mut().ok_or("no disk")?;
+            for (index, block) in blocks.iter_mut().enumerate() {
+                let sector = start_block_idx.0 as u64 + index as u64;
+                disk.read_sector(sector, &mut block.contents)?;
+            }
+            Ok(())
+        })
     }
 
     fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        let mut disk = DISK.lock();
-        let disk = disk.as_mut().ok_or("no disk")?;
-        for (index, block) in blocks.iter().enumerate() {
-            let sector = start_block_idx.0 as u64 + index as u64;
-            disk.write_sector(sector, &block.contents)?;
-        }
-        Ok(())
+        crate::interrupts::with_irqs(|| {
+            let mut disk = DISK.lock();
+            let disk = disk.as_mut().ok_or("no disk")?;
+            for (index, block) in blocks.iter().enumerate() {
+                let sector = start_block_idx.0 as u64 + index as u64;
+                disk.write_sector(sector, &block.contents)?;
+            }
+            Ok(())
+        })
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
@@ -336,11 +337,7 @@ impl VirtioBlk {
         }
     }
 
-    fn wait_complete(
-        &mut self,
-        q: *mut QueueArea,
-        io: *mut IoBufs,
-    ) -> Result<(), &'static str> {
+    fn wait_complete(&mut self, q: *mut QueueArea, io: *mut IoBufs) -> Result<(), &'static str> {
         let start = crate::timer::get_ticks();
         let freq = timer_freq();
         // Half a second of virtual time. ioeventfd completion runs on another

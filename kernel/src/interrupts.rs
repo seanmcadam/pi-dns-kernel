@@ -61,6 +61,34 @@ pub fn unmask() {
     }
 }
 
+/// Run `body` with IRQs unmasked, then restore the previous DAIF.
+///
+/// A syscall enters EL1 with DAIF.I set and stays that way until `eret`.
+/// An SD transfer inside that syscall must not keep the timer masked: the
+/// hang check treats a core that stops taking ticks as stalled, and the
+/// core that notices it is the one that parks. Block code calls this
+/// around the device wait. Nested calls restore the outer state.
+pub fn with_irqs<R>(body: impl FnOnce() -> R) -> R {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {daif}, daif",
+            "msr daifclr, #2",
+            daif = out(reg) daif,
+            options(nomem, nostack),
+        );
+    }
+    let result = body();
+    unsafe {
+        core::arch::asm!(
+            "msr daif, {daif}",
+            daif = in(reg) daif,
+            options(nomem, nostack),
+        );
+    }
+    result
+}
+
 /// Wake a core sitting in WFE. Used when the block IRQ is delivered to a
 /// different CPU than the thread waiting on the device.
 pub fn event() {
