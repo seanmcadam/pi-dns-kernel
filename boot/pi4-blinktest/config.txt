@@ -1,6 +1,8 @@
 # Same handoff file as boot/pi4/config.txt. The card also needs the
 # March 2025 start4.elf, fixup4.dat, and bcm2711-rpi-4-b.dtb.
 # See boot/pi4/README.md.
+# hdmi_force_hotplug stays out. On 0.1.67 it reported 640x480
+# and left the monitor on the firmware rainbow.
 arm_64bit=1
 kernel=kernel8.img
 kernel_address=0x80000

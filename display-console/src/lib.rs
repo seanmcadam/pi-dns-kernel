@@ -26,6 +26,39 @@ pub const LOG_LABEL_Y: usize = 314;
 pub const LOG_TEXT_Y: usize = 326;
 pub const LOG_ROWS: usize = 16;
 
+/// Last-resort sizes. Used only after a physical-size query stays empty.
+/// The first is the one the console asks for. The second is the one the
+/// firmware itself picked when hotplug was forced, so it is the smaller ask.
+pub const HDMI_FALLBACK_W: u32 = 1280;
+pub const HDMI_FALLBACK_H: u32 = 720;
+pub const HDMI_LAST_W: u32 = 640;
+pub const HDMI_LAST_H: u32 = 480;
+
+/// What to do after one physical-size query.
+///
+/// A reported size is kept. A miss power-cycles the HDMI domain once,
+/// queries again, and only then asks for a fallback mode. A later miss stops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HdmiStep {
+    Keep,
+    PowerCycle,
+    QueryAgain,
+    Fallback,
+    Stop,
+}
+
+pub fn hdmi_step(have_size: bool, misses: u32) -> HdmiStep {
+    if have_size {
+        return HdmiStep::Keep;
+    }
+    match misses {
+        0 => HdmiStep::PowerCycle,
+        1 => HdmiStep::QueryAgain,
+        2 => HdmiStep::Fallback,
+        _ => HdmiStep::Stop,
+    }
+}
+
 const BG: [u8; 4] = [0x2E, 0x1A, 0x1A, 0x00];
 const BAR: [u8; 4] = [0x40, 0x20, 0x10, 0x00];
 const FG: [u8; 4] = [0xE0, 0xE0, 0xE8, 0x00];
@@ -275,6 +308,17 @@ mod tests {
         let bot = bot_y * STRIDE + 2 * 4;
         assert_eq!(&buf[bot..bot + 4], &FG);
         assert_ne!(&buf[top..top + 4], &FG);
+    }
+
+    #[test]
+    fn a_detected_size_is_kept_and_a_miss_falls_back_once() {
+        assert_eq!(hdmi_step(true, 0), HdmiStep::Keep);
+        assert_eq!(hdmi_step(true, 3), HdmiStep::Keep);
+        assert_eq!(hdmi_step(false, 0), HdmiStep::PowerCycle);
+        assert_eq!(hdmi_step(false, 1), HdmiStep::QueryAgain);
+        assert_eq!(hdmi_step(false, 2), HdmiStep::Fallback);
+        assert_eq!(hdmi_step(false, 3), HdmiStep::Stop);
+        assert_eq!(hdmi_step(false, 9), HdmiStep::Stop);
     }
 
     fn ink(buf: &[u8], y0: usize, y1: usize) -> bool {

@@ -5,6 +5,27 @@ replaced the framebuffer. This image turns that screen on as soon as the
 mailbox answers. The HDMI console is the boot indicator. The green
 activity LED is not a progress counter.
 
+`hdmi_force_hotplug` is not in the generated `config.txt`, the blink-test
+handoff, or the tryboot preset. On 0.1.67 that line made a power-on boot
+report 640x480 and left the rainbow up. The network updater still does
+not rewrite the live `config.txt`. If that line was copied onto the card,
+it has to be removed by mounting the card.
+
+A watchdog or tryboot reboot releases the framebuffer (mailbox tag
+`0x00048001`) and tries the blank tag (`0x00040002`) first. Both are
+bounded by the mailbox timeout and do not hold the reset. If boot then
+sees a 0x0 size, it power-cycles firmware power domain 5, waits, reads
+EDID block 0 (`0x00030020`), and queries the size again. A size the
+firmware reports is kept. Only a size that is still missing asks for
+1280x720 and then 640x480. `/status` shows `hdmi_state`, `hdmi_mode`,
+and `hdmi_recoveries`.
+
+Domain 5 is the old single-HDMI power id. Pi 4 has two HDMI ports, and
+the firmware may answer that the device does not exist. Blank is not
+used on a good boot: sending it while a mode already existed dropped
+this board to no signal. The release and power replies are logged so a
+refused tag is visible. Virt and Pi 5 do not run this path.
+
 On power-up the green LED flickers, stays solid for several seconds, and
 may blink once as the firmware reads the card. That pattern is
 `start4.elf`, not this kernel. Error codes repeat (four short flashes

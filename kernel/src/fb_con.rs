@@ -29,6 +29,27 @@
 //!
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
+//!
+//! A soft reboot releases the buffer (`0x00048001`) and tries the blank
+//! tag (`0x00040002`) first. Both run with IRQs unmasked and the mailbox
+//! timeout. A miss does not stop the watchdog. Panic and exception halt
+//! leave the buffer in place: those paths do not reboot, and the fault
+//! text has to stay on the panel.
+//!
+//! If the physical size is missing, the console power-cycles firmware
+//! power domain 5 (the legacy HDMI id), waits, reads EDID block 0
+//! (`0x00030020`), and queries the size again. Only a still-empty size
+//! asks for 1280x720 and then 640x480. A size the firmware already chose
+//! is kept, including after that recovery.
+//!
+//! Pi 4 firmware honors the framebuffer allocate, release, and geometry
+//! tags used here while this kernel owns the scanout (no vc4-kms overlay).
+//! Blank and `SET_POWER_STATE` are less certain. Domain 5 is the single
+//! HDMI id from the older SoCs. Pi 4 has two HDMI blocks, and the firmware
+//! may answer that the device does not exist (response bit 1). Blank during
+//! an otherwise good boot used to drop this board to no signal, so blank
+//! is only sent on the way into a reset. The reply words are logged either
+//! way. None of this runs on virt or Pi 5.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -54,6 +75,22 @@ const TAG_PITCH: u32 = 0x0004_0008;
 const TAG_GET_PHYS: u32 = 0x0004_0003;
 const TAG_GET_DEPTH: u32 = 0x0004_0005;
 const TAG_GET_ORDER: u32 = 0x0004_0006;
+/// Release the firmware framebuffer. No value bytes.
+const TAG_RELEASE: u32 = 0x0004_8001;
+/// Blank the firmware scanout. Value is 1 to blank.
+const TAG_BLANK: u32 = 0x0004_0002;
+/// One 128-byte EDID block. Value is the block number, then 128 bytes.
+const TAG_GET_EDID: u32 = 0x0003_0020;
+/// Legacy power domain. Value is the device id, then the state.
+const TAG_SET_POWER: u32 = 0x0002_8001;
+/// Single-HDMI power id from the firmware. Pi 4 may reject it.
+const PWR_HDMI: u32 = 5;
+
+/// `/status` codes. 0 none, 1 up, 2 fallback mode, 3 released for reset.
+const HDMI_NONE: u32 = 0;
+const HDMI_UP: u32 = 1;
+const HDMI_FALLBACK: u32 = 2;
+const HDMI_RELEASED: u32 = 3;
 
 const EARLY_CAP: usize = 2048;
 const LINE_CAP: usize = 240;
@@ -124,6 +161,8 @@ static mut SCREEN: Screen = Screen {
 
 static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
+static HDMI_STATE: AtomicU32 = AtomicU32::new(HDMI_NONE);
+static HDMI_RECOVERIES: AtomicU32 = AtomicU32::new(0);
 /// Set when a fault has painted the pinned rows. Later log lines and the
 /// status refresh must not scroll that text off the panel.
 static FROZEN: AtomicBool = AtomicBool::new(false);
@@ -135,6 +174,51 @@ const STATUS_ROWS: u32 = 3;
 const PINNED_ROWS: u32 = 4;
 static mut HEADER: [u8; HEADER_CAP] = [0; HEADER_CAP];
 static mut HEADER_LEN: usize = 0;
+
+/// state, width, height, recoveries. Width and height are the mode last
+/// programmed, including a fallback. Recoveries count power-cycle attempts.
+pub fn console_status() -> (u32, u32, u32, u32) {
+    (
+        HDMI_STATE.load(Ordering::Relaxed),
+        MODE_W.load(Ordering::Relaxed),
+        MODE_H.load(Ordering::Relaxed),
+        HDMI_RECOVERIES.load(Ordering::Relaxed),
+    )
+}
+
+/// Hand the scanout back to the firmware, then return. IRQs stay unmasked
+/// across the mailbox calls. Each call has the mailbox timeout, and the
+/// pair gives up after half a second. The watchdog still runs after this.
+pub fn release_for_reset() {
+    save_line("hdmi release");
+    let held = lock();
+    if held && READY.load(Ordering::Acquire) {
+        paint(b"hdmi release\n");
+    }
+    unlock(held);
+    let start = crate::timer::get_ticks();
+    let freq = crate::timer::frequency().max(1);
+    crate::interrupts::with_irqs(|| {
+        crate::act::note_core(crate::percpu::id());
+        let blank_ok = tag_ok(&blank_msg(1));
+        save_line(if blank_ok {
+            "hdmi release blank ok"
+        } else {
+            "hdmi release blank fail"
+        });
+        crate::act::note_core(crate::percpu::id());
+        if crate::timer::get_ticks().wrapping_sub(start) > freq / 2 {
+            save_line("hdmi release budget");
+        } else if tag_ok(&release_msg()) {
+            save_line("hdmi release buffer ok");
+        } else {
+            save_line("hdmi release buffer fail");
+        }
+        crate::act::note_core(crate::percpu::id());
+    });
+    READY.store(false, Ordering::Release);
+    HDMI_STATE.store(HDMI_RELEASED, Ordering::Relaxed);
+}
 
 /// Allocate the framebuffer and paint one line, before the strict map.
 /// Does not write the UART. Returns whether the panel was programmed.
@@ -327,34 +411,198 @@ pub fn paint_pinned_row(row: u32, text: &str) {
 fn bring_up() -> bool {
     // The firmware already chose a mode for the rainbow. With the dtb
     // loaded and no vc4-kms overlay, that scanout is the one to keep.
-    // Setting another size, or the blank tag, made this board drop HDMI
-    // to no signal. Take the existing buffer first. Set that same size
-    // when the firmware will not hand the buffer over. A made-up
-    // 1280x720 is not a fallback: it is the call that removes the signal.
-    // A GET the older path would have accepted must not stop here. If
-    // the checked GET has no usable size, the older exchange runs and
-    // then keep, then same-size SET_PHYS.
+    // Setting another size, or the blank tag, while a size exists made
+    // this board drop HDMI to no signal. Take the existing buffer first.
+    // Set that same size when the firmware will not hand the buffer over.
+    // A missing size (0x0, or no reply) is the only path that power-cycles
+    // and, last, asks for a fallback mode.
     note_prop();
+    let mut misses = 0u32;
     let mut attempt = 0u32;
-    while attempt < 4 {
+    loop {
         TRY_N.store(attempt, Ordering::Relaxed);
-        clear_probe();
-        begin_capture();
-        if let Some((w, h)) = current_size() {
-            if finish_size(w, h, attempt, false) {
-                return true;
-            }
-        } else if let Some((w, h)) = current_size_pr50() {
-            if finish_size(w, h, attempt, true) {
-                return true;
-            }
+        if let Some(fallback) = take_size(attempt) {
+            HDMI_STATE.store(
+                if fallback { HDMI_FALLBACK } else { HDMI_UP },
+                Ordering::Relaxed,
+            );
+            return true;
         }
-        emit_probe(attempt);
-        dump_capture();
-        attempt += 1;
+        match display_console::hdmi_step(false, misses) {
+            display_console::HdmiStep::Keep => return true,
+            display_console::HdmiStep::PowerCycle => {
+                HDMI_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                recover_power();
+                misses = 1;
+            }
+            display_console::HdmiStep::QueryAgain => {
+                save_line("hdmi recover query");
+                wait_ms(50);
+                misses = 2;
+            }
+            display_console::HdmiStep::Fallback => {
+                if ask_fallback(attempt) {
+                    HDMI_STATE.store(HDMI_FALLBACK, Ordering::Relaxed);
+                    return true;
+                }
+                misses = 3;
+            }
+            display_console::HdmiStep::Stop => break,
+        }
+        attempt = attempt.saturating_add(1);
     }
     save_line("hdmi none retry 4");
     false
+}
+
+/// `Some(true)` is a fallback mode. `Some(false)` kept the firmware size.
+fn take_size(attempt: u32) -> Option<bool> {
+    clear_probe();
+    begin_capture();
+    if let Some((w, h)) = current_size() {
+        if finish_size(w, h, attempt, false) {
+            return Some(false);
+        }
+    } else if let Some((w, h)) = current_size_pr50() {
+        if finish_size(w, h, attempt, true) {
+            return Some(false);
+        }
+    }
+    emit_probe(attempt);
+    dump_capture();
+    None
+}
+
+fn ask_fallback(attempt: u32) -> bool {
+    let sizes = [
+        (display_console::HDMI_FALLBACK_W, display_console::HDMI_FALLBACK_H),
+        (display_console::HDMI_LAST_W, display_console::HDMI_LAST_H),
+    ];
+    for (w, h) in sizes {
+        let mut line = Line::new();
+        line.push("hdmi fallback ");
+        line.dec(w as u64);
+        line.push("x");
+        line.dec(h as u64);
+        save_line(line.text());
+        if finish_size(w, h, attempt, false) {
+            return true;
+        }
+    }
+    false
+}
+
+fn recover_power() {
+    save_line("hdmi recover power off");
+    let off = power_state(false);
+    log_power("off", off);
+    wait_ms(20);
+    save_line("hdmi recover power on");
+    let on = power_state(true);
+    log_power("on", on);
+    wait_ms(50);
+    log_edid();
+}
+
+fn log_power(which: &str, state: Option<u32>) {
+    let mut line = Line::new();
+    line.push("hdmi recover power ");
+    line.push(which);
+    line.push(" ");
+    match state {
+        Some(value) if value & 2 != 0 => line.push("absent"),
+        Some(value) => line.hex32(value),
+        None => line.push("fail"),
+    }
+    save_line(line.text());
+}
+
+fn log_edid() {
+    let mut msg = [0u32; 40];
+    msg[0] = 39 * 4;
+    msg[2] = TAG_GET_EDID;
+    msg[3] = 4 + 128;
+    let reply = call_tag(&msg[..39]);
+    let (header, code, first) = match reply.as_ref() {
+        Some(words) => (edid_header(words), words[1], words[6]),
+        None => (false, 0, 0),
+    };
+    let mut line = Line::new();
+    line.push(if header {
+        "hdmi recover edid yes "
+    } else {
+        "hdmi recover edid no "
+    });
+    line.hex32(code);
+    line.push(" ");
+    line.hex32(first);
+    save_line(line.text());
+}
+
+fn edid_header(words: &[u32; 48]) -> bool {
+    let a = words[6].to_le_bytes();
+    let b = words[7].to_le_bytes();
+    a == [0x00, 0xff, 0xff, 0xff] && b[0] == 0xff && b[1] == 0xff && b[2] == 0xff && b[3] == 0x00
+}
+
+fn power_state(on: bool) -> Option<u32> {
+    let mut msg = [0u32; 8];
+    msg[0] = 32;
+    msg[2] = TAG_SET_POWER;
+    msg[3] = 8;
+    msg[5] = PWR_HDMI;
+    msg[6] = u32::from(on);
+    let reply = call_tag(&msg)?;
+    Some(reply[6])
+}
+
+fn blank_msg(state: u32) -> [u32; 7] {
+    let mut msg = [0u32; 7];
+    msg[0] = 28;
+    msg[2] = TAG_BLANK;
+    msg[3] = 4;
+    msg[5] = state;
+    msg
+}
+
+fn release_msg() -> [u32; 6] {
+    let mut msg = [0u32; 6];
+    msg[0] = 24;
+    msg[2] = TAG_RELEASE;
+    msg
+}
+
+fn tag_ok(template: &[u32]) -> bool {
+    call_tag(template).is_some()
+}
+
+/// Firmware success code, or nothing. The second try uses the raw physical
+/// address after the bus alias is refused. The template is restored first
+/// because a failed exchange leaves the buffer half written.
+fn call_tag(template: &[u32]) -> Option<[u32; 48]> {
+    if template.is_empty() || template.len() > 48 {
+        return None;
+    }
+    let mut msg = [0u32; 48];
+    let n = template.len();
+    msg[..n].copy_from_slice(template);
+    if exchange(&mut msg[..n], true) && msg[1] == REQ_OK {
+        return Some(msg);
+    }
+    msg[..n].copy_from_slice(template);
+    if exchange(&mut msg[..n], false) && msg[1] == REQ_OK {
+        return Some(msg);
+    }
+    None
+}
+
+fn wait_ms(ms: u64) {
+    let freq = crate::timer::frequency().max(1);
+    let start = crate::timer::get_ticks();
+    let need = (freq / 1000).saturating_mul(ms);
+    while crate::timer::get_ticks().wrapping_sub(start) < need {
+        core::hint::spin_loop();
+    }
 }
 
 fn finish_size(w: u32, h: u32, attempt: u32, pr50: bool) -> bool {

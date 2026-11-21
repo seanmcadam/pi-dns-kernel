@@ -25,7 +25,10 @@ if [ "$BOARD" = "pi4" ]; then
 # Handoff test. The card also needs the March 2025 start4.elf,
 # fixup4.dat, and bcm2711-rpi-4-b.dtb. See boot/pi4/README.md.
 # os_check, uart_2ndstage, core_freq, init_uart_clock,
-# hdmi_force_hotplug, arm_boost, and dtoverlay stay out for now.
+# arm_boost, and dtoverlay stay out.
+# hdmi_force_hotplug stays out. On 0.1.67 it reported 640x480
+# and left the monitor on the firmware rainbow. The updater
+# does not rewrite the live config.txt on the card.
 arm_64bit=1
 kernel=kernel8.img
 kernel_address=0x80000

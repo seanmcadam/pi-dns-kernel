@@ -632,6 +632,9 @@ pub fn kernel_value_ok(value: &str) -> bool {
 
 /// The one-shot boot file. `kernel` is the staged 8.3 name for this board,
 /// so a second platform image can pass its own name later.
+/// Pi 4 and Pi 5 tryboot preset. `hdmi_force_hotplug` is not written.
+/// On 0.1.67 that line made a Pi 4 power-on report 640x480 and left the
+/// rainbow splash up. The live `config.txt` is not a destination here.
 pub fn fill_tryboot(
     out: &mut [u8],
     kernel: &str,
@@ -803,6 +806,7 @@ mod tests {
             text,
             "arm_64bit=1\nkernel=kernel8.new\nkernel_address=0x80000\nenable_uart=1\n"
         );
+        assert!(!text.contains("hdmi_force_hotplug"));
         let n = fill_tryboot(&mut buf, "k2712.new", 0x200000, false).unwrap();
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
