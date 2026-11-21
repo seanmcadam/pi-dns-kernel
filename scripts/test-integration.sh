@@ -17,7 +17,7 @@ echo "Using host ports DNS ${DNS_HOST_PORT}, HTTP ${HTTP_HOST_PORT}, telnet ${TE
 # Start QEMU in background
 echo "Starting QEMU..."
 rm -f qemu/boot-output.txt
-timeout 180 qemu-system-aarch64 \
+timeout 240 qemu-system-aarch64 \
     -M virt,gic-version=2 \
     -cpu cortex-a72 \
     -smp 4 \
@@ -185,6 +185,7 @@ need = (
     "arp_requests_tx", "arp_replies_rx", "arp_cache_hits", "arp_cache_misses",
     "dns_inflight", "upstream_timeouts",
     "rx_drops", "rx_overruns", "rx_queued", "forward_full", "reply_drops",
+    "poll_count", "poll_us", "poll_max_us", "irq_rearms", "tx_full", "tx_slow",
     "hdmi_state", "hdmi_mode", "hdmi_recoveries",
     "sd_state", "sd_error", "sd_blocks", "fs_mounted",
 )
@@ -193,6 +194,7 @@ extra = (
     "arp_requests_tx", "arp_replies_rx", "arp_cache_hits", "arp_cache_misses",
     "dns_inflight", "upstream_timeouts",
     "rx_drops", "rx_overruns", "rx_queued", "forward_full", "reply_drops",
+    "poll_count", "poll_us", "poll_max_us", "irq_rearms", "tx_full", "tx_slow",
 )
 a = json.load(open(sys.argv[1]))
 b = json.load(open(sys.argv[2]))
@@ -637,6 +639,29 @@ then
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo "✗ DNS load lost local names or /status counters were missing"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 59: Sustained DNS load keeps the NIC IRQ and the owner"
+if python3 scripts/dns_stress.py \
+    --server 127.0.0.1 \
+    --port "${DNS_HOST_PORT}" \
+    --http-port "${HTTP_HOST_PORT}" \
+    --duration 24 \
+    --qps 20 \
+    --timeout 2 \
+    --a-only \
+    --fail-local-loss 5 \
+    --max-p99 400 \
+    --max-busy-ratio 0.75 \
+    --irq-moves \
+    --seed 59
+then
+    echo "✓ Sustained load kept local names, latency, idle time, and NIC IRQs"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Sustained load lost names, pinned the network core, or the NIC IRQ stalled"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 

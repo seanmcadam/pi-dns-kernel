@@ -101,6 +101,10 @@ impl Board for Pi4 {
         genet::rx_load()
     }
 
+    fn nic_faults() -> (u64, u64, u64) {
+        genet::nic_faults()
+    }
+
     fn retarget_nic(cpu: usize) {
         genet::retarget(cpu);
     }
@@ -134,20 +138,16 @@ impl Board for Pi4 {
     }
 
     fn handle_irq(id: u32) -> IrqHit {
-        // Packet data is polled. Mask the level line here; the poll rearms
-        // it after the ring is drained. The summary is cleared there too,
-        // including a frame that landed while the line was masked.
+        // Packet data is polled. RX masks the GENET summary so the level
+        // line drops before EOI. The poll unmasks it. The GIC line stays
+        // enabled: disabling it and then forgetting the re-arm left the
+        // interrupt dead for the rest of the boot.
         if id == GENET_IRQ0 || id == GENET_IRQ1 {
             let which = if id == GENET_IRQ0 { 0 } else { 1 };
-            // RX masks the level line until the poll drains and rearms.
-            // TX done is cleared here and left enabled. Waking on it made
+            // TX done is cleared here and left unmasked. Waking on it made
             // every transmit schedule another poll, so the owner never slept.
             match genet::take_irq(which) {
-                genet::NicIrq::Wake => {
-                    genet::note_irq_held();
-                    crate::gic::disable_id(id);
-                    return IrqHit::Net;
-                }
+                genet::NicIrq::Wake => return IrqHit::Net,
                 genet::NicIrq::TxOnly => return IrqHit::None,
             }
         }
