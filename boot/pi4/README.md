@@ -5,6 +5,27 @@ replaced the framebuffer. This image turns that screen on as soon as the
 mailbox answers. The HDMI console is the boot indicator. The green
 activity LED is not a progress counter.
 
+`hdmi_force_hotplug` is not in the generated `config.txt`, the blink-test
+handoff, or the tryboot preset. On 0.1.67 that line made a power-on boot
+report 640x480 and left the rainbow up. The network updater still does
+not rewrite the live `config.txt`. If that line was copied onto the card,
+it has to be removed by mounting the card.
+
+A watchdog or tryboot reboot releases the framebuffer (mailbox tag
+`0x00048001`) and tries the blank tag (`0x00040002`) first. Both are
+bounded by the mailbox timeout and do not hold the reset. If boot then
+sees a 0x0 size, it power-cycles firmware power domain 5, waits, reads
+EDID block 0 (`0x00030020`), and queries the size again. A size the
+firmware reports is kept. Only a size that is still missing asks for
+1280x720 and then 640x480. `/status` shows `hdmi_state`, `hdmi_mode`,
+and `hdmi_recoveries`.
+
+Domain 5 is the old single-HDMI power id. Pi 4 has two HDMI ports, and
+the firmware may answer that the device does not exist. Blank is not
+used on a good boot: sending it while a mode already existed dropped
+this board to no signal. The release and power replies are logged so a
+refused tag is visible. Virt and Pi 5 do not run this path.
+
 On power-up the green LED flickers, stays solid for several seconds, and
 may blink once as the firmware reads the card. That pattern is
 `start4.elf`, not this kernel. Error codes repeat (four short flashes
@@ -184,15 +205,15 @@ arm_64bit=1
 kernel=kernel8.img
 kernel_address=0x80000
 enable_uart=1
-hdmi_force_hotplug=1
 ```
 
 `kernel_address=0x80000` is the link address. `enable_uart=1` turns the
-PL011 on. `hdmi_force_hotplug=1` tells the firmware a display is
-attached. After a software or watchdog reset the hotplug detect can
-come back empty, and the framebuffer mailbox then returns 0x0 until a
-hard power cycle. The console is output-only: this does not enable a
-keyboard, a mouse, or the KMS overlay. These lines stay out until the
+PL011 on. `hdmi_force_hotplug` stays out. On 0.1.67 it made a power-on
+boot report 640x480 and left the rainbow up. A soft reboot that still
+sees 0x0 is handled in the kernel: release the framebuffer before
+reset, then power-cycle and re-query at the next boot. The console is
+output-only: this does not enable a keyboard, a mouse, or the KMS
+overlay. These lines stay out until the
 image is known to start: `os_check=0`, `uart_2ndstage=1`,
 `core_freq=250`, `init_uart_clock=48000000`, `disable_overscan=1`,
 `arm_boost=1`, and `dtoverlay=vc4-kms-v3d`.
@@ -232,6 +253,6 @@ before the first off write.
 ### DNS kernel
 
 `./scripts/build-pi4.sh`, then `./scripts/fetch-pi4-boot.sh kernel`, then
-the same copy. `boot/pi4/config.txt` is those five lines, including
-`hdmi_force_hotplug=1`. The ACT
+the same copy. `boot/pi4/config.txt` is those four lines.
+`hdmi_force_hotplug` stays out. The ACT
 counts in the table above apply only after the firmware enters the image.

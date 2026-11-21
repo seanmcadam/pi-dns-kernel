@@ -60,6 +60,7 @@ const UPSTREAM_HEALTH: u64 = 61;
 const NET_COUNTERS: u64 = 64;
 const NET_EXTRA: u64 = 66;
 const SD_STATUS: u64 = 68;
+const HDMI_CONSOLE: u64 = 69;
 
 const EAGAIN: i64 = -11;
 
@@ -793,8 +794,9 @@ fn handle_status() -> HttpResponse {
         forward_full,
         reply_drops,
     ) = net_extra();
+    let (hdmi_state, hdmi_mode, hdmi_recoveries) = hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -816,12 +818,50 @@ fn handle_status() -> HttpResponse {
         rx_queued,
         forward_full,
         reply_drops,
+        hdmi_state,
+        hdmi_mode,
+        hdmi_recoveries,
         firmware::fields(),
         sd_fields()
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
     response
+}
+
+/// `hdmi_state` is none, up, fallback, or released. `hdmi_mode` is `WxH`.
+/// Virt and Pi 5 report none, 0x0, and zero recoveries.
+fn hdmi_status() -> (String, String, u64) {
+    let mut buf = [0u8; 16];
+    let n = sys(
+        HDMI_CONSOLE,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    if n != 16 {
+        return (String::from("none"), String::from("0x0"), 0);
+    }
+    let word = |index: usize| {
+        let off = index * 4;
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&buf[off..off + 4]);
+        u32::from_le_bytes(raw)
+    };
+    let state = match word(0) {
+        1 => "up",
+        2 => "fallback",
+        3 => "released",
+        _ => "none",
+    };
+    (
+        String::from(state),
+        format!("{}x{}", word(1), word(2)),
+        u64::from(word(3)),
+    )
 }
 
 /// nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms.
