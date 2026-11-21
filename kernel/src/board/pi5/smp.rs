@@ -36,7 +36,17 @@ pub fn system_power(reset: bool) -> bool {
     } else {
         PSCI_SYSTEM_OFF
     };
-    let _ret = psci_smc(fid, 0, 0, 0);
+    // Pi 5 reset is PSCI, not the BCM2711 PM block. There is no tryboot
+    // flag on this board. The line is logged before SMC.
+    crate::disklog::line(if reset {
+        "power: psci reset"
+    } else {
+        "power: psci off"
+    });
+    let ret = psci_smc(fid, 0, 0, 0);
+    crate::console::write_str("power: psci ");
+    hex_out(ret);
+    crate::console::write_str("\r\n");
     true
 }
 

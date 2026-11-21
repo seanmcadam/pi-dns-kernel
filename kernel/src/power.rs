@@ -63,22 +63,35 @@ pub fn poll() {
     if CMD.swap(0, Ordering::AcqRel) == 0 {
         return;
     }
+    // The mailbox and the reset run on this core. IRQs stay unmasked and
+    // the stall checkpoint is refreshed around the call, including on Pi 5
+    // and virt, whose reset is PSCI rather than the PM block.
     if cmd == 3 {
-        crate::console::write_str("power: tryboot\r\n");
-        if crate::board::power_tryboot() {
+        step("power: tryboot");
+        let refused = crate::interrupts::with_irqs(crate::board::power_tryboot);
+        if refused {
             FAIL.store(3, Ordering::Release);
-            crate::console::write_str("power: tryboot refused\r\n");
+            step("power: tryboot refused");
         }
         return;
     }
     let reset = cmd == 2;
-    crate::console::write_str(if reset {
-        "power: reboot\r\n"
+    step(if reset {
+        "power: reboot"
     } else {
-        "power: shutdown\r\n"
+        "power: shutdown"
     });
-    if crate::board::power(reset) {
+    let refused = crate::interrupts::with_irqs(|| crate::board::power(reset));
+    if refused {
         FAIL.store(cmd, Ordering::Release);
-        crate::console::write_str("power: refused\r\n");
+        step("power: refused");
     }
+}
+
+fn step(text: &str) {
+    // The stall detector exists on the Pi 4. Refresh its checkpoint before
+    // the mailbox or the watchdog so this core is not parked mid-reset.
+    #[cfg(feature = "board-pi4")]
+    crate::act::note_core(crate::percpu::id());
+    crate::disklog::line(text);
 }
