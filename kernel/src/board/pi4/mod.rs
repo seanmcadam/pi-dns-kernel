@@ -199,8 +199,16 @@ impl Board for Pi4 {
     }
 }
 
-/// VideoCore property tag `RPI_FIRMWARE_SET_REBOOT_FLAGS`.
+/// VideoCore property tag `RPI_FIRMWARE_SET_REBOOT_FLAGS` (`0x00038064`).
+/// The mailbox and the following watchdog run with IRQs unmasked and a
+/// fresh stall checkpoint, so a slow property call cannot park the net core.
 fn set_reboot_flag(flag: u32) -> bool {
+    checkpoint();
+    crate::disklog::line(if flag == 0 {
+        "power: mbox 00038064 clear"
+    } else {
+        "power: mbox 00038064"
+    });
     let mut words = [0u32; 8];
     words[0] = 7 * 4;
     words[1] = 0;
@@ -209,53 +217,93 @@ fn set_reboot_flag(flag: u32) -> bool {
     words[4] = 0;
     words[5] = flag;
     words[6] = 0;
-    if mbox::run(MBOX_BASE, &mut words) != 0 {
-        return false;
-    }
-    words[1] == 0x8000_0000 && words[4] & 0x8000_0000 != 0
+    let rc = crate::interrupts::with_irqs(|| {
+        checkpoint();
+        mbox::run(MBOX_BASE, &mut words)
+    });
+    checkpoint();
+    let ok = rc == 0 && words[1] == 0x8000_0000 && words[4] & 0x8000_0000 != 0;
+    crate::disklog::line(if ok {
+        "power: mbox 00038064 ok"
+    } else {
+        "power: mbox 00038064 refused"
+    });
+    ok
 }
 
-/// BCM2711 power management at `0xFE100000` (bus `0x7E100000`).
-/// The same watchdog the Linux Pi driver uses: partition bits `0x555` ask the
-/// firmware to halt, and a full reset without those bits reboots.
-/// This has not been run on a Pi 4. A missing register is left alone.
+/// BCM2711 power management at physical `0xFE100000` (bus `0x7E100000`).
+///
+/// PM_RSTC is `+0x1c`, PM_RSTS is `+0x20`, and PM_WDOG is `+0x24`. After
+/// the MMU is on the CPU uses the kernel virtual form. A raw physical load
+/// of PM_RSTS (`0xFE100020`) is a level-1 translation fault, and
+/// `read_u32_catching` only resumes an external abort. The mailbox, UART,
+/// GENET, EMMC, GIC, and HDMI mailbox already go through `phys_to_virt`.
+/// HDMI hotplug uses the same helper. The watchdog sequence matches the
+/// Linux Pi driver: partition bits `0x555` ask the firmware to halt, and a
+/// full reset without those bits reboots. A missing register is left alone.
+/// `true` means the board is still up.
 fn watchdog_power(reset: bool) -> bool {
     const PM_BASE: u64 = 0xFE10_0000;
-    const PM_RSTC: u64 = PM_BASE + 0x1c;
-    const PM_RSTS: u64 = PM_BASE + 0x20;
-    const PM_WDOG: u64 = PM_BASE + 0x24;
     const PM_PASSWORD: u32 = 0x5a00_0000;
     const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
     const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x20;
     const PM_RSTS_HALT: u32 = 0x555;
-    let Some(rsts) = crate::exception::read_u32_catching(PM_RSTS as *const u32) else {
-        return true;
-    };
-    let Some(rstc) = crate::exception::read_u32_catching(PM_RSTC as *const u32) else {
-        return true;
-    };
-    let rsts = if reset {
-        rsts & !PM_RSTS_HALT
+    let rsts_p = dev_reg(PM_BASE + 0x20);
+    let rstc_p = dev_reg(PM_BASE + 0x1c);
+    let wdog_p = dev_reg(PM_BASE + 0x24);
+    checkpoint();
+    crate::disklog::line(if reset {
+        "power: watchdog reset"
     } else {
-        (rsts & !PM_RSTS_HALT) | PM_RSTS_HALT
-    };
-    unsafe {
-        core::ptr::write_volatile(PM_RSTS as *mut u32, PM_PASSWORD | rsts);
-        core::ptr::write_volatile(PM_WDOG as *mut u32, PM_PASSWORD | 10);
-        let rstc = (rstc & PM_RSTC_WRCFG_CLR) | PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET;
-        core::ptr::write_volatile(PM_RSTC as *mut u32, rstc);
-        core::arch::asm!("dsb sy", options(nostack));
+        "power: watchdog halt"
+    });
+    let armed = crate::interrupts::with_irqs(|| {
+        checkpoint();
+        let Some(rsts_raw) = crate::exception::read_u32_catching(rsts_p) else {
+            return false;
+        };
+        let Some(rstc_raw) = crate::exception::read_u32_catching(rstc_p) else {
+            return false;
+        };
+        let rsts = if reset {
+            rsts_raw & !PM_RSTS_HALT
+        } else {
+            (rsts_raw & !PM_RSTS_HALT) | PM_RSTS_HALT
+        };
+        let rstc = (rstc_raw & PM_RSTC_WRCFG_CLR) | PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET;
+        unsafe {
+            core::ptr::write_volatile(rsts_p, PM_PASSWORD | rsts);
+            core::ptr::write_volatile(wdog_p, PM_PASSWORD | 10);
+            core::ptr::write_volatile(rstc_p, rstc);
+            core::arch::asm!("dsb sy", options(nostack));
+        }
+        true
+    });
+    if !armed {
+        crate::disklog::line("power: watchdog missing");
+        return true;
     }
+    checkpoint();
+    crate::disklog::line("power: watchdog armed");
     let deadline = crate::timer::millis().saturating_add(50);
     while crate::timer::millis() < deadline {
+        checkpoint();
         core::hint::spin_loop();
     }
     true
 }
 
+fn dev_reg(pa: u64) -> *mut u32 {
+    crate::addr::phys_to_virt(pa) as *mut u32
+}
+
+fn checkpoint() {
+    crate::act::note_core(crate::percpu::id());
+}
+
 fn read_hotplug() -> i64 {
-    let a = crate::exception::read_u32_catching(HDMI0_HOTPLUG as *const u32);
-    let b = crate::exception::read_u32_catching(HDMI1_HOTPLUG as *const u32);
+    let a = crate::exception::read_u32_catching(dev_reg(HDMI0_HOTPLUG));
+    let b = crate::exception::read_u32_catching(dev_reg(HDMI1_HOTPLUG));
     if a.is_none() && b.is_none() {
         return -1;
     }

@@ -4,6 +4,9 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(dead_code)]
 
+#[path = "../../kernel/src/addr.rs"]
+mod addr;
+
 #[path = "../../kernel/src/fault_log.rs"]
 mod fault_log;
 

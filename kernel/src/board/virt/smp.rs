@@ -25,6 +25,7 @@ pub fn start_secondary(cpu: usize, entry: u64, entry_el: u64) {
 /// came back. It never targets the host.
 pub fn system_power(reset: bool) -> bool {
     if el2_blocks_psci() {
+        crate::disklog::line("power: psci blocked");
         return true;
     }
     let fid = if reset {
@@ -32,6 +33,11 @@ pub fn system_power(reset: bool) -> bool {
     } else {
         PSCI_SYSTEM_OFF
     };
+    crate::disklog::line(if reset {
+        "power: psci reset"
+    } else {
+        "power: psci off"
+    });
     let ret = psci(fid, 0, 0, 0, true);
     crate::console::write_str("power: psci ");
     hex_out(ret);

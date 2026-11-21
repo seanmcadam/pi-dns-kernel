@@ -2120,12 +2120,18 @@ if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted")})
 
 before = doc["uptime"]
+serial_before = open(serial_path, "rb").read()
+banners_before = serial_before.count(MARKER)
+psci_before = serial_before.count(b"power: psci reset")
 status, body, _ = form("/firmware/reboot", (("confirm", "reboot"), ("tryboot", "1")))
 if status != 400 or b"tryboot is not supported on this board" not in body:
     fail("tryboot %s %s" % (status, body[:160]))
 time.sleep(0.6)
 if uptime()["uptime"] < before:
     fail("tryboot request rebooted the guest")
+serial_after = open(serial_path, "rb").read()
+if serial_after.count(MARKER) != banners_before or serial_after.count(b"power: psci reset") != psci_before:
+    fail("tryboot=1 reset the guest")
 
 status, body, _ = req("POST", "/firmware/config", "kernel=/etc/passwd\n", {"X-Fw-Kind": "boot", "X-Fw-Commit": "1", "Content-Type": "text/plain"})
 if status != 400 or b"kernel" not in body:
@@ -2348,6 +2354,9 @@ while time.time() < deadline:
         status, part, headers = req("GET", "/firmware/read/test/0")
         if status != 200 or headers["X-Fw-Sha256"] != hashlib.sha256(scratch).hexdigest():
             fail("test file missing after reboot")
+        serial = open(serial_path, "rb").read()
+        if b"power: reboot" not in serial or b"power: psci reset" not in serial:
+            fail("firmware reboot did not log the reset")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
     time.sleep(0.3)
@@ -3089,6 +3098,9 @@ while time.time() < deadline:
         status, home = req("GET", "/")
         if b'value="start">Start</button>' not in home or b">Shutdown</button>" not in home:
             fail("home after reboot %s" % home[:240])
+        serial = open(serial_path, "rb").read()
+        if b"power: reboot" not in serial or b"power: psci reset" not in serial:
+            fail("reboot did not log the reset")
         print("reboot", before, now, "banners", old_n, new_n)
         break
     time.sleep(0.3)
@@ -3158,7 +3170,7 @@ then
         sleep 0.3
     done
 fi
-if [ "$SHUTDOWN_OK" = 1 ] && grep -q "power: shutdown" qemu/power-off.txt; then
+if [ "$SHUTDOWN_OK" = 1 ] && grep -q "power: shutdown" qemu/power-off.txt && grep -q "power: psci off" qemu/power-off.txt; then
     echo "✓ Guest shutdown exited that QEMU"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
