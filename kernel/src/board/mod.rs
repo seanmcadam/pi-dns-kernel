@@ -165,6 +165,12 @@ pub trait Board {
         4096
     }
 
+    /// Framebuffer console: state, width, height, recoveries.
+    /// State is 0 none, 1 up, 2 fallback, 3 released. Virt and Pi 5 stay at 0.
+    fn hdmi_console() -> (u32, u32, u32, u32) {
+        (0, 0, 0, 0)
+    }
+
     /// Shut down or reboot this guest. `reset` selects reboot.
     /// A successful call does not return. `true` means the platform refused
     /// and this guest is still running.
@@ -317,6 +323,10 @@ pub fn hdmi_code_ptr() -> *mut u8 {
 
 pub fn hdmi_code_bytes() -> usize {
     <Active as Board>::hdmi_code_bytes()
+}
+
+pub fn hdmi_console() -> (u32, u32, u32, u32) {
+    <Active as Board>::hdmi_console()
 }
 
 pub fn power(reset: bool) -> bool {

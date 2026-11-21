@@ -58,6 +58,9 @@
 //!      irq_rearms, tx_full, tx_slow. `dns_inflight` is the forward queue depth.
 //!  67  firmware(op, ...). Staged SD updates. Op 10 promotes, op 11 rolls back. See `fw::syscall`.
 //!  68  sd_status(buf, cap) -> 64. state[16], error[32], blocks u32, mounted u32.
+//!  69  hdmi_console(buf, cap) -> 16. Four little-endian u32s:
+//!      state, width, height, recoveries. State 0 none, 1 up, 2 fallback, 3 released.
+//!      Virt and Pi 5 return zeros.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -121,6 +124,7 @@ const SET_DNS_LOAD: u64 = 65;
 const NET_EXTRA: u64 = 66;
 const FW: u64 = 67;
 const SD_STATUS: u64 = 68;
+const HDMI_CONSOLE: u64 = 69;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -231,6 +235,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         NET_EXTRA => net_extra(args[0], args[1]),
         FW => crate::fw::syscall(args),
         SD_STATUS => sd_status(args[0], args[1]),
+        HDMI_CONSOLE => hdmi_console(args[0], args[1]),
         _ => -1,
     };
     value as u64
@@ -1163,6 +1168,23 @@ fn config_remove(ptr: u64, len: u64) -> i64 {
         Ok(false) => 1,
         Err(_) => EINVAL,
     }
+}
+
+/// Four little-endian u32s: state, width, height, recoveries.
+/// State is 0 none, 1 up, 2 fallback, 3 released. Virt and Pi 5 write zeros.
+fn hdmi_console(ptr: u64, cap: u64) -> i64 {
+    const N: usize = 16;
+    if cap < N as u64 || !crate::mmu::user_write_ok(ptr, N as u64) {
+        return EFAULT;
+    }
+    let (state, width, height, recoveries) = crate::board::hdmi_console();
+    let words = [state, width, height, recoveries];
+    let mut raw = [0u8; N];
+    for (index, word) in words.iter().enumerate() {
+        let off = index * 4;
+        raw[off..off + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    if write_user(ptr, &raw) { N as i64 } else { EFAULT }
 }
 
 fn sd_status(ptr: u64, cap: u64) -> i64 {

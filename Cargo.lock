@@ -190,6 +190,7 @@ dependencies = [
  "aarch64-cpu",
  "config",
  "cortex-a",
+ "display-console",
  "embedded-hal",
  "embedded-sdmmc",
  "fwupd",

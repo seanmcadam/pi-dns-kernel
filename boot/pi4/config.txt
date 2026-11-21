@@ -1,12 +1,11 @@
 # Handoff test. The card also needs the March 2025 start4.elf,
 # fixup4.dat, and bcm2711-rpi-4-b.dtb. See boot/pi4/README.md.
 # os_check, uart_2ndstage, core_freq, init_uart_clock,
-# arm_boost, and dtoverlay stay out for now.
-# hdmi_force_hotplug=1 makes the firmware report a display on soft
-# reboot, when hotplug detection otherwise comes back empty. The
-# console is output-only; this does not add a keyboard or mouse.
+# arm_boost, and dtoverlay stay out.
+# hdmi_force_hotplug stays out. On 0.1.67 it reported 640x480
+# and left the monitor on the firmware rainbow. The updater
+# does not rewrite the live config.txt on the card.
 arm_64bit=1
 kernel=kernel8.img
 kernel_address=0x80000
 enable_uart=1
-hdmi_force_hotplug=1

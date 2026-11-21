@@ -632,12 +632,14 @@ pub fn kernel_value_ok(value: &str) -> bool {
 
 /// The one-shot boot file. `kernel` is the staged 8.3 name for this board,
 /// so a second platform image can pass its own name later.
+/// Pi 4 and Pi 5 tryboot preset. `hdmi_force_hotplug` is not written.
+/// On 0.1.67 that line made a Pi 4 power-on report 640x480 and left the
+/// rainbow splash up. The live `config.txt` is not a destination here.
 pub fn fill_tryboot(
     out: &mut [u8],
     kernel: &str,
     address: u32,
     uart: bool,
-    hotplug: bool,
 ) -> Result<usize, &'static str> {
     if !kernel_value_ok(kernel) {
         return Err("kernel");
@@ -650,11 +652,6 @@ pub fn fill_tryboot(
     push(out, &mut n, b"\n")?;
     if uart {
         push(out, &mut n, b"enable_uart=1\n")?;
-    }
-    // Pi 4 only. Tryboot replaces config.txt, so a soft reboot would
-    // otherwise boot with no display detected. Output-only.
-    if hotplug {
-        push(out, &mut n, b"hdmi_force_hotplug=1\n")?;
     }
     let text = core::str::from_utf8(&out[..n]).map_err(|_| "utf8")?;
     validate_boot(text)?;
@@ -802,19 +799,14 @@ mod tests {
     #[test]
     fn boot_config_rules() {
         let mut buf = [0u8; 128];
-        let n = fill_tryboot(&mut buf, "kernel8.new", 0x80000, true, true).unwrap();
-        let text = core::str::from_utf8(&buf[..n]).unwrap();
-        assert_eq!(
-            text,
-            "arm_64bit=1\nkernel=kernel8.new\nkernel_address=0x80000\nenable_uart=1\nhdmi_force_hotplug=1\n"
-        );
-        let n = fill_tryboot(&mut buf, "kernel8.new", 0x80000, true, false).unwrap();
+        let n = fill_tryboot(&mut buf, "kernel8.new", 0x80000, true).unwrap();
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
             text,
             "arm_64bit=1\nkernel=kernel8.new\nkernel_address=0x80000\nenable_uart=1\n"
         );
-        let n = fill_tryboot(&mut buf, "k2712.new", 0x200000, false, false).unwrap();
+        assert!(!text.contains("hdmi_force_hotplug"));
+        let n = fill_tryboot(&mut buf, "k2712.new", 0x200000, false).unwrap();
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
             text,
