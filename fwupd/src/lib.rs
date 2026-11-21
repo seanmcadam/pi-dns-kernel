@@ -357,6 +357,42 @@ fn replace_checked<C: Card>(
     Ok(())
 }
 
+/// Which on-disk kernel matches the running image.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootPick {
+    Img,
+    New,
+    Unknown,
+}
+
+/// `img` and `new_file` are `Some(true)` when that file's tail contains this
+/// build's id, `Some(false)` when it was read and does not, and `None` when
+/// the file is missing. A conclusive file match wins. `dt` is used when the
+/// files are identical or neither carries the id. `partition` and `boot-mode`
+/// are not tryboot. Mailbox flag 0 is not a normal boot: the loader clears it.
+pub fn choose_booted(img: Option<bool>, new_file: Option<bool>, dt: Option<bool>) -> BootPick {
+    let from_files = match (img, new_file) {
+        (Some(false), Some(true)) | (None, Some(true)) => Some(BootPick::New),
+        (Some(true), Some(false) | None) => Some(BootPick::Img),
+        _ => None,
+    };
+    if let Some(pick) = from_files {
+        return pick;
+    }
+    match dt {
+        Some(true) => BootPick::New,
+        Some(false) => BootPick::Img,
+        None => BootPick::Unknown,
+    }
+}
+
+pub fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|window| window == needle)
+}
+
 /// A raw kernel image: size bounds, not an ELF, and not a blank or erased
 /// header. This project's image has no `ARM\x64` magic, so that magic is
 /// not required.
@@ -395,7 +431,9 @@ pub fn bootloader_tryboot(blob: &[u8]) -> Option<bool> {
     }
     let strings = &blob[off_strings..total];
     let mut p = off_struct;
-    let mut path: [&str; 4] = ["", "", "", ""];
+    // A real blob starts with an empty root, so chosen/bootloader is not
+    // at a fixed depth. Match the node names wherever they sit.
+    let mut path: [&str; 8] = ["", "", "", "", "", "", "", ""];
     let mut depth = 0usize;
     let mut saw_loader = false;
     let mut tryboot = None;
@@ -414,7 +452,7 @@ pub fn bootloader_tryboot(blob: &[u8]) -> Option<bool> {
                 let name = core::str::from_utf8(&blob[start..p]).ok()?;
                 p = (p + 4) & !3;
                 if depth < path.len() {
-                    path[depth] = name;
+                    path[depth] = node_base(name);
                 }
                 depth += 1;
             }
@@ -422,7 +460,7 @@ pub fn bootloader_tryboot(blob: &[u8]) -> Option<bool> {
                 if depth == 0 {
                     return None;
                 }
-                if depth == 2 && path[0] == "chosen" && path[1] == "bootloader" {
+                if under_bootloader(&path, depth) {
                     saw_loader = true;
                 }
                 depth -= 1;
@@ -442,12 +480,11 @@ pub fn bootloader_tryboot(blob: &[u8]) -> Option<bool> {
                 }
                 let value = &blob[p..p + len];
                 p = (p + len + 3) & !3;
-                if depth == 2
-                    && path[0] == "chosen"
-                    && path[1] == "bootloader"
-                    && cstr_at(strings, nameoff) == Some("tryboot")
-                {
+                let prop = cstr_at(strings, nameoff);
+                if under_bootloader(&path, depth) && prop == Some("tryboot") {
                     saw_loader = true;
+                    tryboot = Some(tryboot_value(value));
+                } else if under_chosen(&path, depth) && prop == Some("tryboot") {
                     tryboot = Some(tryboot_value(value));
                 }
             }
@@ -464,6 +501,18 @@ pub fn bootloader_tryboot(blob: &[u8]) -> Option<bool> {
     } else {
         None
     }
+}
+
+fn node_base(name: &str) -> &str {
+    name.split_once('@').map(|(base, _)| base).unwrap_or(name)
+}
+
+fn under_chosen(path: &[&str], depth: usize) -> bool {
+    depth >= 1 && depth <= path.len() && path[depth - 1] == "chosen"
+}
+
+fn under_bootloader(path: &[&str], depth: usize) -> bool {
+    depth >= 2 && depth <= path.len() && path[depth - 2] == "chosen" && path[depth - 1] == "bootloader"
 }
 
 fn tryboot_value(value: &[u8]) -> bool {
@@ -1253,5 +1302,96 @@ mod fdt_tests {
         body.extend_from_slice(&be(2));
         body.extend_from_slice(&be(9));
         assert_eq!(bootloader_tryboot(&finish(body)), None);
+        assert_eq!(bootloader_tryboot(&rooted(Some(&[]))), Some(true));
+        assert_eq!(bootloader_tryboot(&rooted(None)), Some(false));
+        assert_eq!(bootloader_tryboot(&rooted_mode()), Some(false));
+    }
+
+    fn rooted(tryboot: Option<&[u8]>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "");
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "chosen");
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "bootloader");
+        if let Some(value) = tryboot {
+            body.extend_from_slice(&be(3));
+            body.extend_from_slice(&be(value.len() as u32));
+            body.extend_from_slice(&be(0));
+            body.extend_from_slice(value);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(9));
+        finish(body)
+    }
+
+    fn rooted_mode() -> Vec<u8> {
+        let strings = b"boot-mode\0";
+        let mut body = Vec::new();
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "");
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "chosen");
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "bootloader");
+        body.extend_from_slice(&be(3));
+        body.extend_from_slice(&be(4));
+        body.extend_from_slice(&be(0));
+        body.extend_from_slice(&be(1));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(9));
+        let mut out = vec![0u8; 40];
+        let off_struct = 40u32;
+        let off_strings = 40 + body.len() as u32;
+        out.extend_from_slice(&body);
+        out.extend_from_slice(strings);
+        let total = out.len() as u32;
+        out[0..4].copy_from_slice(&be(0xd00d_feed));
+        out[4..8].copy_from_slice(&be(total));
+        out[8..12].copy_from_slice(&be(off_struct));
+        out[12..16].copy_from_slice(&be(off_strings));
+        out
+    }
+}
+
+#[cfg(test)]
+mod boot_pick_tests {
+    use super::{choose_booted, contains_bytes, BootPick};
+
+    #[test]
+    fn file_id_beats_a_missing_tree_and_boot_mode_is_not_tryboot() {
+        assert_eq!(
+            choose_booted(Some(false), Some(true), None),
+            BootPick::New
+        );
+        assert_eq!(choose_booted(Some(true), None, Some(true)), BootPick::Img);
+        assert_eq!(
+            choose_booted(Some(true), Some(true), Some(true)),
+            BootPick::New
+        );
+        assert_eq!(choose_booted(Some(true), Some(true), None), BootPick::Unknown);
+        assert_eq!(
+            choose_booted(Some(false), Some(false), Some(true)),
+            BootPick::New
+        );
+        assert_eq!(choose_booted(None, None, None), BootPick::Unknown);
+        assert!(contains_bytes(b"xxpi4dns-boot-id:0.1.65yy", b"pi4dns-boot-id:0.1.65"));
+        assert!(!contains_bytes(b"pi4dns-boot-id:0.1.64", b"pi4dns-boot-id:0.1.65"));
+        assert!(contains_bytes(
+            b"pi4dns-boot-id:0.1.65\0",
+            b"pi4dns-boot-id:0.1.65\0"
+        ));
+        assert!(!contains_bytes(
+            b"pi4dns-boot-id:0.1.650\0",
+            b"pi4dns-boot-id:0.1.65\0"
+        ));
     }
 }

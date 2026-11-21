@@ -1031,21 +1031,36 @@ fn pi5_promote() -> bool {
 /// `reboot requested` result. Called once, after the card is mounted.
 pub fn boot_report() {
     let names = kernel_names();
-    let dt = dtb_tryboot();
     let pi4 = cfg!(feature = "board-pi4");
-    // The mailbox is only a fallback. A tree that already answered must
-    // not depend on GET_REBOOT_FLAGS, which the loader often clears.
-    let mbox = if pi4 && dt.is_none() {
+    let _keep_id = version::BOOT_ID[0];
+    let dt = dtb_tryboot();
+    // The loader clears GET_REBOOT_FLAGS before the kernel runs. A zero
+    // does not mean this was a normal boot. A set bit still means tryboot.
+    let mbox = if pi4 {
         crate::board::tryboot_flag()
     } else {
         None
     };
-    let which = if !pi4 {
-        BOOT_UNKNOWN
-    } else if dt == Some(true) || (dt.is_none() && mbox.is_some_and(|flag| flag & 1 != 0)) {
-        BOOT_NEW
-    } else if dt.is_some() {
-        BOOT_IMG
+    let dt_hint = if dt.is_some() {
+        dt
+    } else if mbox.is_some_and(|flag| flag & 1 != 0) {
+        Some(true)
+    } else {
+        None
+    };
+    let (img_id, new_id) = if pi4 {
+        let img = tail_has_boot_id(names.live);
+        let newer = tail_has_boot_id(names.dest);
+        (img, newer)
+    } else {
+        (None, None)
+    };
+    let which = if pi4 {
+        match fwupd::choose_booted(img_id, new_id, dt_hint) {
+            fwupd::BootPick::Img => BOOT_IMG,
+            fwupd::BootPick::New => BOOT_NEW,
+            fwupd::BootPick::Unknown => BOOT_UNKNOWN,
+        }
     } else {
         BOOT_UNKNOWN
     };
@@ -1060,7 +1075,7 @@ pub fn boot_report() {
         Some(false) => "tryboot dt 0",
         None => "tryboot dt none",
     });
-    crate::disklog::line(if !pi4 || dt.is_some() {
+    crate::disklog::line(if !pi4 {
         "tryboot mbox skipped"
     } else {
         match mbox {
@@ -1069,6 +1084,9 @@ pub fn boot_report() {
             None => "tryboot mbox none",
         }
     });
+    if pi4 {
+        crate::disklog::line(id_line(img_id, new_id));
+    }
     let mut line = [0u8; 32];
     let prefix = b"boot ";
     line[..prefix.len()].copy_from_slice(prefix);
@@ -1079,11 +1097,14 @@ pub fn boot_report() {
     }
     if let Ok(text) = crate::fs::read_text("FWRES.TXT") {
         if text.trim() == "reboot requested" {
-            note(if which == BOOT_NEW {
+            let word = if which == BOOT_NEW {
                 "tryboot boot"
-            } else {
+            } else if which == BOOT_IMG || !pi4 {
                 "normal boot"
-            });
+            } else {
+                "boot unknown"
+            };
+            note(word);
         }
     }
     let hash_name = if which == BOOT_NEW {
@@ -1117,6 +1138,31 @@ pub fn booted_name() -> &'static str {
 
 fn dtb_tryboot() -> Option<bool> {
     let pa = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_DTB)) };
+    log_hex("dtb x0", pa);
+    match magic_at(pa) {
+        Some(magic) => log_hex32("dtb magic", magic),
+        None => crate::disklog::line("dtb magic unread"),
+    }
+    if let Some(flag) = parse_dtb_at(pa) {
+        return Some(flag);
+    }
+    // The arm64 header reserves 8 MiB at 0x80000. The firmware loads the
+    // DTB after that reservation. The Pi stub often clears x0, so look there
+    // when the entry pointer is not a tree. Other boards must not touch it.
+    if cfg!(feature = "board-pi4") {
+        const PROBE: u64 = 0x80000 + 0x800000;
+        if pa != PROBE {
+            if let Some(flag) = parse_dtb_at(PROBE) {
+                log_hex("dtb probe", PROBE);
+                return Some(flag);
+            }
+            crate::disklog::line("dtb probe miss");
+        }
+    }
+    None
+}
+
+fn parse_dtb_at(pa: u64) -> Option<bool> {
     if pa == 0 || pa & 3 != 0 {
         return None;
     }
@@ -1136,6 +1182,76 @@ fn dtb_tryboot() -> Option<bool> {
     }
     let blob = unsafe { core::slice::from_raw_parts(ptr, total as usize) };
     fwupd::bootloader_tryboot(blob)
+}
+
+fn magic_at(pa: u64) -> Option<u32> {
+    if pa == 0 || pa & 3 != 0 {
+        return None;
+    }
+    let ram0 = crate::board::RAM_START;
+    let ram1 = crate::board::RAM_END;
+    if pa < ram0 || pa.saturating_add(4) > ram1 {
+        return None;
+    }
+    let ptr = crate::addr::phys_to_virt(pa) as *const u8;
+    let hdr = unsafe { core::slice::from_raw_parts(ptr, 4) };
+    Some(u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]))
+}
+
+fn log_hex(prefix: &str, value: u64) {
+    log_hex_bytes(prefix, &value.to_be_bytes());
+}
+
+fn log_hex32(prefix: &str, value: u32) {
+    log_hex_bytes(prefix, &value.to_be_bytes());
+}
+
+fn log_hex_bytes(prefix: &str, bytes: &[u8]) {
+    let mut raw = [0u8; 64];
+    let pb = prefix.as_bytes();
+    let n = pb.len().min(20);
+    raw[..n].copy_from_slice(&pb[..n]);
+    raw[n] = b' ';
+    let mut hex = [0u8; 16];
+    let Some(digits) = fwupd::hex_encode(bytes, &mut hex) else {
+        return;
+    };
+    raw[n + 1..n + 1 + digits].copy_from_slice(&hex[..digits]);
+    if let Ok(text) = core::str::from_utf8(&raw[..n + 1 + digits]) {
+        crate::disklog::line(text);
+    }
+}
+
+fn id_line(img: Option<bool>, new_file: Option<bool>) -> &'static str {
+    match (img, new_file) {
+        (Some(false), Some(true)) | (None, Some(true)) => "boot id new",
+        (Some(true), Some(false) | None) => "boot id img",
+        (Some(true), Some(true)) => "boot id both",
+        (Some(false), Some(false)) => "boot id neither",
+        _ => "boot id unread",
+    }
+}
+
+fn tail_has_boot_id(name: &str) -> Option<bool> {
+    let len = io(|| crate::fs::file_len(name)).ok()?;
+    if len == 0 {
+        return Some(false);
+    }
+    let take = len.min(4096);
+    let start = len - take;
+    let mut buf = [0u8; 4096];
+    let got = io(|| crate::fs::read_at(name, start, &mut buf[..take as usize])).ok()?;
+    if got == 0 {
+        return Some(false);
+    }
+    // The image stores the id NUL-terminated, so 0.1.65 does not match 0.1.650.
+    let id = version::BOOT_ID_STR.as_bytes();
+    let mut needle = [0u8; 32];
+    if id.len() + 1 > needle.len() {
+        return Some(false);
+    }
+    needle[..id.len()].copy_from_slice(id);
+    Some(fwupd::contains_bytes(&buf[..got], &needle[..id.len() + 1]))
 }
 
 fn promote(force: bool) -> i64 {

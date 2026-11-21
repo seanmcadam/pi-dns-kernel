@@ -42,6 +42,16 @@ SECTIONS
         __data_start = .;
         *(.data*)
         . = ALIGN(4096);
+    }
+
+    .eh_frame_hdr : { *(.eh_frame_hdr) *(.eh_frame_hdr.*) }
+    .eh_frame : { *(.eh_frame) *(.eh_frame.*) }
+
+    .bootid :
+    {
+        KEEP(*(.bootid))
+        KEEP(*(.bootid.*))
+        . = ALIGN(8);
         __data_end = .;
     }
 
