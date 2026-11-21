@@ -59,6 +59,7 @@ const VNC_CTRL: u64 = 59;
 const UPSTREAM_HEALTH: u64 = 61;
 const NET_COUNTERS: u64 = 64;
 const NET_EXTRA: u64 = 66;
+const SD_STATUS: u64 = 68;
 
 const EAGAIN: i64 = -11;
 
@@ -773,7 +774,7 @@ fn handle_status() -> HttpResponse {
     let (arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses, dns_inflight, upstream_timeouts) =
         net_extra();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -790,7 +791,8 @@ fn handle_status() -> HttpResponse {
         arp_cache_misses,
         dns_inflight,
         upstream_timeouts,
-        firmware::fields()
+        firmware::fields(),
+        sd_fields()
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
@@ -846,6 +848,47 @@ fn net_extra() -> (u64, u64, u64, u64, u64, u64) {
         u64::from_le_bytes(raw)
     };
     (word(0), word(1), word(2), word(3), word(4), word(5))
+}
+
+/// SD probe outcome. The kernel records this before the log task exists,
+/// so `/status` is the copy that does not scroll off the HDMI console.
+fn sd_fields() -> String {
+    let mut buf = [0u8; 64];
+    let n = sys(
+        SD_STATUS,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    if n < 56 {
+        return String::from(
+            "\"sd_state\":\"absent\",\"sd_error\":\"unavailable\",\"sd_blocks\":0,\"fs_mounted\":0",
+        );
+    }
+    let blocks = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]);
+    let mounted = u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]);
+    format!(
+        "\"sd_state\":\"{}\",\"sd_error\":\"{}\",\"sd_blocks\":{},\"fs_mounted\":{}",
+        json_token(&buf[..16]),
+        json_token(&buf[16..48]),
+        blocks,
+        mounted
+    )
+}
+
+fn json_token(raw: &[u8]) -> String {
+    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    let mut out = String::new();
+    for byte in &raw[..end] {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || ch == ' ' || ch == '-' {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// `[{"ip":"a.b.c.d","up":true}, ...]`. Empty until the DNS task publishes.

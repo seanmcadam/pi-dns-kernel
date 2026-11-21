@@ -87,11 +87,13 @@ pub fn probe() -> bool {
         Some(value) => value,
         None => {
             log::warn!("SDHCI did not respond");
+            crate::disklog::set_error("sdhci", "bus fault");
             return false;
         }
     };
     if version == 0 || version == 0xffff_ffff {
         log::warn!("SDHCI controller is not present ({version:#x})");
+        crate::disklog::set_error("sdhci", "absent");
         return false;
     }
     log::info!("SDHCI version {version:#x}");
@@ -103,11 +105,13 @@ pub fn probe() -> bool {
     match identify() {
         Ok(card) => {
             log::info!("SD card rca {:#x}, {} blocks", card.rca, card.blocks);
+            crate::disklog::set_card("sdhci", card.blocks);
             *CARD.lock() = Some(card);
             true
         }
         Err(err) => {
             log::warn!("SD card init failed: {err}");
+            crate::disklog::set_error("sdhci", err);
             false
         }
     }

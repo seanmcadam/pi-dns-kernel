@@ -113,6 +113,7 @@ pub struct DiskDev;
 
 pub fn probe() -> bool {
     let Some(mut dev) = VirtioBlk::new() else {
+        crate::disklog::set_error("absent", "no device");
         return false;
     };
     let mut sector = [0u8; 512];
@@ -124,7 +125,9 @@ pub fn probe() -> bool {
     } else {
         log::info!("VirtIO blk ready, {} sectors", dev.capacity);
     }
+    let blocks = dev.capacity.min(u32::MAX as u64) as u32;
     *DISK.lock() = Some(dev);
+    crate::disklog::set_card("virtio", blocks);
     true
 }
 

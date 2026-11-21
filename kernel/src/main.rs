@@ -11,6 +11,7 @@ mod config_manager;
 mod console;
 mod cpu_stat;
 mod dhcp_rx;
+mod disklog;
 mod dns;
 mod exception;
 mod fault_log;

@@ -62,6 +62,9 @@ pub fn init() -> Result<(), FsError> {
     let found = crate::board::probe_disk();
     if !found {
         log::info!("No block device, filesystem not mounted");
+        crate::disklog::line("sd no block device");
+        crate::disklog::fail_if_empty("no block device");
+        crate::disklog::set_mounted(false);
         return Err(FsError::NotInitialized);
     }
 
@@ -75,11 +78,16 @@ pub fn init() -> Result<(), FsError> {
             }
             *FS.lock() = Some(mgr);
             log::info!("FAT32 filesystem mounted");
+            crate::disklog::line("sd fat mounted");
+            crate::disklog::set_mounted(true);
             append_log("boot");
             Ok(())
         }
         Err(err) => {
             log::warn!("FAT32 mount failed: {err:?}");
+            crate::disklog::line("sd fat mount failed");
+            crate::disklog::note_error("fat mount");
+            crate::disklog::set_mounted(false);
             Err(FsError::NotInitialized)
         }
     }

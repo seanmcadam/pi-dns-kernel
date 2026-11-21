@@ -54,6 +54,7 @@
 //!      arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses,
 //!      dns_inflight, upstream_timeouts.
 //!  67  firmware(op, ...). Staged SD updates. See `fw::syscall`.
+//!  68  sd_status(buf, cap) -> 64. state[16], error[32], blocks u32, mounted u32.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -116,6 +117,7 @@ const NET_COUNTERS: u64 = 64;
 const SET_DNS_LOAD: u64 = 65;
 const NET_EXTRA: u64 = 66;
 const FW: u64 = 67;
+const SD_STATUS: u64 = 68;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -225,6 +227,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         SET_DNS_LOAD => set_dns_load(args[0], args[1]),
         NET_EXTRA => net_extra(args[0], args[1]),
         FW => crate::fw::syscall(args),
+        SD_STATUS => sd_status(args[0], args[1]),
         _ => -1,
     };
     value as u64
@@ -1156,6 +1159,19 @@ fn config_remove(ptr: u64, len: u64) -> i64 {
         Ok(true) => 0,
         Ok(false) => 1,
         Err(_) => EINVAL,
+    }
+}
+
+fn sd_status(ptr: u64, cap: u64) -> i64 {
+    if cap < crate::disklog::EXPORT_LEN as u64 || !crate::mmu::user_write_ok(ptr, cap) {
+        return EFAULT;
+    }
+    let mut buf = [0u8; crate::disklog::EXPORT_LEN];
+    crate::disklog::export(&mut buf);
+    if write_user(ptr, &buf) {
+        crate::disklog::EXPORT_LEN as i64
+    } else {
+        EFAULT
     }
 }
 
