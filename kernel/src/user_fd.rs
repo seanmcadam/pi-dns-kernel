@@ -54,7 +54,8 @@
 //!  66  net_extra(buf, cap) -> 88. Eleven little-endian u64s:
 //!      arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses,
 //!      dns_inflight, upstream_timeouts, rx_drops, rx_overruns, rx_queued,
-//!      forward_full, reply_drops. `dns_inflight` is the forward queue depth.
+//!      forward_full, reply_drops, poll_count, poll_us, poll_max_us,
+//!      irq_rearms, tx_full, tx_slow. `dns_inflight` is the forward queue depth.
 //!  67  firmware(op, ...). Staged SD updates. Op 10 promotes, op 11 rolls back. See `fw::syscall`.
 //!  68  sd_status(buf, cap) -> 64. state[16], error[32], blocks u32, mounted u32.
 //!
@@ -1303,13 +1304,15 @@ fn set_dns_load(inflight: u64, timeouts: u64, forward_full: u64, reply_drops: u6
 }
 
 fn net_extra(ptr: u64, cap: u64) -> i64 {
-    const N: usize = 88;
+    const N: usize = 136;
     if cap < N as u64 || !crate::mmu::user_write_ok(ptr, N as u64) {
         return EFAULT;
     }
     let (requests, replies, hits, misses) = crate::net::arp_counters();
     let (inflight, timeouts, forward_full, reply_drops) = crate::dns::load();
     let (rx_drops, rx_overruns, rx_queued) = crate::board::rx_load();
+    let (poll_count, poll_us, poll_max_us) = crate::net::service::poll_stats();
+    let (irq_rearms, tx_full, tx_slow) = crate::board::nic_faults();
     let words = [
         requests,
         replies,
@@ -1322,6 +1325,12 @@ fn net_extra(ptr: u64, cap: u64) -> i64 {
         rx_queued,
         forward_full,
         reply_drops,
+        poll_count,
+        poll_us,
+        poll_max_us,
+        irq_rearms,
+        tx_full,
+        tx_slow,
     ];
     let mut raw = [0u8; N];
     for (index, word) in words.iter().enumerate() {
