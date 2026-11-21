@@ -53,7 +53,9 @@ cd pi4-dns-kernel
 
 That writes `boot/pi4-blinktest/kernel8.img`. `config.txt` in the same
 directory is the handoff file (`arm_64bit=1`, `kernel=kernel8.img`,
-`kernel_address=0x80000`, `enable_uart=1`). The card also needs the
+`kernel_address=0x80000`, `enable_uart=1`, `hdmi_force_hotplug=1`).
+`hdmi_force_hotplug=1` forces display detection for the output-only
+console. The card also needs the
 March 2025 `start4.elf`, `fixup4.dat`, and `bcm2711-rpi-4-b.dtb`. The
 copy steps are in `boot/pi4/README.md`.
 

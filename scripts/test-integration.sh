@@ -2672,7 +2672,8 @@ START_ADDR=$(aarch64-linux-gnu-nm target/aarch64-unknown-none/release/kernel8 | 
 if [ -f boot/pi4/kernel8.img ] && [ -f boot/pi4/config.txt ] \
     && echo "$START_ADDR" | grep -Eq '^0*ffff000000080000$' \
     && grep -q 'kernel=kernel8.img' boot/pi4/config.txt \
-    && grep -q 'arm_64bit=1' boot/pi4/config.txt; then
+    && grep -q 'arm_64bit=1' boot/pi4/config.txt \
+    && grep -q 'hdmi_force_hotplug=1' boot/pi4/config.txt; then
     echo "✓ Pi 4 kernel8.img linked at 0x${START_ADDR} with config.txt"
     echo "  QEMU raspi4b has no GENET. DHCP is enabled in this image."
     TESTS_PASSED=$((TESTS_PASSED + 1))

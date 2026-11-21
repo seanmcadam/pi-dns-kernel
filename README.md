@@ -319,7 +319,7 @@ The virt machine is what the integration suite uses for DNS, HTTP, and telnet. `
    That writes:
 
    - `boot/pi4/kernel8.img` — raw kernel. The ELF entry is `0xFFFF000000080000`. The firmware loads the file at physical `0x80000`.
-   - `boot/pi4/config.txt` — `arm_64bit=1`, `enable_uart=1`, `kernel=kernel8.img`
+   - `boot/pi4/config.txt` — `arm_64bit=1`, `enable_uart=1`, `kernel=kernel8.img`, `hdmi_force_hotplug=1` (output-only; forces display detection across a soft reboot)
 
    The image uses the Pi 4 PL011 UART at `0xFE201000` (GPIO 14/15, 115200 8N1), the EMMC2 SD controller at `0xFE340000`, and the GENET Ethernet controller at `0xFD580000`.
 
