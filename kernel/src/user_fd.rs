@@ -53,7 +53,7 @@
 //!  66  net_extra(buf, cap) -> 48. Six little-endian u64s:
 //!      arp_requests_tx, arp_replies_rx, arp_cache_hits, arp_cache_misses,
 //!      dns_inflight, upstream_timeouts.
-//!  67  firmware(op, ...). Staged SD updates. See `fw::syscall`.
+//!  67  firmware(op, ...). Staged SD updates. Op 10 promotes, op 11 rolls back. See `fw::syscall`.
 //!  68  sd_status(buf, cap) -> 64. state[16], error[32], blocks u32, mounted u32.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.

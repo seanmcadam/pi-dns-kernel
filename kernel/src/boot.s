@@ -197,6 +197,12 @@ reloc_jump:
 reloc_stub_end:
 
 2:
+    // The firmware passes the device tree in x0. Save it before the next
+    // instruction overwrites x0. Virt often has a tree with no tryboot
+    // node. A zero means the loader did not pass one.
+    adrp    x19, BOOT_DTB
+    add     x19, x19, :lo12:BOOT_DTB
+    str     x0, [x19]
     // Stack before any call. QEMU raspi4b enters at EL2h with SP = 0.
     // QEMU virt enters at EL1h, also with SP = 0. The blink path does not
     // use the stack. The code after this point does. SPSel 1 makes mov
@@ -1296,3 +1302,10 @@ early_l0_hi:
 .space 4096
 early_l1_hi:
 .space 4096
+
+// Device tree pointer from x0. Not .bss: that section is zeroed after the store.
+.section .data
+.balign 8
+.global BOOT_DTB
+BOOT_DTB:
+.quad 0

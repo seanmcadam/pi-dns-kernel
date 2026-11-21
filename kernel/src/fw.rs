@@ -5,15 +5,17 @@
 //! reboot that should try it asks the VideoCore firmware to load
 //! `tryboot.txt` once. That flag is cleared by the bootloader before
 //! `start.elf`, so a failed boot falls back to `config.txt` and the
-//! untouched `kernel8.img`. A rename of `kernel8.img` itself has a window
-//! with no kernel, so this path does not do that and it does not promote
-//! the staged file over the live one.
+//! untouched `kernel8.img`. An upload never renames onto that live file.
+//! Promote does, and only after the previous kernel is already stored as
+//! `KERNEL8.BAK` and the new bytes are in a temp file.
 //!
 //! Pi 5 can stage a short name. Its tryboot mailbox is not wired, and the
-//! real `kernel_2712.img` name does not fit 8.3, so that file is never
-//! opened. Virt stages the Pi 4 names. QEMU boots with `-kernel`, so a
-//! virt reboot does not execute the staged file. The files are still on
-//! the FAT volume for the test to read back.
+//! real `kernel_2712.img` name does not fit 8.3, so promote and rollback
+//! are refused there. Virt stages the Pi 4 names. QEMU boots with
+//! `-kernel`, so a virt reboot does not execute the staged file. Promote
+//! still copies the FAT files, and the test reads them back. A promote
+//! moves the live kernel aside, installs the staged file from a temp name,
+//! and puts the old file back if that rename fails.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use spin::Mutex;
@@ -29,13 +31,26 @@ const PUMP_BYTES: usize = 64 * 1024;
 const PUMP_MS: u64 = 40;
 const TEST_MAX: u32 = 64 * 1024;
 const KERNEL_MAX: u32 = 8 * 1024 * 1024;
-const STATUS_LEN: usize = 160;
+const STATUS_LEN: usize = 224;
 
 const KIND_TEST: u64 = 1;
 const KIND_KERNEL: u64 = 2;
 const KIND_BOOT: u64 = 3;
 const KIND_JSON: u64 = 4;
 const KIND_LOG: u64 = 5;
+const KIND_LIVE: u64 = 6;
+const KIND_BAK: u64 = 7;
+
+const BOOT_UNKNOWN: u8 = 0;
+const BOOT_IMG: u8 = 1;
+const BOOT_NEW: u8 = 2;
+
+const CP_COPY: u8 = 1;
+const CP_VERIFY: u8 = 2;
+const CP_RENAME: u8 = 3;
+const OP_BACKUP: u8 = 1;
+const OP_INSTALL: u8 = 2;
+const OP_ROLLBACK: u8 = 3;
 
 struct Names {
     dest: &'static str,
@@ -76,6 +91,7 @@ const PH_RECV: u8 = 1;
 const PH_VERIFY: u8 = 2;
 const PH_STAGING: u8 = 3;
 const PH_STAGED: u8 = 4;
+const PH_COPY: u8 = 5;
 
 struct Job {
     kind: u8,
@@ -98,6 +114,7 @@ pub fn phase_word() -> &'static str {
         PH_VERIFY => "verifying",
         PH_STAGING => "staging",
         PH_STAGED => "staged",
+        PH_COPY => "copying",
         _ => "idle",
     }
 }
@@ -119,6 +136,37 @@ struct Note {
 }
 
 static JOB: Mutex<Option<Job>> = Mutex::new(None);
+static COPY: Mutex<Option<CopyJob>> = Mutex::new(None);
+static COPY_BUSY: AtomicBool = AtomicBool::new(false);
+static BOOT_SHA: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+static BOOTED: AtomicU8 = AtomicU8::new(BOOT_UNKNOWN);
+static HASH: Mutex<Option<HashJob>> = Mutex::new(None);
+
+struct CopyJob {
+    op: u8,
+    phase: u8,
+    src: &'static str,
+    temp: &'static str,
+    dest: &'static str,
+    side: &'static str,
+    offset: u32,
+    total: u32,
+    image: bool,
+    sha: fwupd::Sha256,
+    expect: [u8; 32],
+    head: [u8; 64],
+}
+
+struct HashJob {
+    name: &'static str,
+    offset: u32,
+    total: u32,
+    sha: fwupd::Sha256,
+}
+
+extern "C" {
+    static BOOT_DTB: u64;
+}
 static RESULT: Mutex<Note> = Mutex::new(Note {
     text: [0; 47],
     len: 0,
@@ -153,14 +201,18 @@ pub fn scrub() {
         "FWTEST.TMP",
         "FW.OLD",
         "KN8.TMP",
-        "KN8.OLD",
         "K2712.TMP",
         "K2712.OLD",
         "TRYB.TMP",
         "TRYB.OLD",
+        "KN8B.TMP",
     ] {
         let _ = crate::fs::delete_file(name);
     }
+    // A promote that died between the two renames left the live kernel
+    // under the side name. Put it back before that name is dropped.
+    restore_live("KERNEL8.IMG", "KN8.OLD");
+    restore_live("KERNEL8.BAK", "KN8B.OLD");
     if let Ok(text) = crate::fs::read_text("FWRES.TXT") {
         if text.trim() == "receiving" || text.trim() == "verifying" {
             note("interrupted");
@@ -179,11 +231,16 @@ pub fn syscall(args: [u64; 6]) -> i64 {
         6 => reboot(args[1]),
         7 => hash_out(args[1], args[2]),
         8 => preset(args[1]),
+        10 => promote(args[1] == 1),
+        11 => rollback(),
         _ => -4,
     }
 }
 
 fn chunk(kind: u64, offset: u64, total: u64, ptr: u64, len: u64) -> i64 {
+    if COPY.lock().is_some() {
+        return -3;
+    }
     let Some(kind) = upload_kind(kind) else {
         return -4;
     };
@@ -628,10 +685,21 @@ fn fill_status(out: &mut [u8]) {
     }
     put_u32(out, 152, prog);
     put_u32(out, 156, total);
+    copy_name(out, 160, booted_name());
+    if let Some(sha) = *BOOT_SHA.lock() {
+        out[176] = 1;
+        out[177..209].copy_from_slice(&sha);
+    }
+    put_u32(out, 212, u32::from(exists("KERNEL8.BAK") || exists("K2712.BAK")));
 }
 
-/// Keep a verify moving when the page polls status. One slice, then return.
+/// Keep a verify or a promote moving when the page polls status.
 fn advance() {
+    if COPY.lock().is_some() {
+        pump_copy();
+        return;
+    }
+    pump_boot_hash();
     let kind = {
         let slot = JOB.lock();
         match slot.as_ref() {
@@ -641,6 +709,17 @@ fn advance() {
     };
     let names = upload_names(kind);
     let _ = pump(kind, &names);
+}
+
+/// One slice of promote, rollback, or the boot hash. The idle loop calls
+/// this so the copy does not depend on the next HTTP poll, and each slice
+/// stays inside the stall budget.
+pub fn poll() {
+    if COPY.lock().is_some() {
+        pump_copy();
+    } else {
+        pump_boot_hash();
+    }
 }
 
 fn read_out(kind: u64, offset: u64, ptr: u64, cap: u64) -> i64 {
@@ -669,8 +748,19 @@ fn hash_out(kind: u64, ptr: u64) -> i64 {
     let Some(name) = read_name(kind) else {
         return -4;
     };
-    if kind == KIND_KERNEL {
+    if kind == KIND_KERNEL || kind == KIND_LIVE {
         if let Some((len, sha)) = read_kstat() {
+            if crate::fs::file_len(name).ok() == Some(len) {
+                return if copy_out(ptr, &sha) { len as i64 } else { -2 };
+            }
+        }
+        let len = crate::fs::file_len(name).unwrap_or(u32::MAX);
+        if len > TEST_MAX {
+            return -11;
+        }
+    }
+    if kind == KIND_BAK {
+        if let Some((len, sha)) = read_bstat() {
             if crate::fs::file_len(name).ok() == Some(len) {
                 return if copy_out(ptr, &sha) { len as i64 } else { -2 };
             }
@@ -905,12 +995,545 @@ fn read_name(kind: u64) -> Option<&'static str> {
         KIND_TEST => Some("FWTEST.BIN"),
         KIND_KERNEL => Some(kernel_names().dest),
         KIND_BOOT => Some("TRYBOOT.TXT"),
+        KIND_LIVE => Some(kernel_names().live),
+        KIND_BAK => Some(bak_name()),
         _ => None,
     }
 }
 
 fn exists(name: &str) -> bool {
     crate::fs::file_exists(name).unwrap_or(false)
+}
+
+fn restore_live(live: &str, side: &str) {
+    if exists(live) {
+        let _ = crate::fs::delete_file(side);
+        return;
+    }
+    if exists(side) {
+        let _ = crate::fs::rename_file(side, live);
+    }
+}
+
+fn bak_name() -> &'static str {
+    if cfg!(feature = "board-pi5") {
+        "K2712.BAK"
+    } else {
+        "KERNEL8.BAK"
+    }
+}
+
+fn pi5_promote() -> bool {
+    cfg!(feature = "board-pi5")
+}
+
+/// Record which kernel the firmware started and replace a leftover
+/// `reboot requested` result. Called once, after the card is mounted.
+pub fn boot_report() {
+    let names = kernel_names();
+    let dt = dtb_tryboot();
+    let pi4 = cfg!(feature = "board-pi4");
+    // The mailbox is only a fallback. A tree that already answered must
+    // not depend on GET_REBOOT_FLAGS, which the loader often clears.
+    let mbox = if pi4 && dt.is_none() {
+        crate::board::tryboot_flag()
+    } else {
+        None
+    };
+    let which = if !pi4 {
+        BOOT_UNKNOWN
+    } else if dt == Some(true) || (dt.is_none() && mbox.is_some_and(|flag| flag & 1 != 0)) {
+        BOOT_NEW
+    } else if dt.is_some() {
+        BOOT_IMG
+    } else {
+        BOOT_UNKNOWN
+    };
+    BOOTED.store(which, Ordering::Relaxed);
+    let name = match which {
+        BOOT_IMG => "kernel8.img",
+        BOOT_NEW => "kernel8.new",
+        _ => "unknown",
+    };
+    crate::disklog::line(match dt {
+        Some(true) => "tryboot dt 1",
+        Some(false) => "tryboot dt 0",
+        None => "tryboot dt none",
+    });
+    crate::disklog::line(if !pi4 || dt.is_some() {
+        "tryboot mbox skipped"
+    } else {
+        match mbox {
+            Some(flag) if flag & 1 != 0 => "tryboot mbox 1",
+            Some(_) => "tryboot mbox 0",
+            None => "tryboot mbox none",
+        }
+    });
+    let mut line = [0u8; 32];
+    let prefix = b"boot ";
+    line[..prefix.len()].copy_from_slice(prefix);
+    let n = name.len().min(line.len() - prefix.len());
+    line[prefix.len()..prefix.len() + n].copy_from_slice(&name.as_bytes()[..n]);
+    if let Ok(text) = core::str::from_utf8(&line[..prefix.len() + n]) {
+        crate::disklog::line(text);
+    }
+    if let Ok(text) = crate::fs::read_text("FWRES.TXT") {
+        if text.trim() == "reboot requested" {
+            note(if which == BOOT_NEW {
+                "tryboot boot"
+            } else {
+                "normal boot"
+            });
+        }
+    }
+    let hash_name = if which == BOOT_NEW {
+        Some(names.dest)
+    } else if which == BOOT_IMG {
+        Some(names.live)
+    } else {
+        None
+    };
+    if let Some(name) = hash_name {
+        if let Ok(total) = crate::fs::file_len(name) {
+            if total > 0 && total <= KERNEL_MAX {
+                *HASH.lock() = Some(HashJob {
+                    name,
+                    offset: 0,
+                    total,
+                    sha: fwupd::Sha256::new(),
+                });
+            }
+        }
+    }
+}
+
+pub fn booted_name() -> &'static str {
+    match BOOTED.load(Ordering::Relaxed) {
+        BOOT_IMG => "kernel8.img",
+        BOOT_NEW => "kernel8.new",
+        _ => "unknown",
+    }
+}
+
+fn dtb_tryboot() -> Option<bool> {
+    let pa = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_DTB)) };
+    if pa == 0 || pa & 3 != 0 {
+        return None;
+    }
+    let ram0 = crate::board::RAM_START;
+    let ram1 = crate::board::RAM_END;
+    if pa < ram0 || pa.saturating_add(40) > ram1 {
+        return None;
+    }
+    let ptr = crate::addr::phys_to_virt(pa) as *const u8;
+    let hdr = unsafe { core::slice::from_raw_parts(ptr, 40) };
+    if hdr[0..4] != [0xd0, 0x0d, 0xfe, 0xed] {
+        return None;
+    }
+    let total = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
+    if total < 40 || total > 256 * 1024 || pa.saturating_add(total) > ram1 {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr, total as usize) };
+    fwupd::bootloader_tryboot(blob)
+}
+
+fn promote(force: bool) -> i64 {
+    if pi5_promote() {
+        return -14;
+    }
+    if COPY.lock().is_some() || JOB.lock().is_some() {
+        return -3;
+    }
+    let names = kernel_names();
+    if !exists(names.dest) {
+        note("not staged");
+        return -4;
+    }
+    let from_tryboot = cfg!(feature = "board-pi4") && BOOTED.load(Ordering::Relaxed) == BOOT_NEW;
+    if !from_tryboot && !force {
+        note("needs tryboot");
+        return -12;
+    }
+    let Some(len) = crate::fs::file_len(names.live).ok() else {
+        note("no card");
+        return -5;
+    };
+    start_copy(CopyJob {
+        op: OP_BACKUP,
+        phase: CP_COPY,
+        src: names.live,
+        temp: "KN8B.TMP",
+        dest: "KERNEL8.BAK",
+        side: "KN8B.OLD",
+        offset: 0,
+        total: len,
+        image: false,
+        sha: fwupd::Sha256::new(),
+        expect: [0; 32],
+        head: [0; 64],
+    });
+    0
+}
+
+fn rollback() -> i64 {
+    if pi5_promote() {
+        return -14;
+    }
+    if COPY.lock().is_some() || JOB.lock().is_some() {
+        return -3;
+    }
+    let bak = bak_name();
+    let Some(len) = crate::fs::file_len(bak).ok() else {
+        note("no backup");
+        return -13;
+    };
+    start_copy(CopyJob {
+        op: OP_ROLLBACK,
+        phase: CP_COPY,
+        src: bak,
+        temp: "KN8.TMP",
+        dest: kernel_names().live,
+        side: "KN8.OLD",
+        offset: 0,
+        total: len,
+        image: false,
+        sha: fwupd::Sha256::new(),
+        expect: [0; 32],
+        head: [0; 64],
+    });
+    0
+}
+
+fn start_copy(job: CopyJob) {
+    let total = job.total;
+    let label = match job.op {
+        OP_ROLLBACK => "rolling back",
+        _ => "promoting",
+    };
+    let _ = crate::fs::delete_file(job.temp);
+    *COPY.lock() = Some(job);
+    publish(PH_COPY, 0, total);
+    note(label);
+}
+
+fn pump_copy() {
+    if COPY_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let start = crate::timer::millis();
+    let mut moved = 0usize;
+    let mut buf = [0u8; 4096];
+    while moved < PUMP_BYTES && crate::timer::millis().saturating_sub(start) < PUMP_MS {
+        let plan = {
+            let slot = COPY.lock();
+            let Some(job) = slot.as_ref() else {
+                COPY_BUSY.store(false, Ordering::Release);
+                return;
+            };
+            if job.phase == CP_RENAME {
+                CopyPlan::Rename
+            } else if job.offset >= job.total {
+                CopyPlan::Advance
+            } else {
+                let name = if job.phase == CP_COPY { job.src } else { job.temp };
+                CopyPlan::Io {
+                    phase: job.phase,
+                    name,
+                    temp: job.temp,
+                    op: job.op,
+                    offset: job.offset,
+                    n: (job.total - job.offset).min(buf.len() as u32) as usize,
+                }
+            }
+        };
+        match plan {
+            CopyPlan::Rename => {
+                let Some(job) = COPY.lock().take() else {
+                    break;
+                };
+                finish_copy(job);
+                COPY_BUSY.store(false, Ordering::Release);
+                return;
+            }
+            CopyPlan::Advance => {
+                if !advance_copy() {
+                    COPY_BUSY.store(false, Ordering::Release);
+                    return;
+                }
+            }
+            CopyPlan::Io {
+                phase,
+                name,
+                temp,
+                op,
+                offset,
+                n,
+            } => {
+                let read = io(|| crate::fs::read_at(name, offset, &mut buf[..n]));
+                let got = match read {
+                    Ok(0) | Err(_) => {
+                        fail_copy(op);
+                        COPY_BUSY.store(false, Ordering::Release);
+                        return;
+                    }
+                    Ok(got) => got,
+                };
+                if phase == CP_COPY && io(|| crate::fs::write_named(temp, &buf[..got], true)).is_err()
+                {
+                    fail_copy(op);
+                    COPY_BUSY.store(false, Ordering::Release);
+                    return;
+                }
+                if !apply_copy(phase, offset, &buf[..got]) {
+                    break;
+                }
+                moved += got;
+            }
+        }
+    }
+    COPY_BUSY.store(false, Ordering::Release);
+}
+
+enum CopyPlan {
+    Rename,
+    Advance,
+    Io {
+        phase: u8,
+        name: &'static str,
+        temp: &'static str,
+        op: u8,
+        offset: u32,
+        n: usize,
+    },
+}
+
+fn advance_copy() -> bool {
+    let mut slot = COPY.lock();
+    let Some(job) = slot.as_mut() else {
+        return false;
+    };
+    if job.offset < job.total {
+        return true;
+    }
+    if job.phase == CP_COPY {
+        job.expect = job.sha.finish();
+        job.sha = fwupd::Sha256::new();
+        job.offset = 0;
+        job.phase = CP_VERIFY;
+        return true;
+    }
+    if job.phase == CP_VERIFY {
+        let sha = job.sha.finish();
+        if sha != job.expect {
+            let temp = job.temp;
+            let text = fail_text(job.op);
+            *slot = None;
+            drop(slot);
+            io(|| {
+                let _ = crate::fs::delete_file(temp);
+            });
+            publish(PH_IDLE, 0, 0);
+            note(text);
+            return false;
+        }
+        job.phase = CP_RENAME;
+    }
+    true
+}
+
+fn apply_copy(phase: u8, offset: u32, data: &[u8]) -> bool {
+    let mut slot = COPY.lock();
+    let Some(job) = slot.as_mut() else {
+        return false;
+    };
+    if job.phase != phase || job.offset != offset {
+        return true;
+    }
+    if phase == CP_COPY && job.offset < 64 {
+        let at = job.offset as usize;
+        let take = data.len().min(64 - at);
+        job.head[at..at + take].copy_from_slice(&data[..take]);
+    }
+    job.sha.update(data);
+    job.offset += data.len() as u32;
+    let total = if phase == CP_COPY {
+        job.total
+    } else {
+        job.total.saturating_mul(2)
+    };
+    let prog = if phase == CP_COPY {
+        job.offset
+    } else {
+        job.total + job.offset
+    };
+    publish(PH_COPY, prog, total);
+    true
+}
+
+fn fail_copy(op: u8) {
+    let temp = COPY.lock().take().map(|job| job.temp);
+    publish(PH_IDLE, 0, 0);
+    if let Some(temp) = temp {
+        io(|| {
+            let _ = crate::fs::delete_file(temp);
+        });
+    }
+    note(fail_text(op));
+}
+
+fn finish_copy(job: CopyJob) {
+    let dig = fwupd::Digest {
+        len: job.total,
+        sha: job.expect,
+        head: job.head,
+    };
+    let renamed = io(|| {
+        fwupd::commit_replacing(
+            &mut Fat,
+            job.dest,
+            job.temp,
+            job.side,
+            job.total,
+            &job.expect,
+            job.image,
+            dig,
+        )
+    });
+    if renamed.is_err() {
+        publish(PH_IDLE, 0, 0);
+        note(fail_text(job.op));
+        return;
+    }
+    match job.op {
+        OP_BACKUP => {
+            let _ = io(|| write_bstat(job.total, &job.expect));
+            let names = kernel_names();
+            let Some(len) = crate::fs::file_len(names.dest).ok() else {
+                publish(PH_IDLE, 0, 0);
+                note("promote failed");
+                return;
+            };
+            start_copy(CopyJob {
+                op: OP_INSTALL,
+                phase: CP_COPY,
+                src: names.dest,
+                temp: names.temp,
+                dest: names.live,
+                side: names.side,
+                offset: 0,
+                total: len,
+                image: true,
+                sha: fwupd::Sha256::new(),
+                expect: [0; 32],
+                head: [0; 64],
+            });
+        }
+        OP_INSTALL => {
+            let _ = io(|| write_kstat(job.total, &job.expect));
+            io(|| {
+                let _ = crate::fs::delete_file("TRYBOOT.TXT");
+                let _ = crate::fs::delete_file(kernel_names().dest);
+            });
+            *COPY.lock() = None;
+            publish(PH_IDLE, job.total, job.total);
+            note("promoted");
+        }
+        OP_ROLLBACK => {
+            let _ = io(|| write_kstat(job.total, &job.expect));
+            *COPY.lock() = None;
+            publish(PH_IDLE, job.total, job.total);
+            note("rolled back");
+        }
+        _ => {
+            *COPY.lock() = None;
+            publish(PH_IDLE, 0, 0);
+            note("promote failed");
+        }
+    }
+}
+
+fn fail_text(op: u8) -> &'static str {
+    if op == OP_ROLLBACK {
+        "rollback failed"
+    } else {
+        "promote failed"
+    }
+}
+
+fn pump_boot_hash() {
+    let start = crate::timer::millis();
+    let mut moved = 0usize;
+    let mut buf = [0u8; 4096];
+    while moved < PUMP_BYTES && crate::timer::millis().saturating_sub(start) < PUMP_MS {
+        let planned = {
+            let mut slot = HASH.lock();
+            let Some(job) = slot.as_mut() else {
+                return;
+            };
+            if job.offset >= job.total {
+                let sha = job.sha.finish();
+                *BOOT_SHA.lock() = Some(sha);
+                *slot = None;
+                return;
+            }
+            let n = (job.total - job.offset).min(buf.len() as u32) as usize;
+            (job.name, job.offset, n)
+        };
+        let (name, offset, n) = planned;
+        let got = io(|| crate::fs::read_at(name, offset, &mut buf[..n]));
+        let mut slot = HASH.lock();
+        let Some(job) = slot.as_mut() else {
+            return;
+        };
+        let Ok(got) = got else {
+            *slot = None;
+            return;
+        };
+        if got == 0 || job.offset != offset {
+            if got == 0 {
+                *slot = None;
+            }
+            return;
+        }
+        job.sha.update(&buf[..got]);
+        job.offset += got as u32;
+        moved += got;
+    }
+}
+
+fn write_bstat(len: u32, sha: &[u8; 32]) -> Result<(), ()> {
+    write_stat("BSTAT.TXT", len, sha)
+}
+
+fn read_bstat() -> Option<(u32, [u8; 32])> {
+    read_stat("BSTAT.TXT")
+}
+
+fn write_stat(name: &str, len: u32, sha: &[u8; 32]) -> Result<(), ()> {
+    let mut line = [0u8; 74];
+    fwupd::hex_encode(&len.to_be_bytes(), &mut line[..8]).ok_or(())?;
+    line[8] = b' ';
+    fwupd::hex_encode(sha, &mut line[9..73]).ok_or(())?;
+    line[73] = b'\n';
+    crate::fs::write_named(name, &line, false).map_err(|_| ())
+}
+
+fn read_stat(name: &str) -> Option<(u32, [u8; 32])> {
+    let mut buf = [0u8; 80];
+    let n = crate::fs::read_at(name, 0, &mut buf).ok()?;
+    if n < 73 || buf[8] != b' ' {
+        return None;
+    }
+    let mut lenb = [0u8; 4];
+    let mut sha = [0u8; 32];
+    if fwupd::hex_decode(&buf[..8], &mut lenb)? != 4 {
+        return None;
+    }
+    if fwupd::hex_decode(&buf[9..73], &mut sha)? != 32 {
+        return None;
+    }
+    Some((u32::from_be_bytes(lenb), sha))
 }
 
 fn note(text: &str) {

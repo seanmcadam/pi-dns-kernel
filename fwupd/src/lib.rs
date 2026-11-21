@@ -203,12 +203,23 @@ pub struct Digest {
 
 /// What [`commit`] is allowed to rename onto. The live kernel, the Pi
 /// boot `config.txt`, the DNS JSON files, and the firmware blobs are
-/// absent on purpose.
+/// absent on purpose. Promote and rollback use [`commit_replacing`].
 pub fn dest_allowed(name: &str) -> bool {
     matches!(
         name,
         "FWTEST.BIN" | "KERNEL8.NEW" | "K2712.NEW" | "TRYBOOT.TXT"
     )
+}
+
+fn live_dest(name: &str) -> bool {
+    matches!(
+        name,
+        "KERNEL8.IMG" | "KERNEL8.BAK" | "K2712.IMG" | "K2712.BAK"
+    )
+}
+
+fn dest_ok(name: &str, allow_live: bool) -> bool {
+    dest_allowed(name) || (allow_live && live_dest(name))
 }
 
 pub trait Card {
@@ -242,7 +253,7 @@ pub fn commit<C: Card>(
     expect_sha: &[u8; 32],
     image: bool,
 ) -> Result<(), CommitError<C::Error>> {
-    if !dest_allowed(dest)
+    if !dest_ok(dest, false)
         || dest.eq_ignore_ascii_case(temp)
         || dest.eq_ignore_ascii_case(side)
         || temp.eq_ignore_ascii_case(side)
@@ -272,7 +283,45 @@ pub fn commit_digest<C: Card>(
     image: bool,
     dig: Digest,
 ) -> Result<(), CommitError<C::Error>> {
-    if !dest_allowed(dest)
+    replace_checked(
+        card, dest, temp, side, expect_len, expect_sha, image, dig, false,
+    )
+}
+
+/// Install `temp` as the live kernel or its backup.
+///
+/// Upload [`commit`] still refuses those names. The previous `dest` is
+/// moved to `side` first and put back if the rename of `temp` fails, so a
+/// failed install does not leave the card without `dest`.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_replacing<C: Card>(
+    card: &mut C,
+    dest: &str,
+    temp: &str,
+    side: &str,
+    expect_len: u32,
+    expect_sha: &[u8; 32],
+    image: bool,
+    dig: Digest,
+) -> Result<(), CommitError<C::Error>> {
+    replace_checked(
+        card, dest, temp, side, expect_len, expect_sha, image, dig, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_checked<C: Card>(
+    card: &mut C,
+    dest: &str,
+    temp: &str,
+    side: &str,
+    expect_len: u32,
+    expect_sha: &[u8; 32],
+    image: bool,
+    dig: Digest,
+    allow_live: bool,
+) -> Result<(), CommitError<C::Error>> {
+    if !dest_ok(dest, allow_live)
         || dest.eq_ignore_ascii_case(temp)
         || dest.eq_ignore_ascii_case(side)
         || temp.eq_ignore_ascii_case(side)
@@ -323,6 +372,120 @@ pub fn image_ok(len: u32, head: &[u8]) -> bool {
     let blank = head[..64].iter().all(|byte| *byte == 0);
     let erased = head[..64].iter().all(|byte| *byte == 0xff);
     !blank && !erased
+}
+
+/// `/chosen/bootloader/tryboot` from a flattened device tree.
+///
+/// `Some(true)` is a tryboot boot. `Some(false)` is a bootloader node with
+/// the property absent or zero, which is a normal boot. `None` means the
+/// blob is not a device tree or it has no bootloader node, so the caller
+/// cannot tell. An empty property and a big-endian `1` both count as tryboot.
+pub fn bootloader_tryboot(blob: &[u8]) -> Option<bool> {
+    if blob.len() < 40 || u32be(blob, 0)? != 0xd00d_feed {
+        return None;
+    }
+    let total = u32be(blob, 4)? as usize;
+    if total < 40 || total > blob.len() {
+        return None;
+    }
+    let off_struct = u32be(blob, 8)? as usize;
+    let off_strings = u32be(blob, 12)? as usize;
+    if off_struct > total || off_strings > total {
+        return None;
+    }
+    let strings = &blob[off_strings..total];
+    let mut p = off_struct;
+    let mut path: [&str; 4] = ["", "", "", ""];
+    let mut depth = 0usize;
+    let mut saw_loader = false;
+    let mut tryboot = None;
+    while p + 4 <= total {
+        let token = u32be(blob, p)?;
+        p += 4;
+        match token {
+            1 => {
+                let start = p;
+                while p < total && blob[p] != 0 {
+                    p += 1;
+                }
+                if p >= total {
+                    return None;
+                }
+                let name = core::str::from_utf8(&blob[start..p]).ok()?;
+                p = (p + 4) & !3;
+                if depth < path.len() {
+                    path[depth] = name;
+                }
+                depth += 1;
+            }
+            2 => {
+                if depth == 0 {
+                    return None;
+                }
+                if depth == 2 && path[0] == "chosen" && path[1] == "bootloader" {
+                    saw_loader = true;
+                }
+                depth -= 1;
+                if depth < path.len() {
+                    path[depth] = "";
+                }
+            }
+            3 => {
+                if p + 8 > total {
+                    return None;
+                }
+                let len = u32be(blob, p)? as usize;
+                let nameoff = u32be(blob, p + 4)? as usize;
+                p += 8;
+                if p + len > total {
+                    return None;
+                }
+                let value = &blob[p..p + len];
+                p = (p + len + 3) & !3;
+                if depth == 2
+                    && path[0] == "chosen"
+                    && path[1] == "bootloader"
+                    && cstr_at(strings, nameoff) == Some("tryboot")
+                {
+                    saw_loader = true;
+                    tryboot = Some(tryboot_value(value));
+                }
+            }
+            4 => {}
+            9 => break,
+            _ => return None,
+        }
+    }
+    if let Some(flag) = tryboot {
+        return Some(flag);
+    }
+    if saw_loader {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn tryboot_value(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() >= 4 {
+        let word = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+        return word == 1;
+    }
+    value.first() == Some(&b'1')
+}
+
+fn cstr_at(strings: &[u8], off: usize) -> Option<&str> {
+    let rest = strings.get(off..)?;
+    let end = rest.iter().position(|byte| *byte == 0)?;
+    core::str::from_utf8(&rest[..end]).ok()
+}
+
+fn u32be(blob: &[u8], off: usize) -> Option<u32> {
+    let bytes = blob.get(off..off + 4)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// Pi `config.txt` / `tryboot.txt` lines. This is not the DNS JSON schema
@@ -942,5 +1105,153 @@ mod fat {
         .unwrap();
         assert_eq!(read_all(&mut card, "FWTEST.BIN"), scratch);
         assert_eq!(read_all(&mut card, "KERNEL8.IMG"), live);
+    }
+
+    #[test]
+    fn promote_replaces_the_live_kernel_and_keeps_a_bad_one_in_place() {
+        let mut card = FatCard { disk: format() };
+        let live = b"SENTINEL-KERNEL8.IMG-DO-NOT-TOUCH!!!!!!!!!!!!";
+        write_new(&mut card, "KERNEL8.IMG", live);
+        let mut next = vec![0u8; 4096];
+        next[0] = 0x11;
+        next[1] = 0x22;
+        write_new(&mut card, "KN8.TMP", &next);
+        let refused = commit(
+            &mut card,
+            "KERNEL8.IMG",
+            "KN8.TMP",
+            "KN8.OLD",
+            next.len() as u32,
+            &Sha256::hash(&next),
+            true,
+        );
+        assert!(matches!(refused, Err(CommitError::Refused)));
+        assert_eq!(read_all(&mut card, "KERNEL8.IMG"), live);
+
+        let wrong = dig_of(b"nope");
+        let err = commit_replacing(
+            &mut card,
+            "KERNEL8.IMG",
+            "KN8.TMP",
+            "KN8.OLD",
+            next.len() as u32,
+            &wrong.sha,
+            true,
+            wrong,
+        );
+        assert!(matches!(err, Err(CommitError::Checksum)));
+        assert_eq!(read_all(&mut card, "KERNEL8.IMG"), live);
+        assert!(!card.exists("KN8.TMP").unwrap());
+
+        write_new(&mut card, "KN8B.TMP", live);
+        commit_replacing(
+            &mut card,
+            "KERNEL8.BAK",
+            "KN8B.TMP",
+            "KN8B.OLD",
+            live.len() as u32,
+            &Sha256::hash(live),
+            false,
+            dig_of(live),
+        )
+        .unwrap();
+        write_new(&mut card, "KN8.TMP", &next);
+        commit_replacing(
+            &mut card,
+            "KERNEL8.IMG",
+            "KN8.TMP",
+            "KN8.OLD",
+            next.len() as u32,
+            &Sha256::hash(&next),
+            true,
+            dig_of(&next),
+        )
+        .unwrap();
+        assert_eq!(read_all(&mut card, "KERNEL8.IMG"), next);
+        assert_eq!(read_all(&mut card, "KERNEL8.BAK"), live);
+        assert!(!card.exists("KN8.OLD").unwrap());
+        assert!(!card.exists("KN8.TMP").unwrap());
+    }
+
+    fn dig_of(data: &[u8]) -> Digest {
+        let mut head = [0u8; 64];
+        let n = data.len().min(64);
+        head[..n].copy_from_slice(&data[..n]);
+        Digest {
+            len: data.len() as u32,
+            sha: Sha256::hash(data),
+            head,
+        }
+    }
+}
+
+#[cfg(test)]
+mod fdt_tests {
+    use super::bootloader_tryboot;
+
+    fn be(n: u32) -> [u8; 4] {
+        n.to_be_bytes()
+    }
+
+    fn push_name(body: &mut Vec<u8>, name: &str) {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+    }
+
+    fn finish(body: Vec<u8>) -> Vec<u8> {
+        let strings = b"tryboot\0";
+        let mut out = vec![0u8; 40];
+        let off_struct = 40u32;
+        let off_strings = 40 + body.len() as u32;
+        out.extend_from_slice(&body);
+        out.extend_from_slice(strings);
+        let total = out.len() as u32;
+        out[0..4].copy_from_slice(&be(0xd00d_feed));
+        out[4..8].copy_from_slice(&be(total));
+        out[8..12].copy_from_slice(&be(off_struct));
+        out[12..16].copy_from_slice(&be(off_strings));
+        out
+    }
+
+    fn blob(tryboot: Option<&[u8]>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "chosen");
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "bootloader");
+        if let Some(value) = tryboot {
+            body.extend_from_slice(&be(3));
+            body.extend_from_slice(&be(value.len() as u32));
+            body.extend_from_slice(&be(0));
+            body.extend_from_slice(value);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(9));
+        finish(body)
+    }
+
+    #[test]
+    fn tryboot_property_and_a_normal_bootloader_node() {
+        assert_eq!(bootloader_tryboot(&blob(Some(&be(1)))), Some(true));
+        assert_eq!(bootloader_tryboot(&blob(Some(&[]))), Some(true));
+        assert_eq!(bootloader_tryboot(&blob(Some(&be(0)))), Some(false));
+        assert_eq!(bootloader_tryboot(&blob(None)), Some(false));
+        assert_eq!(bootloader_tryboot(&[0; 64]), None);
+        let mut body = Vec::new();
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "chosen");
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "bootargs");
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(9));
+        assert_eq!(bootloader_tryboot(&finish(body)), None);
     }
 }

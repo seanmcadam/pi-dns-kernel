@@ -5,6 +5,7 @@
 #![no_main]
 
 extern crate alloc;
+extern crate version;
 
 mod server;
 
