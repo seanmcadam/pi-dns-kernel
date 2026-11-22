@@ -21,9 +21,9 @@
 //!
 //! boot.s drops EL2 to EL1 before this runs. The Pi 4 and Pi 5 ranges are
 //! untested on hardware. Addresses below 4 GiB use the four level-2 tables.
-//! A small extra pool covers the BCM2712 device window above 4 GiB. Virt
-//! never allocates from that pool. The Pi 4 HDMI console uses one of those
-//! level-2 tables for a non-identity window at `0xFFFF000200000000`.
+//! A small extra pool covers the BCM2712 device window above 4 GiB and the
+//! Pi 4 HDMI alias at `0x4_7EE00000`. Virt never allocates from that pool.
+//! The Pi 4 HDMI console uses one of the low tables for its framebuffer.
 
 use crate::addr::{phys_to_virt, virt_to_phys};
 
@@ -145,8 +145,8 @@ struct Tables {
 pub const USER_SLOTS: usize = 7;
 
 /// Level-2 tables for physical addresses at 4 GiB and above. The BCM2712
-/// device window needs two of these (gigabytes 0x40 and 0x41). Virt and
-/// Pi 4 stay inside the four low tables.
+/// device window needs two of these (gigabytes 0x40 and 0x41). Pi 4 uses
+/// one for the 35-bit HDMI alias (gigabyte 17). Virt uses none.
 const HIGH_L2: usize = 4;
 
 struct HighL2 {

@@ -19,10 +19,14 @@ mod smp;
 mod uart;
 
 /// HDMI0 at child `0x7ef00700`. The bcm2711 soc ranges add `0xFE000000 - 0x7E000000`.
-/// `HDMI_HOTPLUG` is offset `0x1c`, bit 0. Neither the address nor the bit has
-/// been confirmed on hardware. HDMI1 is the same block at `0x7ef05700`.
-const HDMI0_HOTPLUG: u64 = 0xFEF0_071C;
-const HDMI1_HOTPLUG: u64 = 0xFEF0_571C;
+/// Linux `vc5` `HDMI_HOTPLUG` is offset `0x1a8`, bit 0. The older sample at
+/// `0x1c` is still read. HDMI1 is the same block at `0x7ef05700`. The 35-bit
+/// alias of HDMI0 hot-plug is `0x4_7EF008A8`.
+const HDMI0_HOTPLUG_LEGACY: u64 = 0xFEF0_071C;
+const HDMI0_HOTPLUG: u64 = 0xFEF0_08A8;
+const HDMI1_HOTPLUG_LEGACY: u64 = 0xFEF0_571C;
+const HDMI1_HOTPLUG: u64 = 0xFEF0_58A8;
+const HDMI0_HOTPLUG_HI: u64 = 0x4_7EF0_08A8;
 /// BCM2711 mailbox at `0x7E00B880`, same translation. Channel 8 is the property channel.
 const MBOX_BASE: u64 = 0xFE00_B880;
 
@@ -35,7 +39,13 @@ pub fn set_speed_cap(cap: u32) {
     genet::set_speed_cap(cap);
 }
 
-const DEVICE_RANGES: &[(u64, u64)] = &[(0xFC00_0000, 0x1_0000_0000)];
+const DEVICE_RANGES: &[(u64, u64)] = &[
+    // Low-peripheral window. Mailbox, UART, GENET, EMMC, HDMI, HVS.
+    (0xFC00_0000, 0x1_0000_0000),
+    // Full 35-bit alias of the HDMI block (bus `0x7EE00000..0x7F000000`).
+    // One 2 MiB device page. Reads that fault stay inside the probe.
+    (0x4_7EE0_0000, 0x4_7F00_0000),
+];
 
 /// BCM2711 GIC-400 SPI 157 and 158. The driver arms these after a real
 /// revision read. QEMU raspi4b never raises them.
@@ -198,6 +208,10 @@ impl Board for Pi4 {
         crate::fb_con::copy_last_shut(out)
     }
 
+    fn hdmi_regs(out: &mut [u8]) -> usize {
+        crate::fb_con::copy_regs(out)
+    }
+
     fn power(reset: bool) -> bool {
         watchdog_power(reset)
     }
@@ -355,12 +369,25 @@ fn checkpoint() {
 }
 
 fn read_hotplug() -> i64 {
-    let a = crate::exception::read_u32_catching(dev_reg(HDMI0_HOTPLUG));
-    let b = crate::exception::read_u32_catching(dev_reg(HDMI1_HOTPLUG));
-    if a.is_none() && b.is_none() {
+    let addrs = [
+        HDMI0_HOTPLUG,
+        HDMI1_HOTPLUG,
+        HDMI0_HOTPLUG_LEGACY,
+        HDMI1_HOTPLUG_LEGACY,
+        HDMI0_HOTPLUG_HI,
+    ];
+    let mut saw = false;
+    let mut connected = false;
+    for pa in addrs {
+        let Some(raw) = crate::exception::read_u32_catching(dev_reg(pa)) else {
+            continue;
+        };
+        saw = true;
+        connected |= raw & 1 != 0;
+    }
+    if !saw {
         return -1;
     }
-    let connected = a.unwrap_or(0) & 1 != 0 || b.unwrap_or(0) & 1 != 0;
     if connected {
         1
     } else {
