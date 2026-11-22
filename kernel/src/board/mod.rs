@@ -179,6 +179,14 @@ pub trait Board {
         n
     }
 
+    /// Shutdown record from the previous reboot. Virt and Pi 5 report `none`.
+    fn hdmi_last_shut(out: &mut [u8]) -> usize {
+        let text = b"none";
+        let n = text.len().min(out.len());
+        out[..n].copy_from_slice(&text[..n]);
+        n
+    }
+
     /// Shut down or reboot this guest. `reset` selects reboot.
     /// A successful call does not return. `true` means the platform refused
     /// and this guest is still running.
@@ -339,6 +347,10 @@ pub fn hdmi_console() -> (u32, u32, u32, u32) {
 
 pub fn hdmi_diag(out: &mut [u8]) -> usize {
     <Active as Board>::hdmi_diag(out)
+}
+
+pub fn hdmi_last_shut(out: &mut [u8]) -> usize {
+    <Active as Board>::hdmi_last_shut(out)
 }
 
 pub fn power(reset: bool) -> bool {

@@ -30,31 +30,31 @@
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
 //!
-//! A soft reboot tells the firmware first (`NOTIFY_REBOOT`, `0x00030048`,
-//! no payload — the call Linux has sent since 2018), then blanks and
-//! releases the framebuffer, then powers off the HDMI and video-scaler
-//! domains with `SET_DOMAIN_STATE` (`0x00038030`). Those calls run with
-//! IRQs unmasked, share a one-second budget, and a miss does not stop the
-//! watchdog. Linux still resets with the watchdog after the notify; this
-//! kernel does too. `PM_RSTS` partition bits stay cleared for a reboot
-//! and set for a halt. Panic and exception halt leave the buffer in place:
-//! those paths do not reboot, and the fault text has to stay on the panel.
-//! A halt does not notify, because Linux only notifies on restart.
+//! A soft reboot first puts the HDMI PHY and DVP in the state Linux leaves
+//! them (`vc5_hdmi_phy_disable`, DVP reset pulsed, 108 MHz clocks left
+//! running). A watchdog does not reset that block, and `PM_RSTC` full
+//! reset cannot be made to look like a power-on: the hardware sets the
+//! watchdog reason bits as the reset happens. The kernel then sends
+//! `NOTIFY_REBOOT` (`0x00030048`, no payload), blanks and releases the
+//! framebuffer, and powers off HDMI domain 6 and scaler domain 4. The
+//! mailbox calls share a one-second budget. A miss does not stop the
+//! watchdog. The register and mailbox words are written to `HDMISHUT.TXT`
+//! so the next boot can show them in `hdmi_last_shut`. Halt and panic do
+//! not do this: those paths do not reboot, and the fault text has to stay
+//! on the panel.
 //!
-//! The legacy `SET_POWER_STATE` (`0x00028001`) id 5 is I2C1, not HDMI.
-//! 0.1.69 cycled that id and the firmware refused it. The domain-state
-//! index is the device-tree index plus one: HDMI is 6, the HVS scaler is
-//! 4. Pi 4's PM block does not implement the old HDMI power switches, so
-//! this path does not poke `PM_HDMI`. Whether `start4.elf` actually resets
-//! the HDMI PHY on `NOTIFY_REBOOT` is what a soft reboot on the board has
-//! to show; the reply words are logged either way.
+//! The legacy `SET_POWER_STATE` id 5 is I2C1, not HDMI. 0.1.69 cycled it
+//! and the firmware refused it. 0.1.70 used the real domain ids and the
+//! firmware accepted them, but EDID was still zeros after the watchdog
+//! because the PHY and hot-plug block had not been reset. Pi 4's PM block
+//! does not implement the old HDMI power switches.
 //!
-//! If the physical size is missing, the console cycles domains 6 and 4
-//! off and back on, waits, reads EDID block 0 (`0x00030020`), and queries
-//! the size again. Only a still-empty size asks for 1280x720 and then
-//! 640x480. A size the firmware already chose is kept. Blank is only sent
-//! on the way into a reset: sending it while a mode existed dropped this
-//! board to no signal. None of this runs on virt or Pi 5.
+//! If the physical size is missing, the console resets the PHY and DVP,
+//! cycles domains 6 and 4, reads EDID from the mailbox and from the HDMI
+//! DDC block, and queries the size again. A size the firmware reports is
+//! kept. A mode parsed from a real EDID block is tried before 1280x720
+//! and 640x480. Blank is only sent on the way into a reset. None of this
+//! runs on virt or Pi 5.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -176,6 +176,12 @@ static HDMI_RECOVERIES: AtomicU32 = AtomicU32::new(0);
 const DIAG_CAP: usize = 80;
 static mut DIAG: [u8; DIAG_CAP] = [0; DIAG_CAP];
 static DIAG_LEN: AtomicU8 = AtomicU8::new(0);
+const SHUT_CAP: usize = 160;
+static mut SHUT: [u8; SHUT_CAP] = [0; SHUT_CAP];
+static SHUT_LEN: AtomicU8 = AtomicU8::new(0);
+static EDID_W: AtomicU32 = AtomicU32::new(0);
+static EDID_H: AtomicU32 = AtomicU32::new(0);
+const SHUT_FILE: &str = "HDMISHUT.TXT";
 /// Set when a fault has painted the pinned rows. Later log lines and the
 /// status refresh must not scroll that text off the panel.
 static FROZEN: AtomicBool = AtomicBool::new(false);
@@ -216,13 +222,41 @@ pub fn copy_diag(out: &mut [u8]) -> usize {
     n
 }
 
-/// Tell the firmware a restart is coming, hand the scanout back, and power
-/// the HDMI and scaler domains off. IRQs stay unmasked. The whole sequence
-/// gives up after one second, and the watchdog still runs after this.
+/// Previous reboot's shutdown record. Empty until `HDMISHUT.TXT` is read
+/// or this boot is about to reset.
+pub fn copy_last_shut(out: &mut [u8]) -> usize {
+    copy_text(
+        out,
+        addr_of!(SHUT).cast::<u8>(),
+        SHUT_LEN.load(Ordering::Acquire) as usize,
+        SHUT_CAP,
+    )
+}
+
+/// Read `HDMISHUT.TXT` after the filesystem is mounted. A missing file
+/// leaves `hdmi_last_shut` as `none`.
+pub fn load_last_shut() {
+    if !matches!(crate::fs::file_exists(SHUT_FILE), Ok(true)) {
+        return;
+    }
+    let mut raw = [0u8; SHUT_CAP];
+    let Ok(n) = crate::fs::read_named(SHUT_FILE, &mut raw) else {
+        return;
+    };
+    set_shut(core::str::from_utf8(&raw[..n]).unwrap_or(""));
+}
+
+/// Reset the HDMI block, tell the firmware a restart is coming, and power
+/// the HDMI and scaler domains off. IRQs stay unmasked. The mailbox calls
+/// give up after one second. The watchdog still runs after this. The
+/// summary is stored for `/status` and for `HDMISHUT.TXT`.
 pub fn prepare_reboot() {
+    report_shut("hdmi shut start", true);
+    let hw = crate::hdmi_hw::quiesce();
+    log_hw("hdmi shut hpd", &hw, true);
+    log_hw_regs("hdmi shut reg", &hw, true);
     let start = crate::timer::get_ticks();
     let budget = crate::timer::frequency().max(1);
-    report_shut("hdmi shut start", true);
     let notify = shut_step(start, budget, &notify_msg());
     log_shut("hdmi shut notify", notify, true);
     let blank = shut_step(start, budget, &blank_msg(1));
@@ -233,6 +267,34 @@ pub fn prepare_reboot() {
     log_shut("hdmi shut d6", hdmi, false);
     let scaler = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 0));
     log_shut("hdmi shut d4", scaler, false);
+    let rsts = crate::hdmi_hw::pm_rsts();
+    let mut note = Note::new();
+    note.push("h0=");
+    note.hex32(hw.h0);
+    note.push(" h1=");
+    note.hex32(hw.h1);
+    note.push(" phy=");
+    note.hex32(hw.phy0);
+    note.push(" dvp=");
+    note.hex32(hw.dvp);
+    note.push(" clk=");
+    note.hex32(hw.clk);
+    note.push(" n=");
+    note.hex32(notify.1);
+    note.push(" b=");
+    note.hex32(blank.1);
+    note.push(" r=");
+    note.hex32(release.1);
+    note.push(" d6=");
+    note.hex32(hdmi.1);
+    note.push(":");
+    note.hex32(hdmi.2);
+    note.push(" d4=");
+    note.hex32(scaler.1);
+    note.push(":");
+    note.hex32(scaler.2);
+    note.push(" rsts=");
+    note.hex32(rsts);
     let mut line = Line::new();
     line.push("n=");
     line.hex32(notify.1);
@@ -249,8 +311,10 @@ pub fn prepare_reboot() {
     line.push(":");
     line.hex32(scaler.2);
     set_diag(line.text());
+    set_shut(note.text());
     READY.store(false, Ordering::Release);
     HDMI_STATE.store(HDMI_RELEASED, Ordering::Relaxed);
+    store_shut(note.text());
 }
 
 /// Allocate the framebuffer and paint one line, before the strict map.
@@ -510,13 +574,26 @@ fn take_size(attempt: u32) -> Option<bool> {
 }
 
 fn ask_fallback(attempt: u32) -> bool {
-    let sizes = [
+    let edid_w = EDID_W.load(Ordering::Relaxed);
+    let edid_h = EDID_H.load(Ordering::Relaxed);
+    let mut sizes = [
+        (0u32, 0u32),
         (display_console::HDMI_FALLBACK_W, display_console::HDMI_FALLBACK_H),
         (display_console::HDMI_LAST_W, display_console::HDMI_LAST_H),
     ];
+    if edid_w != 0 && edid_h != 0 {
+        sizes[0] = (edid_w, edid_h);
+    }
     for (w, h) in sizes {
+        if w == 0 || h == 0 {
+            continue;
+        }
         let mut line = Line::new();
-        line.push("hdmi fallback ");
+        if w == edid_w && h == edid_h {
+            line.push("hdmi edid mode ");
+        } else {
+            line.push("hdmi fallback ");
+        }
         line.dec(w as u64);
         line.push("x");
         line.dec(h as u64);
@@ -529,8 +606,11 @@ fn ask_fallback(attempt: u32) -> bool {
 }
 
 fn recover_power() {
-    // Only reached when the firmware reported no size. Cycle the real
-    // HDMI and scaler domains. Legacy SET_POWER_STATE id 5 is I2C1.
+    // Only reached when the firmware reported no size. Reset the PHY
+    // while the domain is still on, cycle domains 6 and 4, then release
+    // the PHY and read DDC. Legacy SET_POWER_STATE id 5 is I2C1.
+    let pre = crate::hdmi_hw::quiesce();
+    log_hw("hdmi recover hpd", &pre, false);
     let d6_off = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 0));
     log_boot("hdmi recover d6 off", d6_off);
     wait_ms(20);
@@ -543,7 +623,17 @@ fn recover_power() {
     let d4_on = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 1));
     log_boot("hdmi recover d4 on", d4_on);
     wait_ms(50);
+    let post = crate::hdmi_hw::boot_recover();
+    log_hw("hdmi recover hpd2", &post, false);
+    log_hw_regs("hdmi recover reg", &post, false);
     let edid = log_edid();
+    if edid.2 != 0 && edid.3 != 0 {
+        EDID_W.store(edid.2, Ordering::Relaxed);
+        EDID_H.store(edid.3, Ordering::Relaxed);
+    } else if post.edid_w != 0 && post.edid_h != 0 {
+        EDID_W.store(post.edid_w, Ordering::Relaxed);
+        EDID_H.store(post.edid_h, Ordering::Relaxed);
+    }
     let mut line = Line::new();
     line.push("d6=");
     line.hex32(d6_on.1);
@@ -557,6 +647,8 @@ fn recover_power() {
     line.hex32(edid.0);
     line.push(":");
     line.hex32(edid.1);
+    line.push(" h0=");
+    line.hex32(post.h0);
     set_diag(line.text());
 }
 
@@ -570,13 +662,22 @@ fn log_boot(label: &str, reply: (bool, u32, u32)) {
     save_line(line.text());
 }
 
-fn log_edid() -> (u32, u32) {
+fn log_edid() -> (u32, u32, u32, u32) {
     let mut msg = [0u32; 40];
     msg[0] = 39 * 4;
     msg[2] = TAG_GET_EDID;
     msg[3] = 4 + 128;
     let (ok, reply) = exchange_tag(&msg[..39]);
-    let header = ok && edid_header(&reply);
+    let mut block = [0u8; 128];
+    if ok {
+        let mut i = 0;
+        while i < 32 {
+            block[i * 4..i * 4 + 4].copy_from_slice(&reply[6 + i].to_le_bytes());
+            i += 1;
+        }
+    }
+    let timing = edid::preferred(&block);
+    let header = timing.is_some();
     let code = reply[1];
     let first = reply[6];
     let mut line = Line::new();
@@ -589,13 +690,10 @@ fn log_edid() -> (u32, u32) {
     line.push(" ");
     line.hex32(first);
     save_line(line.text());
-    (code, first)
-}
-
-fn edid_header(words: &[u32; 48]) -> bool {
-    let a = words[6].to_le_bytes();
-    let b = words[7].to_le_bytes();
-    a == [0x00, 0xff, 0xff, 0xff] && b[0] == 0xff && b[1] == 0xff && b[2] == 0xff && b[3] == 0x00
+    let (w, h) = timing
+        .map(|item| (u32::from(item.width), u32::from(item.height)))
+        .unwrap_or((0, 0));
+    (code, first, w, h)
 }
 
 fn notify_msg() -> [u32; 6] {
@@ -649,13 +747,149 @@ fn report_shut(text: &str, draw: bool) {
 }
 
 fn set_diag(text: &str) {
-    let n = text.len().min(DIAG_CAP);
+    store_text(text, addr_of_mut!(DIAG).cast(), DIAG_CAP, &DIAG_LEN);
+}
+
+fn set_shut(text: &str) {
+    store_text(text, addr_of_mut!(SHUT).cast(), SHUT_CAP, &SHUT_LEN);
+}
+
+fn store_text(text: &str, dst: *mut u8, cap: usize, len: &AtomicU8) {
+    let mut n = 0;
     unsafe {
-        let dst = addr_of_mut!(DIAG).cast::<u8>();
-        core::ptr::write_bytes(dst, 0, DIAG_CAP);
-        core::ptr::copy_nonoverlapping(text.as_ptr(), dst, n);
+        core::ptr::write_bytes(dst, 0, cap);
+        for byte in text.bytes() {
+            if n + 1 >= cap {
+                break;
+            }
+            if byte == b'\n' || byte == b'\r' {
+                break;
+            }
+            if !(byte.is_ascii_graphic() || byte == b' ') || byte == b'"' || byte == b'\\' {
+                continue;
+            }
+            dst.add(n).write(byte);
+            n += 1;
+        }
     }
-    DIAG_LEN.store(n as u8, Ordering::Release);
+    len.store(n as u8, Ordering::Release);
+}
+
+fn copy_text(out: &mut [u8], src: *const u8, n: usize, cap: usize) -> usize {
+    if n == 0 {
+        let text = b"none";
+        let n = text.len().min(out.len());
+        out[..n].copy_from_slice(&text[..n]);
+        return n;
+    }
+    let n = n.min(out.len()).min(cap);
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+    }
+    n
+}
+
+fn store_shut(text: &str) {
+    let bytes = text.as_bytes();
+    let n = bytes.len().min(SHUT_CAP - 1);
+    let mut raw = [0u8; SHUT_CAP];
+    raw[..n].copy_from_slice(&bytes[..n]);
+    raw[n] = b'\n';
+    if crate::percpu::live() {
+        crate::act::note_core(crate::percpu::id());
+    }
+    let saved = crate::interrupts::with_irqs(|| {
+        crate::fs::write_named(SHUT_FILE, &raw[..n + 1], false).is_ok()
+    });
+    if crate::percpu::live() {
+        crate::act::note_core(crate::percpu::id());
+    }
+    report_shut(
+        if saved {
+            "hdmi shut file ok"
+        } else {
+            "hdmi shut file fail"
+        },
+        false,
+    );
+}
+
+fn log_hw(label: &str, ports: &crate::hdmi_hw::Ports, draw: bool) {
+    let mut line = Line::new();
+    line.push(label);
+    line.push(" h0=");
+    line.hex32(ports.h0);
+    line.push(" h1=");
+    line.hex32(ports.h1);
+    line.push(" leg=");
+    line.hex32(ports.legacy0);
+    emit_hw(line.text(), draw);
+}
+
+fn log_hw_regs(label: &str, ports: &crate::hdmi_hw::Ports, draw: bool) {
+    let mut line = Line::new();
+    line.push(label);
+    line.push(" phy=");
+    line.hex32(ports.phy0);
+    line.push(" dvp=");
+    line.hex32(ports.dvp);
+    line.push(" clk=");
+    line.hex32(ports.clk);
+    emit_hw(line.text(), draw);
+    if ports.edid_w != 0 && ports.edid_h != 0 {
+        let mut mode = Line::new();
+        mode.push(label);
+        mode.push(" ddc ");
+        mode.dec(ports.edid_w as u64);
+        mode.push("x");
+        mode.dec(ports.edid_h as u64);
+        emit_hw(mode.text(), draw);
+    }
+}
+
+fn emit_hw(text: &str, draw: bool) {
+    if draw {
+        report_shut(text, true);
+    } else {
+        save_line(text);
+    }
+}
+
+struct Note {
+    buf: [u8; SHUT_CAP],
+    n: usize,
+}
+
+impl Note {
+    fn new() -> Self {
+        Self {
+            buf: [0; SHUT_CAP],
+            n: 0,
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if self.n + 1 >= SHUT_CAP {
+                break;
+            }
+            self.buf[self.n] = byte;
+            self.n += 1;
+        }
+    }
+
+    fn hex32(&mut self, value: u32) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut shift = 28i32;
+        while shift >= 0 {
+            self.push(core::str::from_utf8(&[HEX[((value >> shift) & 0xf) as usize]]).unwrap_or("0"));
+            shift -= 4;
+        }
+    }
+
+    fn text(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.n]).unwrap_or("hdmi shut")
+    }
 }
 
 fn blank_msg(state: u32) -> [u32; 7] {
