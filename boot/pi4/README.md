@@ -11,22 +11,30 @@ report 640x480 and left the rainbow up. The network updater still does
 not rewrite the live `config.txt`. If that line was copied onto the card,
 it has to be removed by mounting the card.
 
-A watchdog or tryboot reboot first sends `NOTIFY_REBOOT` (`0x00030048`,
-the tag Linux sends before it arms the watchdog), then blanks and
-releases the framebuffer, then powers off firmware domains 6 (HDMI) and
-4 (HVS scaler) with `SET_DOMAIN_STATE` (`0x00038030`). The sequence is
-bounded by one second and does not hold the reset. `SET_POWER_STATE` id
-5 is I2C1, not HDMI; 0.1.69 cycled that id and the firmware refused it.
-If the next boot still sees a 0x0 size, it cycles domains 6 and 4 off
-and on, reads EDID block 0 (`0x00030020`), and queries the size again.
-A size the firmware reports is kept. Only a size that is still missing
-asks for 1280x720 and then 640x480. `/status` shows `hdmi_state`,
-`hdmi_mode`, `hdmi_recoveries`, and `hdmi_diag` (the response codes).
+A watchdog or tryboot reboot first resets the HDMI PHY and the DVP
+block the way Linux does (`vc5_hdmi_phy_disable`, a pulse of DVP resets
+0 and 1, 108 MHz clocks left running), then sends `NOTIFY_REBOOT`
+(`0x00030048`), blanks and releases the framebuffer, and powers off
+firmware domains 6 (HDMI) and 4 (HVS scaler). The mailbox part is
+bounded by one second and does not hold the reset. The register and
+mailbox words are written to `HDMISHUT.TXT`. The next boot shows that
+line in `/status` as `hdmi_last_shut`, including when telnet missed the
+lines that were printed in the moment before the watchdog.
 
-Pi 4's PM block does not implement the old HDMI power switches, so this
-path does not poke `PM_HDMI`. Whether `start4.elf` resets the HDMI PHY
-when it sees `NOTIFY_REBOOT` is what a soft reboot on the board has to
-show. Blank is not used on a good boot: sending it while a mode already
+0.1.70's domain cycle was accepted (`d6` and `d4` came back
+`80000000`) and EDID was still zeros. The watchdog does not reset the
+HDMI DVP, and `PM_RSTC` `WRCFG` `0x20` with the halt bits cleared is
+already the Linux full reset. The hardware sets the watchdog reason
+bits in `PM_RSTS` as the reset happens, so that write cannot look like
+a power-on to `start4.elf`. If the next boot still sees a 0x0 size, it
+resets the PHY and DVP again, cycles domains 6 and 4, reads EDID from
+the mailbox and from the HDMI DDC block, and queries the size again.
+A size the firmware reports is kept. A mode taken from a real EDID
+block is tried before 1280x720 and 640x480. `/status` also keeps
+`hdmi_state`, `hdmi_mode`, `hdmi_recoveries`, and `hdmi_diag`.
+
+Pi 4's PM block does not implement the old HDMI power switches.
+Blank is not used on a good boot: sending it while a mode already
 existed dropped this board to no signal. Virt and Pi 5 do not run this
 path.
 

@@ -194,6 +194,10 @@ impl Board for Pi4 {
         crate::fb_con::copy_diag(out)
     }
 
+    fn hdmi_last_shut(out: &mut [u8]) -> usize {
+        crate::fb_con::copy_last_shut(out)
+    }
+
     fn power(reset: bool) -> bool {
         watchdog_power(reset)
     }
@@ -279,7 +283,11 @@ fn get_reboot_flag() -> Option<u32> {
 /// GENET, EMMC, GIC, and HDMI mailbox already go through `phys_to_virt`.
 /// HDMI hotplug uses the same helper. The watchdog sequence matches the
 /// Linux Pi driver: partition bits `0x555` ask the firmware to halt, and a
-/// full reset without those bits reboots. A missing register is left alone.
+/// full reset without those bits reboots. `WRCFG` `0x20` is
+/// `PM_RSTC_WRCFG_FULL_RESET`, the same value Linux writes. The watchdog
+/// reason bits in `PM_RSTS` are set by the reset itself, so this write
+/// cannot make `start4.elf` treat the boot as a power-on. A missing
+/// register is left alone.
 /// `true` means the board is still up.
 fn watchdog_power(reset: bool) -> bool {
     // Halt is not a restart: Linux only notifies the firmware on reboot,

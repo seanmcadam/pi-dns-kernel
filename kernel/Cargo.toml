@@ -37,6 +37,7 @@ embedded-hal = { workspace = true }
 config = { path = "../config", default-features = false }
 fwupd = { path = "../fwupd", default-features = false }
 version = { path = "../version" }
+edid = { path = "../edid" }
 display-console = { path = "../display-console", optional = true }
 
 [[bin]]

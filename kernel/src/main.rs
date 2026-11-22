@@ -17,6 +17,8 @@ mod exception;
 mod fault_log;
 #[cfg(feature = "board-pi4")]
 mod fb_con;
+#[cfg(feature = "board-pi4")]
+mod hdmi_hw;
 mod fs;
 mod fw;
 mod http;
@@ -154,6 +156,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         Ok(()) => uart_write("[OK] Filesystem mounted\r\n"),
         Err(_) => uart_write("[OK] No filesystem, using defaults\r\n"),
     }
+    #[cfg(feature = "board-pi4")]
+    fb_con::load_last_shut();
     fw::scrub();
     fw::boot_report();
     let config = config_manager::load_config();
