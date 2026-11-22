@@ -413,6 +413,11 @@ const DISPLAY_FIELDS: &[Field] = &[
         required: true,
         kind: FieldKind::U64 { min: 0, max: 1 },
     },
+    Field {
+        name: "hdmi_reset",
+        required: false,
+        kind: FieldKind::U64 { min: 0, max: 1 },
+    },
 ];
 
 const MAIN_FIELDS: &[Field] = &[

@@ -118,6 +118,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     #[cfg(feature = "board-pi4")]
     fb_con::switch_to_nc();
     uart_write("[OK] MMU and caches enabled\r\n");
+    #[cfg(feature = "board-pi4")]
+    fb_con::load_vclog();
 
     percpu::init_bsp();
 

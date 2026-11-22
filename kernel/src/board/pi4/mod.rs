@@ -216,6 +216,10 @@ impl Board for Pi4 {
         crate::fb_con::copy_port(out)
     }
 
+    fn hdmi_vclog(out: &mut [u8]) -> usize {
+        crate::fb_con::copy_vclog(out)
+    }
+
     fn power(reset: bool) -> bool {
         watchdog_power(reset)
     }
@@ -336,10 +340,13 @@ fn watchdog_power(reset: bool) -> bool {
         let Some(rstc_raw) = crate::exception::read_u32_catching(rstc_p) else {
             return false;
         };
+        // Linux `bcm2835_restart`: `PM_RSTS & 0xfffffaaa`, then the
+        // partition bits (0 for a reboot, `0x555` for a halt),
+        // `PM_WDOG = password | 10`, `PM_RSTC = password | (rstc & ~0x30) | 0x20`.
         let rsts = if reset {
-            rsts_raw & !PM_RSTS_HALT
+            rsts_raw & 0xffff_faaa
         } else {
-            (rsts_raw & !PM_RSTS_HALT) | PM_RSTS_HALT
+            (rsts_raw & 0xffff_faaa) | PM_RSTS_HALT
         };
         let rstc = (rstc_raw & PM_RSTC_WRCFG_CLR) | PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET;
         unsafe {

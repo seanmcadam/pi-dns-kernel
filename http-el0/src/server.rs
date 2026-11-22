@@ -227,6 +227,7 @@ fn handle(request: &HttpRequest) -> HttpResponse {
     match request.path.as_str() {
         "/" => handle_index(),
         "/status" => handle_status(),
+        "/vclog" => handle_vclog(),
         "/config" => handle_config(request),
         "/records" => handle_records(request),
         "/records/delete" => handle_record_delete(request),
@@ -763,6 +764,7 @@ fn handle_index() -> HttpResponse {
     <h2>Management</h2>
     <ul>
         <li><a href="/status">System Status (JSON)</a></li>
+        <li><a href="/vclog">Firmware log (JSON)</a></li>
         <li><a href="/firmware">Firmware update</a></li>
         <li><a href="/config">Configuration</a></li>
         <li><a href="/records">DNS Records (JSON)</a></li>
@@ -800,10 +802,10 @@ fn handle_status() -> HttpResponse {
         tx_full,
         tx_slow,
     ) = net_extra();
-    let (hdmi_state, hdmi_mode, hdmi_recoveries, hdmi_diag, hdmi_last_shut, hdmi_regs, hdmi_port) =
+    let (hdmi_state, hdmi_mode, hdmi_recoveries, hdmi_diag, hdmi_last_shut, hdmi_regs, hdmi_port, vclog) =
         hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}",{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}",{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -838,6 +840,7 @@ fn handle_status() -> HttpResponse {
         hdmi_last_shut,
         hdmi_regs,
         hdmi_port,
+        vclog,
         firmware::fields(),
         sd_fields()
     );
@@ -850,9 +853,10 @@ fn handle_status() -> HttpResponse {
 /// `hdmi_diag` is this boot's mailbox summary. `hdmi_last_shut` is the
 /// previous reboot's pre-write register dump. `hdmi_regs` is this boot's
 /// read-only dump. `hdmi_port` is `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or
-/// `none`. Virt and Pi 5 report none, 0x0, zero recoveries, and `none`.
-fn hdmi_status() -> (String, String, u64, String, String, String, String) {
-    let mut buf = [0u8; 432];
+/// `none`. `vclog` is the firmware message log. Virt and Pi 5 report
+/// none, 0x0, zero recoveries, and `none`.
+fn hdmi_status() -> (String, String, u64, String, String, String, String, String) {
+    let mut buf = [0u8; 736];
     let n = sys(
         HDMI_CONSOLE,
         buf.as_mut_ptr() as u64,
@@ -862,11 +866,12 @@ fn hdmi_status() -> (String, String, u64, String, String, String, String) {
         0,
         0,
     );
-    if n != 432 {
+    if n != 736 {
         return (
             String::from("none"),
             String::from("0x0"),
             0,
+            String::from("none"),
             String::from("none"),
             String::from("none"),
             String::from("none"),
@@ -886,9 +891,10 @@ fn hdmi_status() -> (String, String, u64, String, String, String, String) {
         _ => "none",
     };
     let diag = text_field(&buf[16..96]);
-    let last = text_field(&buf[96..256]);
-    let regs = text_field(&buf[256..416]);
-    let port = text_field(&buf[416..432]);
+    let last = text_field(&buf[96..288]);
+    let regs = text_field(&buf[288..480]);
+    let port = text_field(&buf[480..496]);
+    let vclog = text_field(&buf[496..736]);
     (
         String::from(state),
         format!("{}x{}", word(1), word(2)),
@@ -897,7 +903,16 @@ fn hdmi_status() -> (String, String, u64, String, String, String, String) {
         last,
         regs,
         port,
+        vclog,
     )
+}
+
+fn handle_vclog() -> HttpResponse {
+    let (_, _, _, _, _, _, _, vclog) = hdmi_status();
+    let json = format!(r#"{{"vclog":"{}"}}"#, vclog);
+    let mut response = HttpResponse::ok(&json);
+    response.add_header("Content-Type", "application/json");
+    response
 }
 
 fn text_field(bytes: &[u8]) -> String {
