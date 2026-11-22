@@ -58,11 +58,12 @@
 //!      irq_rearms, tx_full, tx_slow. `dns_inflight` is the forward queue depth.
 //!  67  firmware(op, ...). Staged SD updates. Op 10 promotes, op 11 rolls back. See `fw::syscall`.
 //!  68  sd_status(buf, cap) -> 64. state[16], error[32], blocks u32, mounted u32.
-//!  69  hdmi_console(buf, cap) -> 416. Four little-endian u32s
+//!  69  hdmi_console(buf, cap) -> 432. Four little-endian u32s
 //!      (state, width, height, recoveries), then 80 bytes of `hdmi_diag`,
-//!      then 160 bytes of `hdmi_last_shut`, then 160 bytes of `hdmi_regs`.
-//!      The texts are NUL padded. State 0 none, 1 up, 2 fallback, 3 released.
-//!      Virt and Pi 5 return zeros and the text `none`.
+//!      then 160 bytes of `hdmi_last_shut`, then 160 bytes of `hdmi_regs`,
+//!      then 16 bytes of `hdmi_port`. The texts are NUL padded. State 0
+//!      none, 1 up, 2 fallback, 3 released. Virt and Pi 5 return zeros
+//!      and the text `none`.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -1173,10 +1174,11 @@ fn config_remove(ptr: u64, len: u64) -> i64 {
 }
 
 /// Four little-endian u32s, 80 bytes of `hdmi_diag`, 160 bytes of
-/// `hdmi_last_shut`, then 160 bytes of `hdmi_regs`. State is 0 none,
-/// 1 up, 2 fallback, 3 released. Virt and Pi 5 write zeros and `none`.
+/// `hdmi_last_shut`, 160 bytes of `hdmi_regs`, then 16 bytes of
+/// `hdmi_port`. State is 0 none, 1 up, 2 fallback, 3 released. Virt and
+/// Pi 5 write zeros and `none`.
 fn hdmi_console(ptr: u64, cap: u64) -> i64 {
-    const N: usize = 416;
+    const N: usize = 432;
     if cap < N as u64 || !crate::mmu::user_write_ok(ptr, N as u64) {
         return EFAULT;
     }
@@ -1189,7 +1191,8 @@ fn hdmi_console(ptr: u64, cap: u64) -> i64 {
     }
     let _ = crate::board::hdmi_diag(&mut raw[16..96]);
     let _ = crate::board::hdmi_last_shut(&mut raw[96..256]);
-    let _ = crate::board::hdmi_regs(&mut raw[256..]);
+    let _ = crate::board::hdmi_regs(&mut raw[256..416]);
+    let _ = crate::board::hdmi_port(&mut raw[416..432]);
     if write_user(ptr, &raw) { N as i64 } else { EFAULT }
 }
 

@@ -30,20 +30,25 @@
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
 //!
-//! A soft reboot first reads the HDMI, DVP, PHY, HVS, and pixel-valve
-//! registers and writes that line to `HDMISHUT.TXT` before it changes
-//! any of them. The same read, with no writes, is taken when the console
-//! comes up and published as `hdmi_regs`. The PHY and DVP are then left
-//! the way Linux leaves them (`vc5_hdmi_phy_disable`, DVP reset pulsed,
-//! 108 MHz clocks left running). A watchdog does not reset that block,
-//! and `PM_RSTC` full reset cannot be made to look like a power-on: the
-//! hardware sets the watchdog reason bits as the reset happens. The
-//! kernel then sends `NOTIFY_REBOOT` (`0x00030048`, no payload), blanks
-//! and releases the framebuffer, and powers off HDMI domain 6 and scaler
-//! domain 4. The mailbox calls share a one-second budget. A miss does
-//! not stop the watchdog. The next boot shows the pre-write line in
-//! `hdmi_last_shut`. Halt and panic do not do this: those paths do not
-//! reboot, and the fault text has to stay on the panel.
+//! A soft reboot first reads both HDMI ports and writes that line to
+//! `HDMISHUT.TXT` before it changes any of them. The same read, with no
+//! writes, is taken when the console comes up and published as
+//! `hdmi_regs`. The port whose hot-plug bit is set (HDMI1 on this board,
+//! pixelvalve4) is the one that is reset. HDMI0 is left alone when its
+//! hot-plug bit is clear. `raspberrypi-power.h` has one HDMI domain,
+//! firmware id 6, shared by both ports. The last domain write is on, for
+//! that id and for scaler id 4. Leaving them off dropped HDMI1: the next
+//! boot saw hot-plug 0, pixelvalve4 off, and PHY power `0x7ff`. The PHY
+//! is pulsed and then written back to the pair measured while the
+//! picture was up (`0x0f` and `0x400`). `0x7ff` is never written. The
+//! pixel valve enable is not cleared: the watchdog does not reset that
+//! block, and a cleared enable is the failed state. The kernel then
+//! sends `NOTIFY_REBOOT` (`0x00030048`, no payload) and blanks and
+//! releases the framebuffer. The mailbox calls share a one-second
+//! budget. A miss does not stop the watchdog. The next boot shows the
+//! pre-write line in `hdmi_last_shut`. Halt and panic do not do this:
+//! those paths do not reboot, and the fault text has to stay on the
+//! panel.
 //!
 //! The legacy `SET_POWER_STATE` id 5 is I2C1, not HDMI. 0.1.69 cycled it
 //! and the firmware refused it. 0.1.70 used the real domain ids and the
@@ -51,12 +56,13 @@
 //! because the PHY and hot-plug block had not been reset. Pi 4's PM block
 //! does not implement the old HDMI power switches.
 //!
-//! If the physical size is missing, the console resets the PHY and DVP,
-//! cycles domains 6 and 4, reads EDID from the mailbox and from the HDMI
-//! DDC block, and queries the size again. A size the firmware reports is
-//! kept. A mode parsed from a real EDID block is tried before 1280x720
-//! and 640x480. Blank is only sent on the way into a reset. None of this
-//! runs on virt or Pi 5.
+//! If the physical size is missing, the console turns domains 6 and 4 on
+//! (it does not power them off), resets the PHY and DVP of the detected
+//! port, and if neither port shows hot-plug or a live pixel valve it
+//! services both. DDC is read on those ports, then the mailbox EDID tag.
+//! A size the firmware reports is kept. A mode parsed from a real EDID
+//! block is tried before 1280x720 and 640x480. Blank is only sent on the
+//! way into a reset. None of this runs on virt or Pi 5.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -184,6 +190,9 @@ static SHUT_LEN: AtomicU8 = AtomicU8::new(0);
 const REGS_CAP: usize = 160;
 static mut REGS: [u8; REGS_CAP] = [0; REGS_CAP];
 static REGS_LEN: AtomicU8 = AtomicU8::new(0);
+const PORT_CAP: usize = 16;
+static mut PORT: [u8; PORT_CAP] = [0; PORT_CAP];
+static PORT_LEN: AtomicU8 = AtomicU8::new(0);
 static EDID_W: AtomicU32 = AtomicU32::new(0);
 static EDID_H: AtomicU32 = AtomicU32::new(0);
 const SHUT_FILE: &str = "HDMISHUT.TXT";
@@ -250,6 +259,17 @@ pub fn copy_regs(out: &mut [u8]) -> usize {
     )
 }
 
+/// `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or `none`. Empty until the console
+/// has sampled hot-plug. The caller prints `none`.
+pub fn copy_port(out: &mut [u8]) -> usize {
+    copy_text(
+        out,
+        addr_of!(PORT).cast::<u8>(),
+        PORT_LEN.load(Ordering::Acquire) as usize,
+        PORT_CAP,
+    )
+}
+
 /// Read `HDMISHUT.TXT` after the filesystem is mounted. A missing file
 /// leaves `hdmi_last_shut` as `none`.
 pub fn load_last_shut() {
@@ -263,10 +283,11 @@ pub fn load_last_shut() {
     set_shut(core::str::from_utf8(&raw[..n]).unwrap_or(""));
 }
 
-/// Reset the HDMI block, tell the firmware a restart is coming, and power
-/// the HDMI and scaler domains off. IRQs stay unmasked. The mailbox calls
-/// give up after one second. The watchdog still runs after this. The
-/// register dump is stored for `HDMISHUT.TXT` before any HDMI write.
+/// Reset the connected HDMI port, tell the firmware a restart is coming,
+/// and leave the shared HDMI and scaler domains on. IRQs stay unmasked.
+/// The mailbox calls give up after one second. The watchdog still runs
+/// after this. The register dump is stored for `HDMISHUT.TXT` before any
+/// HDMI write.
 pub fn prepare_reboot() {
     report_shut("hdmi shut start", true);
     if crate::percpu::live() {
@@ -289,10 +310,11 @@ pub fn prepare_reboot() {
     log_shut("hdmi shut blank", blank, true);
     let release = shut_step(start, budget, &release_msg());
     log_shut("hdmi shut release", release, false);
-    let hdmi = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 0));
-    log_shut("hdmi shut d6", hdmi, false);
-    let scaler = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 0));
-    log_shut("hdmi shut d4", scaler, false);
+    report_shut("hdmi dom fw6 shared", false);
+    let hdmi = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 1));
+    log_shut("hdmi shut d6 on", hdmi, false);
+    let scaler = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 1));
+    log_shut("hdmi shut d4 on", scaler, false);
     let rsts = crate::hdmi_hw::pm_rsts();
     let mut line = Line::new();
     line.push("n=");
@@ -610,25 +632,27 @@ fn ask_fallback(attempt: u32) -> bool {
 }
 
 fn recover_power() {
-    // Only reached when the firmware reported no size. Reset the PHY
-    // while the domain is still on, cycle domains 6 and 4, then release
-    // the PHY and read DDC. Legacy SET_POWER_STATE id 5 is I2C1.
-    let pre = crate::hdmi_hw::quiesce();
-    log_hw("hdmi recover hpd", &pre, false);
-    let d6_off = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 0));
-    log_boot("hdmi recover d6 off", d6_off);
-    wait_ms(20);
+    // Only reached when the firmware reported no size. Domain 6 is the
+    // one HDMI domain in `raspberrypi-power.h` (DT index 5). Powering it
+    // off, and scaler domain 4 off, is what left HDMI1 with hot-plug 0
+    // and PHY power `0x7ff`. The last write is on. If no port was
+    // visible, `boot_recover` services both rather than assuming HDMI0.
+    // Legacy SET_POWER_STATE id 5 is I2C1 and is not used.
+    if crate::hdmi_hw::port_mask() == 0 {
+        save_line("hdmi recover both");
+    } else {
+        let mut line = Line::new();
+        line.push("hdmi recover ");
+        line.push(crate::hdmi_hw::port_text());
+        save_line(line.text());
+    }
     let d6_on = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 1));
     log_boot("hdmi recover d6 on", d6_on);
-    wait_ms(50);
-    let d4_off = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 0));
-    log_boot("hdmi recover d4 off", d4_off);
-    wait_ms(20);
     let d4_on = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 1));
     log_boot("hdmi recover d4 on", d4_on);
-    wait_ms(50);
     let post = crate::hdmi_hw::boot_recover();
-    log_hw("hdmi recover hpd2", &post, false);
+    set_port(crate::hdmi_hw::port_text());
+    log_hw("hdmi recover hpd", &post, false);
     log_hw_regs("hdmi recover reg", &post, false);
     let edid = log_edid();
     if edid.2 != 0 && edid.3 != 0 {
@@ -762,17 +786,24 @@ fn set_regs(text: &str) {
     store_text(text, addr_of_mut!(REGS).cast(), REGS_CAP, &REGS_LEN);
 }
 
+fn set_port(text: &str) {
+    store_text(text, addr_of_mut!(PORT).cast(), PORT_CAP, &PORT_LEN);
+}
+
 fn record_regs(draw: bool) {
     let snap = crate::hdmi_hw::snapshot();
     log_bases(draw);
     log_snap(&snap, draw);
     set_regs(format_snap(&snap).text());
+    set_port(crate::hdmi_hw::port_text());
 }
 
 fn log_bases(draw: bool) {
     emit_hw("hdmi base lo=FEF00700 phy=FEF00F00 hd=FEF20000", draw);
+    emit_hw("hdmi base h1=FEF05700 phy1=FEF05F00 pv4=FE216000", draw);
     emit_hw("hdmi base clk=FEF00000 hvs=FE400000 pv2=FE20A000", draw);
     emit_hw("hdmi base hi=47EF00700 dvp=FEF00300 aon=FEF00100", draw);
+    emit_hw("hdmi clk m2mc 13 bvb 14 dvp bit3 bit4", draw);
     if crate::hdmi_hw::using_hi() {
         emit_hw("hdmi aperture 35bit", draw);
     }
@@ -788,21 +819,35 @@ fn log_snap(snap: &crate::hdmi_hw::Snap, draw: bool) {
     a.hex32(snap.vid);
     emit_hw(a.text(), draw);
     let mut b = Line::new();
-    b.push("hdmi regs phy=");
+    b.push("hdmi regs phy0=");
     b.hex32(snap.phy);
-    b.push(" pwr=");
+    b.push(" pwr0=");
     b.hex32(snap.pwr);
     b.push(" sw=");
     b.hex32(snap.sw);
     emit_hw(b.text(), draw);
+    let mut b1 = Line::new();
+    b1.push("hdmi regs phy1=");
+    b1.hex32(snap.phy1);
+    b1.push(" pwr1=");
+    b1.hex32(snap.pwr1);
+    emit_hw(b1.text(), draw);
     let mut c = Line::new();
     c.push("hdmi regs clk=");
     c.hex32(snap.clk);
     c.push(" hvs=");
     c.hex32(snap.hvs);
-    c.push(" pv=");
-    c.hex32(snap.pv);
     emit_hw(c.text(), draw);
+    let mut c1 = Line::new();
+    c1.push("hdmi regs pv0=");
+    c1.hex32(snap.pv);
+    c1.push(" pv1=");
+    c1.hex32(snap.pv4);
+    emit_hw(c1.text(), draw);
+    let mut port = Line::new();
+    port.push("hdmi port ");
+    port.push(crate::hdmi_hw::port_text());
+    emit_hw(port.text(), draw);
     let mut d = Line::new();
     d.push("hdmi regs h1=");
     d.hex32(snap.h1);
@@ -840,28 +885,38 @@ fn log_snap(snap: &crate::hdmi_hw::Snap, draw: bool) {
 
 fn format_snap(snap: &crate::hdmi_hw::Snap) -> Note {
     let mut note = Note::new();
-    note.push("hot=");
+    note.push("p=");
+    match crate::hdmi_hw::active_ports(snap) {
+        0 => note.push("-"),
+        mask => {
+            if mask & 1 != 0 {
+                note.push("0");
+            }
+            if mask & 2 != 0 {
+                note.push("1");
+            }
+        }
+    }
+    note.push(" h0=");
     note.hex32(snap.hot);
-    note.push(" sch=");
-    note.hex32(snap.sch);
-    note.push(" vid=");
-    note.hex32(snap.vid);
-    note.push(" phy=");
-    note.hex32(snap.phy);
-    note.push(" pwr=");
-    note.hex32(snap.pwr);
-    note.push(" sw=");
-    note.hex32(snap.sw);
-    note.push(" clk=");
-    note.hex32(snap.clk);
-    note.push(" hvs=");
-    note.hex32(snap.hvs);
-    note.push(" pv=");
-    note.hex32(snap.pv);
     note.push(" h1=");
     note.hex32(snap.h1);
-    note.push(" hi=");
-    note.hex32(snap.hi);
+    note.push(" phy0=");
+    note.hex32(snap.phy);
+    note.push(" pwr0=");
+    note.hex32(snap.pwr);
+    note.push(" phy1=");
+    note.hex32(snap.phy1);
+    note.push(" pwr1=");
+    note.hex32(snap.pwr1);
+    note.push(" pv0=");
+    note.hex32(snap.pv);
+    note.push(" pv1=");
+    note.hex32(snap.pv4);
+    note.push(" hvs=");
+    note.hex32(snap.hvs);
+    note.push(" clk=");
+    note.hex32(snap.clk);
     note
 }
 
@@ -940,13 +995,25 @@ fn log_hw(label: &str, ports: &crate::hdmi_hw::Ports, draw: bool) {
 fn log_hw_regs(label: &str, ports: &crate::hdmi_hw::Ports, draw: bool) {
     let mut line = Line::new();
     line.push(label);
-    line.push(" phy=");
+    line.push(" phy0=");
     line.hex32(ports.phy0);
-    line.push(" dvp=");
-    line.hex32(ports.dvp);
-    line.push(" clk=");
-    line.hex32(ports.clk);
+    line.push(" pwr0=");
+    line.hex32(ports.pwr0);
     emit_hw(line.text(), draw);
+    let mut other = Line::new();
+    other.push(label);
+    other.push(" phy1=");
+    other.hex32(ports.phy1);
+    other.push(" pwr1=");
+    other.hex32(ports.pwr1);
+    emit_hw(other.text(), draw);
+    let mut gates = Line::new();
+    gates.push(label);
+    gates.push(" dvp=");
+    gates.hex32(ports.dvp);
+    gates.push(" clk=");
+    gates.hex32(ports.clk);
+    emit_hw(gates.text(), draw);
     if ports.edid_w != 0 && ports.edid_h != 0 {
         let mut mode = Line::new();
         mode.push(label);

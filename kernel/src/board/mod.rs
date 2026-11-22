@@ -195,6 +195,15 @@ pub trait Board {
         n
     }
 
+    /// Connected HDMI port: `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or `none`.
+    /// Virt and Pi 5 report `none`.
+    fn hdmi_port(out: &mut [u8]) -> usize {
+        let text = b"none";
+        let n = text.len().min(out.len());
+        out[..n].copy_from_slice(&text[..n]);
+        n
+    }
+
     /// Shut down or reboot this guest. `reset` selects reboot.
     /// A successful call does not return. `true` means the platform refused
     /// and this guest is still running.
@@ -363,6 +372,10 @@ pub fn hdmi_last_shut(out: &mut [u8]) -> usize {
 
 pub fn hdmi_regs(out: &mut [u8]) -> usize {
     <Active as Board>::hdmi_regs(out)
+}
+
+pub fn hdmi_port(out: &mut [u8]) -> usize {
+    <Active as Board>::hdmi_port(out)
 }
 
 pub fn power(reset: bool) -> bool {
