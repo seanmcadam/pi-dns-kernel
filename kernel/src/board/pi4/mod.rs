@@ -190,6 +190,10 @@ impl Board for Pi4 {
         crate::fb_con::console_status()
     }
 
+    fn hdmi_diag(out: &mut [u8]) -> usize {
+        crate::fb_con::copy_diag(out)
+    }
+
     fn power(reset: bool) -> bool {
         watchdog_power(reset)
     }
@@ -278,10 +282,12 @@ fn get_reboot_flag() -> Option<u32> {
 /// full reset without those bits reboots. A missing register is left alone.
 /// `true` means the board is still up.
 fn watchdog_power(reset: bool) -> bool {
-    // The caller already cleared the IRQ mask. Releasing the framebuffer
-    // uses that window and its own timeout. Halt and panic do not come
-    // through here, so a fault line stays on the panel.
-    crate::fb_con::release_for_reset();
+    // Halt is not a restart: Linux only notifies the firmware on reboot,
+    // and a halt should leave the fault or status text on the panel.
+    // A refused mailbox does not skip the watchdog.
+    if reset {
+        crate::fb_con::prepare_reboot();
+    }
     const PM_BASE: u64 = 0xFE10_0000;
     const PM_PASSWORD: u32 = 0x5a00_0000;
     const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;

@@ -11,20 +11,24 @@ report 640x480 and left the rainbow up. The network updater still does
 not rewrite the live `config.txt`. If that line was copied onto the card,
 it has to be removed by mounting the card.
 
-A watchdog or tryboot reboot releases the framebuffer (mailbox tag
-`0x00048001`) and tries the blank tag (`0x00040002`) first. Both are
-bounded by the mailbox timeout and do not hold the reset. If boot then
-sees a 0x0 size, it power-cycles firmware power domain 5, waits, reads
-EDID block 0 (`0x00030020`), and queries the size again. A size the
-firmware reports is kept. Only a size that is still missing asks for
-1280x720 and then 640x480. `/status` shows `hdmi_state`, `hdmi_mode`,
-and `hdmi_recoveries`.
+A watchdog or tryboot reboot first sends `NOTIFY_REBOOT` (`0x00030048`,
+the tag Linux sends before it arms the watchdog), then blanks and
+releases the framebuffer, then powers off firmware domains 6 (HDMI) and
+4 (HVS scaler) with `SET_DOMAIN_STATE` (`0x00038030`). The sequence is
+bounded by one second and does not hold the reset. `SET_POWER_STATE` id
+5 is I2C1, not HDMI; 0.1.69 cycled that id and the firmware refused it.
+If the next boot still sees a 0x0 size, it cycles domains 6 and 4 off
+and on, reads EDID block 0 (`0x00030020`), and queries the size again.
+A size the firmware reports is kept. Only a size that is still missing
+asks for 1280x720 and then 640x480. `/status` shows `hdmi_state`,
+`hdmi_mode`, `hdmi_recoveries`, and `hdmi_diag` (the response codes).
 
-Domain 5 is the old single-HDMI power id. Pi 4 has two HDMI ports, and
-the firmware may answer that the device does not exist. Blank is not
-used on a good boot: sending it while a mode already existed dropped
-this board to no signal. The release and power replies are logged so a
-refused tag is visible. Virt and Pi 5 do not run this path.
+Pi 4's PM block does not implement the old HDMI power switches, so this
+path does not poke `PM_HDMI`. Whether `start4.elf` resets the HDMI PHY
+when it sees `NOTIFY_REBOOT` is what a soft reboot on the board has to
+show. Blank is not used on a good boot: sending it while a mode already
+existed dropped this board to no signal. Virt and Pi 5 do not run this
+path.
 
 On power-up the green LED flickers, stays solid for several seconds, and
 may blink once as the firmware reads the card. That pattern is
