@@ -1,24 +1,67 @@
-# Architecture Documentation
+# Architecture
 
-## Current address space
+This is a bare-metal DNS appliance. The kernel is `no_std` Rust. It does not run Linux. One Cargo feature selects the board, and the rest of the tree calls `crate::board` instead of naming that feature.
 
-The kernel is linked in the upper half and runs from TTBR1. QEMU loads the raw image at physical `0x40080000` and the link address is `0xFFFF000040080000`. The Pi 4 firmware loads the raw image at physical `0x80000` and the link address is `0xFFFF000000080000`. That Pi 4 image has not been tested on hardware. Bits 47:0 of a kernel virtual address equal the physical address.
+| Image | Feature | Load address | Link address | Output | NIC | Block |
+| --- | --- | --- | --- | --- | --- | --- |
+| QEMU virt | `board-virt` (default) | `0x40080000` | `0xFFFF000040080000` | `boot/kernel8.img` | virtio-net | virtio-blk |
+| Raspberry Pi 4 | `board-pi4` | `0x80000` | `0xFFFF000000080000` | `boot/pi4/kernel8.img` | GENET | EMMC2, then the legacy Arasan |
+| Raspberry Pi 5 | `board-pi5` | `0x200000` | `0xFFFF000000200000` | `boot/pi5/kernel_2712.img` | not driven (RP1 is behind PCIe) | `sdio1` |
 
-`boot.s` drops EL2 to EL1 when it entered at EL2, builds a 1 GiB block map, turns the MMU on, jumps to the high PC, and clears TTBR0. Rust then installs a strict TTBR1 map: kernel text is read-only and executable, rodata is read-only, data is not executable, `.dma` is Normal non-cacheable, devices are Device-nGnRE, and one guard page under the stack is unmapped. Devices are given physical addresses. The CPU uses the high alias.
+`./scripts/build.sh` builds virt. `./scripts/build.sh pi4` and `./scripts/build-pi4.sh` pass `--no-default-features --features board-pi4,dhcp-default`. `./scripts/build.sh pi5` and `./scripts/build-pi5.sh` pass `--no-default-features --features board-pi5`. The target is `aarch64-unknown-none`. `kernel/build.rs` copies the selected link script and links the EL0 programs.
 
-TTBR0 holds only the EL0 window, in its own page tables:
+The Pi 4 image is the one that runs on the board: PL011, EMMC, GENET, the firmware framebuffer, and the network updater. QEMU `raspi4b` (9.0 or newer; the install script is QEMU 10) boots that image far enough to check the UART, the upper-half map, four cores, FAT, and the log task. That machine has no GENET, so DNS, HTTP, and telnet stay down there. The Pi 5 image links and is not booted. QEMU has no Pi 5 machine. The integration stage then boots the virt image with `-cpu cortex-a76`.
+
+## Boot
+
+`kernel/src/boot.s` runs on core 0. Cores that enter `_start` instead of the secondary entry park. The sequence drops EL2 to EL1 when the CPU entered at EL2, sets the stack at the load address, zeroes BSS, builds a 1 GiB block map, turns the MMU on, jumps to the high link address, and clears TTBR0. Rust then installs the strict TTBR1 map. Kernel text is read-only and executable, rodata is read-only, data is not executable, `.dma` is Normal non-cacheable, devices are Device-nGnRE, and one guard page under the stack is unmapped. Devices are programmed with physical addresses. The CPU uses the high alias. Bits 47:0 of a kernel virtual address are the physical address.
+
+`kernel_main` in `kernel/src/main.rs`:
+
+1. On Pi 4, `fb_con::start_early` reads the firmware framebuffer before the UART and before the strict map. A hang in either of those used to leave the rainbow up. This step does not write the HDMI block. See HDMI below.
+2. Board early init, then the strict MMU. On Pi 4 the framebuffer is switched to a non-cacheable window and the firmware message log is copied.
+3. Bump allocator (2 MiB, never frees), logger, ARM virtual timer, GIC.
+4. Secondary cores. Virt and Pi 5 use PSCI `CPU_ON` (`0xC4000003`). Virt's conduit is HVC. With `-M virt,virtualization=on` that HVC stops at EL2 and the extra cores stay offline. The default virt machine has no EL2, so `-smp 4` brings all four up. Pi 5 uses SMC and affinity `cpu << 8`. Pi 4 does not use PSCI. It writes the spin-table release words at `0xE0`, `0xE8`, and `0xF0` (core n at `0xD8 + 8*n`), cleans the line, and sends an event. If the firmware stub is not parked on those words, the stores hit RAM and the extra cores stay offline.
+5. A short EL0 boot test, then the FAT volume, Pi 4 `HDMISHUT.TXT`, firmware scrub and boot report, and `CONFIG.JSN`.
+6. The NIC. A missing device skips DNS, HTTP, and telnet. The log task still starts. That is the raspi4b case and the Pi 5 image.
+7. Supervisor slots: log, then DNS, HTTP, and telnet when the NIC is up, VNC when `display.vnc` is 1, and the EL0 HDMI process when `display.hdmi` is 1 and the board has a controller.
+8. The poll loop drives the NIC, the user tasks, the power command, and the firmware pump. On Pi 4 a stall checkpoint halts, and does not reboot, if the network owner stays inside one poll.
+
+Each core has its own stack, its own virtual timer, and its own GIC CPU interface. `TPIDR_EL1` holds that core's current thread. The published tick count is core 0's 100 Hz counter. The other cores preempt and do not add to it. Uptime is `CNTVCT` since boot, because QEMU does not clear the counter on reset.
+
+### Pi 5 map
+
+`boot.s` widens `TCR_EL1.IPS` to 40-bit physical addresses so the early map can cover the SoC window at `0x10_0000_0000`. That window is two 1 GiB device blocks in the early tables and 2 MiB blocks in the strict map. RAM above 4 GiB is not mapped. The debug UART is `uart10` at `0x107d001000`. The GIC-400 distributor is `0x107fff9000` and the CPU interface is `0x107fffa000`. The SD host is `sdio1` at `0x1000fff000`. The first register read is fault-catching, so a missing window fails the probe instead of halting. Card power and card detect are not programmed. RP1 Ethernet is a Cadence GEM behind `pcie2`. Link training, ECAM, the RP1 BAR, and a MAC driver are not in this image.
+
+## EL0
+
+TTBR0 holds only the user window, in its own page tables:
 
 - code `0x1_0000_0000`, 512 KiB, EL0 read/execute
 - a gap, then data `0x1_0009_0000`, 64 KiB
 - heap `0x1_000A_0000`, 1536 KiB
 - stack `0x1_0022_0000`, 64 KiB
 
-User pages are non-global. The boot test and the DNS task use ASID 1. The HTTP task uses ASID 2. The spinner uses ASID 3. The log task uses ASID 4. Threads of one process share that process's TTBR0 root and ASID. A switch between those threads does not flush the TLB. A map change uses `tlbi vmalle1is` and `dsb ish`, so the maintenance is inner-shareable and reaches every core. EL0 cannot walk TTBR1, so a user access to kernel memory faults and kills that task. The DNS resolver, the HTTP dashboard, and the log task each run in this window, in separate page tables. The kernel keeps the NIC, the smoltcp sockets, storage, and the config file. A task yields when a socket would block. A timer IRQ at EL0 also returns to the poll loop after two 10 ms ticks, and that loop polls the NIC before running the next task. The published tick count is core 0's 100 Hz counter. The other cores arm their own virtual timers and preempt, and they do not add to that counter.
+User pages are non-global. Threads of one process share that process's TTBR0 root and ASID. A switch between those threads does not flush the TLB. A map change uses `tlbi vmalle1is` and `dsb ish`. EL0 cannot walk TTBR1, so a user access to kernel memory faults and kills that task. PAN is enabled when the CPU implements it.
 
-Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
+Supervised slots:
+
+| Slot | Process | Preferred ASID | Started |
+| --- | --- | --- | --- |
+| 0 | DNS | 1 | with a NIC |
+| 1 | HTTP | 2 | with a NIC |
+| 2 | spinner | 3 | from the dashboard |
+| 3 | log | 4 | always |
+| 4 | telnet | 5 | with a NIC |
+| 5 | VNC | 6 | `display.vnc` is 1 |
+| 6 | HDMI | 7 | `display.hdmi` is 1 and the board has HDMI |
+
+The boot self-test runs on slot 0 with ASID 1, then DNS reuses that id. The kernel keeps the NIC, the smoltcp sockets, storage, and the config. A task yields when a socket would block. A timer IRQ at EL0 returns to the poll loop after two 10 ms ticks. The supervisor restarts dns, http, log, telnet, and an armed spinner. The delay starts at 100 ms and doubles up to 10 seconds, and it resets after 60 healthy seconds. Five deaths in 60 seconds leave that service down. Config is not touched. `GET /debug` shows each service, free user pages, held ASIDs, and open fds.
+
+Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`. A pointer outside the user window returns `-2` and is not touched. A store into user code is the same. `-1` is an unknown number, `-3` a bad fd, `-4` a bad argument, `-5` I/O, `-6` too many fds or threads, `-7` text that does not fit, and `-11` means try again. Packet and config buffers are at most 4096 bytes. Each task has 24 fds.
 
 | x8 | Call |
-|----|------|
+| --- | --- |
 | 0 | `log(ptr, len)` |
 | 1 | `yield` |
 | 2 | `uptime_ticks` |
@@ -29,497 +72,217 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`:
 | 7 | `udp_send(fd, buf, len, ip, port)` |
 | 8 | `tcp_listen(port)` |
 | 9 | `tcp_accept(fd)` |
-| 10 | `tcp_recv(fd, buf, cap)` |
+| 10 | `tcp_recv(fd, buf, cap, flags)`. `flags` 1 returns `-11` instead of sleeping |
 | 11 | `tcp_send(fd, buf, len)` |
 | 12 | `tcp_close(fd)` |
-| 13 | `config_records(buf, cap)` |
-| 14 | `config_upstreams(buf, cap)` |
-| 15 | `config_blocklist(buf, cap)` |
-| 16 | `config_cache_size` |
+| 13–16 | config records, upstreams, blocklist, cache size |
 | 17 | `set_cache_entries(n)` |
-| 18 | `auth(user, user_len, pass, pass_len)` |
-| 19 | `config_add(buf, len)` |
-| 20 | `config_remove(buf, len)` |
-| 21 | `uptime_secs` |
-| 22 | `cache_entries` |
-| 23 | `fault_guard` |
-| 24 | `fault_text` |
-| 25 | `http_info(buf, cap)` |
-| 26 | `tick_hz` |
-| 27 | `debug_spin` |
-| 28 | `log_post(ptr, len)` |
-| 29 | `log_drain(buf, cap)` |
-| 30 | `log_emit(ptr, len)` |
-| 31 | `log_recent(buf, cap)` |
-| 32 | `file_read(name, name_len, buf, cap)` |
-| 33 | `file_write(name, name_len, buf, len, flags)` |
-| 34 | `thread_create(entry, stack, arg)` |
-| 35 | `thread_exit(code)` |
-| 36 | `thread_join(tid)` |
-| 37 | `futex_wait(addr, expected)` |
-| 38 | `futex_wake(addr, n)` |
-| 39 | `log_publish(ptr, len)` |
-| 40 | `log_follow(cursor, buf, cap, drops)` |
-| 41 | `log_wake()` |
-| 42 | `debug_status(buf, cap)` |
-| 43 | `debug_crash(slot, worker)` |
-| 44 | `thread_try_join(tid)` |
-| 45 | `log_reload` |
-| 46 | `config_read(which, buf, cap)` |
-| 47 | `config_write(which, buf, len, err, err_cap)` |
-| 48 | `log_fill(n)` |
-| 49 | `config_set_cache(slots, secs, err, err_cap)` |
-| 50 | `config_cache_reap` |
-| 51 | `timer_ticks` |
-| 52 | `timer_freq` |
-| 53 | `set_cache_stats(ptr)` |
-| 54 | `cache_plant(op, ttl)` |
+| 18 | `auth` |
+| 19–20 | `config_add`, `config_remove` |
+| 21–22 | `uptime_secs`, `cache_entries` |
+| 23–24 | `fault_guard`, `fault_text`. Do not return |
+| 25–27 | `http_info`, `tick_hz`, `debug_spin` |
+| 28–33 | log post, drain, emit, recent, file read, file write |
+| 34–38 | `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake` |
+| 39–44 | log publish and follow, supervisor status, crash, `thread_try_join` |
+| 45–50 | log reload, config read and write, log fill, cache set, cache reap |
+| 51–54 | timer ticks and frequency, cache stats, cache plant |
+| 55 | `display_io`. HDMI mailbox and framebuffer, plus VNC settings |
+| 56 | `display_set`. Writes `display` in `CONFIG.JSN` and queues the supervisor |
+| 57 | `set_dns_top` |
+| 58 | `power`. 0 queries, 1 shutdown, 2 reboot, 3 tryboot |
+| 59 | `vnc_ctrl` |
+| 60–63 | upstream health publish and read, probe interval, `net_ready` |
+| 64 | `net_counters`. Five `u64`s: IRQs, RX, TX, busy ms, idle ms |
+| 65 | `set_dns_load` |
+| 66 | `net_extra`. ARP, DNS load, RX faults, poll time, IRQ rearms, TX stalls |
+| 67 | `firmware`. Staged SD updates. Op 10 promotes, op 11 rolls back |
+| 68 | `sd_status` |
+| 69 | `hdmi_console`. 736 bytes: state, size, recoveries, diag, last shut, regs, port, vclog |
 
-`log_publish` is the log task only. It copies one line into a kernel ring and returns. It does not wait. `log_follow` copies the next line for that cursor and writes the new cursor and how many lines were skipped. It sleeps until a line is published, unless its fifth argument is `1`, in which case it returns `0`. `tcp_recv` takes a fourth argument: `1` returns `-11` instead of sleeping when the peer has not sent data. Anything else returns `-1`. `-2` is a bad user pointer. `-4` is a bad argument. `-6` means the thread table is full. `-11` means try again. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned. `futex_wait` and `futex_wake` require a 4-byte-aligned user address. The kernel re-reads the word under the scheduler lock, so a wake that lands before the wait returns a mismatch and the caller retries. The older sections below describe earlier revisions of this tree.
-
-QEMU is started with `-smp 4`. Core 0 brings the other three up with PSCI `CPU_ON` (`0xC4000003`) through HVC. This QEMU virt machine's PSCI conduit is HVC; SMC from EL1 is undefined because EL3 is not implemented. When the CPU implements EL2 (`-M virt,virtualization=on`), that HVC is delivered to EL2 instead of the firmware, and the extra cores stay offline. The default virt machine does not implement EL2, so all four cores come up. Each core has its own stack, its own virtual timer, and its own GICv2 CPU interface. `TPIDR_EL1` points at that core's current thread. The Pi 4 build does not use PSCI. It writes the physical entry to the spin-table release addresses `0xE0`, `0xE8`, and `0xF0` (core n at `0xD8 + 8*n`), cleans the line, and sends an event. That path is untested on hardware. If the firmware stub is not parked on those words, the stores hit RAM and the extra cores stay offline.
+`log_publish` is the log task only. It copies one line into a kernel ring and returns. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned.
 
 Lock order, outermost first. A holder may take a later lock and must not take an earlier one.
 
-1. `SCHED` — run queue, thread state, futex waiters, join waiters, and socket sleepers. IRQ-safe. The timer IRQ does not take it.
-2. `FD` — one lock per EL0 task, for that task's file descriptors. Not IRQ-safe. A socket syscall drops it before sleeping.
-3. `CONFIG` — config records. Not IRQ-safe.
-4. `FS` — the FAT volume. One lock, any core. Not IRQ-safe.
-5. `LOGQ` — the log queue and the recent-log buffer. Not IRQ-safe.
+1. `SCHED`. Run queue, thread state, futex waiters, join waiters, and socket sleepers. IRQ-safe. The timer IRQ does not take it.
+2. `FD`. One lock per EL0 task. A socket syscall drops it before sleeping.
+3. `CONFIG`.
+4. `FS`. One FAT lock. The library is not reentrant and the block device has one command slot.
+5. `LOGQ`.
 
-The telnet fan-out is not a lock. The log task publishes each line once into a fixed ring. A reader that falls behind skips ahead. Waking a reader takes `SCHED` and no other lock. The supervisor lock is taken alone and dropped before any lock in this list. When the log task is down, a crash line is written to the UART and the fan directly so a telnet reader is not left waiting on that task.
+The telnet fan-out is not a lock. The supervisor lock is taken alone and dropped before any lock in this list. smoltcp and the NIC are not behind a lock. One core owns them. No IRQ handler takes `SCHED`, `FS`, or the disk mutex.
 
-smoltcp and the NIC are not behind a lock. Core 1 owns them once the stack is up. It sleeps in `wfi` until the virtio used-ring IRQ, an SGI from a core that queued a socket job, or the timer, which is also how smoltcp `poll_delay` is serviced. If none of those are pending it runs one user thread, so network work stays ahead of user work and the core is not busy-polling. Core 0 owns the NIC until that handoff, and on a one-core boot, and drives on the same conditions from its loop. Other cores push a socket request onto a lock-free ring, send SGI 1 to the owner, and sleep. The owner copies the result into the caller's user buffer and wakes the thread. It may take `FD` to publish a new socket, then drop it, then take `SCHED`. `FS` stays one lock because the FAT library is not reentrant and the block device has one command slot. The virtio-blk waiter holds the disk mutex and sleeps on `wfe`; the IRQ handler does not take that mutex or any lock above. It acknowledges the device and the GIC and stores an atomic. A kick that arrives after the idle check is not lost: the owner rechecks with IRQs masked, and `wfi` returns while the interrupt is still pending. The timer IRQ takes none of these locks. The UART and the panic path take no locks.
+## Pi 4 firmware handoff
 
-QEMU virt (GICv2) maps virtio-mmio slot `n` to SPI `16 + n`, INTID `48 + n`. QEMU 8.2 plugs `-device virtio-*-device` into the high slots, so with a NIC and a block device the measured lines are INTID 79 (SPI 47) and INTID 78 (SPI 46). Both are level-triggered; the handler writes the virtio-mmio interrupt-ack register before EOI. The NIC line is routed at the owner and moved to core 1 when that core claims the stack. The block line targets every online CPU, and the handler sends an event so the waiter wakes on whichever core holds the disk mutex. The `cntpct` timeout remains the fallback.
+The card needs the March 2025 matched set, the same bytes as the Raspberry Pi OS card that boots this board. `scripts/fetch-pi4-boot.sh` downloads them from `raspberrypi/firmware` commit `80f23d4be5` (19 Mar 2025):
 
-On the Pi 4 the GIC-400 lines are GENET SPI 157 and 158 (INTID 189 and 190) and EMMC2 SPI 126 (INTID 158). EMMC waits sleep on `wfe` with the same half-second `cntpct` cap, and the handler masks the line so a stuck level cannot spin. GENET's lines are recognized and, if they fire, masked after one count. They are left disabled because the device INTRL2 mask is not programmed and has not been tested. GENET packet completion is observed on the timer or socket-queue wake. None of the Pi 4 IRQ path has been run on hardware.
+- `start4.elf`, 2263840 bytes, `VC_BUILD_ID` `ca6e8171`
+- `fixup4.dat`, 5459 bytes
+- `bcm2711-rpi-4-b.dtb`, 56211 bytes
 
-The DNS task keeps two threads blocked in the upstream receive, one blocked on TCP port 53, and one that sleeps until a query is forwarded. The HTTP task keeps four connection workers, one per listener. Extra threads share the process page tables and sit on one global run queue.
+A newer firmware master is a different matched pair and is not what this board uses. Copy those three files from a working card when the EEPROM already matches that card. Do not copy that card's `config.txt`, `cmdline.txt`, `kernel8.img`, or `overlays/`.
 
-## Overview
-
-This is a bare-metal operating system kernel written in Rust for the Raspberry Pi 4, implementing a DNS server appliance. The design prioritizes simplicity, testability, and clear separation of concerns.
-
-## Design Principles
-
-1. **Bare Metal**: No Linux, no standard library in kernel code
-2. **Layered Architecture**: Clear separation between hardware, network, and application
-3. **Testability**: Protocol layers testable on host with `std`
-4. **Type Safety**: Leverage Rust's type system for memory and concurrency safety
-5. **Minimal Complexity**: Simple allocator, interrupt-driven device I/O
-
-## Component Architecture
-
-### Boot Layer
-
-**Location**: `kernel/src/boot.s`, `kernel/src/main.rs`
-
-The boot process:
-1. The loader copies the raw image to a physical address: `0x40080000` on QEMU virt, `0x80000` on the Pi 4, `0x200000` on the Pi 5
-2. Assembly code (`_start`) runs on core 0. Cores that enter `_start` instead of the secondary entry park. QEMU starts the other cores later, at `secondary_entry`, through PSCI
-3. Sets the stack at that physical address, drops EL2 to EL1 when needed, and zeroes BSS
-4. Turns the MMU on and jumps to the upper-half link address
-5. Calls Rust `kernel_main()`
-
-The stack grows down from the load address. The QEMU link script is `kernel/src/board/virt/link.ld`. The Pi 4 link script is `kernel/src/board/pi4/link.ld`. The Pi 5 link script is `kernel/src/board/pi5/link.ld` (`0xFFFF000000200000`). `kernel/build.rs` copies the one selected by the Cargo feature into the link search path.
-
-Board-specific code is `kernel/src/board`. `board-virt` is the default feature. `board-pi4` is selected with `--no-default-features --features board-pi4` (`./scripts/build.sh pi4` or `./scripts/build-pi4.sh`). `board-pi5` is selected with `--no-default-features --features board-pi5` (`./scripts/build.sh pi5` or `./scripts/build-pi5.sh`). The scheduler, syscalls, network owner, filesystem, logger, and EL0 services call `crate::board` and do not name a feature. The board supplies the memory map, UART base, GIC bases and the timer INTID, the NIC, the block device, secondary-core startup, the link script, and the default network config.
-
-### Pi 5 (BCM2712)
-
-The Pi 5 board is Cortex-A76, GICv2 (GIC-400), and the generic timer at PPI 11. `boot.s` widens `TCR_EL1.IPS` to 40-bit physical addresses so the early map can cover the SoC window at `0x10_0000_0000`. That window is two 1 GiB device blocks in the early tables and 2 MiB blocks in the strict map. The extra level-2 tables used for addresses above 4 GiB are not used by virt or Pi 4. RAM above 4 GiB is not mapped.
-
-`probe_nic` returns none. RP1 Ethernet is a Cadence GEM behind PCIe controller 2 (`pcie2` at `0x1000120000`, outbound window `0x1f_00000000`). Bringing that up means link training, an ECAM scan, the RP1 BAR, and a MACB driver. None of that is in this image. The missing NIC is non-fatal: DNS, HTTP, and telnet stay down, and the log task still starts.
-
-The SD driver talks to `sdio1` at `0x1000fff000` (cfg block `0x1000fff400`, IRQ 305). The first read is `read_u32_catching`, so an external abort on a missing window fails the probe. Card power and card detect are `gio_aon` GPIOs and are not programmed. Secondary cores use PSCI `CPU_ON` with SMC and affinity `cpu << 8`. `el2_blocks_secondaries` is false because SMC is not delivered to EL2.
-
-QEMU cannot boot this image. The integration stage checks the link address and then boots the virt image with `-cpu cortex-a76`. See the README section "Real Raspberry Pi 5" for the address table, the sources, and the hardware risks.
-
-### Display
-
-VNC and HDMI are supervised EL0 processes. They draw one 640×480 console from `display-console`. Three bands stack on that surface: system counters (uptime, per-core user/kernel/idle ticks, kernel heap, NIC packet and byte counts, and one line per supervised process), DNS counters (queries, rate, cache, and the top names, types, and sources), and a log window that keeps the newest lines at the bottom. The surface is 32-bit little-endian, bytes B, G, R, X, 1228800 bytes. Both processes redraw about once a second. The display does not take keyboard or pointer input.
-
-VNC is slot 5, ASID 6, on every board. It is an RFB 3.8 server, raw encoding, optional DES authentication. It is not started unless `display.vnc` is 1. The HTTP form and a `CONFIG.JSN` upload store the flag and leave a command for the poll loop. The syscall holds the FD lock, so it does not take the supervisor lock or enter the new process. Stopping sets a hold flag so the exit is not a crash. The VNC user image is 128 KiB code, 4 KiB data, 1280 KiB heap, 16 KiB stack: 357 pages. The framebuffer sits at the heap base `0x1_000A_0000` and is not in the ELF.
-
-HDMI is slot 6. `kernel/build.rs` links `hdmi-el0/pi4` or `hdmi-el0/pi5` only for that board feature, and the user pages live in the board module. Virt does not include the binary. The kernel syscall copies a property buffer through the mailbox or reads the hotplug register. EDID parsing, allocation, and drawing stay in the process. The framebuffer is mapped at `0x1_0024_0000`, at most 1280 KiB, non-cacheable. HDMI pages are 41 (128 KiB code, 4 KiB data, 16 KiB heap, 16 KiB stack) plus a 64 KiB kernel stack. Virt still has that kernel stack and a 4 KiB fault stub; it does not reserve the user pages.
-
-DNS top-N counters live in the EL0 resolver: eight names, eight types, and eight sources. A new key replaces the smallest counter. The query path only updates those slots. A worker publishes the blob about five times a second through syscall 57, and `/debug` prints it.
-
-The home page has Shutdown, Reboot, and one VNC button. The VNC button says Start or Stop from the supervised process: running, starting, stopping, failed, or off. A click is a POST that only queues the command. The poll loop, which is not holding the FD lock, starts or stops the process. Shutdown and reboot are also queued. The loop waits 300 ms, counted on the hardware timer, so the response can be sent, then asks the board to stop or reset this guest. The home page asks for a checkbox and a browser confirmation. A POST without the matching confirm field is rejected. GET does not change either control.
-
-On QEMU virt the call is PSCI `SYSTEM_OFF` or `SYSTEM_RESET` through HVC. That exits or resets the guest. If EL2 is present, HVC never reaches the firmware, the call is skipped, and the page says the attempt failed. On the Pi 4 image the same request programs the BCM2711 watchdog at `0xFE100000`: halt bits `0x555` for shutdown, a full reset without those bits for reboot. That path has not been run on a Pi 4, and QEMU 8.2 has no `raspi4b` machine here. On the Pi 5 image the call is PSCI over SMC. That has not been run on a Pi 5. A firmware that returns from the call leaves the board running, and the page says so. None of these paths reset the machine that is hosting QEMU.
-
-Hotplug is polled. Pi 4 reads `0xFEF0071C` and `0xFEF0571C` (HDMI child `0x7ef00700` / `0x7ef05700` plus the bcm2711 range offset), bit 0. That address and bit are not confirmed on hardware. A faulting read returns disconnected-or-absent and the process idles. Pi 5 does not program RP1. Its hotplug call returns disconnected, so the mailbox is not used. The two candidate mailbox bases, `0x107E00B880` and `0x107C013880`, are assumptions. The bus-to-physical translation is `bus & 0x3FFFFFFF`, and addresses below 16 MiB are rejected. None of the HDMI path has been run on a Pi.
-
-### System Layer
-
-#### Memory Allocator (`kernel/src/memory.rs`)
-
-- **Type**: Bump allocator (monotonic)
-- **Size**: 1 MB heap
-- **Characteristics**:
-  - Never deallocates (acceptable for long-lived server)
-  - Simple and fast
-  - Suitable for steady-state allocation patterns
-- **Future**: Consider linked-list or buddy allocator for deallocation
-
-#### UART Driver (`kernel/src/uart.rs`)
-
-- **Hardware**: Mini UART (UART1) at `0xFE215040`
-- **Purpose**: Debug logging and early boot output
-- **Configuration**: 115200 baud, 8N1
-- **Implementation**: Memory-mapped I/O with tock-registers
-
-#### Timer (`kernel/src/timer.rs`)
-
-- **Hardware**: System Timer at `0xFE003000`
-- **Resolution**: 1 microsecond
-- **Usage**: Delays and smoltcp timestamp source
-
-#### Interrupts (`kernel/src/interrupts.rs`)
-
-- **Status**: Disabled (polling mode only)
-- **Hardware**: GIC-400 (not yet configured)
-- **Future**: Enable for efficient network I/O
-
-### Network Layer
-
-#### Device Abstraction (`kernel/src/net/device.rs`)
-
-Two device types:
-1. **QEMU**: Placeholder for virtio-net (testing)
-2. **GENET**: BCM2711 Ethernet (Pi 4 hardware, not yet implemented)
-
-**Trait**: `smoltcp::phy::Device`
-- `receive()`: Get incoming packets
-- `transmit()`: Send outgoing packets
-- `capabilities()`: MTU and medium type
-
-**Current Status**: Stub implementation, no actual packet I/O
-
-#### Network Stack (`kernel/src/net/stack.rs`)
-
-- **Implementation**: `smoltcp` TCP/IP stack
-- **Features**:
-  - IPv4 and IPv6
-  - TCP, UDP, raw sockets
-  - DHCP client (planned)
-  - Ethernet medium
-- **Configuration**:
-  - Static IP: Direct configuration
-  - DHCP: Automatic address assignment (fallback to static if unavailable)
-
-**Main Loop** (`net::poll()`):
-- Called from `kernel_main()` event loop
-- Processes network packets
-- Drives smoltcp state machine
-
-### Protocol Layer
-
-These crates are `no_std`-compatible but have `std` feature for testing.
-
-#### DNS Protocol (`dns-protocol`)
-
-**Features**:
-- Full packet parser and builder
-- Supported record types: A, AAAA, CNAME, PTR, NS, MX, TXT
-- Name compression (RFC 1035)
-- Query and response handling
-
-**Key Types**:
-- `DnsPacket`: Complete DNS message
-- `Question`: Query section
-- `ResourceRecord`: Answer/authority/additional sections
-- `RData`: Record data by type
-
-**Testing**: 12 unit tests covering parsing, building, compression
-
-#### HTTP Server (`http-server`)
-
-**Features**:
-- HTTP/1.1 request parsing
-- Response builder with status codes
-- Basic authentication (RFC 7617)
-
-**Key Types**:
-- `HttpRequest`: Method, path, headers, body
-- `HttpResponse`: Status, headers, body
-- `parse_basic_auth()`: Base64 credential extraction
-
-**Testing**: 5 unit tests covering GET/POST, auth, responses
-
-#### DNS Cache (`dns-cache`)
-
-**Features**:
-- Fixed slots reserved at startup (default 1024, `cache_size` 1..=1024)
-- Free list, hash chains on a fixed bucket array, LRU eviction
-- Reaper thread, interval `cache_reap_interval_secs` (1..=3600, default 5)
-- Expiry is an absolute `CNTPCT` value
-
-**Implementation**:
-- Each slot is 800 bytes: 255-byte name, type, class, 512-byte response, links
-- 1024 slots plus 1024 buckets reserve 823296 bytes
-- No allocation after `DnsCache::new`
-- Replies that do not fit, and names over 255 bytes, are not stored
-
-**Testing**: unit tests for collisions, free-list reuse, expiry, and LRU eviction
-
-### Application Layer
-
-#### DNS Server (`kernel/src/dns/`)
-
-**Status**: Initialization only
-
-**Planned Features**:
-- UDP socket on port 53
-- Authoritative answers for local records
-- Forwarding to upstream resolvers
-- Cache integration
-- Query logging
-
-**Request Flow**:
-```
-1. Receive UDP packet on port 53
-2. Parse DNS query (dns-protocol)
-3. Check local records
-4. If not found, check cache
-5. If cache miss, forward to upstream
-6. Build response (dns-protocol)
-7. Send UDP packet
-8. Log query
-```
-
-#### HTTP Server (`kernel/src/http/`)
-
-**Status**: Initialization only
-
-**Planned Features**:
-- TCP socket on port 80 (configurable)
-- Management web interface
-- Basic authentication
-- REST API for configuration
-
-**Endpoints** (planned):
-- `GET /`: Dashboard
-- `GET /status`: System status JSON
-- `GET /logs`: Recent queries
-- `GET /config`: Current configuration
-- `POST /config`: Update configuration
-- `GET /records`: DNS records
-- `POST /records`: Add/modify records
-- `DELETE /records/:name`: Remove record
-
-#### Configuration Manager (`kernel/src/config_manager.rs`)
-
-**Current**: In-memory default configuration
-
-**Planned**: Load from SD card filesystem
-
-**Configuration Structure**:
-```rust
-Config {
-    network: {
-        mode: Static { ip, netmask, gateway } | Dhcp
-    },
-    dns: {
-        records: Vec<DnsRecord>,
-        upstreams: Vec<Ipv4Addr>,
-        cache_size: usize,
-    },
-    http: {
-        port: u16,
-        username: String,
-        password: String,
-    }
-}
-```
-
-#### Filesystem (`kernel/src/fs/`)
-
-**Status**: Not implemented
-
-**Planned**:
-- EMMC2 SD card driver (SPI or native mode)
-- FAT32 filesystem (via `embedded-sdmmc`)
-- Configuration file: `/config.txt`
-- Log files: `/logs/queries.log`, `/logs/system.log`
-- Log rotation: Size-based or daily
-
-## Data Flow Examples
-
-### DNS Query Resolution
+`boot/pi4/config.txt` is the whole handoff:
 
 ```
-Network (UDP) → smoltcp → dns::server
-                             ↓
-                    dns_protocol::parse()
-                             ↓
-                    Check local records
-                             ↓
-                    Check cache (dns-cache)
-                             ↓
-                    Forward to upstream
-                             ↓
-                    Cache response
-                             ↓
-                    dns_protocol::build()
-                             ↓
-                    smoltcp → Network (UDP)
+arm_64bit=1
+kernel=kernel8.img
+kernel_address=0x80000
+enable_uart=1
 ```
 
-### HTTP Configuration Update
+`hdmi_force_hotplug` is not in that file, the blink-test handoff, or the tryboot preset. On 0.1.67 that line reported 640×480 and left the rainbow up. `os_check`, `uart_2ndstage`, `core_freq`, `init_uart_clock`, `arm_boost`, and `dtoverlay` stay out. The network updater does not rewrite the live `config.txt`. A mode is not hard-coded.
 
-```
-Network (TCP) → smoltcp → http::server
-                             ↓
-                    http_server::parse()
-                             ↓
-                    Verify authentication
-                             ↓
-                    Update config_manager
-                             ↓
-                    Save to filesystem
-                             ↓
-                    http_server::build()
-                             ↓
-                    smoltcp → Network (TCP)
-```
+The firmware probes HDMI and paints the rainbow before this kernel runs. The kernel keeps that scanout.
 
-### Boot Sequence
+## HDMI and display
 
-```
-Power On
-  ↓
-Firmware loads kernel8.img
-  ↓
-boot.s: Initialize stack, clear BSS
-  ↓
-kernel_main()
-  ↓
-├─ Init UART
-├─ Init memory allocator
-├─ Init logger
-├─ Init timer
-├─ Init interrupts (stub)
-├─ Init filesystem (stub)
-├─ Load config
-├─ Init network stack
-├─ Start DNS server
-├─ Start HTTP server
-  ↓
-Main event loop: net::poll()
-```
+Two different paths exist. The boot console is the one that must not disturb a picture the firmware already brought up. The optional EL0 HDMI process is off unless `display.hdmi` is 1.
 
-## Concurrency Model
+### Boot console
 
-**Single-threaded, cooperative**:
-- No preemption
-- No interrupts (currently)
-- Polling-based I/O
-- Event loop in `kernel_main()`
+`kernel/src/fb_con.rs` and `kernel/src/hdmi_hw.rs` are Pi 4 only. Virt and Pi 5 return zeros and the text `none`.
 
-**Future**: Enable interrupts for:
-- Network packet arrival
-- Timer events
-- UART receive
+A cold boot only reads. `bring_up` records registers, then asks the mailbox for the size the firmware already published. A size in range is kept and painted. A miss retries the query twice, 50 ms apart, and then stops. The boot path does not blank, program a mode, release the framebuffer, or write a PHY, a DVP line, or a power domain. Recoveries stay at 0 when the firmware picture is kept.
 
-## Error Handling
+The HDMI register file and its PHY are read only when `CM_HSMCTL` enable (bit 4, `0xFE101088`) is set and that port's DVP gate bit is clear. A set bit in `DVP_HT_RPI_MISC_CONFIG` (`0xFEF00008`) means that port's 108 MHz clock is stopped. `dvp8=0` means both gates are open, not that the clock is off. `PM_HDMI` (`0xFE100058`), DVP `+4` and `+8`, and the HVS are still read. A read of the HDMI block while the HSM clock is off can lock the bus. A faulting read returns `ffffffff` and is not retried as a write.
 
-**Kernel**: Panic on unrecoverable errors
-- Memory allocation failure
-- Assertion violations
-- Unexpected hardware state
+Port detection is hot-plug bit 0, else pixel-valve enable (PV2 is HDMI0, PV4 is HDMI1). The status names are `none`, `hdmi0`, `hdmi1`, and `hdmi0+hdmi1`. A mask of zero is not treated as both ports.
 
-**Applications**: Result types for recoverable errors
-- Network errors: Log and continue
-- Parse errors: Send error response
-- Configuration errors: Use defaults
+### Reboot
 
-## Security Considerations
+The default soft reboot matches the Linux Pi watchdog. `prepare_reboot` stores a read-only register line, sends mailbox `NOTIFY_REBOOT` (`0x00030048`, empty payload), and then `watchdog_power` writes:
 
-**Current**:
-- Basic authentication on HTTP interface
-- No TLS/HTTPS
-- No DNS security (DNSSEC)
-- No rate limiting
+- `PM_RSTS = (PM_RSTS & 0xfffffaaa) | 0x5a000000`
+- `PM_WDOG = 0x5a000000 | 10`
+- `PM_RSTC = 0x5a000000 | (PM_RSTC & 0xffffffcf) | 0x20`
 
-**Future**:
-- HTTPS via embedded-tls
-- DNSSEC validation
-- Query rate limiting
-- DDoS mitigation
+There is no HDMI, PHY, DVP, blank, release, or power-domain step on that path. Tryboot sets `SET_REBOOT_FLAGS` (`0x00038064`, bit 0) first. A refused flag does not reset. Halt ORs `0x555` into the masked `PM_RSTS` and does not call `prepare_reboot`, so a halt leaves the panel text up. Panic and exception halt do not reboot and do not release HDMI. The watchdog reason bits in `PM_RSTS` are set by the reset itself, so the next boot does not look like power-on to `start4.elf`.
 
-## Performance Characteristics
+`display.hdmi_reset` set to 1 is the only way to get the extra shutdown: per-port PHY and DVP reset, blank, release, then `SET_DOMAIN_STATE` on for firmware domain 6 (HDMI) and domain 4 (HVS). It does not run when no port was detected, so a dark hot-plug sample cannot pulse both ports. The key is optional. The saved `CONFIG.JSN` omits it when it is 0. Domain 6 is shared by both HDMI ports. The old `SET_POWER_STATE` id 5 is I2C1 and is not used. `PM_HDMI` is a diagnostic, not a power switch.
 
-**Expected**:
-- Query latency: <10ms (cached), <100ms (forwarded)
-- Throughput: ~1000 queries/sec (limited by single-threaded polling)
-- Memory: ~2MB runtime (1MB heap + code + stack)
+### Diagnostics
 
-**Optimization Opportunities**:
-- Enable interrupts
-- Use DMA for network
-- Optimize smoltcp buffer sizes
-- Cache preloading
+Syscall 69 and `GET /status` publish:
 
-## Platform-Specific Details
+- `hdmi_state`: `none`, `up`, `fallback`, or `released`
+- `hdmi_mode`: `WxH` or `0x0`
+- `hdmi_recoveries`
+- `hdmi_diag`, `hdmi_port`
+- `hdmi_regs` and `hdmi_last_shut`: `h0`/`h1`, `phy0`/`pwr0`, `phy1`/`pwr1`, `pv0`/`pv1`, `hvs`, `hsm`, `pm`, `dvp4`, `dvp8`
 
-### Raspberry Pi 4 (BCM2711)
+`hdmi_last_shut` is the line stored in `HDMISHUT.TXT` before any optional HDMI write. `GET /vclog` and the `vclog` field are the firmware message log. `/chosen` property `log` in the device tree is two big-endian words, the VideoCore bus address and the size, the same table `vclog -m` walks (`VLOG` at the table, `MESS` at the message header). The kernel copies it after the strict map, from `bus & 0x3fffffff`, and only when that address is inside RAM. Virt and Pi 5 report `none`.
 
-**CPU**: Cortex-A72 (ARMv8-A, 64-bit)
-**Memory**: 1GB+ DRAM (depends on model)
-**Peripherals**:
-- Mini UART: 0xFE215040
-- System Timer: 0xFE003000
-- GENET Ethernet: 0xFD580000
-- EMMC2: 0xFE340000
-- GIC-400: 0xFF840000
+### VNC and the optional HDMI process
 
-**Addresses**: Low peripheral mode (0xFE000000 base)
+VNC and the EL0 HDMI task are supervised processes. They draw one 640×480 console from `display-console`: counters, DNS top-N, and a log window. The surface is 32-bit little-endian B, G, R, X. Neither process takes keyboard or pointer input.
 
-### QEMU Testing
+VNC is an RFB 3.8 server, raw encoding, optional DES authentication. It is not started unless `display.vnc` is 1. The HTTP form only queues the command. The poll loop, which is not holding the FD lock, starts or stops the process. Stopping sets a hold flag so the exit is not a crash.
 
-**Virt machine**: `-M virt,gic-version=2`. This is the integration suite. virtio-net and virtio-blk are the devices.
+The EL0 HDMI process (`hdmi-el0`) is linked only for `board-pi4` and `board-pi5`. Virt does not include the binary. It polls hot-plug through syscall 55 and, when that reports a connection, allocates a framebuffer through the mailbox. That is a different path from the boot console, and the default `display.hdmi` is 0 so it does not run. Pi 5 hot-plug stays disconnected, so that process does not program RP1. The Pi 5 mailbox bases are candidates and are not written while hot-plug stays down.
 
-**raspi4b** (QEMU 9.0 or newer): `-M raspi4b -smp 4 -kernel boot/pi4/kernel8.img` plus `-drive if=sd`. The integration script runs this as an extra stage and skips with a message when the machine is missing. QEMU 8.2 does not have it. The stage checks the UART, the upper-half MMU, four cores, a FAT `CONFIG.TXT`, and the EL0 log task. raspi4b does not emulate GENET, so the kernel continues without DNS, HTTP, or telnet. The SD card is attached to the legacy Arasan at `0xFE300000`, not to EMMC2; the driver tries EMMC2 first (the real Pi 4 slot) and then that legacy controller. None of this has been run on Pi 4 hardware.
+The home page has Shutdown, Reboot, and one VNC button. Shutdown and reboot wait 300 ms, counted on the hardware timer, so the response can leave, then ask the board to stop or reset this guest. They do not reset the machine that is hosting QEMU. On virt the call is PSCI `SYSTEM_OFF` or `SYSTEM_RESET` through HVC. If EL2 is present the call is skipped. On Pi 5 the call is PSCI over SMC.
 
-## Dependencies
+## Networking
 
-**Kernel** (`no_std`):
-- `cortex-a`: ARM CPU control
-- `aarch64-cpu`: AArch64 instructions
-- `tock-registers`: MMIO register access
-- `smoltcp`: TCP/IP stack
-- `spin`: Spinlock for allocator
-- `log`: Logging facade
-- `heapless`: Fixed-capacity containers
-- `embedded-sdmmc`: FAT32 filesystem
+smoltcp is the IPv4 stack: Ethernet, UDP, TCP, and a DHCPv4 client. Core 1 owns the device once the stack is up. It sleeps in `wfi` until a NIC IRQ, an SGI from a core that queued a socket job, or the timer. When none of those are pending it runs one user thread. Other cores push a request onto a lock-free ring, send SGI 1, and sleep. The owner copies the result into the caller's user buffer and wakes the thread. Core 0 owns the NIC until that handoff, and on a one-core boot.
 
-**Protocol Libraries** (testable with `std`):
-- `dns-protocol`, `http-server`, `dns-cache`, `config`: No dependencies
+### virt
 
-**Build**:
-- `cc`: Compile boot assembly
+virtio-mmio is legacy. QEMU virt (GICv2) maps slot `n` to SPI `16 + n`, INTID `48 + n`. With a NIC and a block device the measured lines are INTID 79 (SPI 47) and INTID 78 (SPI 46). Both are level-triggered. The handler writes the virtio-mmio interrupt-ack register before EOI. The NIC line moves to core 1 when that core claims the stack. The block line targets every online CPU. The virtio-blk waiter holds the disk mutex and sleeps on `wfe`. The handler does not take that mutex. Virtio rings and packet buffers live in `.dma`, mapped Normal non-cacheable.
 
-## Future Enhancements
+### GENET
 
-### Short Term
-1. Complete QEMU network testing (virtio-net)
-2. Implement UDP socket handling for DNS
-3. Wire up DNS server logic
-4. Basic HTTP endpoints
+`kernel/src/board/pi4/genet.rs` is the BCM2711 GENET v5 block at `0xFD580000` and the BCM54213PE PHY, address 1, RGMII with the receive delay in the PHY. The March 2025 firmware leaves the GENET clocks gated when a device tree is loaded. The probe enables those clocks and retries the revision register before it decides the block is absent. QEMU raspi4b has no GENET, and that probe failure is non-fatal.
 
-### Medium Term
-1. GENET Ethernet driver
-2. SD card driver (EMMC2)
-3. FAT32 integration
-4. Configuration persistence
+RX completion is GIC SPI 157 and 158 (INTID 189 and 190). The handler masks the GENET summary so the level line drops, then the poll unmasks it and counts a rearm if the summary was masked. TX done is cleared in the handler and does not wake the owner. A posted transmit is not waited out for the whole ring. The driver waits about 50 µs for the consumer so a descriptor is not reused while the MAC still owns it, and `tx_slow` counts a wait that did not finish. The TX ring holds 256 frames. RX offers are refilled as they are taken. After the link has been idle for 100 ms the owner sleeps up to 200 ms (`QUIET_POLL_MS`). That backup is not a substitute for the RX line: a masked summary waits out the whole interval. Gateway ARP is refreshed locally from the DHCP reply's Ethernet source so a quiet link does not solicit the gateway on smoltcp's 60 s neighbor timer.
 
-### Long Term
-1. DNSSEC support
-2. HTTPS (embedded-tls)
-3. DHCPv6
-4. IPv6 SLAAC
-5. Systemd-resolved compatible API
-6. Prometheus metrics endpoint
+`/status` publishes `nic_irqs`, packet counts, `net_busy_ms`, `net_idle_ms`, ARP counters, RX drops, overruns, and queued frames, `poll_count`, `poll_us`, `poll_max_us`, `irq_rearms`, `tx_full`, and `tx_slow`.
+
+EMMC2 is SPI 126 (INTID 158). The waiter sleeps on `wfe` with a half-second `cntpct` cap. The handler masks the line so a stuck level cannot spin.
+
+### DHCP
+
+`network.mode` is `static` or `dhcp`. The Pi 4 build enables `dhcp-default`: ask for a lease, and after `timeout_ms` install the fallback (10.0.2.15/24, gateway 10.0.2.2 in that feature). A static config never sends DHCP. The client waits up to 15 s for PHY link before the DHCP timeout runs. A BOOTREPLY whose `chaddr` is not this board is dropped and is not rewritten. Health probes stay off until an address is installed. `net_ready` is that condition.
+
+## DNS
+
+`dns-el0` is the resolver. It parses with `dns-protocol` (A, AAAA, CNAME, PTR, NS, MX, TXT, name compression). Configured records are A, AAAA, CNAME, and PTR. The path is local records, then the blocklist, then the cache, then a forward.
+
+The cache is `dns-cache`: a fixed pool, default 1024 slots, each 800 bytes, reserved at start. Free list, hash chains, LRU eviction, and a reaper. Expiry is an absolute `CNTPCT` value. Replies that do not fit, and names over 255 bytes, are not stored. `cache_size` is 1..=1024. `cache_reap_interval_secs` is 1..=3600, default 5. Changing the size restarts the DNS task. The reaper returns expired slots to the free list.
+
+Forwards are queued and sent off the client lock, so one dead upstream cannot stall the others. In-flight forwards are capped. A full table counts `forward_full` and refuses a new forward. A client reply the UDP queue will not take counts `reply_drops`. The first attempt uses the upstream that answered last. A timeout walks each other upstream once, then the query fails.
+
+Health is a streak. Every upstream starts up. A probe timeout or a forwarded query timing out counts as one failure. Three failures in a row, with no reply between them, mark that server down and the next lookup skips it. Any reply clears the streak. When every server is down the rotation is the full list. Probes are a short query on the shared upstream socket. Their ids use bit 15 (`0x8000` and up) so a probe reply is not returned to a client. `probe_interval_secs` is optional, 1..=3600, default 5. Probes do not start before the interface has an address. The DNS task publishes the up/down list, and `/status` prints it.
+
+Eight names, eight types, and eight sources are counted in the resolver. A new key replaces the smallest counter. `/debug` prints that blob.
+
+## HTTP
+
+`http-el0` is an HTTP/1.1 server with basic authentication. The dashboard, the JSON endpoints, and the firmware page all require it. `http-server` parses the request and builds the response. There is no TLS.
+
+| Path | Role |
+| --- | --- |
+| `GET /` | Dashboard: records, VNC, shutdown, reboot |
+| `GET /status` | Runtime JSON: uptime, ticks, cache, NIC counters, upstreams, HDMI fields, `vclog`, version |
+| `GET /vclog` | `{"vclog":"..."}` only |
+| `GET /logs` | Recent log |
+| `/log-config`, `/dns-config`, `/display` | Forms for `LOG.JSN` and the matching `CONFIG.JSN` objects |
+| `/config`, `/records` | Config and record JSON |
+| `/config/file/config`, `/config/file/log` | Download `CONFIG.JSN` and `LOG.JSN` |
+| `POST /power`, `POST /vnc` | Queue shutdown, reboot, or the VNC process |
+| `GET /debug` | Supervisor, cache, top-N |
+| `GET /debug/fault/guard`, `/debug/fault/text` | Deliberate faults |
+| `GET /debug/crash/...` | Arm a data abort in one service |
+| `/firmware` | Upload, tryboot, promote, rollback |
+
+### Firmware update
+
+`kernel/src/fw.rs` and `http-el0/src/firmware.rs` stage files on the boot FAT volume. The live kernel and the live `config.txt` are never upload destinations.
+
+- A kernel upload lands on `KERNEL8.NEW` (Pi 4 and virt) or `K2712.NEW` (Pi 5). The browser posts raw 16 KiB chunks to `POST /firmware/chunk` with `X-Fw-Kind`, `X-Fw-Offset`, `X-Fw-Total`, and `X-Fw-Final`.
+- `POST /firmware/reboot` with `tryboot=0` is an ordinary reboot. `tryboot=1` asks the firmware to load `tryboot.txt` once, through `SET_REBOOT_FLAGS`, and only when a staged kernel is present. The bootloader clears that flag before `start.elf`, so a failed tryboot falls back to `config.txt` and the untouched `kernel8.img`.
+- Promote runs in slices from the poll loop so `/status` keeps answering. It copies the live kernel to `KERNEL8.BAK`, then installs the staged bytes. It runs only after a tryboot boot unless force is set. A promote that dies between the renames is repaired from the temp names on the next boot.
+- `POST /firmware/rollback` restores `KERNEL8.BAK` over the live file.
+- `GET /firmware/status` is the JSON view: staged bytes, backup, tryboot, phase, progress, booted id, and SHA-256.
+
+Virt stages the Pi 4 names. QEMU boots with `-kernel`, so a virt reboot does not execute the staged file. The test still reads the FAT names back. Pi 5 can stage `K2712.NEW`. Its tryboot mailbox is not wired, and `kernel_2712.img` does not fit an 8.3 name, so promote and rollback are refused there. The running image is recognized by `pi4dns-boot-id:` plus the version, kept in `.bootid` at the end of the kernel.
+
+## Storage and JSON config
+
+The board supplies the block device: virtio-blk, Pi 4 EMMC2 at `0xFE340000` (legacy Arasan at `0xFE300000` only after EMMC2 fails, which is where raspi4b attaches the card), or Pi 5 `sdio1`. The filesystem is FAT32 through `embedded-sdmmc`. One lock covers the volume.
+
+`CONFIG.JSN` is the appliance config. A leftover `CONFIG.TXT` on that volume is migrated once into `CONFIG.JSN`. That file is not the Pi firmware `config.txt` in the boot partition root. `LOG.JSN` is the log service. `LOG.TXT` rotates to `LOG1.TXT` through `LOG16.TXT`.
+
+Every JSON document has `version` 1. It is accepted only when it is well formed, every required field is present, each value is in range, and no key is unknown. Optional keys may be absent. A saved file is pretty-printed when that text still fits in 4096 bytes. A larger pretty form is stored compact. Callers apply cross-field rules, such as the log budget `max_bytes * (archives + 1) <= 1048576`, before anything is written.
+
+`CONFIG.JSN` objects:
+
+- `network`: `mode` (`static` or `dhcp`), `ip`, `netmask`, `gateway`, `timeout_ms`. Optional `speed` (0..=1000) and `arp_secs` (0..=60).
+- `dns`: `cache_size`, `cache_reap_interval_secs`, `upstreams` (1..=8), `blocklist` (0..=32), `records` (0..=64). Optional `probe_interval_secs`.
+- `http`: `port`, `username`, `password`.
+- `display`: `vnc`, `vnc_port`, `vnc_password` (at most 8 bytes), `hdmi`. Optional `hdmi_reset`, omitted from the file when 0.
+
+`LOG.JSN` is `version`, `max_bytes` (4096..=65536), and `archives` (0..=16). The default is 4096 bytes and 3 archives.
+
+Unknown keys and out-of-range values are rejected and the previous file is left in place. A NIC address or HTTP port change is stored and reported as needing a reboot. The cache size is applied by restarting the DNS task.
+
+## Logging, telnet, exceptions
+
+Before the log task is up, and after it dies, lines go straight to the UART. Once it is up, records go into a fixed queue of 128 slots, 80 bytes each. A full queue drops the line and counts the drop. It never waits. The task prints the line, appends the ones marked for `LOG.TXT`, and publishes each line once into a fan-out ring.
+
+Telnet is TCP port 23, up to 16 connections, each on its own thread. A 17th is told the server is busy and closed. A client that falls behind skips lines and is told how many. That does not stall the log task, the UART, or any other connection. `run-local.sh` forwards host port 2323.
+
+`exception_handler` prints ESR, ELR, FAR, SPSR, and the general registers on the UART, then halts. It does not allocate and it does not reboot. One short line is copied into the log queue only when that lock is free and the log task is up. A nested fault prints one fixed line and halts. `GET /debug/fault/guard` and `GET /debug/fault/text` are the deliberate cases: a translation fault on the guard page, and a permission fault on kernel text.
+
+The Pi 4 power path is the watchdog above. A panic uses the same halt as an exception. Neither one releases the display or resets the board.
+
+## Version, build, and tests
+
+The version is `0.1.<pull request>`. Major stays 0 and minor stays 1. The only literal is `release!()` in `version/src/lib.rs`. The boot banner, the telnet preface, `/status`, the firmware page, and `.bootid` all read it. Bump that literal, and the copies in `scripts/test-integration.sh`, when opening a pull request.
+
+Host tests are `RUSTFLAGS="-D warnings" cargo test --lib`. That does not compile the kernel binary. `cargo test --bin kernel8` is not a supported check. Release checks are `cargo check --release --target aarch64-unknown-none` three ways: virt with default features, Pi 4 with `board-pi4,dhcp-default`, and Pi 5 with `board-pi5`. `RUSTFLAGS="-D warnings"` replaces the flags in `.cargo/config.toml`, so the check has to pass with that variable set.
+
+`scripts/test-integration.sh` builds the virt image, boots QEMU virt (`-M virt,gic-version=2 -cpu cortex-a72 -smp 4`), and checks DNS, HTTP, DHCP, FAT, telnet, VNC, firmware staging, faults, SMP, and load. It then builds the Pi 4 and Pi 5 images, checks the link addresses, and runs the raspi4b smoke test when that machine exists. The first QEMU boot is capped at 240 seconds. Do not edit the script while a run is in progress.
+
+`scripts/run-qemu.sh` is the interactive virt boot. `scripts/fetch-pi4-boot.sh` stages the pinned firmware next to `config.txt`. `scripts/install-qemu-10.sh` installs the QEMU used by the raspi4b stage.
