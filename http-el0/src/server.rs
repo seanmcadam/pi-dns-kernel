@@ -800,9 +800,10 @@ fn handle_status() -> HttpResponse {
         tx_full,
         tx_slow,
     ) = net_extra();
-    let (hdmi_state, hdmi_mode, hdmi_recoveries, hdmi_diag, hdmi_last_shut) = hdmi_status();
+    let (hdmi_state, hdmi_mode, hdmi_recoveries, hdmi_diag, hdmi_last_shut, hdmi_regs) =
+        hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}",{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}",{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -835,6 +836,7 @@ fn handle_status() -> HttpResponse {
         hdmi_recoveries,
         hdmi_diag,
         hdmi_last_shut,
+        hdmi_regs,
         firmware::fields(),
         sd_fields()
     );
@@ -845,10 +847,11 @@ fn handle_status() -> HttpResponse {
 
 /// `hdmi_state` is none, up, fallback, or released. `hdmi_mode` is `WxH`.
 /// `hdmi_diag` is this boot's mailbox summary. `hdmi_last_shut` is the
-/// previous reboot's shutdown record. Virt and Pi 5 report none, 0x0,
-/// zero recoveries, and `none`.
-fn hdmi_status() -> (String, String, u64, String, String) {
-    let mut buf = [0u8; 256];
+/// previous reboot's pre-write register dump. `hdmi_regs` is this boot's
+/// read-only dump. Virt and Pi 5 report none, 0x0, zero recoveries, and
+/// `none`.
+fn hdmi_status() -> (String, String, u64, String, String, String) {
+    let mut buf = [0u8; 416];
     let n = sys(
         HDMI_CONSOLE,
         buf.as_mut_ptr() as u64,
@@ -858,11 +861,12 @@ fn hdmi_status() -> (String, String, u64, String, String) {
         0,
         0,
     );
-    if n != 256 {
+    if n != 416 {
         return (
             String::from("none"),
             String::from("0x0"),
             0,
+            String::from("none"),
             String::from("none"),
             String::from("none"),
         );
@@ -881,12 +885,14 @@ fn hdmi_status() -> (String, String, u64, String, String) {
     };
     let diag = text_field(&buf[16..96]);
     let last = text_field(&buf[96..256]);
+    let regs = text_field(&buf[256..416]);
     (
         String::from(state),
         format!("{}x{}", word(1), word(2)),
         u64::from(word(3)),
         diag,
         last,
+        regs,
     )
 }
 

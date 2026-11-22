@@ -514,6 +514,26 @@ bad_el:
     add     x1, x1, :lo12:early_l1_hi
     str     x13, [x1, x14, lsl #3]
 
+    // Gigabyte 17 (0x4_40000000). The Pi 4 HDMI block's 35-bit alias is
+    // 0x4_7EFxxxxx, inside this block. The console reads it before the
+    // strict map exists. Virt and Pi 5 never load from this index. Same
+    // device attributes as the block above.
+    movz    x13, #0x4, lsl #32
+    movk    x13, #0x4000, lsl #16
+    orr     x13, x13, #1
+    orr     x13, x13, #4
+    orr     x13, x13, #0x200
+    orr     x13, x13, #0x400
+    movz    x12, #0x0060, lsl #48
+    orr     x13, x13, x12
+    mov     x14, #17
+    adrp    x1, early_l1_id
+    add     x1, x1, :lo12:early_l1_id
+    str     x13, [x1, x14, lsl #3]
+    adrp    x1, early_l1_hi
+    add     x1, x1, :lo12:early_l1_hi
+    str     x13, [x1, x14, lsl #3]
+
     // Push the tables to the point of coherency before the walker reads them.
     // Four pages, 64-byte lines. clean_page clobbers x0 and x2.
     adrp    x0, early_l0_id

@@ -30,8 +30,12 @@ mod tests {
         0xFE10_001C, // PM_RSTC
         0xFE10_0020, // PM_RSTS
         0xFE10_0024, // PM_WDOG
-        0xFEF0_071C, // HDMI0 hotplug
-        0xFEF0_571C, // HDMI1 hotplug
+        0xFEF0_071C, // HDMI0 hotplug, legacy offset
+        0xFEF0_08A8, // HDMI0 HDMI_HOTPLUG
+        0xFEF0_0000, // DVP clock
+        0xFE40_0000, // HVS
+        0xFE20_A000, // pixelvalve2
+        0x4_7EF0_08A8, // HDMI0 hotplug, 35-bit alias
         0xFE00_B880, // Pi 4 mailbox
         0xFE20_1000, // Pi 4 UART
         0xFE34_0000, // EMMC2
@@ -48,6 +52,7 @@ mod tests {
         assert_eq!(phys_to_virt(0xFE10_0020), 0xFFFF_0000_FE10_0020);
         assert_eq!(phys_to_virt(0xFE10_001C), 0xFFFF_0000_FE10_001C);
         assert_eq!(phys_to_virt(0xFE10_0024), 0xFFFF_0000_FE10_0024);
+        assert_eq!(phys_to_virt(0x4_7EF0_08A8), 0xFFFF_0004_7EF0_08A8);
         for &pa in POST_MMU_PHYS {
             let va = phys_to_virt(pa);
             assert!(!is_kernel_ptr(pa), "{pa:#x} already looked virtual");

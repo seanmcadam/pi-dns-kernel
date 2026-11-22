@@ -11,15 +11,28 @@ report 640x480 and left the rainbow up. The network updater still does
 not rewrite the live `config.txt`. If that line was copied onto the card,
 it has to be removed by mounting the card.
 
-A watchdog or tryboot reboot first resets the HDMI PHY and the DVP
-block the way Linux does (`vc5_hdmi_phy_disable`, a pulse of DVP resets
-0 and 1, 108 MHz clocks left running), then sends `NOTIFY_REBOOT`
-(`0x00030048`), blanks and releases the framebuffer, and powers off
-firmware domains 6 (HDMI) and 4 (HVS scaler). The mailbox part is
-bounded by one second and does not hold the reset. The register and
-mailbox words are written to `HDMISHUT.TXT`. The next boot shows that
-line in `/status` as `hdmi_last_shut`, including when telnet missed the
-lines that were printed in the moment before the watchdog.
+A watchdog or tryboot reboot first reads the HDMI registers and writes
+that line to `HDMISHUT.TXT` before it changes any of them. It then
+resets the HDMI PHY and the DVP block the way Linux does
+(`vc5_hdmi_phy_disable`, a pulse of DVP resets 0 and 1, 108 MHz clocks
+left running), sends `NOTIFY_REBOOT` (`0x00030048`), blanks and releases
+the framebuffer, and powers off firmware domains 6 (HDMI) and 4 (HVS
+scaler). The mailbox part is bounded by one second and does not hold
+the reset. The next boot shows the pre-write line in `/status` as
+`hdmi_last_shut`. The same read, taken when this boot's picture is
+already up and with no register writes, is `hdmi_regs`. Telnet prints
+the base addresses (`hdmi base`) and the words (`hdmi regs`).
+
+The bases are the `bcm2711.dtsi` bus addresses in low-peripheral mode
+(`0x7e000000` maps to `0xFE000000`, the same window as the mailbox).
+HDMI0 is `0xFEF00700`, its PHY `0xFEF00F00`, the DVP clock `0xFEF00000`,
+the HD block `0xFEF20000`, HVS `0xFE400000`, and HDMI0's pixel valve
+`0xFE20A000`. Those pages are Device-nGnRE. `hi` in the dump is the
+same hot-plug register at the 35-bit alias `0x4_7EF008A8`. A fault is
+`ffffffff`. `hot` bit 0 is Linux `HDMI_HOTPLUG` connected. If that bit
+is clear while the picture is up, the telnet line says why: the HSM
+clock is off, or HVS / the pixel valve is enabled and the firmware
+scanout never set the KMS hot-plug bit. `config.txt` is unchanged.
 
 0.1.70's domain cycle was accepted (`d6` and `d4` came back
 `80000000`) and EDID was still zeros. The watchdog does not reset the

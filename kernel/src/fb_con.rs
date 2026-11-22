@@ -30,18 +30,20 @@
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
 //!
-//! A soft reboot first puts the HDMI PHY and DVP in the state Linux leaves
-//! them (`vc5_hdmi_phy_disable`, DVP reset pulsed, 108 MHz clocks left
-//! running). A watchdog does not reset that block, and `PM_RSTC` full
-//! reset cannot be made to look like a power-on: the hardware sets the
-//! watchdog reason bits as the reset happens. The kernel then sends
-//! `NOTIFY_REBOOT` (`0x00030048`, no payload), blanks and releases the
-//! framebuffer, and powers off HDMI domain 6 and scaler domain 4. The
-//! mailbox calls share a one-second budget. A miss does not stop the
-//! watchdog. The register and mailbox words are written to `HDMISHUT.TXT`
-//! so the next boot can show them in `hdmi_last_shut`. Halt and panic do
-//! not do this: those paths do not reboot, and the fault text has to stay
-//! on the panel.
+//! A soft reboot first reads the HDMI, DVP, PHY, HVS, and pixel-valve
+//! registers and writes that line to `HDMISHUT.TXT` before it changes
+//! any of them. The same read, with no writes, is taken when the console
+//! comes up and published as `hdmi_regs`. The PHY and DVP are then left
+//! the way Linux leaves them (`vc5_hdmi_phy_disable`, DVP reset pulsed,
+//! 108 MHz clocks left running). A watchdog does not reset that block,
+//! and `PM_RSTC` full reset cannot be made to look like a power-on: the
+//! hardware sets the watchdog reason bits as the reset happens. The
+//! kernel then sends `NOTIFY_REBOOT` (`0x00030048`, no payload), blanks
+//! and releases the framebuffer, and powers off HDMI domain 6 and scaler
+//! domain 4. The mailbox calls share a one-second budget. A miss does
+//! not stop the watchdog. The next boot shows the pre-write line in
+//! `hdmi_last_shut`. Halt and panic do not do this: those paths do not
+//! reboot, and the fault text has to stay on the panel.
 //!
 //! The legacy `SET_POWER_STATE` id 5 is I2C1, not HDMI. 0.1.69 cycled it
 //! and the firmware refused it. 0.1.70 used the real domain ids and the
@@ -179,6 +181,9 @@ static DIAG_LEN: AtomicU8 = AtomicU8::new(0);
 const SHUT_CAP: usize = 160;
 static mut SHUT: [u8; SHUT_CAP] = [0; SHUT_CAP];
 static SHUT_LEN: AtomicU8 = AtomicU8::new(0);
+const REGS_CAP: usize = 160;
+static mut REGS: [u8; REGS_CAP] = [0; REGS_CAP];
+static REGS_LEN: AtomicU8 = AtomicU8::new(0);
 static EDID_W: AtomicU32 = AtomicU32::new(0);
 static EDID_H: AtomicU32 = AtomicU32::new(0);
 const SHUT_FILE: &str = "HDMISHUT.TXT";
@@ -223,13 +228,25 @@ pub fn copy_diag(out: &mut [u8]) -> usize {
 }
 
 /// Previous reboot's shutdown record. Empty until `HDMISHUT.TXT` is read
-/// or this boot is about to reset.
+/// or this boot is about to reset. The text is the register dump taken
+/// before any PHY or DVP write.
 pub fn copy_last_shut(out: &mut [u8]) -> usize {
     copy_text(
         out,
         addr_of!(SHUT).cast::<u8>(),
         SHUT_LEN.load(Ordering::Acquire) as usize,
         SHUT_CAP,
+    )
+}
+
+/// This boot's read-only HDMI register dump. Empty until the console has
+/// tried to come up. The caller prints `none`.
+pub fn copy_regs(out: &mut [u8]) -> usize {
+    copy_text(
+        out,
+        addr_of!(REGS).cast::<u8>(),
+        REGS_LEN.load(Ordering::Acquire) as usize,
+        REGS_CAP,
     )
 }
 
@@ -249,9 +266,18 @@ pub fn load_last_shut() {
 /// Reset the HDMI block, tell the firmware a restart is coming, and power
 /// the HDMI and scaler domains off. IRQs stay unmasked. The mailbox calls
 /// give up after one second. The watchdog still runs after this. The
-/// summary is stored for `/status` and for `HDMISHUT.TXT`.
+/// register dump is stored for `HDMISHUT.TXT` before any HDMI write.
 pub fn prepare_reboot() {
     report_shut("hdmi shut start", true);
+    if crate::percpu::live() {
+        crate::act::note_core(crate::percpu::id());
+    }
+    let snap = crate::hdmi_hw::snapshot();
+    log_bases(true);
+    log_snap(&snap, true);
+    let prior = format_snap(&snap);
+    set_shut(prior.text());
+    store_shut(prior.text());
     let hw = crate::hdmi_hw::quiesce();
     log_hw("hdmi shut hpd", &hw, true);
     log_hw_regs("hdmi shut reg", &hw, true);
@@ -268,33 +294,6 @@ pub fn prepare_reboot() {
     let scaler = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 0));
     log_shut("hdmi shut d4", scaler, false);
     let rsts = crate::hdmi_hw::pm_rsts();
-    let mut note = Note::new();
-    note.push("h0=");
-    note.hex32(hw.h0);
-    note.push(" h1=");
-    note.hex32(hw.h1);
-    note.push(" phy=");
-    note.hex32(hw.phy0);
-    note.push(" dvp=");
-    note.hex32(hw.dvp);
-    note.push(" clk=");
-    note.hex32(hw.clk);
-    note.push(" n=");
-    note.hex32(notify.1);
-    note.push(" b=");
-    note.hex32(blank.1);
-    note.push(" r=");
-    note.hex32(release.1);
-    note.push(" d6=");
-    note.hex32(hdmi.1);
-    note.push(":");
-    note.hex32(hdmi.2);
-    note.push(" d4=");
-    note.hex32(scaler.1);
-    note.push(":");
-    note.hex32(scaler.2);
-    note.push(" rsts=");
-    note.hex32(rsts);
     let mut line = Line::new();
     line.push("n=");
     line.hex32(notify.1);
@@ -311,10 +310,12 @@ pub fn prepare_reboot() {
     line.push(":");
     line.hex32(scaler.2);
     set_diag(line.text());
-    set_shut(note.text());
+    let mut rsts_line = Line::new();
+    rsts_line.push("hdmi shut rsts ");
+    rsts_line.hex32(rsts);
+    report_shut(rsts_line.text(), false);
     READY.store(false, Ordering::Release);
     HDMI_STATE.store(HDMI_RELEASED, Ordering::Relaxed);
-    store_shut(note.text());
 }
 
 /// Allocate the framebuffer and paint one line, before the strict map.
@@ -506,6 +507,9 @@ pub fn paint_pinned_row(row: u32, text: &str) {
 }
 
 fn bring_up() -> bool {
+    // Read the live controller before any recovery write. A cold boot that
+    // already has a picture keeps this as `hdmi_regs`.
+    record_regs(false);
     // The firmware already chose a mode for the rainbow. With the dtb
     // loaded and no vc4-kms overlay, that scanout is the one to keep.
     // Setting another size, or the blank tag, while a size exists made
@@ -752,6 +756,113 @@ fn set_diag(text: &str) {
 
 fn set_shut(text: &str) {
     store_text(text, addr_of_mut!(SHUT).cast(), SHUT_CAP, &SHUT_LEN);
+}
+
+fn set_regs(text: &str) {
+    store_text(text, addr_of_mut!(REGS).cast(), REGS_CAP, &REGS_LEN);
+}
+
+fn record_regs(draw: bool) {
+    let snap = crate::hdmi_hw::snapshot();
+    log_bases(draw);
+    log_snap(&snap, draw);
+    set_regs(format_snap(&snap).text());
+}
+
+fn log_bases(draw: bool) {
+    emit_hw("hdmi base lo=FEF00700 phy=FEF00F00 hd=FEF20000", draw);
+    emit_hw("hdmi base clk=FEF00000 hvs=FE400000 pv2=FE20A000", draw);
+    emit_hw("hdmi base hi=47EF00700 dvp=FEF00300 aon=FEF00100", draw);
+    if crate::hdmi_hw::using_hi() {
+        emit_hw("hdmi aperture 35bit", draw);
+    }
+}
+
+fn log_snap(snap: &crate::hdmi_hw::Snap, draw: bool) {
+    let mut a = Line::new();
+    a.push("hdmi regs hot=");
+    a.hex32(snap.hot);
+    a.push(" sch=");
+    a.hex32(snap.sch);
+    a.push(" vid=");
+    a.hex32(snap.vid);
+    emit_hw(a.text(), draw);
+    let mut b = Line::new();
+    b.push("hdmi regs phy=");
+    b.hex32(snap.phy);
+    b.push(" pwr=");
+    b.hex32(snap.pwr);
+    b.push(" sw=");
+    b.hex32(snap.sw);
+    emit_hw(b.text(), draw);
+    let mut c = Line::new();
+    c.push("hdmi regs clk=");
+    c.hex32(snap.clk);
+    c.push(" hvs=");
+    c.hex32(snap.hvs);
+    c.push(" pv=");
+    c.hex32(snap.pv);
+    emit_hw(c.text(), draw);
+    let mut d = Line::new();
+    d.push("hdmi regs h1=");
+    d.hex32(snap.h1);
+    d.push(" hi=");
+    d.hex32(snap.hi);
+    d.push(" his=");
+    d.hex32(snap.his);
+    emit_hw(d.text(), draw);
+    let mut e = Line::new();
+    e.push("hdmi regs leg=");
+    e.hex32(snap.leg);
+    e.push(" ctl=");
+    e.hex32(snap.ctl);
+    e.push(" cst=");
+    e.hex32(snap.cst);
+    emit_hw(e.text(), draw);
+    let mut f = Line::new();
+    f.push("hdmi regs pv4=");
+    f.hex32(snap.pv4);
+    f.push(" hc0=");
+    f.hex32(snap.hc0);
+    f.push(" hc2=");
+    f.hex32(snap.hc2);
+    emit_hw(f.text(), draw);
+    let mut g = Line::new();
+    g.push("hdmi regs hsm=");
+    g.hex32(snap.hsm);
+    g.push(" hsd=");
+    g.hex32(snap.hsd);
+    g.push(" aon=");
+    g.hex32(snap.aon);
+    emit_hw(g.text(), draw);
+    emit_hw(crate::hdmi_hw::hpd_line(snap), draw);
+}
+
+fn format_snap(snap: &crate::hdmi_hw::Snap) -> Note {
+    let mut note = Note::new();
+    note.push("hot=");
+    note.hex32(snap.hot);
+    note.push(" sch=");
+    note.hex32(snap.sch);
+    note.push(" vid=");
+    note.hex32(snap.vid);
+    note.push(" phy=");
+    note.hex32(snap.phy);
+    note.push(" pwr=");
+    note.hex32(snap.pwr);
+    note.push(" sw=");
+    note.hex32(snap.sw);
+    note.push(" clk=");
+    note.hex32(snap.clk);
+    note.push(" hvs=");
+    note.hex32(snap.hvs);
+    note.push(" pv=");
+    note.hex32(snap.pv);
+    note.push(" h1=");
+    note.hex32(snap.h1);
+    note.push(" hi=");
+    note.hex32(snap.hi);
+    note
 }
 
 fn store_text(text: &str, dst: *mut u8, cap: usize, len: &AtomicU8) {
