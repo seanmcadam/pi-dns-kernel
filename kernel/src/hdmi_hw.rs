@@ -14,32 +14,53 @@
 //! alias `0x4_7EE00000`, where the same bus `0x7EFxxxxx` sits in full
 //! 35-bit mode.
 //!
-//! `snapshot` only reads. Shutdown and boot recovery call it first, then
-//! follow `vc5_hdmi_phy_disable` and `vc5_hdmi_reset` on the low-peripheral
-//! bases. The 35-bit alias is used for those writes only when its hot-plug
-//! bit is set and the low-peripheral bit is not. The HSM clock
-//! (`CM_HSMCTL` at `0xFE101088`, enable bit 4) is turned on then, and only
-//! if that bit was clear, so a gated register file can take the PHY write.
-//! The 108 MHz DVP gates stay clear: setting them stops the firmware from
-//! programming the PHY. A read that faults is skipped and reported as
-//! `ffffffff`. Virt and Pi 5 do not build this module.
+//! `snapshot` only reads. It records which port has `HDMI_HOTPLUG` bit 0
+//! set, and if neither does, which pixel valve has `PV_CONTROL` bit 0 set.
+//! Pixelvalve2 is HDMI0 and pixelvalve4 is HDMI1 (`vc4_crtc`
+//! `bcm2711_pv2_data` / `bcm2711_pv4_data`). Shutdown and recovery then
+//! touch only those ports.
+//!
+//! `raspberrypi-power.h` has one HDMI domain, `RPI_POWER_DOMAIN_HDMI`
+//! (DT index 5, firmware id 6). HDMI0 and HDMI1 share it. There is no
+//! HDMI1 id. Firmware clocks 13 (`RPI_FIRMWARE_M2MC_CLK_ID`, the HSM
+//! clock) and 14 (`RPI_FIRMWARE_PIXEL_BVB_CLK_ID`) are also shared. The
+//! per-port gate is the DVP 108 MHz bit: bit 3 for HDMI0, bit 4 for
+//! HDMI1 (`bcm2711-rpi.dtsi` `<&dvp 0>` / `<&dvp 1>`). Reset lines are
+//! the same bits in `DVP_HT_RPI_SW_INIT`.
+//!
+//! A working HDMI1 picture on this board reads PHY reset `0x0f` and PHY
+//! power `0x400` (bit 10). After a soft reboot the power word was
+//! `0x7ff` and hot-plug was gone. The reset pulses the active port, then
+//! writes `0x0f` and `0x400` again. It never writes `0x7ff`. The 35-bit
+//! alias is used for a port only when that port's hot-plug bit is set
+//! there and clear in the low-peripheral register. The HSM clock
+//! (`CM_HSMCTL` at `0xFE101088`, enable bit 4) is turned on first if it
+//! was clear. A read that faults is skipped and reported as `ffffffff`.
+//! Virt and Pi 5 do not build this module.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::exception::read_u32_catching;
 use crate::timer::{frequency, get_ticks};
 
 const MISS: u32 = 0xffff_ffff;
 
-/// Set when the 35-bit alias is the aperture whose hot-plug bit is live.
+/// Set when either active port's hot-plug bit is live only at the 35-bit alias.
 static USE_HI: AtomicBool = AtomicBool::new(false);
+/// Bit 0 is HDMI0, bit 1 is HDMI1. Zero means no port looked connected.
+static PORT_MASK: AtomicU8 = AtomicU8::new(0);
+static PORT0_HI: AtomicBool = AtomicBool::new(false);
+static PORT1_HI: AtomicBool = AtomicBool::new(false);
 
 const DVP_SW_INIT: u64 = 0x04;
 const DVP_MISC: u64 = 0x08;
-/// Bits 3 and 4 gate the HDMI 108 MHz clocks. Set means the clock is off.
-const DVP_CLK_GATE: u32 = (1 << 3) | (1 << 4);
-/// Reset lines 0 and 1 are HDMI0 and HDMI1.
-const DVP_HDMI_RST: u32 = (1 << 0) | (1 << 1);
+/// Bit 3 gates the HDMI0 108 MHz clock. Set means the clock is off.
+const DVP_CLK0: u32 = 1 << 3;
+/// Bit 4 gates the HDMI1 108 MHz clock.
+const DVP_CLK1: u32 = 1 << 4;
+/// `resets = <&dvp 0>` and `<&dvp 1>`.
+const DVP_RST0: u32 = 1 << 0;
+const DVP_RST1: u32 = 1 << 1;
 
 /// Linux `vc5` `HDMI_HOTPLUG`. Bit 0 is connected.
 const HOTPLUG: u64 = 0x1a8;
@@ -55,10 +76,9 @@ const PHY_RESET: u64 = 0x00;
 const PHY_POWER: u64 = 0x04;
 /// Lane resets. Linux `vc5_hdmi_reset_phy` writes this and leaves it.
 const PHY_RESET_HOLD: u32 = 0x0f;
-/// Linux `HDMI_TX_PHY_POWERDOWN_CTL` bit 10, held across `phy_disable`.
+/// Linux `HDMI_TX_PHY_POWERDOWN_CTL` bit 10. A working picture reads this
+/// alone (`0x400`). The failed post-reboot word `0x7ff` is never written.
 const PHY_POWERDOWN: u32 = 1 << 10;
-/// Randomizer power-down. Linux clears the lane power-down and leaves this.
-const PHY_RNG_OFF: u32 = 1 << 4;
 
 const VID_CTL0: u64 = 0x44;
 const VID_CTL1: u64 = 0x48;
@@ -171,6 +191,9 @@ pub struct Snap {
     pub old: u32,
     pub ctl: u32,
     pub cst: u32,
+    pub phy1: u32,
+    pub pwr1: u32,
+    pub hi1: u32,
     pub pv4: u32,
     pub hc0: u32,
     pub hc2: u32,
@@ -184,6 +207,9 @@ pub struct Ports {
     pub h1: u32,
     pub legacy0: u32,
     pub phy0: u32,
+    pub pwr0: u32,
+    pub phy1: u32,
+    pub pwr1: u32,
     pub dvp: u32,
     pub clk: u32,
     pub edid_w: u32,
@@ -205,7 +231,10 @@ pub fn snapshot() -> Snap {
         hvs: read(HVS),
         pv: read(PV2),
         h1: read(LOW.hdmi1 + HOTPLUG),
+        phy1: read(LOW.phy1 + PHY_RESET),
+        pwr1: read(LOW.phy1 + PHY_POWER),
         hi: read(HI.hdmi0 + HOTPLUG),
+        hi1: read(HI.hdmi1 + HOTPLUG),
         his: read(HI.hdmi0 + SCHEDULER),
         leg: read(LOW.hdmi0 + HOTPLUG_LEGACY),
         old: read(LOW.hdmi0 + HOTPLUG_2835),
@@ -218,7 +247,15 @@ pub fn snapshot() -> Snap {
         hsd: read(CM_HSMDIV),
         aon: read(AON),
     };
-    USE_HI.store(prefer_hi(&snap), Ordering::Relaxed);
+    let mask = active_ports(&snap);
+    PORT0_HI.store(use_hi_port(snap.hot, snap.hi), Ordering::Relaxed);
+    PORT1_HI.store(use_hi_port(snap.h1, snap.hi1), Ordering::Relaxed);
+    PORT_MASK.store(mask, Ordering::Relaxed);
+    USE_HI.store(
+        (mask & 1 != 0 && PORT0_HI.load(Ordering::Relaxed))
+            || (mask & 2 != 0 && PORT1_HI.load(Ordering::Relaxed)),
+        Ordering::Relaxed,
+    );
     snap
 }
 
@@ -226,45 +263,89 @@ pub fn using_hi() -> bool {
     USE_HI.load(Ordering::Relaxed)
 }
 
+/// Bit 0 HDMI0, bit 1 HDMI1, from the last `snapshot`.
+pub fn port_mask() -> u8 {
+    PORT_MASK.load(Ordering::Relaxed)
+}
+
+pub fn set_port_mask(mask: u8) {
+    PORT_MASK.store(mask & 3, Ordering::Relaxed);
+}
+
+/// `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or `none`.
+pub fn port_text() -> &'static str {
+    match port_mask() {
+        1 => "hdmi0",
+        2 => "hdmi1",
+        3 => "hdmi0+hdmi1",
+        _ => "none",
+    }
+}
+
+/// Hot-plug bit 0 wins. A valve with `PV_CONTROL` enable set is the
+/// fallback when neither hot-plug bit is set, so a picture that is up
+/// without a KMS hot-plug bit still names its port.
+pub fn active_ports(snap: &Snap) -> u8 {
+    let mut mask = 0u8;
+    if connected(snap.hot) || connected(snap.hi) {
+        mask |= 1;
+    }
+    if connected(snap.h1) || connected(snap.hi1) {
+        mask |= 2;
+    }
+    if mask == 0 {
+        if flag(snap.pv, 1) {
+            mask |= 1;
+        }
+        if flag(snap.pv4, 1) {
+            mask |= 2;
+        }
+    }
+    mask
+}
+
 /// Why hot-plug bit 0 is or is not set. The picture can be up while
 /// `HDMI_HOTPLUG` stays 0: the firmware scanout enables HVS and the pixel
 /// valve without programming the KMS hot-plug bit, or the HSM clock that
 /// clocks the HDMI register file is off.
 pub fn hpd_line(snap: &Snap) -> &'static str {
-    if connected(snap.hot) {
-        return "hdmi hpd connected";
+    match active_ports(snap) {
+        1 => "hdmi hpd hdmi0",
+        2 => "hdmi hpd hdmi1",
+        3 => "hdmi hpd both",
+        _ => {
+            if snap.hot == MISS && snap.h1 == MISS {
+                return "hdmi hpd fault";
+            }
+            if connected(snap.leg) || connected(snap.old) {
+                return "hdmi hpd at legacy";
+            }
+            if pipe_live(snap) && snap.hsm != MISS && snap.hsm & CM_ENABLE == 0 {
+                return "hdmi hpd 0 hsm off";
+            }
+            if pipe_live(snap) {
+                return "hdmi hpd 0 pipe live";
+            }
+            "hdmi hpd 0"
+        }
     }
-    if connected(snap.hi) {
-        return "hdmi hpd on 35bit";
-    }
-    if connected(snap.leg) || connected(snap.old) {
-        return "hdmi hpd at legacy";
-    }
-    if snap.hot == MISS {
-        return "hdmi hpd fault";
-    }
-    if pipe_live(snap) && snap.hsm != MISS && snap.hsm & CM_ENABLE == 0 {
-        return "hdmi hpd 0 hsm off";
-    }
-    if pipe_live(snap) {
-        return "hdmi hpd 0 pipe live";
-    }
-    "hdmi hpd 0"
 }
 
-/// Put both HDMI controllers in the state Linux leaves before a restart.
-/// The PHY stays in reset. The 108 MHz clocks stay on. Call `snapshot`
-/// first: this writes.
+/// Reset the active port or ports, then put each PHY back to the power
+/// word measured while a picture was up (`0x0f` / `0x400`, never `0x7ff`).
+/// A mask of zero writes nothing. Call `snapshot` first.
 pub fn quiesce() -> Ports {
-    let block = active();
-    enable_hsm();
-    ungate(&block);
-    video_off(&block);
-    phy_hold(&block);
-    pulse_dvp(&block);
-    phy_hold(&block);
-    ungate(&block);
-    sample(&block, 0, 0)
+    let mask = port_mask();
+    if mask != 0 {
+        enable_hsm();
+        if mask & 1 != 0 {
+            settle_port(0);
+        }
+        if mask & 2 != 0 {
+            settle_port(1);
+        }
+    }
+    sample(0, 0)
 }
 
 /// `PM_RSTS` as it stands before this kernel writes the reboot pattern.
@@ -273,28 +354,32 @@ pub fn pm_rsts() -> u32 {
     read(0xFE10_0020)
 }
 
-/// Same reset, then release the PHY and try DDC. Only for a boot that
-/// already has no firmware size. Call `snapshot` first.
+/// Same per-port reset used before a reboot. If no port was visible, both
+/// are serviced so a dead hot-plug bit cannot skip HDMI1. Then DDC is read
+/// on those ports. Call `snapshot` first.
 pub fn boot_recover() -> Ports {
-    let block = active();
+    if port_mask() == 0 {
+        set_port_mask(3);
+    }
+    let mask = port_mask();
     enable_hsm();
-    ungate(&block);
-    video_off(&block);
-    phy_hold(&block);
-    pulse_dvp(&block);
-    phy_release(&block);
-    ungate(&block);
+    if mask & 1 != 0 {
+        settle_port(0);
+    }
+    if mask & 2 != 0 {
+        settle_port(1);
+    }
     wait_ms(20);
-    let mut ports = sample(&block, 0, 0);
-    if let Some((w, h)) = read_edid(&block) {
+    let mut ports = sample(0, 0);
+    if let Some((w, h)) = read_edid(mask) {
         ports.edid_w = w;
         ports.edid_h = h;
     }
     ports
 }
 
-fn prefer_hi(snap: &Snap) -> bool {
-    connected(snap.hi) && !connected(snap.hot)
+fn use_hi_port(low: u32, hi: u32) -> bool {
+    connected(hi) && !connected(low)
 }
 
 fn connected(value: u32) -> bool {
@@ -315,20 +400,45 @@ fn flag(value: u32, mask: u32) -> bool {
     value != MISS && value & mask != 0
 }
 
-fn active() -> Block {
-    if USE_HI.load(Ordering::Relaxed) {
+fn block_for(port: u8) -> Block {
+    let hi = if port == 0 {
+        PORT0_HI.load(Ordering::Relaxed)
+    } else {
+        PORT1_HI.load(Ordering::Relaxed)
+    };
+    if hi {
         HI
     } else {
         LOW
     }
 }
 
-fn sample(block: &Block, edid_w: u32, edid_h: u32) -> Ports {
+fn settle_port(port: u8) {
+    let block = block_for(port);
+    let (rst, clk, vid, phy) = if port == 0 {
+        (DVP_RST0, DVP_CLK0, VID_CTL0, block.phy0)
+    } else {
+        (DVP_RST1, DVP_CLK1, VID_CTL1, block.phy1)
+    };
+    ungate_bit(&block, clk);
+    video_off(&block, vid);
+    pulse_phy(phy);
+    phy_ready(phy);
+    pulse_dvp_bit(&block, rst);
+    phy_ready(phy);
+    ungate_bit(&block, clk);
+}
+
+fn sample(edid_w: u32, edid_h: u32) -> Ports {
+    let block = LOW;
     Ports {
         h0: read(block.hdmi0 + HOTPLUG),
         h1: read(block.hdmi1 + HOTPLUG),
         legacy0: read(block.hdmi0 + HOTPLUG_LEGACY),
         phy0: read(block.phy0 + PHY_RESET),
+        pwr0: read(block.phy0 + PHY_POWER),
+        phy1: read(block.phy1 + PHY_RESET),
+        pwr1: read(block.phy1 + PHY_POWER),
         dvp: read(block.dvp_clk + DVP_SW_INIT),
         clk: read(block.dvp_clk + DVP_MISC),
         edid_w,
@@ -348,59 +458,69 @@ fn enable_hsm() {
     let _ = write(CM_HSMCTL, CM_PASSWORD | raw | CM_ENABLE);
 }
 
-fn ungate(block: &Block) {
+fn ungate_bit(block: &Block, bit: u32) {
     let pa = block.dvp_clk + DVP_MISC;
     let Some(raw) = read_ok(pa) else {
         return;
     };
-    let _ = write(pa, raw & !DVP_CLK_GATE);
+    let _ = write(pa, raw & !bit);
 }
 
-fn video_off(block: &Block) {
-    for off in [VID_CTL0, VID_CTL1] {
-        let pa = block.hd + off;
-        let Some(raw) = read_ok(pa) else {
-            continue;
-        };
-        let _ = write(pa, raw & !VID_ENABLE);
+fn video_off(block: &Block, off: u64) {
+    let pa = block.hd + off;
+    let Some(raw) = read_ok(pa) else {
+        return;
+    };
+    if raw & VID_ENABLE == 0 {
+        return;
     }
+    let _ = write(pa, raw & !VID_ENABLE);
 }
 
-fn phy_hold(block: &Block) {
-    for base in [block.phy0, block.phy1] {
-        if read_ok(base + PHY_RESET).is_none() {
-            continue;
-        }
-        let _ = write(base + PHY_RESET, PHY_RESET_HOLD);
-        let _ = write(base + PHY_POWER, PHY_POWERDOWN);
+/// Pulse the lane resets, then restore the power word from a working
+/// picture. `0x7ff` is the failed post-reboot value and is never written.
+fn pulse_phy(phy: u64) {
+    if read_ok(phy + PHY_RESET).is_none() {
+        return;
     }
+    let _ = write(phy + PHY_RESET, PHY_RESET_HOLD);
+    wait_ms(1);
+    let _ = write(phy + PHY_RESET, 0);
+    wait_ms(1);
 }
 
-fn phy_release(block: &Block) {
-    for base in [block.phy0, block.phy1] {
-        if read_ok(base + PHY_RESET).is_none() {
-            continue;
-        }
-        let _ = write(base + PHY_RESET, 0);
-        let _ = write(base + PHY_POWER, PHY_RNG_OFF);
+fn phy_ready(phy: u64) {
+    if read_ok(phy + PHY_RESET).is_none() {
+        return;
     }
+    let _ = write(phy + PHY_RESET, PHY_RESET_HOLD);
+    let _ = write(phy + PHY_POWER, PHY_POWERDOWN);
 }
 
-fn pulse_dvp(block: &Block) {
+fn pulse_dvp_bit(block: &Block, bit: u32) {
     let pa = block.dvp_clk + DVP_SW_INIT;
     let Some(raw) = read_ok(pa) else {
         return;
     };
-    let _ = write(pa, raw | DVP_HDMI_RST);
+    let _ = write(pa, raw | bit);
     wait_ms(1);
-    let _ = write(pa, raw & !DVP_HDMI_RST);
+    let _ = write(pa, raw & !bit);
 }
 
-fn read_edid(block: &Block) -> Option<(u32, u32)> {
-    if let Some(size) = edid_port(block.bsc0, block.auto0) {
-        return Some(size);
+fn read_edid(mask: u8) -> Option<(u32, u32)> {
+    if mask & 1 != 0 {
+        let block = block_for(0);
+        if let Some(size) = edid_port(block.bsc0, block.auto0) {
+            return Some(size);
+        }
     }
-    edid_port(block.bsc1, block.auto1)
+    if mask & 2 != 0 {
+        let block = block_for(1);
+        if let Some(size) = edid_port(block.bsc1, block.auto1) {
+            return Some(size);
+        }
+    }
+    None
 }
 
 fn edid_port(bsc: u64, auto: u64) -> Option<(u32, u32)> {

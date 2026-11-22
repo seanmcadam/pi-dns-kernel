@@ -212,6 +212,10 @@ impl Board for Pi4 {
         crate::fb_con::copy_regs(out)
     }
 
+    fn hdmi_port(out: &mut [u8]) -> usize {
+        crate::fb_con::copy_port(out)
+    }
+
     fn power(reset: bool) -> bool {
         watchdog_power(reset)
     }
