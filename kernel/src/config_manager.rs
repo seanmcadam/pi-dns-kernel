@@ -23,6 +23,9 @@ pub struct DisplayConfig {
     pub vnc_port: u16,
     pub vnc_password: String,
     pub hdmi: bool,
+    /// Off unless `display.hdmi_reset` is 1. Arms the extra HDMI
+    /// shutdown before a reboot. The default reboot path does not use it.
+    pub hdmi_reset: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -97,9 +100,25 @@ static LOG_CACHED_LEN: AtomicUsize = AtomicUsize::new(0);
 /// 1 start, 2 stop, 3 stop then start. The poll loop consumes these.
 static VNC_CMD: AtomicU8 = AtomicU8::new(0);
 static HDMI_CMD: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "board-pi4")]
+static HDMI_RESET: AtomicBool = AtomicBool::new(false);
+
+fn publish(config: &Config) {
+    #[cfg(feature = "board-pi4")]
+    HDMI_RESET.store(config.display.hdmi_reset, Ordering::Relaxed);
+    #[cfg(not(feature = "board-pi4"))]
+    let _ = config;
+}
+
+/// `display.hdmi_reset` from the loaded JSON. Missing means off.
+#[cfg(feature = "board-pi4")]
+pub fn hdmi_reset() -> bool {
+    HDMI_RESET.load(Ordering::Relaxed)
+}
 
 pub fn load_config() -> Config {
     let config = load_main();
+    publish(&config);
     *CURRENT.lock() = Some(config.clone());
     if let Err(err) = reload_log() {
         log::info!("Log config unchanged: {err}");
@@ -208,6 +227,7 @@ pub fn store_config_file(which: u8, text: &str) -> Result<bool, String> {
                 .unwrap_or(false);
             crate::fs::replace_file(crate::fs::CONFIG_NAME, stored.as_bytes())
                 .map_err(|err| alloc::format!("save failed: {err}"))?;
+            publish(&next);
             *CURRENT.lock() = Some(next.clone());
             let old = previous.unwrap_or_else(default_config);
             queue_display(&old, &next);
@@ -293,6 +313,7 @@ pub fn set_dns_cache(slots: u64, reap_secs: u64) -> Result<bool, String> {
     let text = serialize_config(&next)?;
     crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes())
         .map_err(|err| alloc::format!("save failed: {err}"))?;
+    publish(&next);
     *CURRENT.lock() = Some(next);
     log::info!("Updated DNS cache settings");
     Ok(restart)
@@ -334,11 +355,13 @@ pub fn set_display(vnc: u64, port: u64, password: &str, hdmi: u64) -> Result<(),
     }
     let mut next = CURRENT.lock().clone().unwrap_or_else(default_config);
     let old = next.clone();
+    let hdmi_reset = next.display.hdmi_reset;
     next.display = DisplayConfig {
         vnc: vnc != 0,
         vnc_port: port as u16,
         vnc_password: String::from(password),
         hdmi: hdmi != 0,
+        hdmi_reset,
     };
     let text = serialize_config(&next)?;
     match crate::fs::replace_file(crate::fs::CONFIG_NAME, text.as_bytes()) {
@@ -346,6 +369,7 @@ pub fn set_display(vnc: u64, port: u64, password: &str, hdmi: u64) -> Result<(),
         Err(crate::fs::FsError::NotInitialized) => {}
         Err(err) => return Err(alloc::format!("save failed: {err}")),
     }
+    publish(&next);
     *CURRENT.lock() = Some(next.clone());
     queue_display(&old, &next);
     log::info!("Updated display settings");
@@ -364,6 +388,7 @@ pub fn request_vnc(on: bool) -> Result<(), String> {
         Err(crate::fs::FsError::NotInitialized) => {}
         Err(err) => return Err(alloc::format!("save failed: {err}")),
     }
+    publish(&next);
     *CURRENT.lock() = Some(next);
     VNC_CMD.store(if on { 1 } else { 2 }, Ordering::Release);
     log::info!("Queued VNC");
@@ -756,6 +781,7 @@ fn default_config() -> Config {
             vnc_port: config::VNC_PORT_DEFAULT as u16,
             vnc_password: String::new(),
             hdmi: false,
+            hdmi_reset: false,
         },
         timeout_ms: 3_000,
     }
@@ -993,6 +1019,11 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         .ok_or_else(|| String::from("display: missing field"))?;
     let vnc = display.get("vnc").and_then(Value::as_u64).unwrap_or(0) != 0;
     let hdmi = display.get("hdmi").and_then(Value::as_u64).unwrap_or(0) != 0;
+    let hdmi_reset = match display.get("hdmi_reset").and_then(Value::as_u64) {
+        None | Some(0) => false,
+        Some(1) => true,
+        Some(_) => return Err(String::from("display.hdmi_reset: out of bounds (0..=1)")),
+    };
     let vnc_port = display
         .get("vnc_port")
         .and_then(Value::as_u64)
@@ -1041,6 +1072,7 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
             vnc_port,
             vnc_password: vnc_password.to_string(),
             hdmi,
+            hdmi_reset,
         },
         timeout_ms,
     })
@@ -1295,26 +1327,37 @@ fn config_value(config: &Config) -> Value {
         ),
         (
             String::from("display"),
-            Value::Object(vec![
-                (
-                    String::from("vnc"),
-                    Value::Number(u64::from(config.display.vnc)),
-                ),
-                (
-                    String::from("vnc_port"),
-                    Value::Number(u64::from(config.display.vnc_port)),
-                ),
-                (
-                    String::from("vnc_password"),
-                    Value::String(config.display.vnc_password.clone()),
-                ),
-                (
-                    String::from("hdmi"),
-                    Value::Number(u64::from(config.display.hdmi)),
-                ),
-            ]),
+            Value::Object(display_fields(config)),
         ),
     ])
+}
+
+fn display_fields(config: &Config) -> Vec<(String, Value)> {
+    let mut fields = vec![
+        (
+            String::from("vnc"),
+            Value::Number(u64::from(config.display.vnc)),
+        ),
+        (
+            String::from("vnc_port"),
+            Value::Number(u64::from(config.display.vnc_port)),
+        ),
+        (
+            String::from("vnc_password"),
+            Value::String(config.display.vnc_password.clone()),
+        ),
+        (
+            String::from("hdmi"),
+            Value::Number(u64::from(config.display.hdmi)),
+        ),
+    ];
+    if config.display.hdmi_reset {
+        fields.push((
+            String::from("hdmi_reset"),
+            Value::Number(1),
+        ));
+    }
+    fields
 }
 
 fn ip_text(ip: [u8; 4]) -> String {

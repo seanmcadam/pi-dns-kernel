@@ -537,6 +537,180 @@ fn u32be(blob: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// First word of the firmware log table. `vclog` checks this before it
+/// trusts `/chosen/log`. The fourcc is `VLOG`.
+pub const VC_LOG_MAGIC: u32 = 0x564c_4f47;
+/// Message-log header. The fourcc is `MESS`.
+pub const VC_MSG_MAGIC: u32 = 0x5353_454d;
+
+/// `/chosen/log` from a flattened device tree: VideoCore start and size,
+/// both big-endian, as `vclog` reads them. `None` if the node or the
+/// property is absent, or the size is empty or above 1 MiB.
+pub fn chosen_log(blob: &[u8]) -> Option<(u32, u32)> {
+    if blob.len() < 40 || u32be(blob, 0)? != 0xd00d_feed {
+        return None;
+    }
+    let total = u32be(blob, 4)? as usize;
+    if total < 40 || total > blob.len() {
+        return None;
+    }
+    let off_struct = u32be(blob, 8)? as usize;
+    let off_strings = u32be(blob, 12)? as usize;
+    if off_struct > total || off_strings > total {
+        return None;
+    }
+    let strings = &blob[off_strings..total];
+    let mut p = off_struct;
+    let mut path: [&str; 8] = ["", "", "", "", "", "", "", ""];
+    let mut depth = 0usize;
+    while p + 4 <= total {
+        let token = u32be(blob, p)?;
+        p += 4;
+        match token {
+            1 => {
+                let start = p;
+                while p < total && blob[p] != 0 {
+                    p += 1;
+                }
+                if p >= total {
+                    return None;
+                }
+                let name = core::str::from_utf8(&blob[start..p]).ok()?;
+                p = (p + 4) & !3;
+                if depth < path.len() {
+                    path[depth] = node_base(name);
+                }
+                depth += 1;
+            }
+            2 => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth < path.len() {
+                    path[depth] = "";
+                }
+            }
+            3 => {
+                if p + 8 > total {
+                    return None;
+                }
+                let len = u32be(blob, p)? as usize;
+                let nameoff = u32be(blob, p + 4)? as usize;
+                p += 8;
+                if p + len > total {
+                    return None;
+                }
+                let value = &blob[p..p + len];
+                p = (p + len + 3) & !3;
+                if under_chosen(&path, depth) && cstr_at(strings, nameoff) == Some("log") && value.len() >= 8
+                {
+                    let start = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+                    let size = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
+                    if size > 0 && size <= 1024 * 1024 {
+                        return Some((start, size));
+                    }
+                    return None;
+                }
+            }
+            4 => {}
+            9 => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn u32_le(bytes: &[u8], off: usize) -> Option<u32> {
+    let word = bytes.get(off..off + 4)?;
+    Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+}
+
+/// VideoCore address of the message log. `toc` is the 56-byte table at
+/// the start of the `/chosen/log` region (`vclog` `log_toc_t`).
+pub fn vclog_msg_addr(toc: &[u8]) -> Option<u32> {
+    if toc.len() < 56 || u32_le(toc, 0)? != VC_LOG_MAGIC {
+        return None;
+    }
+    u32_le(toc, 44)
+}
+
+/// `(start, end, write, read)` VideoCore addresses from a message-log
+/// header (`vclog` `log_hdr_t`).
+pub fn vclog_msg_range(hdr: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    if hdr.len() < 20 || u32_le(hdr, 0)? != VC_MSG_MAGIC {
+        return None;
+    }
+    Some((
+        u32_le(hdr, 4)?,
+        u32_le(hdr, 8)?,
+        u32_le(hdr, 12)?,
+        u32_le(hdr, 16)?,
+    ))
+}
+
+/// Oldest firmware messages that fit in `out`. `buf` is the circular
+/// buffer already unwrapped, or a linear slice whose messages do not
+/// wrap. `read_off` is the oldest byte and `write_off` is where the
+/// firmware will write next. Each message is `vclog`'s `msg_hdr_t` plus
+/// a 4-byte payload prefix and a C string. The text is ASCII, with
+/// quotes and backslashes turned into spaces so it can sit in JSON.
+pub fn vclog_tail(buf: &[u8], read_off: usize, write_off: usize, out: &mut [u8]) -> usize {
+    if buf.is_empty() || out.is_empty() || read_off > buf.len() || write_off > buf.len() {
+        return 0;
+    }
+    let mut pos = read_off;
+    let mut n = 0usize;
+    let mut steps = 0u32;
+    while pos != write_off && pos < buf.len() && steps < 400 {
+        steps += 1;
+        if pos + 8 > buf.len() {
+            break;
+        }
+        let size = u16::from_le_bytes([buf[pos + 6], buf[pos + 7]]) as usize;
+        if size < 8 || pos + size > buf.len() {
+            break;
+        }
+        let payload = &buf[pos + 8..pos + size];
+        if payload.len() > 4 {
+            let text = &payload[4..];
+            let end = text.iter().position(|byte| *byte == 0).unwrap_or(text.len());
+            if end > 0 {
+                if n > 0 {
+                    if n + 3 >= out.len() {
+                        break;
+                    }
+                    out[n] = b' ';
+                    out[n + 1] = b'|';
+                    out[n + 2] = b' ';
+                    n += 3;
+                }
+                let mut i = 0;
+                while i < end {
+                    if n >= out.len() {
+                        return n;
+                    }
+                    out[n] = json_safe(text[i]);
+                    n += 1;
+                    i += 1;
+                }
+            }
+        }
+        pos += size;
+    }
+    n
+}
+
+fn json_safe(byte: u8) -> u8 {
+    if byte.is_ascii_graphic() && byte != b'"' && byte != b'\\' {
+        byte
+    } else if byte == b' ' || byte == b'\t' {
+        b' '
+    } else {
+        b' '
+    }
+}
+
 /// Pi `config.txt` / `tryboot.txt` lines. This is not the DNS JSON schema
 /// and it does not accept the legacy `CONFIG.TXT` record format.
 pub fn validate_boot(text: &str) -> Result<(), &'static str> {
@@ -1239,7 +1413,7 @@ mod fat {
 
 #[cfg(test)]
 mod fdt_tests {
-    use super::bootloader_tryboot;
+    use super::{bootloader_tryboot, chosen_log, vclog_msg_addr, vclog_msg_range, vclog_tail};
 
     fn be(n: u32) -> [u8; 4] {
         n.to_be_bytes()
@@ -1362,6 +1536,70 @@ mod fdt_tests {
         out[8..12].copy_from_slice(&be(off_struct));
         out[12..16].copy_from_slice(&be(off_strings));
         out
+    }
+
+    fn log_tree(start: u32, size: u32) -> Vec<u8> {
+        let strings = b"log\0";
+        let mut body = Vec::new();
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "");
+        body.extend_from_slice(&be(1));
+        push_name(&mut body, "chosen");
+        body.extend_from_slice(&be(3));
+        body.extend_from_slice(&be(8));
+        body.extend_from_slice(&be(0));
+        body.extend_from_slice(&be(start));
+        body.extend_from_slice(&be(size));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(2));
+        body.extend_from_slice(&be(9));
+        let mut out = vec![0u8; 40];
+        let off_struct = 40u32;
+        let off_strings = 40 + body.len() as u32;
+        out.extend_from_slice(&body);
+        out.extend_from_slice(strings);
+        let total = out.len() as u32;
+        out[0..4].copy_from_slice(&be(0xd00d_feed));
+        out[4..8].copy_from_slice(&be(total));
+        out[8..12].copy_from_slice(&be(off_struct));
+        out[12..16].copy_from_slice(&be(off_strings));
+        out
+    }
+
+    #[test]
+    fn chosen_log_is_the_vclog_pair() {
+        assert_eq!(chosen_log(&log_tree(0x3e00_0000, 4096)), Some((0x3e00_0000, 4096)));
+        assert_eq!(chosen_log(&blob(Some(&be(1)))), None);
+        assert_eq!(chosen_log(&[0; 64]), None);
+    }
+
+    #[test]
+    fn vclog_keeps_the_oldest_firmware_lines() {
+        let mut toc = [0u8; 56];
+        toc[0..4].copy_from_slice(&0x564c_4f47u32.to_le_bytes());
+        toc[44..48].copy_from_slice(&0x1000u32.to_le_bytes());
+        assert_eq!(vclog_msg_addr(&toc), Some(0x1000));
+        let mut hdr = [0u8; 20];
+        hdr[0..4].copy_from_slice(&0x5353_454du32.to_le_bytes());
+        hdr[4..8].copy_from_slice(&0u32.to_le_bytes());
+        hdr[8..12].copy_from_slice(&64u32.to_le_bytes());
+        hdr[12..16].copy_from_slice(&0u32.to_le_bytes());
+        hdr[16..20].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(vclog_msg_range(&hdr), Some((0, 64, 0, 0)));
+        let mut buf = Vec::new();
+        for text in ["HDMI1:EDID", "hdmi: clock off \"x\""] {
+            let payload = 4 + text.len() + 1;
+            let size = 8 + payload;
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&(size as u16).to_le_bytes());
+            buf.extend_from_slice(&[9, 9, 9, 9]);
+            buf.extend_from_slice(text.as_bytes());
+            buf.push(0);
+        }
+        let mut out = [0u8; 64];
+        let n = vclog_tail(&buf, 0, buf.len(), &mut out);
+        assert_eq!(&out[..n], b"HDMI1:EDID | hdmi: clock off  x ");
     }
 }
 

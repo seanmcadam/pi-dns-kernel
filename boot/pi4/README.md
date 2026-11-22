@@ -11,29 +11,37 @@ report 640x480 and left the rainbow up. The network updater still does
 not rewrite the live `config.txt`. If that line was copied onto the card,
 it has to be removed by mounting the card.
 
-A watchdog or tryboot reboot first reads both HDMI ports and writes
-that line to `HDMISHUT.TXT` before it changes any of them. The port
-with `HDMI_HOTPLUG` bit 0 set is the one that is reset. If neither bit
-is set, a pixel valve with `PV_CONTROL` bit 0 set names the port:
-pixelvalve2 (`0xFE20A000`) is HDMI0 and pixelvalve4 (`0xFE216000`) is
-HDMI1. `/status` `hdmi_port` is `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or
-`none`. The reset pulses that port's DVP line only (bit 0 or bit 1)
-and its 108 MHz gate (bit 3 or bit 4), then writes PHY reset `0x0f`
-and PHY power `0x400`. That pair is what a working picture read. The
-failed post-reboot power word `0x7ff` is never written. The pixel
-valve enable is left as it was read: the watchdog does not reset the
-valve, and a cleared enable is the state that lost the picture. The
-kernel then sends `NOTIFY_REBOOT` (`0x00030048`), blanks and releases
-the framebuffer, and sets firmware domains 6 and 4 on. Domain 6 is
-`RPI_POWER_DOMAIN_HDMI` (device-tree index 5). HDMI0 and HDMI1 share
-it. There is no HDMI1 domain id. Firmware clocks 13 (M2MC / HSM) and
-14 (PIXEL_BVB) are shared the same way. The mailbox part is bounded by
-one second and does not hold the reset. The next boot shows the
-pre-write line in `/status` as `hdmi_last_shut`. The same read, taken
-when this boot's picture is already up and with no register writes, is
-`hdmi_regs`. Both lines label `h0`/`h1`, `phy0`/`pwr0`, `phy1`/`pwr1`,
-and `pv0`/`pv1`. Telnet prints the base addresses (`hdmi base`) and
-the words (`hdmi regs`).
+A cold boot does not write the HDMI block. It reads `PM_HDMI`
+(`0xFE100058`) and the DVP reset and clock words (`0xFEF00004` and
+`0xFEF00008`) first. The HDMI register file and PHY are read only when
+`CM_HSMCTL` enable (bit 4) is set and that port's DVP gate is clear.
+A set gate bit means the 108 MHz clock is stopped. `dvp8=0` means both
+gates are open, not that the clock is off. A size the firmware already
+published is kept. A missed query is retried and then left alone. The
+kernel does not blank, pick a mode, or reset a PHY, a DVP line, or a
+power domain on the way up.
+
+0.1.73 cold-booted with `hdmi_recoveries` 1 and `hdmi_port`
+`hdmi0+hdmi1` while the pre-write dump was `p=-` (no hot-plug and no
+pixel-valve enable) and the HVS was still on. The first size miss is
+what arms recovery, and "no port" was then treated as both ports. That
+PHY and DVP pulse, plus the domain mailbox tags, ran against the
+firmware's scanout. 0.1.72 never entered that path (`recoveries` 0,
+1824x984 kept).
+
+A watchdog or tryboot reboot stores the same read-only line in
+`HDMISHUT.TXT`, sends `NOTIFY_REBOOT` (`0x00030048`, no payload), and
+arms the watchdog the way Linux does: `PM_RSTS` masked with
+`0xfffffaaa`, `PM_WDOG` password plus 10, `PM_RSTC` password with
+`WRCFG` `0x20`. No HDMI, PHY, DVP, blank, or power-domain step.
+`display.hdmi_reset` set to 1 in `CONFIG.JSN` turns those extra steps
+back on for an A/B test. The default omits the key. `/status`
+`hdmi_port` is `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or `none`.
+`hdmi_regs` and `hdmi_last_shut` label `h0`/`h1`, `phy0`/`pwr0`,
+`phy1`/`pwr1`, `pv0`/`pv1`, `hsm`, `pm`, `dvp4`, and `dvp8`. `/vclog`
+and the `vclog` field are the firmware message log from `/chosen/log`,
+the same table `vclog -m` prints. Telnet prints `hdmi base` and
+`hdmi regs`.
 
 The bases are the `bcm2711.dtsi` bus addresses in low-peripheral mode
 (`0x7e000000` maps to `0xFE000000`, the same window as the mailbox).
@@ -43,23 +51,9 @@ its PHY `0xFEF05F00`. The DVP clock is `0xFEF00000`, the HD block
 Those pages are Device-nGnRE. A fault is `ffffffff`. `config.txt` is
 unchanged.
 
-0.1.70's domain cycle was accepted (`d6` and `d4` came back
-`80000000`) and EDID was still zeros. 0.1.72's dump showed the
-monitor on HDMI1 (`h1` bit 0 set, `pv1` enable set, HDMI0 hot-plug
-clear) while the reset and the domain-off wrote HDMI0 and then left
-the shared domain off. After `/firmware/reboot` the HDMI1 hot-plug bit
-was 0, pixelvalve4 was off, and PHY power was `0x7ff`. The watchdog
-does not reset the HDMI DVP, and `PM_RSTC` `WRCFG` `0x20` with the
-halt bits cleared is already the Linux full reset. The hardware sets
-the watchdog reason bits in `PM_RSTS` as the reset happens, so that
-write cannot look like a power-on to `start4.elf`. If the next boot
-still sees a 0x0 size, it turns domains 6 and 4 on, resets the port
-that still shows hot-plug or a live valve, and if neither does it
-resets both ports. It reads EDID from the mailbox and from that
-port's DDC block, and queries the size again. A size the firmware
-reports is kept. A mode taken from a real EDID block is tried before
-1280x720 and 640x480. `/status` also keeps `hdmi_state`, `hdmi_mode`,
-`hdmi_recoveries`, and `hdmi_diag`.
+The watchdog reason bits in `PM_RSTS` are set by the reset itself, so
+the reboot cannot look like a power-on to `start4.elf`. `/status` also
+keeps `hdmi_state`, `hdmi_mode`, `hdmi_recoveries`, and `hdmi_diag`.
 
 Pi 4's PM block does not implement the old HDMI power switches.
 Blank is not used on a good boot: sending it while a mode already

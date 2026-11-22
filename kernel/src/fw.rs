@@ -1141,6 +1141,44 @@ pub fn booted_name() -> &'static str {
     }
 }
 
+/// Flattened device tree the firmware passed in, if the pointer is a tree
+/// in RAM. Used for `/chosen/log`.
+#[cfg(feature = "board-pi4")]
+pub fn dtb_bytes() -> Option<&'static [u8]> {
+    let pa = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_DTB)) };
+    dtb_slice(pa).or_else(|| {
+        if cfg!(feature = "board-pi4") {
+            const PROBE: u64 = 0x80000 + 0x800000;
+            if pa != PROBE {
+                return dtb_slice(PROBE);
+            }
+        }
+        None
+    })
+}
+
+#[cfg(feature = "board-pi4")]
+fn dtb_slice(pa: u64) -> Option<&'static [u8]> {
+    if pa == 0 || pa & 3 != 0 {
+        return None;
+    }
+    let ram0 = crate::board::RAM_START;
+    let ram1 = crate::board::RAM_END;
+    if pa < ram0 || pa.saturating_add(40) > ram1 {
+        return None;
+    }
+    let ptr = crate::addr::phys_to_virt(pa) as *const u8;
+    let hdr = unsafe { core::slice::from_raw_parts(ptr, 40) };
+    if hdr[0..4] != [0xd0, 0x0d, 0xfe, 0xed] {
+        return None;
+    }
+    let total = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
+    if total < 40 || total > 256 * 1024 || pa.saturating_add(total) > ram1 {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(ptr, total as usize) })
+}
+
 fn dtb_tryboot() -> Option<bool> {
     let pa = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_DTB)) };
     log_hex("dtb x0", pa);

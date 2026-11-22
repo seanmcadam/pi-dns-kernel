@@ -36,8 +36,9 @@ pub const HDMI_LAST_H: u32 = 480;
 
 /// What to do after one physical-size query.
 ///
-/// A reported size is kept. A miss power-cycles the HDMI domain once,
-/// queries again, and only then asks for a fallback mode. A later miss stops.
+/// A reported size is kept. A miss queries again, then stops. It does not
+/// reset HDMI or program a mode: a size the firmware already published
+/// has to be left alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HdmiStep {
     Keep,
@@ -52,9 +53,7 @@ pub fn hdmi_step(have_size: bool, misses: u32) -> HdmiStep {
         return HdmiStep::Keep;
     }
     match misses {
-        0 => HdmiStep::PowerCycle,
-        1 => HdmiStep::QueryAgain,
-        2 => HdmiStep::Fallback,
+        0 | 1 => HdmiStep::QueryAgain,
         _ => HdmiStep::Stop,
     }
 }
@@ -311,13 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn a_detected_size_is_kept_and_a_miss_falls_back_once() {
+    fn a_detected_size_is_kept_and_a_miss_only_retries_the_query() {
         assert_eq!(hdmi_step(true, 0), HdmiStep::Keep);
         assert_eq!(hdmi_step(true, 3), HdmiStep::Keep);
-        assert_eq!(hdmi_step(false, 0), HdmiStep::PowerCycle);
+        assert_eq!(hdmi_step(false, 0), HdmiStep::QueryAgain);
         assert_eq!(hdmi_step(false, 1), HdmiStep::QueryAgain);
-        assert_eq!(hdmi_step(false, 2), HdmiStep::Fallback);
-        assert_eq!(hdmi_step(false, 3), HdmiStep::Stop);
+        assert_eq!(hdmi_step(false, 2), HdmiStep::Stop);
         assert_eq!(hdmi_step(false, 9), HdmiStep::Stop);
     }
 
