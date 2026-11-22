@@ -30,26 +30,31 @@
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
 //!
-//! A soft reboot releases the buffer (`0x00048001`) and tries the blank
-//! tag (`0x00040002`) first. Both run with IRQs unmasked and the mailbox
-//! timeout. A miss does not stop the watchdog. Panic and exception halt
-//! leave the buffer in place: those paths do not reboot, and the fault
-//! text has to stay on the panel.
+//! A soft reboot tells the firmware first (`NOTIFY_REBOOT`, `0x00030048`,
+//! no payload — the call Linux has sent since 2018), then blanks and
+//! releases the framebuffer, then powers off the HDMI and video-scaler
+//! domains with `SET_DOMAIN_STATE` (`0x00038030`). Those calls run with
+//! IRQs unmasked, share a one-second budget, and a miss does not stop the
+//! watchdog. Linux still resets with the watchdog after the notify; this
+//! kernel does too. `PM_RSTS` partition bits stay cleared for a reboot
+//! and set for a halt. Panic and exception halt leave the buffer in place:
+//! those paths do not reboot, and the fault text has to stay on the panel.
+//! A halt does not notify, because Linux only notifies on restart.
 //!
-//! If the physical size is missing, the console power-cycles firmware
-//! power domain 5 (the legacy HDMI id), waits, reads EDID block 0
-//! (`0x00030020`), and queries the size again. Only a still-empty size
-//! asks for 1280x720 and then 640x480. A size the firmware already chose
-//! is kept, including after that recovery.
+//! The legacy `SET_POWER_STATE` (`0x00028001`) id 5 is I2C1, not HDMI.
+//! 0.1.69 cycled that id and the firmware refused it. The domain-state
+//! index is the device-tree index plus one: HDMI is 6, the HVS scaler is
+//! 4. Pi 4's PM block does not implement the old HDMI power switches, so
+//! this path does not poke `PM_HDMI`. Whether `start4.elf` actually resets
+//! the HDMI PHY on `NOTIFY_REBOOT` is what a soft reboot on the board has
+//! to show; the reply words are logged either way.
 //!
-//! Pi 4 firmware honors the framebuffer allocate, release, and geometry
-//! tags used here while this kernel owns the scanout (no vc4-kms overlay).
-//! Blank and `SET_POWER_STATE` are less certain. Domain 5 is the single
-//! HDMI id from the older SoCs. Pi 4 has two HDMI blocks, and the firmware
-//! may answer that the device does not exist (response bit 1). Blank during
-//! an otherwise good boot used to drop this board to no signal, so blank
-//! is only sent on the way into a reset. The reply words are logged either
-//! way. None of this runs on virt or Pi 5.
+//! If the physical size is missing, the console cycles domains 6 and 4
+//! off and back on, waits, reads EDID block 0 (`0x00030020`), and queries
+//! the size again. Only a still-empty size asks for 1280x720 and then
+//! 640x480. A size the firmware already chose is kept. Blank is only sent
+//! on the way into a reset: sending it while a mode existed dropped this
+//! board to no signal. None of this runs on virt or Pi 5.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -81,10 +86,15 @@ const TAG_RELEASE: u32 = 0x0004_8001;
 const TAG_BLANK: u32 = 0x0004_0002;
 /// One 128-byte EDID block. Value is the block number, then 128 bytes.
 const TAG_GET_EDID: u32 = 0x0003_0020;
-/// Legacy power domain. Value is the device id, then the state.
-const TAG_SET_POWER: u32 = 0x0002_8001;
-/// Single-HDMI power id from the firmware. Pi 4 may reject it.
-const PWR_HDMI: u32 = 5;
+/// Linux sends this with no payload before it arms the watchdog.
+const TAG_NOTIFY_REBOOT: u32 = 0x0003_0048;
+/// New power-domain interface. Value is the firmware domain, then on/off.
+const TAG_SET_DOMAIN: u32 = 0x0003_8030;
+/// Firmware domain for HDMI. The device-tree index is 5; the mailbox
+/// index is one higher. Legacy `SET_POWER_STATE` id 5 is I2C1.
+const DOM_HDMI: u32 = 6;
+/// Firmware domain for the HVS video scaler. The device-tree index is 3.
+const DOM_SCALER: u32 = 4;
 
 /// `/status` codes. 0 none, 1 up, 2 fallback mode, 3 released for reset.
 const HDMI_NONE: u32 = 0;
@@ -163,6 +173,9 @@ static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
 static HDMI_STATE: AtomicU32 = AtomicU32::new(HDMI_NONE);
 static HDMI_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+const DIAG_CAP: usize = 80;
+static mut DIAG: [u8; DIAG_CAP] = [0; DIAG_CAP];
+static DIAG_LEN: AtomicU8 = AtomicU8::new(0);
 /// Set when a fault has painted the pinned rows. Later log lines and the
 /// status refresh must not scroll that text off the panel.
 static FROZEN: AtomicBool = AtomicBool::new(false);
@@ -186,36 +199,56 @@ pub fn console_status() -> (u32, u32, u32, u32) {
     )
 }
 
-/// Hand the scanout back to the firmware, then return. IRQs stay unmasked
-/// across the mailbox calls. Each call has the mailbox timeout, and the
-/// pair gives up after half a second. The watchdog still runs after this.
-pub fn release_for_reset() {
-    save_line("hdmi release");
-    let held = lock();
-    if held && READY.load(Ordering::Acquire) {
-        paint(b"hdmi release\n");
+/// Copy the latest mailbox summary. Empty means this boot has not recorded
+/// one yet; the caller prints `none`.
+pub fn copy_diag(out: &mut [u8]) -> usize {
+    let n = DIAG_LEN.load(Ordering::Acquire) as usize;
+    if n == 0 {
+        let text = b"none";
+        let n = text.len().min(out.len());
+        out[..n].copy_from_slice(&text[..n]);
+        return n;
     }
-    unlock(held);
+    let n = n.min(out.len()).min(DIAG_CAP);
+    unsafe {
+        core::ptr::copy_nonoverlapping(addr_of!(DIAG).cast::<u8>(), out.as_mut_ptr(), n);
+    }
+    n
+}
+
+/// Tell the firmware a restart is coming, hand the scanout back, and power
+/// the HDMI and scaler domains off. IRQs stay unmasked. The whole sequence
+/// gives up after one second, and the watchdog still runs after this.
+pub fn prepare_reboot() {
     let start = crate::timer::get_ticks();
-    let freq = crate::timer::frequency().max(1);
-    crate::interrupts::with_irqs(|| {
-        crate::act::note_core(crate::percpu::id());
-        let blank_ok = tag_ok(&blank_msg(1));
-        save_line(if blank_ok {
-            "hdmi release blank ok"
-        } else {
-            "hdmi release blank fail"
-        });
-        crate::act::note_core(crate::percpu::id());
-        if crate::timer::get_ticks().wrapping_sub(start) > freq / 2 {
-            save_line("hdmi release budget");
-        } else if tag_ok(&release_msg()) {
-            save_line("hdmi release buffer ok");
-        } else {
-            save_line("hdmi release buffer fail");
-        }
-        crate::act::note_core(crate::percpu::id());
-    });
+    let budget = crate::timer::frequency().max(1);
+    report_shut("hdmi shut start", true);
+    let notify = shut_step(start, budget, &notify_msg());
+    log_shut("hdmi shut notify", notify, true);
+    let blank = shut_step(start, budget, &blank_msg(1));
+    log_shut("hdmi shut blank", blank, true);
+    let release = shut_step(start, budget, &release_msg());
+    log_shut("hdmi shut release", release, false);
+    let hdmi = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 0));
+    log_shut("hdmi shut d6", hdmi, false);
+    let scaler = shut_step(start, budget, &domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 0));
+    log_shut("hdmi shut d4", scaler, false);
+    let mut line = Line::new();
+    line.push("n=");
+    line.hex32(notify.1);
+    line.push(" b=");
+    line.hex32(blank.1);
+    line.push(" r=");
+    line.hex32(release.1);
+    line.push(" d6=");
+    line.hex32(hdmi.1);
+    line.push(":");
+    line.hex32(hdmi.2);
+    line.push(" d4=");
+    line.hex32(scaler.1);
+    line.push(":");
+    line.hex32(scaler.2);
+    set_diag(line.text());
     READY.store(false, Ordering::Release);
     HDMI_STATE.store(HDMI_RELEASED, Ordering::Relaxed);
 }
@@ -422,6 +455,9 @@ fn bring_up() -> bool {
     loop {
         TRY_N.store(attempt, Ordering::Relaxed);
         if let Some(fallback) = take_size(attempt) {
+            if misses == 0 {
+                set_diag("kept");
+            }
             HDMI_STATE.store(
                 if fallback { HDMI_FALLBACK } else { HDMI_UP },
                 Ordering::Relaxed,
@@ -493,40 +529,56 @@ fn ask_fallback(attempt: u32) -> bool {
 }
 
 fn recover_power() {
-    save_line("hdmi recover power off");
-    let off = power_state(false);
-    log_power("off", off);
+    // Only reached when the firmware reported no size. Cycle the real
+    // HDMI and scaler domains. Legacy SET_POWER_STATE id 5 is I2C1.
+    let d6_off = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 0));
+    log_boot("hdmi recover d6 off", d6_off);
     wait_ms(20);
-    save_line("hdmi recover power on");
-    let on = power_state(true);
-    log_power("on", on);
+    let d6_on = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_HDMI, 1));
+    log_boot("hdmi recover d6 on", d6_on);
     wait_ms(50);
-    log_edid();
+    let d4_off = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 0));
+    log_boot("hdmi recover d4 off", d4_off);
+    wait_ms(20);
+    let d4_on = run_tag(&domain_msg(TAG_SET_DOMAIN, DOM_SCALER, 1));
+    log_boot("hdmi recover d4 on", d4_on);
+    wait_ms(50);
+    let edid = log_edid();
+    let mut line = Line::new();
+    line.push("d6=");
+    line.hex32(d6_on.1);
+    line.push(":");
+    line.hex32(d6_on.2);
+    line.push(" d4=");
+    line.hex32(d4_on.1);
+    line.push(":");
+    line.hex32(d4_on.2);
+    line.push(" e=");
+    line.hex32(edid.0);
+    line.push(":");
+    line.hex32(edid.1);
+    set_diag(line.text());
 }
 
-fn log_power(which: &str, state: Option<u32>) {
+fn log_boot(label: &str, reply: (bool, u32, u32)) {
     let mut line = Line::new();
-    line.push("hdmi recover power ");
-    line.push(which);
+    line.push(label);
     line.push(" ");
-    match state {
-        Some(value) if value & 2 != 0 => line.push("absent"),
-        Some(value) => line.hex32(value),
-        None => line.push("fail"),
-    }
+    line.hex32(reply.1);
+    line.push(" ");
+    line.hex32(reply.2);
     save_line(line.text());
 }
 
-fn log_edid() {
+fn log_edid() -> (u32, u32) {
     let mut msg = [0u32; 40];
     msg[0] = 39 * 4;
     msg[2] = TAG_GET_EDID;
     msg[3] = 4 + 128;
-    let reply = call_tag(&msg[..39]);
-    let (header, code, first) = match reply.as_ref() {
-        Some(words) => (edid_header(words), words[1], words[6]),
-        None => (false, 0, 0),
-    };
+    let (ok, reply) = exchange_tag(&msg[..39]);
+    let header = ok && edid_header(&reply);
+    let code = reply[1];
+    let first = reply[6];
     let mut line = Line::new();
     line.push(if header {
         "hdmi recover edid yes "
@@ -537,6 +589,7 @@ fn log_edid() {
     line.push(" ");
     line.hex32(first);
     save_line(line.text());
+    (code, first)
 }
 
 fn edid_header(words: &[u32; 48]) -> bool {
@@ -545,15 +598,64 @@ fn edid_header(words: &[u32; 48]) -> bool {
     a == [0x00, 0xff, 0xff, 0xff] && b[0] == 0xff && b[1] == 0xff && b[2] == 0xff && b[3] == 0x00
 }
 
-fn power_state(on: bool) -> Option<u32> {
+fn notify_msg() -> [u32; 6] {
+    let mut msg = [0u32; 6];
+    msg[0] = 24;
+    msg[2] = TAG_NOTIFY_REBOOT;
+    msg
+}
+
+fn domain_msg(tag: u32, id: u32, on: u32) -> [u32; 8] {
     let mut msg = [0u32; 8];
     msg[0] = 32;
-    msg[2] = TAG_SET_POWER;
+    msg[2] = tag;
     msg[3] = 8;
-    msg[5] = PWR_HDMI;
-    msg[6] = u32::from(on);
-    let reply = call_tag(&msg)?;
-    Some(reply[6])
+    msg[5] = id;
+    msg[6] = on;
+    msg
+}
+
+fn shut_step(start: u64, budget: u64, template: &[u32]) -> (bool, u32, u32) {
+    crate::act::note_core(crate::percpu::id());
+    if crate::timer::get_ticks().wrapping_sub(start) > budget {
+        save_line("hdmi shut budget");
+        return (false, 0, 0);
+    }
+    crate::interrupts::with_irqs(|| run_tag(template))
+}
+
+fn log_shut(label: &str, reply: (bool, u32, u32), draw: bool) {
+    let mut line = Line::new();
+    line.push(label);
+    line.push(" ");
+    line.hex32(reply.1);
+    line.push(" ");
+    line.hex32(reply.2);
+    report_shut(line.text(), draw);
+}
+
+fn report_shut(text: &str, draw: bool) {
+    save_line(text);
+    crate::logger::announce(text);
+    if !draw {
+        return;
+    }
+    let held = lock();
+    if held && READY.load(Ordering::Acquire) {
+        paint(text.as_bytes());
+        paint(b"\n");
+    }
+    unlock(held);
+}
+
+fn set_diag(text: &str) {
+    let n = text.len().min(DIAG_CAP);
+    unsafe {
+        let dst = addr_of_mut!(DIAG).cast::<u8>();
+        core::ptr::write_bytes(dst, 0, DIAG_CAP);
+        core::ptr::copy_nonoverlapping(text.as_ptr(), dst, n);
+    }
+    DIAG_LEN.store(n as u8, Ordering::Release);
 }
 
 fn blank_msg(state: u32) -> [u32; 7] {
@@ -572,28 +674,36 @@ fn release_msg() -> [u32; 6] {
     msg
 }
 
-fn tag_ok(template: &[u32]) -> bool {
-    call_tag(template).is_some()
+/// `(ok, response code, value word)`. The value word is the state for a
+/// domain tag and zero when the tag has no value. A timeout is code 0.
+/// The second try uses the raw physical address after the bus alias is
+/// refused. The template is restored first because a failed exchange
+/// leaves the buffer half written.
+fn run_tag(template: &[u32]) -> (bool, u32, u32) {
+    let (ok, msg) = exchange_tag(template);
+    let value = if template.len() > 6 { msg[6] } else { 0 };
+    (ok, msg[1], value)
 }
 
-/// Firmware success code, or nothing. The second try uses the raw physical
-/// address after the bus alias is refused. The template is restored first
-/// because a failed exchange leaves the buffer half written.
-fn call_tag(template: &[u32]) -> Option<[u32; 48]> {
+/// Last mailbox buffer, with the success bit. A timeout keeps the earlier
+/// reply when the bus-alias try wrote one, so a refused tag still shows
+/// its response code.
+fn exchange_tag(template: &[u32]) -> (bool, [u32; 48]) {
     if template.is_empty() || template.len() > 48 {
-        return None;
+        return (false, [0; 48]);
     }
     let mut msg = [0u32; 48];
     let n = template.len();
     msg[..n].copy_from_slice(template);
     if exchange(&mut msg[..n], true) && msg[1] == REQ_OK {
-        return Some(msg);
+        return (true, msg);
     }
+    let missed = msg;
     msg[..n].copy_from_slice(template);
-    if exchange(&mut msg[..n], false) && msg[1] == REQ_OK {
-        return Some(msg);
+    if exchange(&mut msg[..n], false) {
+        return (msg[1] == REQ_OK, msg);
     }
-    None
+    (false, missed)
 }
 
 fn wait_ms(ms: u64) {
