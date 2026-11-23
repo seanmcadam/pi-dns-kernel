@@ -660,6 +660,183 @@ pub fn vclog_msg_range(hdr: &[u8]) -> Option<(u32, u32, u32, u32)> {
     ))
 }
 
+/// ARM physical range that may be read for the firmware log.
+///
+/// `start` is inclusive and `end` is exclusive. Both are byte addresses,
+/// not page-aligned. A read has to sit entirely inside this range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VclogWindow {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Why [`vclog_window`] refused a `/chosen/log` or `GET_VC_MEMORY` pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VclogDeny {
+    /// Neither source was present.
+    NoSource,
+    /// A size was zero.
+    Empty,
+    /// A start plus a size overflowed.
+    Overflow,
+    /// The translated range is outside `0..ram_end`.
+    OutsideRam,
+    /// `/chosen/log` does not overlap `GET_VC_MEMORY`.
+    OutsideChosen,
+    /// The translated range is not inside `GET_VC_MEMORY`, or it misses RAM.
+    OutsideVcMem,
+}
+
+/// Readable firmware-log window.
+///
+/// `dt` is `/chosen/log` (VideoCore start, size). `mem` is mailbox
+/// `GET_VC_MEMORY` `0x00010006` (base, size). A VideoCore address is
+/// tried raw and, when that differs, as `addr & 0x3fff_ffff`. When both
+/// sources exist the window is their intersection, kept from the start
+/// and capped at 1 MiB (the table of contents is at the start). When
+/// only the mailbox window exists, the last 1 MiB is kept: the firmware
+/// parks the table at the top of that reservation. The result has to
+/// sit inside `0..ram_end`.
+pub fn vclog_window(
+    dt: Option<(u32, u32)>,
+    mem: Option<(u32, u32)>,
+    ram_end: u64,
+) -> Result<VclogWindow, VclogDeny> {
+    const CAP: u64 = 1024 * 1024;
+    let dt_ranges = match dt {
+        Some((start, size)) => Some(vc_ranges(start, size)?),
+        None => None,
+    };
+    let mem_ranges = match mem {
+        Some((start, size)) => Some(vc_ranges(start, size)?),
+        None => None,
+    };
+    let picked = match (dt_ranges, mem_ranges) {
+        (None, None) => return Err(VclogDeny::NoSource),
+        (Some(dt_ranges), None) => {
+            let range = first_in_ram(&dt_ranges, ram_end).ok_or(VclogDeny::OutsideRam)?;
+            head_capped(range, CAP)
+        }
+        (None, Some(mem_ranges)) => {
+            let range = first_in_ram(&mem_ranges, ram_end).ok_or(VclogDeny::OutsideRam)?;
+            tail_capped(range, CAP)
+        }
+        (Some(dt_ranges), Some(mem_ranges)) => {
+            let mut best: Option<(u64, u64)> = None;
+            let mut dt_in_ram = false;
+            for dt_range in dt_ranges.into_iter().flatten() {
+                if clamp_ram(dt_range, ram_end).is_some() {
+                    dt_in_ram = true;
+                }
+                for mem_range in mem_ranges.into_iter().flatten() {
+                    let Some(hit) = intersect(dt_range, mem_range) else {
+                        continue;
+                    };
+                    let Some(hit) = clamp_ram(hit, ram_end) else {
+                        continue;
+                    };
+                    let len = hit.1 - hit.0;
+                    let replace = best.map(|have| len > have.1 - have.0).unwrap_or(true);
+                    if replace {
+                        best = Some(hit);
+                    }
+                }
+            }
+            let Some(hit) = best else {
+                return Err(if dt_in_ram {
+                    VclogDeny::OutsideChosen
+                } else {
+                    VclogDeny::OutsideVcMem
+                });
+            };
+            head_capped(hit, CAP)
+        }
+    };
+    if picked.0 >= picked.1 {
+        return Err(VclogDeny::Empty);
+    }
+    Ok(VclogWindow {
+        start: picked.0,
+        end: picked.1,
+    })
+}
+
+/// `pa` for `len` bytes lies entirely inside `window`.
+pub fn vclog_covers(pa: u64, len: u64, window: VclogWindow) -> bool {
+    len > 0 && pa >= window.start && pa.saturating_add(len) <= window.end
+}
+
+fn vc_ranges(start: u32, size: u32) -> Result<[Option<(u64, u64)>; 2], VclogDeny> {
+    if size == 0 {
+        return Err(VclogDeny::Empty);
+    }
+    let raw = span(u64::from(start), u64::from(size))?;
+    let masked_base = u64::from(start) & 0x3fff_ffff;
+    let masked = if masked_base == u64::from(start) {
+        None
+    } else {
+        Some(span(masked_base, u64::from(size))?)
+    };
+    Ok([Some(raw), masked])
+}
+
+fn span(base: u64, size: u64) -> Result<(u64, u64), VclogDeny> {
+    let Some(end) = base.checked_add(size) else {
+        return Err(VclogDeny::Overflow);
+    };
+    if end <= base {
+        return Err(VclogDeny::Empty);
+    }
+    Ok((base, end))
+}
+
+fn intersect(a: (u64, u64), b: (u64, u64)) -> Option<(u64, u64)> {
+    let start = a.0.max(b.0);
+    let end = a.1.min(b.1);
+    if start < end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn clamp_ram(range: (u64, u64), ram_end: u64) -> Option<(u64, u64)> {
+    if range.0 >= ram_end {
+        return None;
+    }
+    let end = range.1.min(ram_end);
+    if range.0 < end {
+        Some((range.0, end))
+    } else {
+        None
+    }
+}
+
+fn first_in_ram(ranges: &[Option<(u64, u64)>; 2], ram_end: u64) -> Option<(u64, u64)> {
+    for range in ranges.iter().flatten() {
+        if let Some(hit) = clamp_ram(*range, ram_end) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn head_capped(range: (u64, u64), cap: u64) -> (u64, u64) {
+    if range.1 - range.0 <= cap {
+        range
+    } else {
+        (range.0, range.0 + cap)
+    }
+}
+
+fn tail_capped(range: (u64, u64), cap: u64) -> (u64, u64) {
+    if range.1 - range.0 <= cap {
+        range
+    } else {
+        (range.1 - cap, range.1)
+    }
+}
+
 /// `(start, end, write, read)` from an assert-log header (`vclog -a`).
 pub fn vclog_assert_range(hdr: &[u8]) -> Option<(u32, u32, u32, u32)> {
     if hdr.len() < 20 || u32_le(hdr, 0)? != VC_ASSERT_MAGIC {
@@ -1686,8 +1863,9 @@ mod fat {
 #[cfg(test)]
 mod fdt_tests {
     use super::{
-        bootloader_tryboot, chosen_log, vclog_assert_addr, vclog_linearize, vclog_msg_addr,
-        vclog_msg_range, vclog_render_asserts, vclog_render_messages, vclog_tail,
+        bootloader_tryboot, chosen_log, vclog_assert_addr, vclog_covers, vclog_linearize,
+        vclog_msg_addr, vclog_msg_range, vclog_render_asserts, vclog_render_messages, vclog_tail,
+        vclog_window, VclogDeny,
     };
 
     fn be(n: u32) -> [u8; 4] {
@@ -1846,6 +2024,56 @@ mod fdt_tests {
         assert_eq!(chosen_log(&log_tree(0x3e00_0000, 4096)), Some((0x3e00_0000, 4096)));
         assert_eq!(chosen_log(&blob(Some(&be(1)))), None);
         assert_eq!(chosen_log(&[0; 64]), None);
+    }
+
+    /// Pi 4 RAM stops at the peripheral window. The 0.1.77 fault address
+    /// `0x3ffa4164` is inside a `/chosen/log` that starts at `0x3ffa0000`.
+    const RAM_END: u64 = 0xFC00_0000;
+    const FAR: u64 = 0x3FFA_4164;
+
+    #[test]
+    fn vclog_window_accepts_the_fault_address_and_rejects_a_short_log() {
+        let dt = Some((0x3FFA_0000, 0x8_0000));
+        let mem = Some((0x3C00_0000, 0x0400_0000));
+        let win = vclog_window(dt, mem, RAM_END).unwrap();
+        assert_eq!(win.start, 0x3FFA_0000);
+        assert_eq!(win.end, 0x4000_0000);
+        assert!(vclog_covers(FAR, 4, win));
+        assert!(vclog_covers(0x3FFA_0000, 0x6_0000, win));
+        assert!(!vclog_covers(0x3FFA_0000, 0x8_0000, win));
+        assert!(!vclog_covers(FAR, 0x8_0000, win));
+        assert!(!vclog_covers(win.end - 1, 2, win));
+        assert!(!vclog_covers(0xFFFF_0000_3FFA_4164, 4, win));
+
+        let short = vclog_window(Some((0x3FFA_0000, 0x1000)), mem, RAM_END).unwrap();
+        assert!(!vclog_covers(FAR, 4, short));
+        assert!(vclog_covers(0x3FFA_0000, 0x1000, short));
+    }
+
+    #[test]
+    fn vclog_window_uses_the_bus_alias_and_refuses_a_miss() {
+        let dt = Some((0xFFFA_0000, 0x8000));
+        let mem = Some((0xFFC0_0000, 0x0400_0000));
+        let win = vclog_window(dt, mem, RAM_END).unwrap();
+        assert_eq!(win.start, 0x3FFA_0000);
+        assert!(vclog_covers(FAR, 4, win));
+        assert_eq!(
+            vclog_window(Some((0x3FFA_0000, 0x1000)), Some((0x1000_0000, 0x1000)), RAM_END),
+            Err(VclogDeny::OutsideChosen)
+        );
+        assert_eq!(vclog_window(None, None, RAM_END), Err(VclogDeny::NoSource));
+        assert_eq!(
+            vclog_window(Some((0x3FFA_0000, 0)), None, RAM_END),
+            Err(VclogDeny::Empty)
+        );
+        assert_eq!(
+            vclog_window(Some((0x3FFA_0000, 0x1000)), None, 0x1000_0000),
+            Err(VclogDeny::OutsideRam)
+        );
+        let tail = vclog_window(None, Some((0x3C00_0000, 0x0400_0000)), RAM_END).unwrap();
+        assert_eq!(tail.start, 0x3FF0_0000);
+        assert_eq!(tail.end, 0x4000_0000);
+        assert!(vclog_covers(FAR, 4, tail));
     }
 
     #[test]

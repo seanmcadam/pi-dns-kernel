@@ -789,6 +789,101 @@ unsafe fn l3_for(pa: u64) -> *mut Table {
     l3
 }
 
+/// Level-3 tables for one firmware-log window. Two tables cover 4 MiB,
+/// which is enough for the 1 MiB cap in [`fwupd::vclog_window`]. They are
+/// not the kernel fine-page pool.
+#[cfg(feature = "board-pi4")]
+struct VcTables {
+    l3: [Table; 2],
+}
+
+#[cfg(feature = "board-pi4")]
+static mut VC_TABLES: VcTables = VcTables {
+    l3: [const { Table { entries: [0; 512] } }; 2],
+};
+
+/// Map `[start, end)` read-only Device-nGnRE, splitting the 2 MiB blocks
+/// that cover it. Other pages in those blocks keep the attributes they
+/// already had, so a framebuffer block stays non-cacheable. Fails closed
+/// when the range is empty, outside RAM, overlaps the kernel, crosses more
+/// than two blocks, or a block is already a page table. The caller must
+/// not read the range when this returns false.
+#[cfg(feature = "board-pi4")]
+pub fn map_vc_ro(start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    let heap_end = virt_to_phys(addr_of!(__heap_end) as u64);
+    if start < heap_end || end > crate::board::RAM_END {
+        return false;
+    }
+    let page_lo = align_down(start, PAGE);
+    let page_hi = align_up(end, PAGE);
+    let block_lo = align_down(page_lo, BLOCK);
+    let block_hi = align_up(page_hi, BLOCK);
+    let blocks = (block_hi - block_lo) / BLOCK;
+    if blocks == 0 || blocks > 2 {
+        return false;
+    }
+    unsafe {
+        let mut n = 0u64;
+        while n < blocks {
+            let block = block_lo + n * BLOCK;
+            let l2 = l2_for(block);
+            let index = ((block >> 21) & 511) as usize;
+            let entry = (&*l2).entries[index];
+            if entry & VALID == 0 || entry & TABLE_OR_PAGE != 0 {
+                return false;
+            }
+            n += 1;
+        }
+        let va = phys_to_virt(page_lo);
+        let va_end = phys_to_virt(page_hi);
+        let mut line = va & !63;
+        while line < va_end {
+            core::arch::asm!("dc civac, {line}", line = in(reg) line, options(nostack));
+            line = line.saturating_add(64);
+        }
+        core::arch::asm!("dsb sy", options(nostack));
+        let device = attrs(ATTR_DEVICE, SH_OUTER, AP_RO, true);
+        n = 0;
+        while n < blocks {
+            let block = block_lo + n * BLOCK;
+            let l2 = l2_for(block);
+            let index = ((block >> 21) & 511) as usize;
+            let entry = (&*l2).entries[index];
+            let l3 = addr_of_mut!(VC_TABLES.l3[n as usize]);
+            (&mut *l3).entries = [0; 512];
+            let keep = block_leaf_attrs(entry);
+            let mut page = 0u64;
+            while page < 512 {
+                let pa = block + page * PAGE;
+                let flags = if pa + PAGE > start && pa < end {
+                    device
+                } else {
+                    keep
+                };
+                (&mut *l3).entries[page as usize] =
+                    (pa & !((1 << 12) - 1)) | flags | VALID | TABLE_OR_PAGE;
+                page += 1;
+            }
+            (&mut *l2).entries[index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
+            n += 1;
+        }
+    }
+    flush_tlb();
+    true
+}
+
+/// Attribute bits shared by a block and a page. Bits [20:12] of a block
+/// are not an address, but they are part of a page's output address, so
+/// they are not copied.
+#[cfg(feature = "board-pi4")]
+fn block_leaf_attrs(entry: u64) -> u64 {
+    const KEEP: u64 = (0b111 << 2) | (0b11 << 6) | (0b11 << 8) | AF | NG | PXN | UXN;
+    entry & KEEP
+}
+
 /// Map a Pi 4 framebuffer and return the virtual address to store through.
 ///
 /// The window is Normal non-cacheable, EL1-only, and not an identity map.
