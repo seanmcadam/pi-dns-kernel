@@ -102,9 +102,20 @@ pub fn classify(tryboot: bool, kernel: &str) {
 /// A staged upload or a promote replaces the kernel this streak was counting.
 pub fn forget() {
     let image = boot_rec::image_id(version::BOOT_ID_STR.as_bytes());
-    let prev_stage = saved().map(|rec| rec.stage).unwrap_or(0);
+    let prev = saved();
+    let stopped = prev
+        .map(|rec| boot_rec::stopped_at(&rec))
+        .unwrap_or(0);
+    let was_good = prev.is_some_and(|rec| rec.good != 0 || rec.stage == boot_rec::STAGE_GOOD);
     let mut rec = boot_rec::reconcile(None, boot_rec::Arrival::Staged, image).0;
-    rec.prev_stage = prev_stage;
+    rec.prev_stage = stopped;
+    if was_good {
+        rec.good = 1;
+        rec.stage = boot_rec::STAGE_GOOD;
+        rec.prev_stage = boot_rec::STAGE_GOOD;
+    } else if stopped != 0 {
+        rec.stage = stopped;
+    }
     ACTION.store(ACT_CONTINUE, Ordering::Release);
     ROLLBACK.store(false, Ordering::Release);
     CLASSIFIED.store(true, Ordering::Release);
@@ -137,6 +148,12 @@ pub fn report() {
     let mut reset_n = push(&mut reset_line, 0, b"last reset ");
     reset_n = push(&mut reset_line, reset_n, cause.as_bytes());
     if let Ok(text) = core::str::from_utf8(&reset_line[..reset_n]) {
+        crate::disklog::line(text);
+    }
+    let mut rsts_line = [0u8; 24];
+    let mut rsts_n = push(&mut rsts_line, 0, b"pm rsts ");
+    rsts_n = push_hex(&mut rsts_line, rsts_n, crate::board::last_rsts());
+    if let Ok(text) = core::str::from_utf8(&rsts_line[..rsts_n]) {
         crate::disklog::line(text);
     }
 }
@@ -368,6 +385,7 @@ fn force_fail() {
 
 fn hold_hang() {
     HELD.store(true, Ordering::Release);
+    note_watchdog_hold();
     #[cfg(feature = "board-pi4")]
     crate::act::suspend_watch();
     crate::disklog::line("watchdog hold");
@@ -377,6 +395,16 @@ fn hold_hang() {
             core::arch::asm!("wfe", options(nomem, nostack));
         }
     }
+}
+
+/// The PM watchdog does not pass through this function, and the firmware
+/// clears `PM_RSTS` before the next kernel reads it. The flag in the boot
+/// record is what the next boot reports.
+fn note_watchdog_hold() {
+    let image = boot_rec::image_id(version::BOOT_ID_STR.as_bytes());
+    let mut rec = saved().unwrap_or_else(|| boot_rec::reconcile(None, boot_rec::Arrival::Same, image).0);
+    rec.reset = boot_rec::RESET_WATCHDOG;
+    remember(&rec);
 }
 
 fn pet() {
@@ -503,6 +531,23 @@ fn push(out: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
         }
         out[n] = *byte;
         n += 1;
+    }
+    n
+}
+
+fn push_hex(out: &mut [u8], mut n: usize, value: u32) -> usize {
+    let bytes = value.to_be_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        let hex = b"0123456789abcdef";
+        if n + 2 > out.len() {
+            return n;
+        }
+        out[n] = hex[(byte >> 4) as usize];
+        out[n + 1] = hex[(byte & 0xf) as usize];
+        n += 2;
+        i += 1;
     }
     n
 }

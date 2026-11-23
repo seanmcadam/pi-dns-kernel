@@ -74,6 +74,22 @@ pub enum Action {
     Stay,
 }
 
+/// Last stage the previous boot reached.
+///
+/// `good` means that boot passed the 15 second healthy mark, even if a later
+/// rewrite left `stage` at `start`. `start` means it did not get past arming
+/// the record. `0` is `unknown` (no previous boot). This is not the current
+/// boot's progress; that is `boot_good`.
+pub fn stopped_at(prev: &Rec) -> u32 {
+    if prev.good != 0 || prev.stage == STAGE_GOOD {
+        STAGE_GOOD
+    } else if prev.stage != 0 {
+        prev.stage
+    } else {
+        prev.prev_stage
+    }
+}
+
 pub fn stage_name(stage: u32) -> &'static str {
     match stage {
         STAGE_START => "start",
@@ -102,27 +118,28 @@ pub fn reconcile(prev: Option<Rec>, arrival: Arrival, image: [u8; 16]) -> (Rec, 
     let Some(prev) = prev else {
         return (fresh_image(0, image), Action::Continue);
     };
+    let stopped = stopped_at(&prev);
     if arrival == Arrival::Staged || arrival == Arrival::Other {
-        return (fresh_image(prev.stage, image), Action::Continue);
+        return (fresh_image(stopped, image), Action::Continue);
     }
     if arrival != Arrival::Backup && prev.image != [0; 16] && prev.image != image {
-        return (fresh_image(prev.stage, image), Action::Continue);
+        return (fresh_image(stopped, image), Action::Continue);
     }
     if arrival == Arrival::Backup {
         return backup_arrival(prev, image);
     }
     if prev.restored != 0 && prev.good != 0 {
-        return (fresh_image(prev.stage, image), Action::Continue);
+        return (fresh_image(stopped, image), Action::Continue);
     }
     if prev.good != 0 && prev.fallback < FB_ACTIVE {
-        return (fresh_image(prev.stage, image), Action::Continue);
+        return (fresh_image(stopped, image), Action::Continue);
     }
     if prev.fallback == FB_RESET {
         return (
             Rec {
                 attempts: prev.attempts,
                 stage: STAGE_START,
-                prev_stage: prev.stage,
+                prev_stage: stopped,
                 fallback: FB_ACTIVE,
                 good: 0,
                 restored: 0,
@@ -134,7 +151,7 @@ pub fn reconcile(prev: Option<Rec>, arrival: Arrival, image: [u8; 16]) -> (Rec, 
     }
     if prev.fallback == FB_ACTIVE && prev.restored == 0 {
         return (
-            owned(prev.attempts, prev.stage, FB_RESET, image),
+            owned(prev.attempts, stopped, FB_RESET, image),
             Action::Fallback,
         );
     }
@@ -143,7 +160,7 @@ pub fn reconcile(prev: Option<Rec>, arrival: Arrival, image: [u8; 16]) -> (Rec, 
             Rec {
                 attempts: prev.attempts,
                 stage: STAGE_START,
-                prev_stage: prev.stage,
+                prev_stage: stopped,
                 fallback: FB_ABANDONED,
                 good: 0,
                 restored: 0,
@@ -156,23 +173,24 @@ pub fn reconcile(prev: Option<Rec>, arrival: Arrival, image: [u8; 16]) -> (Rec, 
     let attempts = prev.attempts.saturating_add(1);
     if attempts >= FAIL_LIMIT {
         return (
-            owned(attempts, prev.stage, FB_RESET, image),
+            owned(attempts, stopped, FB_RESET, image),
             Action::Fallback,
         );
     }
     (
-        owned(attempts, prev.stage, FB_NONE, image),
+        owned(attempts, stopped, FB_NONE, image),
         Action::Continue,
     )
 }
 
 fn backup_arrival(prev: Rec, image: [u8; 16]) -> (Rec, Action) {
+    let stopped = stopped_at(&prev);
     if prev.fallback == FB_RESET {
         return (
             Rec {
                 attempts: prev.attempts,
                 stage: STAGE_START,
-                prev_stage: prev.stage,
+                prev_stage: stopped,
                 fallback: FB_ACTIVE,
                 good: 0,
                 restored: 0,
@@ -184,7 +202,7 @@ fn backup_arrival(prev: Rec, image: [u8; 16]) -> (Rec, Action) {
     }
     if prev.fallback == FB_ACTIVE && prev.restored == 0 {
         return (
-            owned(prev.attempts, prev.stage, FB_RESET, image),
+            owned(prev.attempts, stopped, FB_RESET, image),
             Action::Fallback,
         );
     }
@@ -193,7 +211,7 @@ fn backup_arrival(prev: Rec, image: [u8; 16]) -> (Rec, Action) {
             Rec {
                 attempts: prev.attempts,
                 stage: STAGE_START,
-                prev_stage: prev.stage,
+                prev_stage: stopped,
                 fallback: FB_ABANDONED,
                 good: 0,
                 restored: 0,
@@ -203,7 +221,7 @@ fn backup_arrival(prev: Rec, image: [u8; 16]) -> (Rec, Action) {
             Action::Stay,
         );
     }
-    (fresh_image(prev.stage, image), Action::Continue)
+    (fresh_image(stopped, image), Action::Continue)
 }
 
 /// `true` only when this boot is the `kernel8.bak` tryboot the record asked for.
@@ -473,6 +491,18 @@ mod tests {
         assert_eq!(action, Action::Continue);
         assert_eq!(next.fallback, FB_NONE);
         assert_eq!(next.attempts, 0);
+        assert_eq!(stage_name(next.prev_stage), "good");
+    }
+
+    #[test]
+    fn a_good_boot_stays_good_when_the_stage_word_was_reset() {
+        let (rec, _) = on_boot(None);
+        let mut rec = mark_good(rec);
+        rec.stage = STAGE_START;
+        let (next, action) = on_boot(Some(rec));
+        assert_eq!(action, Action::Continue);
+        assert_eq!(next.attempts, 0);
+        assert_eq!(stage_name(next.prev_stage), "good");
     }
 
     #[test]
@@ -530,6 +560,7 @@ mod tests {
         assert_eq!(classify_reset(0x200, 0), RESET_REBOOT);
         assert_eq!(classify_reset(0x1000, 0), RESET_POWER);
         assert_eq!(classify_reset(0x220, RESET_WATCHDOG), RESET_WATCHDOG);
+        assert_eq!(classify_reset(0, RESET_WATCHDOG), RESET_WATCHDOG);
         assert_eq!(reset_name(RESET_WATCHDOG), "watchdog");
         assert_ne!(
             image_id(b"pi4dns-boot-id:0.1.82"),

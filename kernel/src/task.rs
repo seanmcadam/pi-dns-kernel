@@ -560,7 +560,9 @@ fn syscall() -> u64 {
         | HDMI_CONSOLE
         | CRASH
         | BOOT
-        | BOARD => {
+        | BOARD
+        | 74
+        | 75 => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME

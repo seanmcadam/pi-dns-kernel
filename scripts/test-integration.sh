@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.83" qemu/boot-output.txt && \
+   grep -q "version 0.1.84" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.83"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.84"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -269,6 +269,39 @@ else
     echo "✗ /status NIC counters missing or stuck"
     echo "--- first ---"; cat qemu/status-nic-a.txt 2>/dev/null || true
     echo "--- second ---"; cat qemu/status-nic-b.txt 2>/dev/null || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 62: /status HTML for browsers, JSON for scripts"
+if timeout 5 curl -s -u admin:admin -H 'Accept: text/html' "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-html.txt \
+    && timeout 5 curl -s -u admin:admin -H 'Accept: text/html' "http://127.0.0.1:${HTTP_HOST_PORT}/status?format=json" > qemu/status-fmt.json \
+    && timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/json/status" > qemu/status-json.txt \
+    && python3 - qemu/status-html.txt qemu/status-fmt.json qemu/status-json.txt <<'PY'
+import json, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+forced = json.load(open(sys.argv[2]))
+plain = json.load(open(sys.argv[3]))
+if "<h1" not in html or "boot_good" not in html or "/crash/list" not in html or "/json/status" not in html:
+    print("html", html[:240])
+    sys.exit(1)
+if html.lstrip().startswith("{"):
+    print("html was json")
+    sys.exit(1)
+if forced.get("status") != "running" or plain.get("status") != "running":
+    print("json", forced.get("status"), plain.get("status"))
+    sys.exit(1)
+if forced.get("version") != plain.get("version") or "0.1.84" not in html:
+    print("version", forced.get("version"), plain.get("version"))
+    sys.exit(1)
+print("status html", len(html), "json", plain.get("version"))
+sys.exit(0)
+PY
+then
+    echo "✓ /status is HTML for browsers and JSON otherwise"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ /status HTML or /json/status failed"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -1504,6 +1537,40 @@ if status != 200:
 status, now = req("GET", "/config/file/config")
 if now != kept:
     fail("restore bytes %s" % now[:180])
+import urllib.parse
+status, page = req("GET", "/config")
+if status != 200 or b'name="csrf"' not in page or b"<form" not in page or b"CONFIG.BAK" not in page:
+    fail("config page %s" % page[:220])
+mark = b'name="csrf" value="'
+at = page.find(mark)
+token = page[at + len(mark):].split(b'"', 1)[0].decode()
+changed = json.loads(kept)
+changed["dns"]["cache_reap_interval_secs"] = 9
+body = urllib.parse.urlencode({
+    "csrf": token,
+    "reboot": "0",
+    "json": json.dumps(changed, separators=(",", ":")),
+})
+status, saved = req("POST", "/config", body, {"Content-Type": "application/x-www-form-urlencoded"})
+if status != 200 or b"Saved" not in saved:
+    fail("form save %s %s" % (status, saved[:180]))
+status, now = req("GET", "/config/file/config")
+if json.loads(now)["dns"]["cache_reap_interval_secs"] != 9:
+    fail("form round trip %s" % now[:180])
+status, denied = req(
+    "POST",
+    "/config",
+    urllib.parse.urlencode({"reboot": "0", "json": "{}"}),
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 403:
+    fail("csrf %s %s" % (status, denied[:80]))
+status, restored = req("POST", "/config/file/config", kept.decode(), {"Content-Type": "application/json"})
+if status != 200:
+    fail("form restore %s" % restored[:120])
+status, now = req("GET", "/config/file/config")
+if now != kept:
+    fail("form restore bytes")
 print("rejections")
 
 status, saved = req(
@@ -2178,12 +2245,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.83" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.84" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.83" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.84" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2199,7 +2266,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.83" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.84" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2446,12 +2513,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.83":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.84":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.83" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.84" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break

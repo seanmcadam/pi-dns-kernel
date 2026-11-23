@@ -14,6 +14,42 @@ pub use auth::*;
 pub use request::*;
 pub use response::*;
 
+/// Path and query from a request target. The query is empty when there is none.
+pub fn split_target(target: &str) -> (&str, &str) {
+    match target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (target, ""),
+    }
+}
+
+/// Browsers send `Accept: text/html`. Scripts and `format=json` stay on JSON.
+/// `format=html` forces the page. `*/*` alone does not.
+pub fn wants_html(query: &str, accept: Option<&str>) -> bool {
+    if query_is(query, "format", "json") {
+        return false;
+    }
+    if query_is(query, "format", "html") {
+        return true;
+    }
+    match accept {
+        Some(accept) => {
+            let lower = accept.to_ascii_lowercase();
+            lower.split(',').any(|part| {
+                let media = part.split(';').next().unwrap_or("").trim();
+                media == "text/html"
+            })
+        }
+        None => false,
+    }
+}
+
+fn query_is(query: &str, key: &str, value: &str) -> bool {
+    query.split('&').any(|part| {
+        let (got_key, got_value) = part.split_once('=').unwrap_or((part, ""));
+        got_key == key && got_value == value
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,6 +82,25 @@ mod tests {
 
         assert!(output.contains("HTTP/1.1 200 OK"));
         assert!(output.contains("Hello, world!"));
+    }
+
+    #[test]
+    fn accept_negotiation_keeps_scripts_on_json() {
+        assert!(!wants_html("", None));
+        assert!(!wants_html("", Some("*/*")));
+        assert!(!wants_html("", Some("application/json")));
+        assert!(wants_html("", Some("text/html")));
+        assert!(wants_html(
+            "",
+            Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        ));
+        assert!(!wants_html("format=json", Some("text/html")));
+        assert!(wants_html("format=html", None));
+        assert!(wants_html("format=html&x=1", Some("application/json")));
+        let (path, query) = split_target("/status?format=json");
+        assert_eq!(path, "/status");
+        assert_eq!(query, "format=json");
+        assert_eq!(split_target("/json/status"), ("/json/status", ""));
     }
 
     #[test]

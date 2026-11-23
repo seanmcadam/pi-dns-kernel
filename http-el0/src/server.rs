@@ -55,6 +55,8 @@ const CACHE_PLANT: u64 = 54;
 const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
 const POWER: u64 = 58;
+const CSRF: u64 = 74;
+const NET_ARM: u64 = 75;
 const VNC_CTRL: u64 = 59;
 const UPSTREAM_HEALTH: u64 = 61;
 const NET_COUNTERS: u64 = 64;
@@ -225,12 +227,20 @@ fn handle(request: &HttpRequest) -> HttpResponse {
     if !check_auth(request) {
         return HttpResponse::unauthorized();
     }
-    if request.path == "/firmware" || request.path.starts_with("/firmware/") {
+    let (path, query) = http_server::split_target(&request.path);
+    if path == "/firmware" || path.starts_with("/firmware/") {
         return firmware::handle(request);
     }
-    match request.path.as_str() {
+    match path {
         "/" => handle_index(),
-        "/status" => handle_status(),
+        "/status" => {
+            if http_server::wants_html(query, request.get_header("Accept")) {
+                status_html()
+            } else {
+                status_json()
+            }
+        }
+        "/json/status" => status_json(),
         "/vclog" => handle_vclog(),
         "/config" => handle_config(request),
         "/records" => handle_records(request),
@@ -920,7 +930,8 @@ fn handle_index() -> HttpResponse {
     {power_block}
     <h2>Management</h2>
     <ul>
-        <li><a href="/status">System Status (JSON)</a></li>
+        <li><a href="/status">System status</a></li>
+        <li><a href="/json/status">System status (JSON)</a></li>
         <li><a href="/vclog">Firmware log</a></li>
         <li><a href="/firmware">Firmware update</a></li>
         <li><a href="/config">Configuration</a></li>
@@ -938,7 +949,104 @@ fn handle_index() -> HttpResponse {
     html_response(&html)
 }
 
-fn handle_status() -> HttpResponse {
+fn status_html() -> HttpResponse {
+    let version = version::VERSION;
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Status {version}</title>
+<style>
+body{{font:16px/1.45 sans-serif;margin:1rem;max-width:42rem}}
+h1{{font-size:1.35rem;margin:0 0 .4rem}}
+h2{{font-size:1.05rem;margin:1rem 0 .3rem}}
+dl{{margin:0}} dt{{font-weight:600}} dd{{margin:0 0 .35rem}}
+a{{color:#0645ad}}
+</style>
+</head><body>
+<h1>Status <span id="version">{version}</span></h1>
+<p><a href="/">Home</a> · <a href="/config">Config</a> · <a href="/json/status">JSON</a></p>
+<h2>System</h2>
+<dl>
+<dt>Uptime</dt><dd id="uptime">…</dd>
+<dt>Board</dt><dd id="board">…</dd>
+</dl>
+<h2>Network</h2>
+<dl>
+<dt>NIC IRQs</dt><dd id="nic_irqs">…</dd>
+<dt>RX / TX</dt><dd id="rxtx">…</dd>
+<dt>Busy / idle ms</dt><dd id="busy">…</dd>
+<dt>Upstreams</dt><dd id="upstreams">…</dd>
+</dl>
+<h2>DNS</h2>
+<dl>
+<dt>Cache entries</dt><dd id="cache_entries">…</dd>
+<dt>In flight</dt><dd id="dns_inflight">…</dd>
+<dt>Upstream timeouts</dt><dd id="upstream_timeouts">…</dd>
+</dl>
+<h2>SD</h2>
+<dl>
+<dt>Mode</dt><dd id="sd_mode">…</dd>
+<dt>Clock</dt><dd id="sd_clock_hz">…</dd>
+<dt>Mounted</dt><dd id="fs_mounted">…</dd>
+</dl>
+<h2>Boot</h2>
+<dl>
+<dt>boot_good</dt><dd id="boot_good">…</dd>
+<dt>fallback</dt><dd id="fallback_active">…</dd>
+<dt>boot_stopped</dt><dd id="boot_stopped">…</dd>
+<dt>last_reset</dt><dd id="last_reset">…</dd>
+<dt>Kernel</dt><dd id="booted_kernel">…</dd>
+</dl>
+<h2>Crash</h2>
+<dl>
+<dt>Count</dt><dd id="crash_count">…</dd>
+<dt>Last</dt><dd id="last_crash">…</dd>
+</dl>
+<p><a href="/crash/list">Crash list</a> · <a href="/crash/last">Last crash</a></p>
+<script>
+function text(id, value) {{
+  var el = document.getElementById(id);
+  if (el) el.textContent = value;
+}}
+function fill(d) {{
+  text("version", d.version);
+  text("uptime", d.uptime + " s");
+  text("board", d.board + " " + d.board_revision + " " + d.board_source);
+  text("nic_irqs", d.nic_irqs);
+  text("rxtx", d.rx_packets + " / " + d.tx_packets);
+  text("busy", d.net_busy_ms + " / " + d.net_idle_ms);
+  text("upstreams", d.upstreams);
+  text("cache_entries", d.cache_entries);
+  text("dns_inflight", d.dns_inflight);
+  text("upstream_timeouts", d.upstream_timeouts);
+  text("sd_mode", d.sd_mode);
+  text("sd_clock_hz", d.sd_clock_hz);
+  text("fs_mounted", d.fs_mounted);
+  text("boot_good", d.boot_good);
+  text("fallback_active", d.fallback_active);
+  text("boot_stopped", d.boot_stopped);
+  text("last_reset", d.last_reset);
+  text("booted_kernel", d.booted_kernel);
+  text("crash_count", d.crash_count);
+  text("last_crash", d.last_crash);
+}}
+function load() {{
+  fetch("/json/status", {{headers: {{Accept: "application/json"}}}})
+    .then(function(res) {{ return res.json(); }})
+    .then(fill);
+}}
+load();
+setInterval(load, 5000);
+</script>
+</body></html>"#
+    );
+    html_response(&html)
+}
+
+fn status_json() -> HttpResponse {
     let (nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms) = net_counters();
     let (
         arp_requests_tx,
@@ -1283,16 +1391,198 @@ fn upstream_status() -> String {
 
 fn handle_config(request: &HttpRequest) -> HttpResponse {
     match request.method {
-        HttpMethod::GET => {
-            let (port, user) = http_info();
-            let json = format!(r#"{{"http_port":{port},"username":"{user}"}}"#);
-            let mut response = HttpResponse::ok(&json);
-            response.add_header("Content-Type", "application/json");
-            response
-        }
-        HttpMethod::POST => HttpResponse::ok(r#"{"status":"Configuration update not yet implemented"}"#),
+        HttpMethod::GET => config_page(),
+        HttpMethod::POST => config_save(request),
         _ => HttpResponse::new(405, "Method Not Allowed"),
     }
+}
+
+fn csrf_token() -> String {
+    let mut buf = [0u8; 16];
+    let n = sys(CSRF, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0);
+    if n != 16 {
+        return String::new();
+    }
+    String::from(core::str::from_utf8(&buf).unwrap_or(""))
+}
+
+fn html_escape(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn config_page() -> HttpResponse {
+    let current = read_config_file(0).unwrap_or_else(|| String::from("{}"));
+    let token = csrf_token();
+    let escaped = html_escape(&current);
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Config</title>
+<style>
+body{{font:16px/1.4 sans-serif;margin:1rem;max-width:42rem}}
+label{{display:block;margin:.4rem 0}} input,select,textarea{{width:100%;box-sizing:border-box}}
+textarea{{min-height:8rem;font-family:monospace}}
+button{{margin-top:.6rem;padding:.4rem .8rem}}
+</style>
+</head><body>
+<h1>Configuration</h1>
+<p><a href="/">Home</a> · <a href="/status">Status</a> · <a href="/config/file/config">CONFIG.JSN</a></p>
+<p id="msg"></p>
+<form method="POST" action="/config" id="form">
+<input type="hidden" name="csrf" value="{token}">
+<label>Network mode <select id="mode" name="mode"><option>dhcp</option><option>static</option></select></label>
+<label>IP <input id="ip" name="ip" required></label>
+<label>Netmask <input id="netmask" name="netmask" required></label>
+<label>Gateway <input id="gateway" name="gateway" required></label>
+<label>Timeout ms (100..=60000) <input id="timeout_ms" name="timeout_ms" required></label>
+<label>Cache size (1..=1024) <input id="cache_size" name="cache_size" required></label>
+<label>Reap seconds (1..=3600) <input id="reap" name="reap" required></label>
+<label>Probe seconds (1..=3600) <input id="probe" name="probe" required></label>
+<label>Upstreams, one address per line <textarea id="upstreams" name="upstreams"></textarea></label>
+<label>Local records, one per line: name type value ttl <textarea id="records" name="records"></textarea></label>
+<label>Block list, one name per line <textarea id="blocklist" name="blocklist"></textarea></label>
+<label>board.detect (0 or 1, 1 is the default) <input id="detect" name="detect" value="1" required></label>
+<label>HTTP port <input id="port" name="port" required></label>
+<label>HTTP user <input id="user" name="user" required></label>
+<label>HTTP password <input id="password" name="password" required></label>
+<label><input id="reboot" name="reboot" type="checkbox" value="1" style="width:auto"> Reboot now. Required before a new static address, HTTP port, or cache size is used. A static address that does not come up within 20 seconds is restored from CONFIG.BAK.</label>
+<textarea id="json" name="json">{escaped}</textarea>
+<button type="submit">Save</button>
+</form>
+<script type="application/json" id="base">{escaped}</script>
+<script>
+var base = JSON.parse(document.getElementById("base").textContent);
+function val(id) {{ return document.getElementById(id).value; }}
+function setv(id, value) {{ document.getElementById(id).value = value; }}
+function lines(text) {{
+  return text.split(/\n/).map(function(s) {{ return s.trim(); }}).filter(Boolean);
+}}
+function fill() {{
+  var net = base.network || {{}};
+  var dns = base.dns || {{}};
+  var http = base.http || {{}};
+  setv("mode", net.mode || "dhcp");
+  setv("ip", net.ip || "");
+  setv("netmask", net.netmask || "");
+  setv("gateway", net.gateway || "");
+  setv("timeout_ms", net.timeout_ms || 3000);
+  setv("cache_size", dns.cache_size || 1);
+  setv("reap", dns.cache_reap_interval_secs || 5);
+  setv("probe", dns.probe_interval_secs || 5);
+  setv("upstreams", (dns.upstreams || []).join("\n"));
+  setv("blocklist", (dns.blocklist || []).join("\n"));
+  setv("records", (dns.records || []).map(function(r) {{
+    return r.name + " " + r.type + " " + r.value + " " + r.ttl;
+  }}).join("\n"));
+  setv("detect", base.board && base.board.detect === 0 ? "0" : "1");
+  setv("port", http.port || 80);
+  setv("user", http.username || "");
+  setv("password", http.password || "");
+}}
+function bounds(n, lo, hi, name) {{
+  if (!Number.isInteger(n) || n < lo || n > hi) return name + " out of bounds";
+  return "";
+}}
+function build() {{
+  var err = bounds(Number(val("timeout_ms")), 100, 60000, "timeout_ms")
+    || bounds(Number(val("cache_size")), 1, 1024, "cache_size")
+    || bounds(Number(val("reap")), 1, 3600, "reap")
+    || bounds(Number(val("probe")), 1, 3600, "probe")
+    || bounds(Number(val("port")), 1, 65535, "port")
+    || bounds(Number(val("detect")), 0, 1, "detect");
+  if (val("mode") !== "dhcp" && val("mode") !== "static") err = err || "mode";
+  if (err) return err;
+  base.network.mode = val("mode");
+  base.network.ip = val("ip").trim();
+  base.network.netmask = val("netmask").trim();
+  base.network.gateway = val("gateway").trim();
+  base.network.timeout_ms = Number(val("timeout_ms"));
+  base.dns.cache_size = Number(val("cache_size"));
+  base.dns.cache_reap_interval_secs = Number(val("reap"));
+  base.dns.probe_interval_secs = Number(val("probe"));
+  base.dns.upstreams = lines(val("upstreams"));
+  base.dns.blocklist = lines(val("blocklist"));
+  base.dns.records = lines(val("records")).map(function(line) {{
+    var p = line.split(/\s+/);
+    return {{name:p[0], type:p[1], value:p[2], ttl:Number(p[3] || 300)}};
+  }});
+  base.http.port = Number(val("port"));
+  base.http.username = val("user");
+  base.http.password = val("password");
+  if (Number(val("detect")) === 0) base.board = {{detect:0}};
+  else delete base.board;
+  return "";
+}}
+fill();
+document.getElementById("form").addEventListener("submit", function(ev) {{
+  var err = build();
+  if (err) {{
+    ev.preventDefault();
+    document.getElementById("msg").textContent = err;
+    return;
+  }}
+  document.getElementById("json").value = JSON.stringify(base);
+}});
+</script>
+</body></html>"#
+    );
+    html_response(&html)
+}
+
+fn config_save(request: &HttpRequest) -> HttpResponse {
+    let Ok(body) = core::str::from_utf8(&request.body) else {
+        return bad_request("malformed form");
+    };
+    let token = csrf_token();
+    if !config::csrf_matches(&token, body) {
+        let mut response = HttpResponse::new(403, "Forbidden");
+        response.set_body(b"csrf");
+        return response;
+    }
+    let json = match config::posted_json(body) {
+        Ok(json) => json,
+        Err(err) => return bad_request(&err.text()),
+    };
+    let mut err = [0u8; 240];
+    let rc = sys(
+        CONFIG_WRITE,
+        0,
+        json.as_ptr() as u64,
+        json.len() as u64,
+        err.as_mut_ptr() as u64,
+        err.len() as u64,
+        0,
+    );
+    if rc < 0 {
+        let end = err.iter().position(|byte| *byte == 0).unwrap_or(err.len());
+        let message = core::str::from_utf8(&err[..end]).unwrap_or("rejected");
+        return bad_request(message);
+    }
+    if rc == 1 && config::reboot_confirmed(body) {
+        let _ = sys(NET_ARM, 0, 0, 0, 0, 0, 0);
+        let _ = sys(POWER, 2, 0, 0, 0, 0, 0);
+        return html_ok(
+            "Saved. Reboot requested. A static address that does not come up in 20 seconds is restored from CONFIG.BAK.",
+        );
+    }
+    if rc == 1 {
+        return html_ok(
+            "Saved. Reboot required before network, port, or cache size changes apply. Not rebooted.",
+        );
+    }
+    html_ok("Saved and applied.")
 }
 
 fn handle_records(request: &HttpRequest) -> HttpResponse {

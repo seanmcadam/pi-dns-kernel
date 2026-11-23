@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::net::NetworkMode;
 use alloc::string::{String, ToString};
@@ -232,8 +232,16 @@ pub fn store_config_file(which: u8, text: &str) -> Result<bool, String> {
                 .as_ref()
                 .map(|old| needs_restart(old, &next))
                 .unwrap_or(false);
+            keep_config_backup()?;
             crate::fs::replace_file(crate::fs::CONFIG_NAME, stored.as_bytes())
                 .map_err(|err| alloc::format!("save failed: {err}"))?;
+            match crate::fs::read_text(crate::fs::CONFIG_NAME) {
+                Ok(got) if got == stored => {}
+                _ => {
+                    restore_config_backup();
+                    return Err(String::from("save verify failed"));
+                }
+            }
             publish(&next);
             *CURRENT.lock() = Some(next.clone());
             let old = previous.unwrap_or_else(default_config);
@@ -252,6 +260,128 @@ pub fn store_config_file(which: u8, text: &str) -> Result<bool, String> {
             Ok(false)
         }
         _ => Err(String::from("unknown config")),
+    }
+}
+
+fn keep_config_backup() -> Result<(), String> {
+    match crate::fs::read_text(crate::fs::CONFIG_NAME) {
+        Ok(prev) => crate::fs::write_named("CONFIG.BAK", prev.as_bytes(), false)
+            .map_err(|err| alloc::format!("backup failed: {err}")),
+        Err(crate::fs::FsError::Io { detail, .. }) if detail.contains("NotFound") => Ok(()),
+        Err(crate::fs::FsError::NotInitialized) => Ok(()),
+        Err(err) => Err(alloc::format!("backup failed: {err}")),
+    }
+}
+
+fn restore_config_backup() {
+    let Ok(prev) = crate::fs::read_text("CONFIG.BAK") else {
+        return;
+    };
+    let _ = crate::fs::replace_file(crate::fs::CONFIG_NAME, prev.as_bytes());
+}
+
+static NET_LOOK: AtomicU8 = AtomicU8::new(0);
+static NET_AT: AtomicU64 = AtomicU64::new(0);
+static CSRF_WORD: AtomicU64 = AtomicU64::new(0);
+
+pub fn csrf_bytes() -> [u8; 16] {
+    let mut token = CSRF_WORD.load(Ordering::Acquire);
+    if token == 0 {
+        let mixed = crate::timer::millis()
+            ^ (u64::from(version::BOOT_ID[20]) << 32)
+            ^ 0xC5F5_001D;
+        let mixed = if mixed == 0 { 1 } else { mixed };
+        let _ = CSRF_WORD.compare_exchange(0, mixed, Ordering::AcqRel, Ordering::Acquire);
+        token = CSRF_WORD.load(Ordering::Acquire);
+    }
+    let mut out = [0u8; 16];
+    let hex = b"0123456789abcdef";
+    let bytes = token.to_be_bytes();
+    let mut i = 0;
+    while i < 8 {
+        out[i * 2] = hex[(bytes[i] >> 4) as usize];
+        out[i * 2 + 1] = hex[(bytes[i] & 0xf) as usize];
+        i += 1;
+    }
+    out
+}
+
+/// Arm the static-address watchdog. A later boot that never installs an
+/// address copies `CONFIG.BAK` back. DHCP is left to its own fallback.
+pub fn arm_net_pending() -> bool {
+    let static_mode = CURRENT.lock().as_ref().is_some_and(|config| {
+        matches!(config.network.mode, NetworkMode::Static { .. })
+    });
+    if !static_mode {
+        return false;
+    }
+    if crate::fs::write_named("NET.PEND", b"static\n", false).is_err() {
+        log::info!("network config pending file failed");
+        return false;
+    }
+    NET_LOOK.store(1, Ordering::Release);
+    NET_AT.store(0, Ordering::Release);
+    log::info!("network config pending");
+    true
+}
+
+/// Called from the main loop. One card look until a pending file is seen.
+pub fn poll_net_pending() {
+    let look = NET_LOOK.load(Ordering::Acquire);
+    if look == 2 {
+        return;
+    }
+    let now = crate::timer::millis();
+    if look == 0 {
+        let pending = crate::fs::read_text("NET.PEND").is_ok();
+        if !pending {
+            NET_LOOK.store(2, Ordering::Release);
+            return;
+        }
+        NET_LOOK.store(1, Ordering::Release);
+        NET_AT.store(now, Ordering::Release);
+    }
+    let started = {
+        let at = NET_AT.load(Ordering::Acquire);
+        if at == 0 {
+            NET_AT.store(now, Ordering::Release);
+            now
+        } else {
+            at
+        }
+    };
+    let static_mode = CURRENT.lock().as_ref().is_some_and(|config| {
+        matches!(config.network.mode, NetworkMode::Static { .. })
+    });
+    let word = config::net_watch(config::NetWatch {
+        pending: true,
+        static_mode,
+        address_up: crate::net::has_address(),
+        elapsed_ms: now.saturating_sub(started),
+        limit_ms: 20_000,
+    });
+    match word {
+        "hold" => {
+            let _ = crate::fs::delete_file("NET.PEND");
+            NET_LOOK.store(2, Ordering::Release);
+            log::info!("network config held");
+        }
+        "revert" => {
+            restore_config_backup();
+            if let Ok(prev) = crate::fs::read_text(crate::fs::CONFIG_NAME) {
+                if let Ok(value) = config::parse(&prev) {
+                    if let Ok(config) = config_from_value(&value) {
+                        publish(&config);
+                        *CURRENT.lock() = Some(config);
+                    }
+                }
+            }
+            let _ = crate::fs::delete_file("NET.PEND");
+            NET_LOOK.store(2, Ordering::Release);
+            log::info!("network config reverted");
+            let _ = crate::board::power(true);
+        }
+        _ => {}
     }
 }
 

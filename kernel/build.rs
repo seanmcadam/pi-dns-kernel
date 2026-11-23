@@ -283,6 +283,10 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../version/src/lib.rs").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../config/src/lib.rs").display()
+    );
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let version = out_dir.join("libversion.rlib");
@@ -298,6 +302,13 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         &manifest_dir.join("../http-server/src/lib.rs"),
         "http_server",
         &http,
+    );
+    let config_rlib = out_dir.join("libconfig_http.rlib");
+    compile_rlib(
+        &rustc,
+        &manifest_dir.join("../config/src/lib.rs"),
+        "config",
+        &config_rlib,
     );
 
     let elf = out_dir.join("http.elf");
@@ -326,6 +337,8 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         .arg(format!("panic_rt={}", panic_rt.display()))
         .arg("--extern")
         .arg(format!("version={}", version.display()))
+        .arg("--extern")
+        .arg(format!("config={}", config_rlib.display()))
         .arg("-o")
         .arg(&elf)
         .arg(dir.join("src/main.rs"))
