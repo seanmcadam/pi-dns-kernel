@@ -220,6 +220,7 @@ fn report_stall(cpu: usize, now: u64) -> ! {
         }
     }
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("STALL");
+    crate::crash::note(crate::crash_rec::KIND_HANG, text.as_bytes());
     // Straight to the UART data register and the framebuffer. No log queue
     // and no console lock: the core that is stuck may be holding either.
     raw_uart(text.as_bytes());

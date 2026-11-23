@@ -133,6 +133,7 @@ const FW: u64 = 67;
 const SD_STATUS: u64 = 68;
 const HDMI_CONSOLE: u64 = 69;
 const VCLOG_READ: u64 = 70;
+const CRASH: u64 = 71;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -245,6 +246,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         SD_STATUS => sd_status(args[0], args[1]),
         HDMI_CONSOLE => hdmi_console(args[0], args[1]),
         VCLOG_READ => vclog_read(args[0], args[1], args[2]),
+        CRASH => crash_call(args),
         _ => -1,
     };
     value as u64
@@ -1228,6 +1230,31 @@ fn vclog_read(ptr: u64, cap: u64, offset: u64) -> i64 {
         off += n as u64;
     }
     wrote as i64
+}
+
+fn crash_call(args: [u64; 6]) -> i64 {
+    match args[0] {
+        0 => crate::crash::arm(args[1] as u8),
+        1 => crash_copy(args[1], args[2], crate::crash::status),
+        2 => crash_copy(args[1], args[2], crate::crash::last_text),
+        3 => crash_copy(args[1], args[2], crate::crash::list_text),
+        _ => EINVAL,
+    }
+}
+
+fn crash_copy(ptr: u64, cap: u64, fill: fn(&mut [u8]) -> usize) -> i64 {
+    if cap == 0 || cap > 4096 || !crate::mmu::user_write_ok(ptr, cap) {
+        return EFAULT;
+    }
+    let mut buf = [0u8; 4096];
+    let n = fill(&mut buf[..cap as usize]);
+    if crate::mmu::user_write_ok(ptr, n as u64) && write_user(ptr, &buf[..n]) {
+        n as i64
+    } else if n == 0 {
+        0
+    } else {
+        EFAULT
+    }
 }
 
 fn sd_status(ptr: u64, cap: u64) -> i64 {

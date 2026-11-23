@@ -30,6 +30,12 @@ pub fn start_secondary(cpu: usize, entry: u64, _entry_el: u64) {
 /// PSCI `SYSTEM_OFF` or `SYSTEM_RESET` through SMC. The Pi 5 firmware claims
 /// `arm,psci`. This has not been run on a Pi 5. A return means the firmware
 /// refused the call and the board is still up.
+/// PSCI reset with no log lock. `true` means the firmware refused it.
+pub fn reset_now() -> bool {
+    let _ = psci_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+    true
+}
+
 pub fn system_power(reset: bool) -> bool {
     let fid = if reset {
         PSCI_SYSTEM_RESET

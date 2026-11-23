@@ -83,4 +83,13 @@ SECTIONS
     __heap_start = .;
     . += 0x200000; /* 2MB heap */
     __heap_end = .;
+
+    /* 32 MiB into guest RAM. QEMU reloads the image on reset and does not
+       clear the rest, and boot does not zero this section. */
+    .crash 0xFFFF000042000000 (NOLOAD) :
+    {
+        __crash_start = .;
+        . += 8192;
+        __crash_end = .;
+    }
 }

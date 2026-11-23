@@ -40,7 +40,10 @@ fn panic(info: &PanicInfo) -> ! {
     let n = crate::fault_log::format_panic_line(&mut raw, b"kern", file, line, &msg[..msg_len]);
     if let Ok(text) = core::str::from_utf8(&raw[..n]) {
         crate::logger::note_fault(text);
-        #[cfg(feature = "board-pi4")]
+    }
+    crate::crash::from_panic(file, line as u64, &msg[..msg_len]);
+    #[cfg(feature = "board-pi4")]
+    if let Ok(text) = core::str::from_utf8(&raw[..n]) {
         crate::act::halt_with(text);
     }
     halt();

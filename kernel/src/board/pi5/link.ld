@@ -83,4 +83,12 @@ SECTIONS
     __heap_start = .;
     . += 0x200000; /* 2MB heap */
     __heap_end = .;
+
+    /* 32 MiB. Same role as the Pi 4 slot: not loaded, not zeroed. */
+    .crash 0xFFFF000002000000 (NOLOAD) :
+    {
+        __crash_start = .;
+        . += 8192;
+        __crash_end = .;
+    }
 }

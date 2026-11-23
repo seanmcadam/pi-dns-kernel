@@ -86,6 +86,7 @@ const NET_EXTRA: u64 = 66;
 const FW: u64 = 67;
 const SD_STATUS: u64 = 68;
 const HDMI_CONSOLE: u64 = 69;
+const CRASH: u64 = 71;
 const POWER: u64 = 58;
 const VNC_CTRL: u64 = 59;
 const THREAD_CREATE: u64 = 34;
@@ -554,7 +555,8 @@ fn syscall() -> u64 {
         | NET_EXTRA
         | FW
         | SD_STATUS
-        | HDMI_CONSOLE => {
+        | HDMI_CONSOLE
+        | CRASH => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
@@ -649,6 +651,7 @@ fn log_el0_fault(name: &str) {
     };
     #[cfg(feature = "board-pi4")]
     if unsafe { SCENARIO } == 0xff && EL0_FAULTS.fetch_add(1, Ordering::Relaxed) >= 3 {
+        crate::crash::note(crate::crash_rec::KIND_FAULT, line.as_bytes());
         if overflow {
             let text = unsafe { core::str::from_utf8_unchecked(&pin[..pin_n]) };
             crate::act::halt_with(text);
