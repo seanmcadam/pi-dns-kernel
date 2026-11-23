@@ -30,13 +30,12 @@
 //! This has not been run on a Pi 4. QEMU raspi4b emulates the property
 //! channel and the framebuffer.
 //!
-//! A cold boot only reads. The HDMI register file and PHY are skipped
-//! when `CM_HSMCTL` enable is clear or that port's DVP gate bit is set
-//! (set means the 108 MHz clock is stopped). A size the firmware already
-//! published is kept. A missed size query is retried and then given up.
-//! It does not blank, program a mode, or reset the PHY, DVP, or a power
-//! domain. 0.1.73 did that on the first miss, with no port detected, and
-//! the firmware picture did not come back.
+//! A cold boot only reads. Hot-plug, PHY, pixel valve, HVS, HSM, PM, and
+//! DVP are sampled even when `CM_HSMCTL` bit 4 is clear: on a live
+//! 1824x984 picture that bit was clear and skipping the reads left the
+//! port and valve words at zero. A size the firmware already published
+//! is kept. A missed size query is retried and then given up. It does
+//! not blank, program a mode, or reset the PHY, DVP, or a power domain.
 //!
 //! A soft reboot reads the same registers into `HDMISHUT.TXT`, sends
 //! `NOTIFY_REBOOT` (`0x00030048`, no payload), and arms the watchdog the
@@ -248,8 +247,8 @@ pub fn copy_port(out: &mut [u8]) -> usize {
     )
 }
 
-/// Firmware message log (`vclog -m`), oldest lines that fit. Empty until
-/// the device tree has been read. The caller prints `none`.
+/// Firmware message log (`vclog -m`), or a short reason the log could not
+/// be read. Empty until [`load_vclog`]. The caller prints `none`.
 pub fn copy_vclog(out: &mut [u8]) -> usize {
     copy_text(
         out,
@@ -272,71 +271,356 @@ pub fn load_last_shut() {
     set_shut(core::str::from_utf8(&raw[..n]).unwrap_or(""));
 }
 
-/// Read the firmware message log after the MMU is on. `/chosen/log` is
-/// the pair `vclog` uses. A missing tree or a bad magic leaves `vclog`
-/// as `none`. This does not write HDMI registers.
+/// Read the firmware message log after the MMU is on. `vclog` takes the
+/// table address from `/chosen/log` and, through `/dev/vcio`, asks the
+/// property mailbox for `GET_VC_MEMORY` (`0x00010006`) when it has to
+/// explain a missing table. Linux `rpi-6.12.y` has no separate VC_LOG
+/// tag. `RPI_FIRMWARE_VCHIQ_INIT` (`0x00048010`) only enables VCHIQ.
+/// This reads that mailbox tag, then the device-tree pair, and maps the
+/// bytes with volatile loads. It does not store to that RAM and it does
+/// not write HDMI registers. A miss stores a reason instead of leaving
+/// the field empty.
 pub fn load_vclog() {
-    let Some(blob) = crate::fw::dtb_bytes() else {
-        return;
-    };
-    let Some((vc_start, vc_size)) = fwupd::chosen_log(blob) else {
-        save_line("vclog dt none");
-        return;
-    };
-    let phys = u64::from(vc_start) & 0x3fff_ffff;
-    if vc_size < 56 || !ram_holds(phys, 56) {
-        save_line("vclog range");
-        return;
+    let mem = vc_memory();
+    let dt = crate::fw::dtb_bytes().and_then(fwupd::chosen_log);
+    if let Some((start, size)) = dt {
+        if publish_log(start, size) {
+            save_line("vclog ok");
+            return;
+        }
     }
+    if let Some((base, size)) = mem {
+        if scan_vlog(base, size) {
+            return;
+        }
+    }
+    let mut why = Note::new();
+    why.push("vclog ");
+    match dt {
+        Some((start, size)) => {
+            why.push("dt ");
+            why.hex32(start);
+            why.push(" ");
+            why.hex32(size);
+            why.push(" nomsg");
+        }
+        None => why.push("dt-none"),
+    }
+    match mem {
+        Some((base, size)) => {
+            why.push(" vc ");
+            why.hex32(base);
+            why.push(" ");
+            why.hex32(size);
+            why.push(" novlog");
+        }
+        None => why.push(" mbox-fail"),
+    }
+    remember_vclog(why.text());
+}
+
+/// `GET_VC_MEMORY` (`0x00010006`), the property tag `vclog` sends on
+/// `/dev/vcio`. The value is base then size, both VideoCore addresses.
+fn vc_memory() -> Option<(u32, u32)> {
+    let mut msg = [0u32; 8];
+    msg[0] = 32;
+    msg[2] = 0x0001_0006;
+    msg[3] = 8;
+    if !ask_mbox(&mut msg) {
+        let mut line = Line::new();
+        line.push("vclog mbox ");
+        line.hex32(msg[1]);
+        save_line(line.text());
+        return None;
+    }
+    let base = msg[5];
+    let size = msg[6];
+    let mut line = Line::new();
+    line.push("vclog mbox ");
+    line.hex32(msg[1]);
+    line.push(" ");
+    line.hex32(base);
+    line.push(" ");
+    line.hex32(size);
+    save_line(line.text());
+    if base == 0 || size == 0 || size > 256 * 1024 * 1024 {
+        return None;
+    }
+    Some((base, size))
+}
+
+fn publish_log(vc_start: u32, vc_size: u32) -> bool {
+    if vc_size < 56 {
+        return false;
+    }
+    let mut slot = 0;
+    while slot < 2 {
+        let Some(phys) = vc_phys(vc_start, slot) else {
+            slot += 1;
+            continue;
+        };
+        if read_log(phys) {
+            return true;
+        }
+        slot += 1;
+    }
+    false
+}
+
+/// ARM physical address of a VideoCore bus address. Slot 0 keeps an
+/// address that already sits in RAM (the BCM2711 GPU window above 1 GiB).
+/// Slot 1 applies the legacy `bus & 0x3fffffff` alias `vclog` uses after
+/// it has mapped `/dev/mem`.
+fn vc_phys(vc: u32, slot: u8) -> Option<u64> {
+    let raw = u64::from(vc);
+    let masked = raw & 0x3fff_ffff;
+    let pa = if slot == 0 { raw } else { masked };
+    if slot == 1 && masked == raw {
+        return None;
+    }
+    if ram_holds(pa, 56) {
+        Some(pa)
+    } else {
+        None
+    }
+}
+
+fn read_log(phys: u64) -> bool {
     let mut toc = [0u8; 56];
     if !read_ram(phys, &mut toc) {
-        save_line("vclog toc");
-        return;
+        return false;
     }
     let Some(msg_vc) = fwupd::vclog_msg_addr(&toc) else {
-        save_line("vclog magic");
-        return;
+        return false;
     };
-    let msg_phys = u64::from(msg_vc) & 0x3fff_ffff;
+    let mut saw = false;
+    let mut slot = 0;
+    while slot < 2 {
+        let Some(msg_phys) = vc_phys(msg_vc, slot) else {
+            slot += 1;
+            continue;
+        };
+        if finish_log(msg_phys) {
+            saw = true;
+            break;
+        }
+        slot += 1;
+    }
+    saw
+}
+
+fn finish_log(msg_phys: u64) -> bool {
     if !ram_holds(msg_phys, 20) {
-        save_line("vclog hdr");
-        return;
+        return false;
     }
     let mut hdr = [0u8; 20];
     if !read_ram(msg_phys, &mut hdr) {
-        return;
+        return false;
     }
     let Some((start, end, write, read)) = fwupd::vclog_msg_range(&hdr) else {
-        save_line("vclog id");
-        return;
+        return false;
     };
     let log_size = end.wrapping_sub(start);
-    if log_size == 0 || log_size > 64 * 1024 {
-        save_line("vclog size");
-        return;
+    if log_size == 0 || log_size > 1024 * 1024 {
+        return false;
     }
-    let base = u64::from(start) & 0x3fff_ffff;
-    if !ram_holds(base, u64::from(log_size)) {
-        save_line("vclog buf");
-        return;
+    let mut slot = 0;
+    while slot < 2 {
+        let Some(base) = vc_phys(start, slot) else {
+            slot += 1;
+            continue;
+        };
+        if !ram_holds(base, u64::from(log_size).min(4096)) {
+            slot += 1;
+            continue;
+        }
+        let read_off = read.wrapping_sub(start) as usize;
+        let write_off = write.wrapping_sub(start) as usize;
+        if read_off >= log_size as usize || write_off >= log_size as usize {
+            slot += 1;
+            continue;
+        }
+        let mut linear = [0u8; 4096];
+        let copied = copy_log(&mut linear, base, log_size as usize, read_off, write_off);
+        let mut text = [0u8; VCLOG_CAP];
+        let n = fwupd::vclog_tail(&linear[..copied], 0, copied, &mut text);
+        if n == 0 {
+            slot += 1;
+            continue;
+        }
+        let shown = core::str::from_utf8(&text[..n]).unwrap_or("");
+        remember_vclog(shown);
+        return true;
     }
-    let read_off = read.wrapping_sub(start) as usize;
-    let write_off = write.wrapping_sub(start) as usize;
-    if read_off >= log_size as usize || write_off >= log_size as usize {
-        save_line("vclog ptr");
-        return;
+    false
+}
+
+/// Look for the `VLOG` table in the GPU window from `GET_VC_MEMORY`.
+/// The firmware parks that table at the top of the window (a Pi 3 tree
+/// reports `0x3ff80000`). The walk is read-only: the first 64 KiB, then
+/// the last 1 MiB when the window is larger. A magic word is kept only
+/// when the message header behind it checks out.
+fn scan_vlog(base: u32, size: u32) -> bool {
+    let window = u64::from(size);
+    if window <= 1024 * 1024 {
+        return scan_region(base, 0, window);
     }
-    let mut linear = [0u8; 4096];
-    let copied = copy_log(&mut linear, base, log_size as usize, read_off, write_off);
-    let mut text = [0u8; VCLOG_CAP];
-    let n = fwupd::vclog_tail(&linear[..copied], 0, copied, &mut text);
-    if n == 0 {
-        save_line("vclog empty");
-        return;
+    if scan_region(base, 0, 64 * 1024) {
+        return true;
     }
-    let shown = core::str::from_utf8(&text[..n]).unwrap_or("");
-    store_text(shown, addr_of_mut!(VCLOG).cast(), VCLOG_CAP, &VCLOG_LEN);
-    save_line("vclog ok");
+    scan_region(base, window - 1024 * 1024, 1024 * 1024)
+}
+
+fn scan_region(base: u32, off: u64, len: u64) -> bool {
+    let mut slot = 0;
+    while slot < 2 {
+        let Some(phys) = vc_phys(base, slot) else {
+            slot += 1;
+            continue;
+        };
+        let mut step = 0u64;
+        while step + 4 <= len {
+            let pa = phys + off + step;
+            if !ram_holds(pa, 4) {
+                break;
+            }
+            let mut word = [0u8; 4];
+            if read_ram(pa, &mut word) && word == fwupd::VC_LOG_MAGIC.to_le_bytes() {
+                let hit = pa as u32;
+                if publish_log(hit, 56) {
+                    let mut line = Line::new();
+                    line.push("vclog scan ");
+                    line.hex32(hit);
+                    save_line(line.text());
+                    return true;
+                }
+            }
+            step += 4;
+        }
+        slot += 1;
+    }
+    false
+}
+
+fn remember_vclog(text: &str) {
+    store_text(
+        text,
+        addr_of_mut!(VCLOG).cast(),
+        VCLOG_CAP,
+        &VCLOG_LEN,
+    );
+    save_line(text);
+}
+
+/// Read-only property tags for the firmware display. No SET, blank,
+/// allocate, or release. Logged at boot and again before the watchdog.
+fn log_display_mbox() {
+    log_fb_tags();
+    log_settings(0);
+    log_settings(1);
+    log_edid(0x0003_0020, 0, false);
+    log_edid(0x0003_0023, 0, true);
+    log_edid(0x0003_0023, 1, true);
+}
+
+fn log_fb_tags() {
+    let mut msg = [0u32; 24];
+    let mut n = 1usize;
+    msg[n] = 0;
+    n += 1;
+    let phys_at = n;
+    n = tag2(&mut msg, n, 0x0004_0003, 0, 0);
+    let virt_at = n;
+    n = tag2(&mut msg, n, 0x0004_0004, 0, 0);
+    let depth_at = n;
+    n = tag1(&mut msg, n, 0x0004_0005, 0);
+    let pitch_at = n;
+    n = tag1(&mut msg, n, 0x0004_0008, 0);
+    msg[n] = 0;
+    n += 1;
+    msg[0] = (n * 4) as u32;
+    let _ = ask_mbox(&mut msg[..n]);
+    log_mbox_pair("40003", msg[1], msg[phys_at + 3], msg[phys_at + 4]);
+    log_mbox_pair("40004", msg[virt_at + 2], msg[virt_at + 3], msg[virt_at + 4]);
+    log_mbox_pair("40005", msg[depth_at + 2], msg[depth_at + 3], 0);
+    log_mbox_pair("40008", msg[pitch_at + 2], msg[pitch_at + 3], 0);
+}
+
+fn log_settings(display: u32) {
+    let mut msg = [0u32; 22];
+    msg[0] = 88;
+    msg[2] = 0x0004_0014;
+    msg[3] = 64;
+    msg[5] = display;
+    let _ = ask_mbox(&mut msg);
+    let mut line = Line::new();
+    line.push("hdmi mb 40014 d");
+    line.dec(display as u64);
+    line.push(" ");
+    line.hex32(msg[1]);
+    line.push(" ");
+    line.hex32(msg[5]);
+    line.push(" ");
+    line.hex32(msg[6]);
+    line.push(" ");
+    line.hex32(msg[7]);
+    note_mbox(line.text());
+}
+
+/// `GET_EDID_BLOCK` is `0x00030020` (block, status, 128 bytes). Linux fkms
+/// uses `GET_EDID_BLOCK_DISPLAY` `0x00030023` (block, display, 128 bytes).
+/// `st` is that second value word. The first EDID word follows it.
+fn log_edid(tag: u32, display: u32, with_display: bool) {
+    let mut msg = [0u32; 40];
+    msg[0] = 160;
+    msg[2] = tag;
+    msg[3] = 136;
+    msg[6] = if with_display { display } else { 0 };
+    let _ = ask_mbox(&mut msg);
+    let mut line = Line::new();
+    line.push("hdmi mb ");
+    line.hex32(tag);
+    line.push(" d");
+    line.dec(display as u64);
+    line.push(" ");
+    line.hex32(msg[1]);
+    line.push(" st ");
+    line.hex32(msg[6]);
+    line.push(" ");
+    line.hex32(msg[7]);
+    note_mbox(line.text());
+}
+
+fn log_mbox_pair(tag: &str, code: u32, a: u32, b: u32) {
+    let mut line = Line::new();
+    line.push("hdmi mb ");
+    line.push(tag);
+    line.push(" ");
+    line.hex32(code);
+    line.push(" ");
+    line.hex32(a);
+    line.push(" ");
+    line.hex32(b);
+    note_mbox(line.text());
+}
+
+fn note_mbox(text: &str) {
+    save_line(text);
+    if crate::task::log_live() {
+        crate::logger::announce(text);
+    }
+}
+
+fn ask_mbox(msg: &mut [u32]) -> bool {
+    let mut sent = [0u32; 48];
+    let n = msg.len().min(sent.len());
+    sent[..n].copy_from_slice(&msg[..n]);
+    PHASE.store(b'q', Ordering::Relaxed);
+    if exchange(msg, true) && msg[1] == REQ_OK {
+        return true;
+    }
+    msg[..n].copy_from_slice(&sent[..n]);
+    exchange(msg, false) && msg[1] == REQ_OK
 }
 
 fn ram_holds(pa: u64, len: u64) -> bool {
@@ -407,6 +691,7 @@ pub fn prepare_reboot() {
     let prior = format_snap(&snap);
     set_shut(prior.text());
     store_shut(prior.text());
+    log_display_mbox();
     let start = crate::timer::get_ticks();
     let budget = crate::timer::frequency().max(1);
     let mut extra = false;
@@ -640,6 +925,7 @@ fn bring_up() -> bool {
     // `hdmi_regs`. Nothing in this function writes the HDMI register
     // file, the PHY, the DVP, a power domain, or a blank tag.
     record_regs(false);
+    log_display_mbox();
     // The firmware already chose a mode for the rainbow. With the dtb
     // loaded and no vc4-kms overlay, that scanout is the one to keep.
     // Setting another size, or the blank tag, while a size exists made
@@ -893,6 +1179,8 @@ fn format_snap(snap: &crate::hdmi_hw::Snap) -> Note {
     note.hex32(snap.pv4);
     note.push(" hvs=");
     note.hex32(snap.hvs);
+    note.push(" hc0=");
+    note.hex32(snap.hc0);
     note.push(" hsm=");
     note.hex32(snap.hsm);
     note.push(" pm=");

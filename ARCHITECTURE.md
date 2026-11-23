@@ -145,7 +145,7 @@ Two different paths exist. The boot console is the one that must not disturb a p
 
 A cold boot only reads. `bring_up` records registers, then asks the mailbox for the size the firmware already published. A size in range is kept and painted. A miss retries the query twice, 50 ms apart, and then stops. The boot path does not blank, program a mode, release the framebuffer, or write a PHY, a DVP line, or a power domain. Recoveries stay at 0 when the firmware picture is kept.
 
-The HDMI register file and its PHY are read only when `CM_HSMCTL` enable (bit 4, `0xFE101088`) is set and that port's DVP gate bit is clear. A set bit in `DVP_HT_RPI_MISC_CONFIG` (`0xFEF00008`) means that port's 108 MHz clock is stopped. `dvp8=0` means both gates are open, not that the clock is off. `PM_HDMI` (`0xFE100058`), DVP `+4` and `+8`, and the HVS are still read. A read of the HDMI block while the HSM clock is off can lock the bus. A faulting read returns `ffffffff` and is not retried as a write.
+The sample reads both hot-plug registers, both PHYs, both pixel valves, the HVS, `CM_HSMCTL` (`0xFE101088`), `PM_HDMI` (`0xFE100058`), and DVP `+4` and `+8`. It does not skip those reads when `CM_HSMCTL` bit 4 is clear. A live picture was measured with that bit clear (`hsm=0000636d`) and HVS still on; skipping the reads left the port and valve words at zero. A set bit in `DVP_HT_RPI_MISC_CONFIG` (`0xFEF00008`) means that port's 108 MHz clock is stopped. `dvp8=0` means both gates are open, not that the clock is off. A faulting read returns `ffffffff` and is not followed by a write.
 
 Port detection is hot-plug bit 0, else pixel-valve enable (PV2 is HDMI0, PV4 is HDMI1). The status names are `none`, `hdmi0`, `hdmi1`, and `hdmi0+hdmi1`. A mask of zero is not treated as both ports.
 
@@ -171,7 +171,7 @@ Syscall 69 and `GET /status` publish:
 - `hdmi_diag`, `hdmi_port`
 - `hdmi_regs` and `hdmi_last_shut`: `h0`/`h1`, `phy0`/`pwr0`, `phy1`/`pwr1`, `pv0`/`pv1`, `hvs`, `hsm`, `pm`, `dvp4`, `dvp8`
 
-`hdmi_last_shut` is the line stored in `HDMISHUT.TXT` before any optional HDMI write. `GET /vclog` and the `vclog` field are the firmware message log. `/chosen` property `log` in the device tree is two big-endian words, the VideoCore bus address and the size, the same table `vclog -m` walks (`VLOG` at the table, `MESS` at the message header). The kernel copies it after the strict map, from `bus & 0x3fffffff`, and only when that address is inside RAM. Virt and Pi 5 report `none`.
+`hdmi_last_shut` is the line stored in `HDMISHUT.TXT` before any optional HDMI write. `GET /vclog` and the `vclog` field are the firmware message log, or a short reason it could not be read. `vclog` (raspberrypi/utils) takes the table from `/chosen/log` and, through `/dev/vcio`, the property tag `GET_VC_MEMORY` (`0x00010006`). Linux `rpi-6.12.y` has no VC_LOG tag. `RPI_FIRMWARE_VCHIQ_INIT` (`0x00048010`) only enables VCHIQ. The kernel asks for that memory tag, then reads the device-tree pair, and loads the `VLOG` / `MESS` table with volatile reads. An address already in RAM is used as-is. The legacy alias is `bus & 0x3fffffff`. With no device-tree pair it searches the start and the top of the VC window for `VLOG`. Virt and Pi 5 report `none`. Boot and the reboot path also log the raw replies for `GET_DISPLAY_SETTINGS` (`0x00040014`), the framebuffer GET tags, and EDID block 0 (`0x00030020` and `0x00030023`). Those tags do not set a mode.
 
 ### VNC and the optional HDMI process
 
