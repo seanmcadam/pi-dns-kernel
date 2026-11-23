@@ -39,10 +39,15 @@ back on for an A/B test. The default omits the key. `/status`
 `hdmi_port` is `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or `none`.
 `hdmi_regs` and `hdmi_last_shut` label `h0`/`h1`, `phy0`/`pwr0`,
 `phy1`/`pwr1`, `pv0`/`pv1`, `hvs`, `hc0`, `hsm`, `pm`, `dvp4`, and
-`dvp8`. `/vclog` is the firmware message log. The address comes from
+`dvp8`. `/vclog` is the whole firmware message log, one line per entry,
+plus the assert log when it is present. The address comes from
 `/chosen/log` and from mailbox `GET_VC_MEMORY` (`0x00010006`), which is
-the property tag `vclog` sends through `/dev/vcio`. A miss names the
-reason instead of `none`. Telnet prints `hdmi base` and `hdmi regs`.
+the property tag `vclog` sends through `/dev/vcio`. The kernel keeps
+256 KiB. `/status` `vclog` is the first line, `vclog_bytes` the rendered
+length, and `vclog_status` whether the ring wrapped or the copy was
+short. `VCLOG.TXT` is written at boot. `VCLOGPRE.TXT` is written just
+before reset. A miss names the reason. Telnet prints `hdmi base` and
+`hdmi regs`.
 
 The bases are the `bcm2711.dtsi` bus addresses in low-peripheral mode
 (`0x7e000000` maps to `0xFE000000`, the same window as the mailbox).

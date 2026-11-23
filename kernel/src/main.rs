@@ -160,6 +160,8 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     }
     #[cfg(feature = "board-pi4")]
     fb_con::load_last_shut();
+    #[cfg(feature = "board-pi4")]
+    fb_con::store_vclog();
     fw::scrub();
     fw::boot_report();
     let config = config_manager::load_config();
