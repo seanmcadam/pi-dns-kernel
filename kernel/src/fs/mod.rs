@@ -135,10 +135,18 @@ pub fn save_crash(name: &str, data: &[u8]) -> Result<(), FsError> {
 
 pub fn crash_exists(name: &str) -> bool {
     with_crash_file(name, Mode::ReadOnly, false, |mgr, file| {
-        mgr.file_length(file).map_err(|err| fs_err("file length", err))?;
+        mgr.file_length(file)
+            .map_err(|err| fs_err("file length", err))?;
         Ok(())
     })
     .is_ok()
+}
+
+pub fn read_crash(name: &str, out: &mut [u8]) -> Result<usize, FsError> {
+    with_crash_file(name, Mode::ReadOnly, false, |mgr, file| {
+        let n = mgr.read(file, out).map_err(|err| fs_err("read", err))?;
+        Ok(n)
+    })
 }
 
 fn with_crash_file<R>(

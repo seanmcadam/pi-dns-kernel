@@ -58,18 +58,51 @@ fn slot() -> &'static mut [u8] {
 }
 
 /// Validate a leftover record and write `CRASH/CRASHnnn.TXT`.
+///
+/// The list and the count always come from the files on the card. A firmware
+/// reboot can drop the RAM slot, and a promote used to leave `/crash/list`
+/// empty until the next crash rewrote it.
 pub fn recover() {
     let raw = slot();
-    let Some(state) = crash_rec::load_loop(raw) else {
-        return;
-    };
-    if state.safe != 0 {
-        RUNTIME_SAFE.store(true, Ordering::Release);
-        crate::disklog::line("crash loop, staying up");
+    let mut ram_file = [0u8; 16];
+    let mut ram_sum = [0u8; 96];
+    let mut ram_sum_n = 0usize;
+    let mut ram_up = 0u64;
+    let mut have_ram = false;
+    if let Some(state) = crash_rec::load_loop(raw) {
+        if state.safe != 0 {
+            RUNTIME_SAFE.store(true, Ordering::Release);
+            crate::disklog::line("crash loop, staying up");
+        }
+        if let Some(record) = crash_rec::load_record(raw) {
+            have_ram = write_ram_record(
+                &record,
+                &mut ram_file,
+                &mut ram_sum,
+                &mut ram_sum_n,
+                &mut ram_up,
+            );
+            crash_rec::store_loop(
+                raw,
+                LoopState {
+                    streak: state.streak,
+                    safe: state.safe,
+                    seq: state.seq,
+                },
+            );
+            clean(raw.as_ptr() as u64, crash_rec::SLOT);
+        }
     }
-    let Some(record) = crash_rec::load_record(raw) else {
-        return;
-    };
+    publish_card(have_ram, &ram_file, &ram_sum[..ram_sum_n], ram_up);
+}
+
+fn write_ram_record(
+    record: &crash_rec::Record,
+    ram_file: &mut [u8; 16],
+    ram_sum: &mut [u8; 96],
+    ram_sum_n: &mut usize,
+    ram_up: &mut u64,
+) -> bool {
     let mut text = [0u8; 4096];
     let n = crash_rec::render(&record, &mut text);
     let name = crash_rec::file_name(record.state.seq);
@@ -86,9 +119,22 @@ pub fn recover() {
     if let Ok(text) = core::str::from_utf8(&line[..len]) {
         crate::disklog::line(text);
     }
+    ram_file[..name.len()].copy_from_slice(&name);
+    let sum_n = record.summary_n.min(ram_sum.len());
+    one_line(&record.summary[..sum_n], ram_sum, ram_sum_n);
+    *ram_up = record.uptime_ms;
+    let mut pub_ = PUB.lock();
+    let copy = n.min(pub_.text.len());
+    pub_.text[..copy].copy_from_slice(&text[..copy]);
+    pub_.text_n = copy;
+    true
+}
+
+fn publish_card(have_ram: bool, ram_file: &[u8; 16], ram_sum: &[u8], ram_up: u64) {
     let mut count = 0u32;
     let mut list = [0u8; 128];
     let mut list_n = 0;
+    let mut newest: Option<([u8; 16], usize)> = None;
     let mut seq = 1u32;
     while seq <= crash_rec::KEEP {
         let candidate = crash_rec::file_name(seq);
@@ -99,36 +145,120 @@ pub fn recover() {
                     list_n = push(&mut list, list_n, b"\n");
                 }
                 list_n = push(&mut list, list_n, candidate.as_bytes());
+                let mut name = [0u8; 16];
+                let n = candidate.len().min(name.len());
+                name[..n].copy_from_slice(&candidate.as_bytes()[..n]);
+                newest = Some((name, n));
             }
         }
         seq += 1;
     }
-    {
-        let mut pub_ = PUB.lock();
-        pub_.count = count;
-        pub_.uptime_ms = record.uptime_ms;
-        pub_.safe = state.safe;
-        pub_.file = [0; 16];
-        pub_.file[..name.len()].copy_from_slice(&name);
-        pub_.summary = [0; 96];
-        let sum_n = record.summary_n.min(pub_.summary.len());
-        pub_.summary[..sum_n].copy_from_slice(&record.summary[..sum_n]);
-        let copy = n.min(pub_.text.len());
-        pub_.text[..copy].copy_from_slice(&text[..copy]);
-        pub_.text_n = copy;
-        let list_copy = list_n.min(pub_.list.len());
-        pub_.list[..list_copy].copy_from_slice(&list[..list_copy]);
-        pub_.list_n = list_copy;
+    let mut file = [0u8; 16];
+    let mut summary = [0u8; 96];
+    let mut summary_n = 0usize;
+    let mut uptime = 0u64;
+    let mut body = [0u8; 4096];
+    let mut body_n = 0usize;
+    if have_ram {
+        file = *ram_file;
+        one_line(ram_sum, &mut summary, &mut summary_n);
+        uptime = ram_up;
+    } else if let Some((name, _)) = newest {
+        file = name;
+        if let Ok(name) = core::str::from_utf8(&file) {
+            let end = name.find('\0').unwrap_or(name.len());
+            if let Ok(n) = crate::fs::read_crash(&name[..end], &mut body) {
+                body_n = n.min(body.len());
+                if let Some((up, sum)) = fields_from_text(&body[..body_n]) {
+                    uptime = up;
+                    one_line(sum, &mut summary, &mut summary_n);
+                }
+            }
+        }
     }
-    crash_rec::store_loop(
-        raw,
-        LoopState {
-            streak: state.streak,
-            safe: state.safe,
-            seq: state.seq,
-        },
-    );
-    clean(raw.as_ptr() as u64, crash_rec::SLOT);
+    let mut pub_ = PUB.lock();
+    pub_.count = count;
+    pub_.uptime_ms = uptime;
+    pub_.safe = u32::from(RUNTIME_SAFE.load(Ordering::Acquire));
+    pub_.file = file;
+    pub_.summary = summary;
+    if !have_ram {
+        let copy = body_n.min(pub_.text.len());
+        pub_.text[..copy].copy_from_slice(&body[..copy]);
+        pub_.text_n = copy;
+    }
+    pub_.list = [0; 128];
+    let list_copy = list_n.min(pub_.list.len());
+    pub_.list[..list_copy].copy_from_slice(&list[..list_copy]);
+    pub_.list_n = list_copy;
+}
+
+fn one_line(src: &[u8], out: &mut [u8], n: &mut usize) -> usize {
+    *n = 0;
+    for byte in src {
+        if *n >= out.len() {
+            break;
+        }
+        let byte = if *byte == b'\n' || *byte == b'\r' {
+            b' '
+        } else {
+            *byte
+        };
+        if byte == 0 {
+            break;
+        }
+        out[*n] = byte;
+        *n += 1;
+    }
+    *n
+}
+
+fn fields_from_text(text: &[u8]) -> Option<(u64, &[u8])> {
+    let uptime = line_value(text, b"uptime_ms ")
+        .and_then(parse_u64)
+        .unwrap_or(0);
+    let summary = text
+        .windows(8)
+        .position(|window| window == b"summary ")
+        .map(|at| {
+            let rest = &text[at + 8..];
+            if rest.last() == Some(&b'\n') {
+                &rest[..rest.len() - 1]
+            } else {
+                rest
+            }
+        })?;
+    Some((uptime, summary))
+}
+
+fn line_value<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut i = 0;
+    while i + key.len() <= text.len() {
+        if (i == 0 || text[i - 1] == b'\n') && &text[i..i + key.len()] == key {
+            let rest = &text[i + key.len()..];
+            let end = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(rest.len());
+            return Some(&rest[..end]);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut n = 0u64;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        n = n.saturating_mul(10).saturating_add((*byte - b'0') as u64);
+    }
+    Some(n)
 }
 
 /// HTTP task only. `kind` is 1 abort, 2 panic, 3 hang.
@@ -193,7 +323,11 @@ pub fn from_exception(esr: u64, elr: u64, far: u64, spsr: u64, sp: u64, regs: &[
         crash_rec::KIND_FAULT
     };
     let mut summary = [0u8; 48];
-    let mut n = push(&mut summary, 0, crate::crash_rec::kind_name(kind).as_bytes());
+    let mut n = push(
+        &mut summary,
+        0,
+        crate::crash_rec::kind_name(kind).as_bytes(),
+    );
     n = push(&mut summary, n, b" ec=");
     n = push_hex2(&mut summary, n, (ec & 0x3f) as u8);
     capture(kind, esr, elr, far, spsr, sp, regs, &summary[..n]);
@@ -230,7 +364,16 @@ pub fn note(kind: u16, summary: &[u8]) {
     capture(kind, 0, regs[30], 0, 0, sp, &regs, summary);
 }
 
-fn capture(kind: u16, esr: u64, elr: u64, far: u64, spsr: u64, sp: u64, regs: &[u64], summary: &[u8]) {
+fn capture(
+    kind: u16,
+    esr: u64,
+    elr: u64,
+    far: u64,
+    spsr: u64,
+    sp: u64,
+    regs: &[u64],
+    summary: &[u8],
+) {
     if BUSY.swap(true, Ordering::AcqRel) {
         return;
     }

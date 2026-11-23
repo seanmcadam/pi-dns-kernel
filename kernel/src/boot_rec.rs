@@ -7,8 +7,12 @@
 //! the live image.
 
 pub const MAGIC: u32 = 0x544F_4F42;
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const LEN: usize = 64;
+pub const RESET_UNKNOWN: u32 = 0;
+pub const RESET_WATCHDOG: u32 = 1;
+pub const RESET_REBOOT: u32 = 2;
+pub const RESET_POWER: u32 = 3;
 pub const FAIL_LIMIT: u32 = 3;
 pub const GOOD_MS: u64 = 15_000;
 pub const WATCHDOG_MS: u64 = 15_000;
@@ -41,6 +45,24 @@ pub struct Rec {
     pub fallback: u32,
     pub good: u32,
     pub restored: u32,
+    /// Identity of the kernel this streak belongs to. A different image
+    /// starts a new streak.
+    pub image: [u8; 16],
+    /// Why the previous boot stopped, when that was recorded before reset.
+    pub reset: u32,
+}
+
+/// How this boot relates to the kernel the record is counting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// `config.txt` loaded the same image the record counts.
+    Same,
+    /// `config.txt` loaded a different image.
+    Other,
+    /// Tryboot of `kernel8.new`, or any tryboot that is not the backup.
+    Staged,
+    /// Tryboot of `kernel8.bak`.
+    Backup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,15 +89,33 @@ pub fn stage_name(stage: u32) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn on_boot(prev: Option<Rec>) -> (Rec, Action) {
+    reconcile(prev, Arrival::Same, [0; 16])
+}
+
+/// Fold the record and the way this image was loaded.
+///
+/// A tryboot of `kernel8.new`, or a normal boot of a different image, drops
+/// the streak and the fallback. Rollback is allowed only for `Backup`.
+pub fn reconcile(prev: Option<Rec>, arrival: Arrival, image: [u8; 16]) -> (Rec, Action) {
     let Some(prev) = prev else {
-        return (fresh(0), Action::Continue);
+        return (fresh_image(0, image), Action::Continue);
     };
+    if arrival == Arrival::Staged || arrival == Arrival::Other {
+        return (fresh_image(prev.stage, image), Action::Continue);
+    }
+    if arrival != Arrival::Backup && prev.image != [0; 16] && prev.image != image {
+        return (fresh_image(prev.stage, image), Action::Continue);
+    }
+    if arrival == Arrival::Backup {
+        return backup_arrival(prev, image);
+    }
     if prev.restored != 0 && prev.good != 0 {
-        return (fresh(prev.stage), Action::Continue);
+        return (fresh_image(prev.stage, image), Action::Continue);
     }
     if prev.good != 0 && prev.fallback < FB_ACTIVE {
-        return (fresh(prev.stage), Action::Continue);
+        return (fresh_image(prev.stage, image), Action::Continue);
     }
     if prev.fallback == FB_RESET {
         return (
@@ -86,20 +126,15 @@ pub fn on_boot(prev: Option<Rec>) -> (Rec, Action) {
                 fallback: FB_ACTIVE,
                 good: 0,
                 restored: 0,
+                image,
+                reset: 0,
             },
             Action::Stay,
         );
     }
     if prev.fallback == FB_ACTIVE && prev.restored == 0 {
         return (
-            Rec {
-                attempts: prev.attempts,
-                stage: STAGE_START,
-                prev_stage: prev.stage,
-                fallback: FB_RESET,
-                good: 0,
-                restored: 0,
-            },
+            owned(prev.attempts, prev.stage, FB_RESET, image),
             Action::Fallback,
         );
     }
@@ -112,6 +147,8 @@ pub fn on_boot(prev: Option<Rec>) -> (Rec, Action) {
                 fallback: FB_ABANDONED,
                 good: 0,
                 restored: 0,
+                image,
+                reset: 0,
             },
             Action::Stay,
         );
@@ -119,28 +156,113 @@ pub fn on_boot(prev: Option<Rec>) -> (Rec, Action) {
     let attempts = prev.attempts.saturating_add(1);
     if attempts >= FAIL_LIMIT {
         return (
-            Rec {
-                attempts,
-                stage: STAGE_START,
-                prev_stage: prev.stage,
-                fallback: FB_RESET,
-                good: 0,
-                restored: 0,
-            },
+            owned(attempts, prev.stage, FB_RESET, image),
             Action::Fallback,
         );
     }
     (
-        Rec {
-            attempts,
-            stage: STAGE_START,
-            prev_stage: prev.stage,
-            fallback: FB_NONE,
-            good: 0,
-            restored: 0,
-        },
+        owned(attempts, prev.stage, FB_NONE, image),
         Action::Continue,
     )
+}
+
+fn backup_arrival(prev: Rec, image: [u8; 16]) -> (Rec, Action) {
+    if prev.fallback == FB_RESET {
+        return (
+            Rec {
+                attempts: prev.attempts,
+                stage: STAGE_START,
+                prev_stage: prev.stage,
+                fallback: FB_ACTIVE,
+                good: 0,
+                restored: 0,
+                image,
+                reset: 0,
+            },
+            Action::Stay,
+        );
+    }
+    if prev.fallback == FB_ACTIVE && prev.restored == 0 {
+        return (
+            owned(prev.attempts, prev.stage, FB_RESET, image),
+            Action::Fallback,
+        );
+    }
+    if prev.fallback == FB_ABANDONED {
+        return (
+            Rec {
+                attempts: prev.attempts,
+                stage: STAGE_START,
+                prev_stage: prev.stage,
+                fallback: FB_ABANDONED,
+                good: 0,
+                restored: 0,
+                image,
+                reset: 0,
+            },
+            Action::Stay,
+        );
+    }
+    (fresh_image(prev.stage, image), Action::Continue)
+}
+
+/// `true` only when this boot is the `kernel8.bak` tryboot the record asked for.
+pub fn allows_rollback(rec: &Rec, arrival: Arrival) -> bool {
+    arrival == Arrival::Backup
+        && (rec.fallback == FB_ACTIVE || rec.fallback == FB_RESET)
+        && rec.fallback != FB_ABANDONED
+        && rec.restored == 0
+}
+
+pub fn image_id(bytes: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < bytes.len() {
+        out[i % 16] ^= bytes[i].wrapping_add(i as u8);
+        i += 1;
+    }
+    out
+}
+
+pub fn reset_name(kind: u32) -> &'static str {
+    match kind {
+        RESET_WATCHDOG => "watchdog",
+        RESET_REBOOT => "reboot",
+        RESET_POWER => "power",
+        _ => "unknown",
+    }
+}
+
+/// `recorded` is the value stored before a software watchdog reset.
+/// `rsts` is `PM_RSTS`. Bit 5 is a watchdog full reset, bit 9 is the marker
+/// this kernel writes before it asks for a reset, and bit 12 is power-on.
+pub fn classify_reset(rsts: u32, recorded: u32) -> u32 {
+    if recorded == RESET_WATCHDOG {
+        return RESET_WATCHDOG;
+    }
+    if rsts & 0x200 != 0 {
+        return RESET_REBOOT;
+    }
+    if rsts & 0x20 != 0 {
+        return RESET_WATCHDOG;
+    }
+    if rsts & 0x1000 != 0 {
+        return RESET_POWER;
+    }
+    RESET_UNKNOWN
+}
+
+fn owned(attempts: u32, prev_stage: u32, fallback: u32, image: [u8; 16]) -> Rec {
+    Rec {
+        attempts,
+        stage: STAGE_START,
+        prev_stage,
+        fallback,
+        good: 0,
+        restored: 0,
+        image,
+        reset: 0,
+    }
 }
 
 pub fn mark_good(mut rec: Rec) -> Rec {
@@ -167,6 +289,8 @@ pub fn load(raw: &[u8]) -> Option<Rec> {
     if len as usize != LEN || read_u32(raw, OFF_SUM) != checksum(&raw[..LEN]) {
         return None;
     }
+    let mut image = [0u8; 16];
+    image.copy_from_slice(&raw[40..56]);
     Some(Rec {
         attempts: read_u32(raw, 16),
         stage: read_u32(raw, 20),
@@ -174,6 +298,8 @@ pub fn load(raw: &[u8]) -> Option<Rec> {
         fallback: read_u32(raw, 28),
         good: read_u32(raw, 32),
         restored: read_u32(raw, 36),
+        image,
+        reset: read_u32(raw, 56),
     })
 }
 
@@ -191,12 +317,19 @@ pub fn store(raw: &mut [u8], rec: &Rec) -> bool {
     write_u32(raw, 28, rec.fallback);
     write_u32(raw, 32, rec.good);
     write_u32(raw, 36, rec.restored);
+    raw[40..56].copy_from_slice(&rec.image);
+    write_u32(raw, 56, rec.reset);
     let sum = checksum(&raw[..LEN]);
     write_u32(raw, OFF_SUM, sum);
     true
 }
 
+#[cfg(test)]
 fn fresh(prev_stage: u32) -> Rec {
+    fresh_image(prev_stage, [0; 16])
+}
+
+fn fresh_image(prev_stage: u32, image: [u8; 16]) -> Rec {
     Rec {
         attempts: 0,
         stage: STAGE_START,
@@ -204,6 +337,8 @@ fn fresh(prev_stage: u32) -> Rec {
         fallback: FB_NONE,
         good: 0,
         restored: 0,
+        image,
+        reset: 0,
     }
 }
 
@@ -266,6 +401,8 @@ mod tests {
                 fallback: 0,
                 good: 0,
                 restored: 0,
+                image: [0; 16],
+                reset: 0,
             }
         ));
         assert_eq!(load(&raw).unwrap().stage, STAGE_FS);
@@ -336,5 +473,67 @@ mod tests {
         assert_eq!(action, Action::Continue);
         assert_eq!(next.fallback, FB_NONE);
         assert_eq!(next.attempts, 0);
+    }
+
+    #[test]
+    fn a_staged_or_different_image_drops_the_fallback() {
+        let image = image_id(b"pi4dns-boot-id:0.1.82");
+        let mut rec = fresh(STAGE_FS);
+        rec.stage = STAGE_FS;
+        rec.attempts = 3;
+        rec.fallback = FB_ACTIVE;
+        rec.image = image;
+        let (staged, action) = reconcile(Some(rec), Arrival::Staged, image);
+        assert_eq!(action, Action::Continue);
+        assert_eq!(staged.attempts, 0);
+        assert_eq!(staged.fallback, FB_NONE);
+        assert!(!allows_rollback(&staged, Arrival::Staged));
+        let other_id = image_id(b"pi4dns-boot-id:0.1.83");
+        let (other, action) = reconcile(Some(rec), Arrival::Other, other_id);
+        assert_eq!(action, Action::Continue);
+        assert_eq!(other.fallback, FB_NONE);
+        assert_eq!(other.image, other_id);
+        let (same, _) = reconcile(Some(rec), Arrival::Same, other_id);
+        assert_eq!(same.fallback, FB_NONE);
+        assert!(!allows_rollback(&rec, Arrival::Same));
+    }
+
+    #[test]
+    fn only_the_backup_tryboot_may_roll_back() {
+        let image = image_id(b"pi4dns-boot-id:0.1.83");
+        let mut rec = fresh(STAGE_FS);
+        rec.stage = STAGE_FS;
+        rec.attempts = 3;
+        rec.fallback = FB_RESET;
+        rec.image = image;
+        let (next, action) = reconcile(Some(rec), Arrival::Backup, image);
+        assert_eq!(action, Action::Stay);
+        assert_eq!(next.fallback, FB_ACTIVE);
+        assert_eq!(stage_name(next.prev_stage), "fs");
+        assert!(allows_rollback(&next, Arrival::Backup));
+        assert!(!allows_rollback(&next, Arrival::Staged));
+        assert!(!allows_rollback(&next, Arrival::Same));
+        let (again, action) = reconcile(Some(next), Arrival::Backup, image);
+        assert_eq!(action, Action::Fallback);
+        assert_eq!(again.fallback, FB_RESET);
+        let mut idle = fresh(0);
+        idle.image = image;
+        let (unasked, action) = reconcile(Some(idle), Arrival::Backup, image);
+        assert_eq!(action, Action::Continue);
+        assert!(!allows_rollback(&unasked, Arrival::Backup));
+    }
+
+    #[test]
+    fn reset_cause_prefers_a_recorded_watchdog_over_the_software_marker() {
+        assert_eq!(classify_reset(0, 0), RESET_UNKNOWN);
+        assert_eq!(classify_reset(0x20, 0), RESET_WATCHDOG);
+        assert_eq!(classify_reset(0x200, 0), RESET_REBOOT);
+        assert_eq!(classify_reset(0x1000, 0), RESET_POWER);
+        assert_eq!(classify_reset(0x220, RESET_WATCHDOG), RESET_WATCHDOG);
+        assert_eq!(reset_name(RESET_WATCHDOG), "watchdog");
+        assert_ne!(
+            image_id(b"pi4dns-boot-id:0.1.82"),
+            image_id(b"pi4dns-boot-id:0.1.83")
+        );
     }
 }

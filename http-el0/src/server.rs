@@ -701,6 +701,23 @@ fn handle_crash_body(op: u64) -> HttpResponse {
     response
 }
 
+fn json_text(raw: &[u8]) -> String {
+    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    let mut out = String::new();
+    for byte in &raw[..end] {
+        match *byte {
+            b'\n' | b'\r' => out.push(' '),
+            b'\\' | b'"' => {
+                out.push('\\');
+                out.push(*byte as char);
+            }
+            0x20..=0x7e => out.push(*byte as char),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn crash_token(raw: &[u8]) -> String {
     let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
     let mut out = String::new();
@@ -725,7 +742,7 @@ fn crash_fields() -> String {
         buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
     ]);
     let file = crash_token(&buf[16..32]);
-    let summary = crash_token(&buf[32..128]);
+    let summary = json_text(&buf[32..128]);
     let last = if file.is_empty() {
         String::new()
     } else {
@@ -778,7 +795,7 @@ fn boot_fields() -> String {
     let n = sys(BOOT, 1, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
     if n < 80 {
         return String::from(
-            "\"boot_attempts\":0,\"boot_good\":0,\"fallback_active\":0,\"booted_kernel\":\"\",\"boot_stopped\":\"unknown\"",
+            "\"boot_attempts\":0,\"boot_good\":0,\"fallback_active\":0,\"booted_kernel\":\"\",\"boot_stopped\":\"unknown\",\"last_reset\":\"unknown\"",
         );
     }
     let attempts = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -786,8 +803,14 @@ fn boot_fields() -> String {
     let fallback = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let kernel = crash_token(&buf[20..36]);
     let stopped = crash_token(&buf[36..52]);
+    let reset = match u32::from_le_bytes([buf[68], buf[69], buf[70], buf[71]]) {
+        1 => "watchdog",
+        2 => "reboot",
+        3 => "power",
+        _ => "unknown",
+    };
     format!(
-        "\"boot_attempts\":{attempts},\"boot_good\":{good},\"fallback_active\":{fallback},\"booted_kernel\":\"{kernel}\",\"boot_stopped\":\"{stopped}\""
+        "\"boot_attempts\":{attempts},\"boot_good\":{good},\"fallback_active\":{fallback},\"booted_kernel\":\"{kernel}\",\"boot_stopped\":\"{stopped}\",\"last_reset\":\"{reset}\""
     )
 }
 

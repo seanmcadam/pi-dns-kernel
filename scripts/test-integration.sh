@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.82" qemu/boot-output.txt && \
+   grep -q "version 0.1.83" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.82"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.83"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -190,7 +190,7 @@ need = (
     "hdmi_regs", "hdmi_port", "vclog", "vclog_bytes", "vclog_status",
     "sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz",
     "crash_count", "safe_mode", "last_crash",
-    "boot_attempts", "boot_good", "fallback_active", "booted_kernel", "boot_stopped",
+    "boot_attempts", "boot_good", "fallback_active", "booted_kernel", "boot_stopped", "last_reset",
     "board", "board_revision", "board_source",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
@@ -243,6 +243,9 @@ for doc in (a, b):
         sys.exit(1)
     if not isinstance(doc["booted_kernel"], str) or not isinstance(doc["boot_stopped"], str):
         print("boot text", doc["booted_kernel"], doc["boot_stopped"])
+        sys.exit(1)
+    if doc["last_reset"] not in ("unknown", "watchdog", "reboot", "power"):
+        print("last reset", doc["last_reset"])
         sys.exit(1)
     if doc["board"] != "virt" or doc["board_source"] != "build" or doc["board_revision"] != "":
         print("board", doc["board"], doc["board_source"], doc["board_revision"])
@@ -2175,12 +2178,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.82" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.83" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.82" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.83" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2196,7 +2199,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.82" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.83" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2443,12 +2446,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.82":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.83":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.82" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.83" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3545,6 +3548,10 @@ if status != 200 or b"armed" not in body:
     fail("hang %s %s" % (status, body[:160]))
 wait_serial(b"watchdog reset")
 wait_up()
+status, raw = req("GET", "/status")
+doc = json.loads(raw)
+if status != 200 or doc.get("last_reset") != "watchdog":
+    fail("watchdog reset %s" % doc.get("last_reset"))
 status, body = form("fail")
 if status != 200 or b"armed" not in body:
     fail("fail %s %s" % (status, body[:160]))
