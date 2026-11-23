@@ -77,6 +77,7 @@ pub fn on_tick() {
         crate::act::note_tick(cpu, elr);
         crate::act::check_hang();
     }
+    crate::boot::check_deadline();
     // One published 100 Hz counter. Every core has its own compare register
     // and uses it for preemption. Adding all four would report 400 Hz.
     if crate::percpu::id() == 0 {

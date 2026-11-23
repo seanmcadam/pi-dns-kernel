@@ -7,6 +7,10 @@ extern crate alloc;
 mod act;
 mod addr;
 mod board;
+mod board_id;
+mod board_rev;
+mod boot;
+mod boot_rec;
 mod config_manager;
 mod crash;
 mod crash_rec;
@@ -98,8 +102,10 @@ fn uart_dec(mut n: u64) {
 
 #[no_mangle]
 pub extern "C" fn kernel_main(entry_el: u64) -> ! {
-    // The framebuffer is programmed before the UART and before the strict
-    // map. A hang in either of those used to leave the firmware rainbow up.
+    // The watchdog is armed before HDMI, the mailbox, and the card. A stage
+    // that never returns expires it. The framebuffer is programmed before
+    // the UART and before the strict map.
+    boot::open();
     #[cfg(feature = "board-pi4")]
     {
         let _ = fb_con::start_early();
@@ -120,6 +126,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     #[cfg(feature = "board-pi4")]
     fb_con::switch_to_nc();
     uart_write("[OK] MMU and caches enabled\r\n");
+    boot::stage(boot_rec::STAGE_MMU);
     // Before the firmware-log read. A crashed tryboot used to leave the
     // one-shot flag set, and on Pi 4 rev 1.0/1.1 that flag lives in EEPROM.
     board::disarm_tryboot();
@@ -141,12 +148,14 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
 
     uart_write("[2] Initializing logger...\r\n");
     logger::init();
+    boot::report();
     #[cfg(feature = "board-pi4")]
     fb_con::report();
     uart_write("[OK] Logger initialized\r\n");
 
     uart_write("[3] Initializing timer...\r\n");
     timer::init();
+    boot::stage(boot_rec::STAGE_TIMER);
     uart_write("[OK] Timer initialized\r\n");
 
     uart_write("[4] Initializing interrupts...\r\n");
@@ -158,28 +167,40 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     uart_write("cores online ");
     uart_dec(smp::online() as u64);
     uart_write("\r\n");
+    boot::stage(boot_rec::STAGE_SMP);
 
     uart_write("[4b] Running EL0 tests...\r\n");
     task::run_boot_tests();
     uart_write("[OK] EL0 tests finished\r\n");
 
     uart_write("[5] Loading config...\r\n");
-    match fs::init() {
-        Ok(()) => uart_write("[OK] Filesystem mounted\r\n"),
-        Err(_) => uart_write("[OK] No filesystem, using defaults\r\n"),
-    }
+    boot::stage(boot_rec::STAGE_FS);
+    let mounted = match fs::init() {
+        Ok(()) => {
+            uart_write("[OK] Filesystem mounted\r\n");
+            true
+        }
+        Err(_) => {
+            uart_write("[OK] No filesystem, using defaults\r\n");
+            false
+        }
+    };
+    boot::after_fs(mounted);
     crash::recover();
     #[cfg(feature = "board-pi4")]
     fb_con::load_last_shut();
     #[cfg(feature = "board-pi4")]
     fb_con::store_vclog();
+    boot::stage(boot_rec::STAGE_DISPLAY);
     fw::scrub();
     fw::boot_report();
     let config = config_manager::load_config();
+    board_id::report();
     uart_write("[OK] Config loaded\r\n");
 
     uart_write(dhcp_rx::self_check_line());
     uart_write("\r\n");
+    boot::stage(boot_rec::STAGE_NET);
     uart_write("[6] Initializing network...\r\n");
     // A missing NIC skips DNS, HTTP, and telnet. The log task still starts.
     // QEMU virt has a NIC. raspi4b has no GENET, and the Pi 5 image does
@@ -239,6 +260,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         uart_write("HTTP server listening on port 80\r\n");
         uart_write("DNS Server ready\r\n");
         uart_write("Ready for queries...\r\n\r\n");
+        boot::serving();
     } else {
         uart_write("\r\n=== Kernel Initialized Without a NIC ===\r\n");
     }
@@ -267,6 +289,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         net::poll();
         power::poll();
         crash::poll();
+        boot::poll();
         fw::poll();
         supervisor::tick();
 

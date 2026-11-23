@@ -1022,6 +1022,17 @@ fn exists(name: &str) -> bool {
 /// The one-shot flag could not be cleared. The bootloader, with that flag
 /// set and no `tryboot.txt`, stays on the rainbow and never loads a kernel.
 /// Rewrite the file in place so it boots `kernel8.img`. The name stays.
+#[cfg(feature = "board-pi4")]
+pub fn install_live_tryboot() -> bool {
+    install_safe_tryboot()
+}
+
+/// Start the existing sliced rollback of `KERNEL8.BAK` over the live kernel.
+/// `false` means it did not start. The copy finishes in `poll`.
+pub fn boot_rollback() -> bool {
+    rollback() == 0
+}
+
 fn install_safe_tryboot() -> bool {
     let mut raw = [0u8; 512];
     if let Ok(n) = crate::fs::read_at("CONFIG.TXT", 0, &mut raw) {
@@ -1087,7 +1098,9 @@ pub fn boot_report() {
     BOOT_TRY.store(dt == Some(true) || mbox_bit, Ordering::Relaxed);
     HW_TRY.store(mbox_bit, Ordering::Relaxed);
     if pi4 && !crate::board::tryboot_disarmed() {
-        if install_safe_tryboot() {
+        if crate::boot::fallback_keeps_backup() {
+            crate::disklog::line("tryboot file kernel8.bak");
+        } else if install_safe_tryboot() {
             crate::disklog::line("tryboot file kernel8.img");
         } else {
             crate::disklog::line("tryboot file stuck");
@@ -1648,6 +1661,10 @@ fn finish_copy(job: CopyJob) {
             *COPY.lock() = None;
             publish(PH_IDLE, job.total, job.total);
             note("rolled back");
+            if crate::boot::take_restore_tryboot() {
+                let _ = io(install_safe_tryboot);
+                crate::boot::note_restored();
+            }
         }
         _ => {
             *COPY.lock() = None;

@@ -392,6 +392,7 @@ pub fn halt_with(text: &str) -> ! {
 }
 
 fn hold(msg: &str) -> ! {
+    crate::boot::disarm();
     FAULT.store(true, Ordering::Relaxed);
     crate::interrupts::mask();
     crate::fb_con::freeze(msg);

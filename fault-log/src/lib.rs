@@ -13,6 +13,12 @@ mod fault_log;
 #[path = "../../kernel/src/crash_rec.rs"]
 mod crash_rec;
 
+#[path = "../../kernel/src/boot_rec.rs"]
+mod boot_rec;
+
+#[path = "../../kernel/src/board_rev.rs"]
+mod board_rev;
+
 #[path = "../../kernel/src/dhcp_rx.rs"]
 mod dhcp_rx;
 

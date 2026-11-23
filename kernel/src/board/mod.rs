@@ -436,6 +436,21 @@ pub fn power(reset: bool) -> bool {
 }
 
 /// Reset from a crash. No filesystem lock and no mailbox.
+pub fn watchdog_arm() {
+    #[cfg(feature = "board-pi4")]
+    pi4::watchdog_arm();
+}
+
+pub fn watchdog_pet() {
+    #[cfg(feature = "board-pi4")]
+    pi4::watchdog_pet();
+}
+
+pub fn watchdog_disarm() {
+    #[cfg(feature = "board-pi4")]
+    pi4::watchdog_disarm();
+}
+
 pub fn crash_reset() -> bool {
     #[cfg(feature = "board-pi4")]
     {
@@ -465,6 +480,17 @@ pub fn tryboot_latched() -> u32 {
 
 pub fn tryboot_disarmed() -> bool {
     <Active as Board>::tryboot_disarmed()
+}
+
+pub fn board_revision() -> u32 {
+    #[cfg(feature = "board-pi4")]
+    {
+        pi4::board_revision()
+    }
+    #[cfg(not(feature = "board-pi4"))]
+    {
+        0
+    }
 }
 
 /// VideoCore bus address to ARM physical address.

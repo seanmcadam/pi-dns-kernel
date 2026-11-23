@@ -282,6 +282,8 @@ fn capture(kind: u16, esr: u64, elr: u64, far: u64, spsr: u64, sp: u64, regs: &[
     if decision.reboot {
         raw_line(b"crash reset\r\n");
         let _ = crate::board::crash_reset();
+    } else {
+        crate::boot::disarm();
     }
     BUSY.store(false, Ordering::Release);
 }

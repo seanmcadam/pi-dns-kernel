@@ -15,6 +15,8 @@ pub struct Config {
     pub http: HttpConfig,
     pub display: DisplayConfig,
     pub timeout_ms: u64,
+    /// `board.detect`. Missing means on. Off reports the build-time board.
+    pub board_detect: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +95,7 @@ pub struct HttpConfig {
 }
 
 static CURRENT: Mutex<Option<Config>> = Mutex::new(None);
+static BOARD_DETECT: AtomicBool = AtomicBool::new(true);
 static LOG_MAX: AtomicU32 = AtomicU32::new(config::LOG_MIN_BYTES as u32);
 static LOG_ARCHIVES: AtomicU32 = AtomicU32::new(3);
 static LOG_CACHED: Mutex<[u8; 512]> = Mutex::new([0; 512]);
@@ -104,10 +107,14 @@ static HDMI_CMD: AtomicU8 = AtomicU8::new(0);
 static HDMI_RESET: AtomicBool = AtomicBool::new(false);
 
 fn publish(config: &Config) {
+    BOARD_DETECT.store(config.board_detect, Ordering::Relaxed);
     #[cfg(feature = "board-pi4")]
     HDMI_RESET.store(config.display.hdmi_reset, Ordering::Relaxed);
-    #[cfg(not(feature = "board-pi4"))]
-    let _ = config;
+}
+
+/// `board.detect` from JSON. Missing means the build still reads the revision.
+pub fn board_detect() -> bool {
+    BOARD_DETECT.load(Ordering::Relaxed)
 }
 
 /// `display.hdmi_reset` from the loaded JSON. Missing means off.
@@ -784,6 +791,7 @@ fn default_config() -> Config {
             hdmi_reset: false,
         },
         timeout_ms: 3_000,
+        board_detect: crate::board_rev::DETECT_DEFAULT,
     }
 }
 
@@ -1019,6 +1027,11 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         .ok_or_else(|| String::from("display: missing field"))?;
     let vnc = display.get("vnc").and_then(Value::as_u64).unwrap_or(0) != 0;
     let hdmi = display.get("hdmi").and_then(Value::as_u64).unwrap_or(0) != 0;
+    let board_detect = match value.get("board").and_then(|board| board.get("detect")).and_then(Value::as_u64) {
+        None | Some(1) => crate::board_rev::DETECT_DEFAULT,
+        Some(0) => false,
+        Some(_) => return Err(String::from("board.detect: out of bounds (0..=1)")),
+    };
     let hdmi_reset = match display.get("hdmi_reset").and_then(Value::as_u64) {
         None | Some(0) => false,
         Some(1) => true,
@@ -1075,6 +1088,7 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
             hdmi_reset,
         },
         timeout_ms,
+        board_detect,
     })
 }
 
@@ -1271,7 +1285,7 @@ fn config_value(config: &Config) -> Value {
             (String::from("ttl"), Value::Number(u64::from(record.ttl))),
         ]));
     }
-    Value::Object(vec![
+    let mut fields = vec![
         (String::from("version"), Value::Number(config::SCHEMA_VERSION)),
         (
             String::from("network"),
@@ -1329,7 +1343,14 @@ fn config_value(config: &Config) -> Value {
             String::from("display"),
             Value::Object(display_fields(config)),
         ),
-    ])
+    ];
+    if !config.board_detect {
+        fields.push((
+            String::from("board"),
+            Value::Object(vec![(String::from("detect"), Value::Number(0))]),
+        ));
+    }
+    Value::Object(fields)
 }
 
 fn display_fields(config: &Config) -> Vec<(String, Value)> {
