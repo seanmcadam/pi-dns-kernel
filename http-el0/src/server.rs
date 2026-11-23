@@ -225,12 +225,20 @@ fn handle(request: &HttpRequest) -> HttpResponse {
     if !check_auth(request) {
         return HttpResponse::unauthorized();
     }
-    if request.path == "/firmware" || request.path.starts_with("/firmware/") {
+    let (path, query) = http_server::split_target(&request.path);
+    if path == "/firmware" || path.starts_with("/firmware/") {
         return firmware::handle(request);
     }
-    match request.path.as_str() {
+    match path {
         "/" => handle_index(),
-        "/status" => handle_status(),
+        "/status" => {
+            if http_server::wants_html(query, request.get_header("Accept")) {
+                status_html()
+            } else {
+                status_json()
+            }
+        }
+        "/json/status" => status_json(),
         "/vclog" => handle_vclog(),
         "/config" => handle_config(request),
         "/records" => handle_records(request),
@@ -920,7 +928,8 @@ fn handle_index() -> HttpResponse {
     {power_block}
     <h2>Management</h2>
     <ul>
-        <li><a href="/status">System Status (JSON)</a></li>
+        <li><a href="/status">System status</a></li>
+        <li><a href="/json/status">System status (JSON)</a></li>
         <li><a href="/vclog">Firmware log</a></li>
         <li><a href="/firmware">Firmware update</a></li>
         <li><a href="/config">Configuration</a></li>
@@ -938,7 +947,104 @@ fn handle_index() -> HttpResponse {
     html_response(&html)
 }
 
-fn handle_status() -> HttpResponse {
+fn status_html() -> HttpResponse {
+    let version = version::VERSION;
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Status {version}</title>
+<style>
+body{{font:16px/1.45 sans-serif;margin:1rem;max-width:42rem}}
+h1{{font-size:1.35rem;margin:0 0 .4rem}}
+h2{{font-size:1.05rem;margin:1rem 0 .3rem}}
+dl{{margin:0}} dt{{font-weight:600}} dd{{margin:0 0 .35rem}}
+a{{color:#0645ad}}
+</style>
+</head><body>
+<h1>Status <span id="version">{version}</span></h1>
+<p><a href="/">Home</a> · <a href="/config">Config</a> · <a href="/json/status">JSON</a></p>
+<h2>System</h2>
+<dl>
+<dt>Uptime</dt><dd id="uptime">…</dd>
+<dt>Board</dt><dd id="board">…</dd>
+</dl>
+<h2>Network</h2>
+<dl>
+<dt>NIC IRQs</dt><dd id="nic_irqs">…</dd>
+<dt>RX / TX</dt><dd id="rxtx">…</dd>
+<dt>Busy / idle ms</dt><dd id="busy">…</dd>
+<dt>Upstreams</dt><dd id="upstreams">…</dd>
+</dl>
+<h2>DNS</h2>
+<dl>
+<dt>Cache entries</dt><dd id="cache_entries">…</dd>
+<dt>In flight</dt><dd id="dns_inflight">…</dd>
+<dt>Upstream timeouts</dt><dd id="upstream_timeouts">…</dd>
+</dl>
+<h2>SD</h2>
+<dl>
+<dt>Mode</dt><dd id="sd_mode">…</dd>
+<dt>Clock</dt><dd id="sd_clock_hz">…</dd>
+<dt>Mounted</dt><dd id="fs_mounted">…</dd>
+</dl>
+<h2>Boot</h2>
+<dl>
+<dt>boot_good</dt><dd id="boot_good">…</dd>
+<dt>fallback</dt><dd id="fallback_active">…</dd>
+<dt>boot_stopped</dt><dd id="boot_stopped">…</dd>
+<dt>last_reset</dt><dd id="last_reset">…</dd>
+<dt>Kernel</dt><dd id="booted_kernel">…</dd>
+</dl>
+<h2>Crash</h2>
+<dl>
+<dt>Count</dt><dd id="crash_count">…</dd>
+<dt>Last</dt><dd id="last_crash">…</dd>
+</dl>
+<p><a href="/crash/list">Crash list</a> · <a href="/crash/last">Last crash</a></p>
+<script>
+function text(id, value) {{
+  var el = document.getElementById(id);
+  if (el) el.textContent = value;
+}}
+function fill(d) {{
+  text("version", d.version);
+  text("uptime", d.uptime + " s");
+  text("board", d.board + " " + d.board_revision + " " + d.board_source);
+  text("nic_irqs", d.nic_irqs);
+  text("rxtx", d.rx_packets + " / " + d.tx_packets);
+  text("busy", d.net_busy_ms + " / " + d.net_idle_ms);
+  text("upstreams", d.upstreams);
+  text("cache_entries", d.cache_entries);
+  text("dns_inflight", d.dns_inflight);
+  text("upstream_timeouts", d.upstream_timeouts);
+  text("sd_mode", d.sd_mode);
+  text("sd_clock_hz", d.sd_clock_hz);
+  text("fs_mounted", d.fs_mounted);
+  text("boot_good", d.boot_good);
+  text("fallback_active", d.fallback_active);
+  text("boot_stopped", d.boot_stopped);
+  text("last_reset", d.last_reset);
+  text("booted_kernel", d.booted_kernel);
+  text("crash_count", d.crash_count);
+  text("last_crash", d.last_crash);
+}}
+function load() {{
+  fetch("/json/status", {{headers: {{Accept: "application/json"}}}})
+    .then(function(res) {{ return res.json(); }})
+    .then(fill);
+}}
+load();
+setInterval(load, 5000);
+</script>
+</body></html>"#
+    );
+    html_response(&html)
+}
+
+fn status_json() -> HttpResponse {
     let (nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms) = net_counters();
     let (
         arp_requests_tx,

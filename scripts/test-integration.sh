@@ -273,6 +273,39 @@ else
 fi
 
 echo ""
+echo "Test 62: /status HTML for browsers, JSON for scripts"
+if timeout 5 curl -s -u admin:admin -H 'Accept: text/html' "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-html.txt \
+    && timeout 5 curl -s -u admin:admin -H 'Accept: text/html' "http://127.0.0.1:${HTTP_HOST_PORT}/status?format=json" > qemu/status-fmt.json \
+    && timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/json/status" > qemu/status-json.txt \
+    && python3 - qemu/status-html.txt qemu/status-fmt.json qemu/status-json.txt <<'PY'
+import json, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+forced = json.load(open(sys.argv[2]))
+plain = json.load(open(sys.argv[3]))
+if "<h1" not in html or "boot_good" not in html or "/crash/list" not in html or "/json/status" not in html:
+    print("html", html[:240])
+    sys.exit(1)
+if html.lstrip().startswith("{"):
+    print("html was json")
+    sys.exit(1)
+if forced.get("status") != "running" or plain.get("status") != "running":
+    print("json", forced.get("status"), plain.get("status"))
+    sys.exit(1)
+if forced.get("version") != plain.get("version") or "0.1.84" not in html:
+    print("version", forced.get("version"), plain.get("version"))
+    sys.exit(1)
+print("status html", len(html), "json", plain.get("version"))
+sys.exit(0)
+PY
+then
+    echo "✓ /status is HTML for browsers and JSON otherwise"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ /status HTML or /json/status failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
 echo "Test 56: idle owner sleeps, and gateway ARP stays bounded"
 if timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-idle-a.txt \
     && sleep 3 \
