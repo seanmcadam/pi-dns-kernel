@@ -3,9 +3,9 @@
 
 extern crate alloc;
 
-mod addr;
 #[cfg(feature = "board-pi4")]
 mod act;
+mod addr;
 mod board;
 mod config_manager;
 mod console;
@@ -17,16 +17,16 @@ mod exception;
 mod fault_log;
 #[cfg(feature = "board-pi4")]
 mod fb_con;
-#[cfg(feature = "board-pi4")]
-mod hdmi_hw;
 mod fs;
 mod fw;
-mod http;
 mod gic;
+#[cfg(feature = "board-pi4")]
+mod hdmi_hw;
+mod http;
 mod interrupts;
-mod mmu;
 mod logger;
 mod memory;
+mod mmu;
 mod net;
 mod panic;
 mod percpu;
@@ -35,8 +35,8 @@ mod smp;
 mod spin;
 mod supervisor;
 mod task;
-mod user_fd;
 mod timer;
+mod user_fd;
 
 use memory::ALLOCATOR;
 
@@ -123,6 +123,11 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     board::disarm_tryboot();
     #[cfg(feature = "board-pi4")]
     fb_con::load_vclog();
+    // The firmware-log mailbox just used the same property channel. If the
+    // early clear timed out, try once more before any file is opened.
+    if !board::tryboot_disarmed() {
+        board::disarm_tryboot();
+    }
 
     percpu::init_bsp();
 
@@ -269,7 +274,9 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         // panel and stop.
         #[cfg(feature = "board-pi4")]
         if net::service::drive_age(now) > 2_000 {
-            act::halt_with("owner stuck in NIC poll\nDHCP or RX callback did not return\nno reboot");
+            act::halt_with(
+                "owner stuck in NIC poll\nDHCP or RX callback did not return\nno reboot",
+            );
         }
         if now >= next_status {
             next_status = now + 2000;

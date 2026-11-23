@@ -1260,11 +1260,15 @@ where
         let num_clusters = offset_from_cluster / bytes_per_cluster;
         let mut block_cache = BlockCache::empty();
         for _ in 0..num_clusters {
-            start.1 = match &self.open_volumes[volume_idx].volume_type {
+            let next = match &self.open_volumes[volume_idx].volume_type {
                 VolumeType::Fat(fat) => {
                     fat.next_cluster(&self.block_device, start.1, &mut block_cache)?
                 }
             };
+            if next == start.1 {
+                return Err(Error::BadCluster);
+            }
+            start.1 = next;
             start.0 += bytes_per_cluster;
         }
         // How many blocks in are we now?

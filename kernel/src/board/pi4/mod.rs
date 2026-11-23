@@ -276,7 +276,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 fn disarm_tryboot_early() {
     let part = clear_partition_bits();
-    let flag = reboot_mbox(None);
+    let flag = reboot_mbox(0x0003_0064, None);
     let mut latch = 0u32;
     if flag.is_some_and(|word| word & 1 != 0) {
         latch |= 1;
@@ -285,8 +285,9 @@ fn disarm_tryboot_early() {
         latch |= 2;
     }
     TRY_LATCH.store(latch, Ordering::Release);
-    let cleared = reboot_mbox(Some(0)).is_some();
+    let cleared = reboot_mbox(0x0003_8064, Some(0)).is_some();
     TRY_CLEAR.store(u32::from(cleared), Ordering::Release);
+    let rev = reboot_mbox(0x0001_0002, None);
     let mut line = [0u8; 72];
     let mut n = 0;
     push_bytes(&mut line, &mut n, b"tryboot flag ");
@@ -296,7 +297,20 @@ fn disarm_tryboot_early() {
     }
     push_bytes(&mut line, &mut n, b" part ");
     push_hex(&mut line, &mut n, part);
-    push_bytes(&mut line, &mut n, if cleared { b" clear ok" } else { b" clear fail" });
+    push_bytes(
+        &mut line,
+        &mut n,
+        if cleared {
+            b" clear ok"
+        } else {
+            b" clear fail"
+        },
+    );
+    push_bytes(&mut line, &mut n, b" rev ");
+    match rev {
+        Some(word) => push_hex(&mut line, &mut n, word),
+        None => push_bytes(&mut line, &mut n, b"none"),
+    }
     if let Ok(text) = core::str::from_utf8(&line[..n]) {
         crate::disklog::line(text);
     }
@@ -344,18 +358,20 @@ fn push_hex(buf: &mut [u8], n: &mut usize, value: u32) {
     }
 }
 
-/// `GET_REBOOT_FLAGS` when `set` is `None`, otherwise `SET_REBOOT_FLAGS`.
-/// `Some` is a successful reply. The value is the flag word.
-fn reboot_mbox(set: Option<u32>) -> Option<u32> {
+/// Property tag `tag`. `set` is the value word for a SET tag.
+/// `Some` is a successful reply. The value is the reply word.
+/// The buffer is 32 bytes so the length is 16-byte aligned. The firmware
+/// accepts the reply when bit 31 of the buffer code and the tag code are set.
+fn reboot_mbox(tag: u32, set: Option<u32>) -> Option<u32> {
     let mut words = [0u32; 8];
-    words[0] = 7 * 4;
-    words[2] = if set.is_some() { 0x0003_8064 } else { 0x0003_0064 };
+    words[0] = 8 * 4;
+    words[2] = tag;
     words[3] = 4;
     if let Some(flag) = set {
         words[5] = flag;
     }
     let rc = mbox::run(MBOX_BASE, &mut words);
-    if rc != 0 || words[1] != 0x8000_0000 || words[4] & 0x8000_0000 == 0 {
+    if rc != 0 || words[1] & 0x8000_0000 == 0 || words[4] & 0x8000_0000 == 0 {
         return None;
     }
     Some(words[5])
@@ -372,7 +388,7 @@ fn set_reboot_flag(flag: u32) -> bool {
         "power: mbox 00038064"
     });
     let mut words = [0u32; 8];
-    words[0] = 7 * 4;
+    words[0] = 8 * 4;
     words[1] = 0;
     words[2] = 0x0003_8064;
     words[3] = 4;
@@ -384,7 +400,7 @@ fn set_reboot_flag(flag: u32) -> bool {
         mbox::run(MBOX_BASE, &mut words)
     });
     checkpoint();
-    let ok = rc == 0 && words[1] == 0x8000_0000 && words[4] & 0x8000_0000 != 0;
+    let ok = rc == 0 && words[1] & 0x8000_0000 != 0 && words[4] & 0x8000_0000 != 0;
     crate::disklog::line(if ok {
         "power: mbox 00038064 ok"
     } else {

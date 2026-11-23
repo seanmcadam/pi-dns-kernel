@@ -1858,6 +1858,140 @@ mod fat {
             head,
         }
     }
+
+    fn format_fat32() -> RamDisk {
+        const RESERVED: u32 = 8;
+        const FAT_SECS: u32 = 4;
+        const DATA: u32 = 256;
+        const TOTAL: u32 = RESERVED + FAT_SECS * 2 + DATA;
+        let mut sectors = vec![[0u8; 512]; 1 + TOTAL as usize];
+        let mbr = &mut sectors[0];
+        mbr[450] = 0x0C;
+        mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
+        mbr[458..462].copy_from_slice(&TOTAL.to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        let bpb = &mut sectors[1];
+        bpb[0] = 0xEB;
+        bpb[1] = 0x58;
+        bpb[2] = 0x90;
+        bpb[3..11].copy_from_slice(b"MSDOS5.0");
+        bpb[11..13].copy_from_slice(&512u16.to_le_bytes());
+        bpb[13] = 1;
+        bpb[14..16].copy_from_slice(&(RESERVED as u16).to_le_bytes());
+        bpb[16] = 2;
+        bpb[21] = 0xF8;
+        bpb[24..26].copy_from_slice(&32u16.to_le_bytes());
+        bpb[26..28].copy_from_slice(&2u16.to_le_bytes());
+        bpb[28..32].copy_from_slice(&1u32.to_le_bytes());
+        bpb[32..36].copy_from_slice(&TOTAL.to_le_bytes());
+        bpb[36..40].copy_from_slice(&FAT_SECS.to_le_bytes());
+        bpb[44..48].copy_from_slice(&2u32.to_le_bytes());
+        bpb[48..50].copy_from_slice(&1u16.to_le_bytes());
+        bpb[50..52].copy_from_slice(&6u16.to_le_bytes());
+        bpb[64] = 0x80;
+        bpb[66] = 0x29;
+        bpb[71..82].copy_from_slice(b"PI4DNS     ");
+        bpb[82..90].copy_from_slice(b"FAT32   ");
+        bpb[510] = 0x55;
+        bpb[511] = 0xAA;
+        for base in [1 + RESERVED as usize, 1 + (RESERVED + FAT_SECS) as usize] {
+            let fat = &mut sectors[base];
+            fat[0..4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
+            fat[4..8].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+            fat[8..12].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        }
+        RamDisk {
+            sectors: Rc::new(RefCell::new(sectors)),
+        }
+    }
+
+    fn fat_link(disk: &RamDisk, cluster: u32, next: u32) {
+        let mut sectors = disk.sectors.borrow_mut();
+        for base in [9usize, 13] {
+            let off = (cluster as usize) * 4;
+            sectors[base][off..off + 4].copy_from_slice(&next.to_le_bytes());
+        }
+    }
+
+    fn fill_dir_sector(disk: &RamDisk, sector: usize) {
+        let mut sectors = disk.sectors.borrow_mut();
+        let block = &mut sectors[sector];
+        for entry in 0..16 {
+            let start = entry * 32;
+            block[start..start + 32].fill(b'B');
+            block[start + 11] = 0x20;
+        }
+    }
+
+    fn stat_line(size_hex: &str, sha_prefix: &str) -> Vec<u8> {
+        let mut line = Vec::new();
+        line.extend_from_slice(size_hex.as_bytes());
+        line.push(b' ');
+        line.extend_from_slice(sha_prefix.as_bytes());
+        line.resize(73, b'0');
+        line.push(b'\n');
+        line
+    }
+
+    #[test]
+    fn boot_files_of_the_stuck_card_do_not_hang_a_cyclic_directory() {
+        let disk = format_fat32();
+        let mut card = FatCard { disk: disk.clone() };
+        let kstat = stat_line("0037c0a8", "c38ea57f");
+        let bstat = stat_line("0037abd0", "d7e0252d");
+        let fwres = b"reboot requested\n".to_vec();
+        let shut = vec![b'h'; 189];
+        let tryb = b"kernel=kernel8.new\n".to_vec();
+        let vclog = vec![b'v'; 3198];
+        let pre = vec![b'p'; 3656];
+        let fwtest = vec![b'f'; 65536];
+        assert_eq!(kstat.len(), 74);
+        assert_eq!(bstat.len(), 74);
+        write_new(&mut card, "KSTAT.TXT", &kstat);
+        write_new(&mut card, "BSTAT.TXT", &bstat);
+        write_new(&mut card, "FWRES.TXT", &fwres);
+        write_new(&mut card, "HDMISHUT.TXT", &shut);
+        write_new(&mut card, "TRYB.OLD", &tryb);
+        write_new(&mut card, "VCLOG.TXT", &vclog);
+        write_new(&mut card, "VCLOGPRE.TXT", &pre);
+        write_new(&mut card, "FWTEST.BIN", &fwtest);
+        assert_eq!(read_all(&mut card, "KSTAT.TXT"), kstat);
+        assert_eq!(read_all(&mut card, "BSTAT.TXT"), bstat);
+        assert_eq!(read_all(&mut card, "FWRES.TXT"), fwres);
+        assert_eq!(read_all(&mut card, "HDMISHUT.TXT").len(), 189);
+        assert_eq!(read_all(&mut card, "TRYB.OLD"), tryb);
+        assert_eq!(read_all(&mut card, "VCLOG.TXT").len(), 3198);
+        assert_eq!(read_all(&mut card, "VCLOGPRE.TXT").len(), 3656);
+        assert_eq!(read_all(&mut card, "FWTEST.BIN").len(), 65536);
+
+        fat_link(&disk, 2, 2);
+        assert!(card.exists("VCLOG.TXT").unwrap());
+        assert!(!card.exists("NOPE.TXT").unwrap());
+        assert_eq!(read_all(&mut card, "FWRES.TXT"), fwres);
+
+        fill_dir_sector(&disk, 17);
+        let missing = card.with_dir(
+            |mgr, dir| match mgr.find_directory_entry(dir, "VCLOG.TXT") {
+                Err(embedded_sdmmc::Error::BadCluster) => Ok("bad"),
+                Ok(_) => Ok("found"),
+                Err(_) => Ok("other"),
+            },
+        );
+        assert_eq!(missing.unwrap(), "bad");
+
+        fat_link(&disk, 2, 3);
+        fat_link(&disk, 3, 2);
+        fill_dir_sector(&disk, 18);
+        let cycled = card.with_dir(|mgr, dir| match mgr.find_directory_entry(dir, "LOG.TXT") {
+            Err(embedded_sdmmc::Error::BadCluster) => Ok(()),
+            other => Err(match other {
+                Ok(_) => "found",
+                Err(_) => "other",
+            }),
+        });
+        assert!(cycled.is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -186,6 +186,39 @@ impl FatVolume {
         Ok(())
     }
 
+    /// A directory walk that passes this has either looped or left the FAT.
+    /// Boot opens files before it writes any, so a loop here hangs the
+    /// machine on the firmware rainbow.
+    fn follow_dir<D>(
+        &self,
+        block_device: &D,
+        cluster: ClusterId,
+        cache: &mut BlockCache,
+        steps: &mut u32,
+    ) -> Result<Option<ClusterId>, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        const CAP: u32 = 64;
+        *steps = steps.saturating_add(1);
+        if *steps > CAP {
+            return Err(Error::BadCluster);
+        }
+        match self.next_cluster(block_device, cluster, cache) {
+            Ok(next) if next == cluster => Err(Error::BadCluster),
+            Ok(next) => {
+                let end = self.cluster_count.saturating_add(2);
+                if next.0 < 2 || next.0 >= end {
+                    Err(Error::BadCluster)
+                } else {
+                    Ok(Some(next))
+                }
+            }
+            Err(Error::EndOfFile) | Err(Error::UnterminatedFatChain) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Look in the FAT to see which cluster comes next.
     pub(crate) fn next_cluster<D>(
         &self,
@@ -325,6 +358,7 @@ impl FatVolume {
 
                 // Walk the directory
                 let mut blocks = [Block::new()];
+                let mut steps = 0u32;
                 while let Some(cluster) = current_cluster {
                     for block in first_dir_block_num.range(dir_size) {
                         block_device
@@ -357,20 +391,22 @@ impl FatVolume {
                     }
                     if cluster != ClusterId::ROOT_DIR {
                         let mut block_cache = BlockCache::empty();
-                        current_cluster =
-                            match self.next_cluster(block_device, cluster, &mut block_cache) {
-                                Ok(n) => {
-                                    first_dir_block_num = self.cluster_to_block(n);
-                                    Some(n)
-                                }
-                                Err(Error::EndOfFile) => {
-                                    let c =
-                                        self.alloc_cluster(block_device, Some(cluster), true)?;
-                                    first_dir_block_num = self.cluster_to_block(c);
-                                    Some(c)
-                                }
-                                _ => None,
-                            };
+                        current_cluster = match self.follow_dir(
+                            block_device,
+                            cluster,
+                            &mut block_cache,
+                            &mut steps,
+                        )? {
+                            Some(n) => {
+                                first_dir_block_num = self.cluster_to_block(n);
+                                Some(n)
+                            }
+                            None => {
+                                let c = self.alloc_cluster(block_device, Some(cluster), true)?;
+                                first_dir_block_num = self.cluster_to_block(c);
+                                Some(c)
+                            }
+                        };
                     } else {
                         current_cluster = None;
                     }
@@ -388,6 +424,7 @@ impl FatVolume {
                 let mut blocks = [Block::new()];
 
                 let dir_size = BlockCount(u32::from(self.blocks_per_cluster));
+                let mut steps = 0u32;
                 // Walk the cluster chain until we run out of clusters
                 while let Some(cluster) = current_cluster {
                     // Loop through the blocks in the cluster
@@ -426,17 +463,17 @@ impl FatVolume {
                     // them, let's fetch another one.
                     let mut block_cache = BlockCache::empty();
                     current_cluster =
-                        match self.next_cluster(block_device, cluster, &mut block_cache) {
-                            Ok(n) => {
+                        match self.follow_dir(block_device, cluster, &mut block_cache, &mut steps)?
+                        {
+                            Some(n) => {
                                 first_dir_block_num = self.cluster_to_block(n);
                                 Some(n)
                             }
-                            Err(Error::EndOfFile) => {
+                            None => {
                                 let c = self.alloc_cluster(block_device, Some(cluster), true)?;
                                 first_dir_block_num = self.cluster_to_block(c);
                                 Some(c)
                             }
-                            _ => None,
                         };
                 }
                 // We ran out of clusters in the chain, and apparently we weren't
@@ -497,6 +534,7 @@ impl FatVolume {
         };
 
         let mut block_cache = BlockCache::empty();
+        let mut steps = 0u32;
         while let Some(cluster) = current_cluster {
             for block_idx in first_dir_block_num.range(dir_size) {
                 let block = block_cache.read(block_device, block_idx, "read_dir")?;
@@ -516,12 +554,19 @@ impl FatVolume {
                 }
             }
             if cluster != ClusterId::ROOT_DIR {
-                current_cluster = match self.next_cluster(block_device, cluster, &mut block_cache) {
-                    Ok(n) => {
+                current_cluster = match self.follow_dir(
+                    block_device,
+                    cluster,
+                    &mut block_cache,
+                    &mut steps,
+                ) {
+                    Ok(Some(n)) => {
                         first_dir_block_num = self.cluster_to_block(n);
                         Some(n)
                     }
-                    _ => None,
+                    Ok(None) => None,
+                    Err(Error::BadCluster) => return Err(Error::BadCluster),
+                    Err(_) => None,
                 };
             } else {
                 current_cluster = None;
@@ -549,6 +594,7 @@ impl FatVolume {
         };
         let mut blocks = [Block::new()];
         let mut block_cache = BlockCache::empty();
+        let mut steps = 0u32;
         while let Some(cluster) = current_cluster {
             let block_idx = self.cluster_to_block(cluster);
             for block in block_idx.range(BlockCount(u32::from(self.blocks_per_cluster))) {
@@ -570,10 +616,12 @@ impl FatVolume {
                     }
                 }
             }
-            current_cluster = match self.next_cluster(block_device, cluster, &mut block_cache) {
-                Ok(n) => Some(n),
-                _ => None,
-            };
+            current_cluster =
+                match self.follow_dir(block_device, cluster, &mut block_cache, &mut steps) {
+                    Ok(next) => next,
+                    Err(Error::BadCluster) => return Err(Error::BadCluster),
+                    Err(_) => None,
+                };
         }
         Ok(())
     }
@@ -609,6 +657,7 @@ impl FatVolume {
                 };
 
                 let mut block_cache = BlockCache::empty();
+                let mut steps = 0u32;
                 while let Some(cluster) = current_cluster {
                     for block in first_dir_block_num.range(dir_size) {
                         match self.find_entry_in_block(
@@ -617,19 +666,25 @@ impl FatVolume {
                             match_name,
                             block,
                         ) {
+                            Ok(Some(entry)) => return Ok(entry),
+                            Ok(None) => return Err(Error::NotFound),
                             Err(Error::NotFound) => continue,
-                            x => return x,
+                            Err(err) => return Err(err),
                         }
                     }
                     if cluster != ClusterId::ROOT_DIR {
-                        current_cluster =
-                            match self.next_cluster(block_device, cluster, &mut block_cache) {
-                                Ok(n) => {
-                                    first_dir_block_num = self.cluster_to_block(n);
-                                    Some(n)
-                                }
-                                _ => None,
-                            };
+                        current_cluster = match self.follow_dir(
+                            block_device,
+                            cluster,
+                            &mut block_cache,
+                            &mut steps,
+                        )? {
+                            Some(n) => {
+                                first_dir_block_num = self.cluster_to_block(n);
+                                Some(n)
+                            }
+                            None => None,
+                        };
                     } else {
                         current_cluster = None;
                     }
@@ -642,6 +697,7 @@ impl FatVolume {
                     _ => Some(dir.cluster),
                 };
                 let mut block_cache = BlockCache::empty();
+                let mut steps = 0u32;
                 while let Some(cluster) = current_cluster {
                     let block_idx = self.cluster_to_block(cluster);
                     for block in block_idx.range(BlockCount(u32::from(self.blocks_per_cluster))) {
@@ -651,15 +707,14 @@ impl FatVolume {
                             match_name,
                             block,
                         ) {
+                            Ok(Some(entry)) => return Ok(entry),
+                            Ok(None) => return Err(Error::NotFound),
                             Err(Error::NotFound) => continue,
-                            x => return x,
+                            Err(err) => return Err(err),
                         }
                     }
                     current_cluster =
-                        match self.next_cluster(block_device, cluster, &mut block_cache) {
-                            Ok(n) => Some(n),
-                            _ => None,
-                        }
+                        self.follow_dir(block_device, cluster, &mut block_cache, &mut steps)?;
                 }
                 Err(Error::NotFound)
             }
@@ -667,13 +722,15 @@ impl FatVolume {
     }
 
     /// Finds an entry in a given block of directory entries.
+    /// `Ok(None)` is the end-of-directory marker. The caller must not look at
+    /// later blocks or clusters. `Err(NotFound)` means this block had no match.
     fn find_entry_in_block<D>(
         &self,
         block_device: &D,
         fat_type: FatType,
         match_name: &ShortFileName,
         block: BlockIdx,
-    ) -> Result<DirEntry, Error<D::Error>>
+    ) -> Result<Option<DirEntry>, Error<D::Error>>
     where
         D: BlockDevice,
     {
@@ -686,13 +743,11 @@ impl FatVolume {
             let end = (entry + 1) * OnDiskDirEntry::LEN;
             let dir_entry = OnDiskDirEntry::new(&blocks[0][start..end]);
             if dir_entry.is_end() {
-                // Can quit early
-                break;
+                return Ok(None);
             } else if dir_entry.matches(match_name) {
-                // Found it
                 // Safe, since Block::LEN always fits on a u32
                 let start = u32::try_from(start).unwrap();
-                return Ok(dir_entry.get_entry(fat_type, block, start));
+                return Ok(Some(dir_entry.get_entry(fat_type, block, start)));
             }
         }
         Err(Error::NotFound)
@@ -729,31 +784,32 @@ impl FatVolume {
                 };
 
                 // Walk the directory
+                let mut block_cache = BlockCache::empty();
+                let mut steps = 0u32;
                 while let Some(cluster) = current_cluster {
                     // Scan the cluster / root dir a block at a time
                     for block in first_dir_block_num.range(dir_size) {
                         match self.delete_entry_in_block(block_device, match_name, block) {
-                            Err(Error::NotFound) => {
-                                // Carry on
-                            }
-                            x => {
-                                // Either we deleted it OK, or there was some
-                                // catastrophic error reading/writing the disk.
-                                return x;
-                            }
+                            Ok(Some(())) => return Ok(()),
+                            Ok(None) => return Err(Error::NotFound),
+                            Err(Error::NotFound) => {}
+                            Err(err) => return Err(err),
                         }
                     }
                     // if it's not the root dir, find the next cluster so we can keep looking
                     if cluster != ClusterId::ROOT_DIR {
-                        let mut block_cache = BlockCache::empty();
-                        current_cluster =
-                            match self.next_cluster(block_device, cluster, &mut block_cache) {
-                                Ok(n) => {
-                                    first_dir_block_num = self.cluster_to_block(n);
-                                    Some(n)
-                                }
-                                _ => None,
-                            };
+                        current_cluster = match self.follow_dir(
+                            block_device,
+                            cluster,
+                            &mut block_cache,
+                            &mut steps,
+                        )? {
+                            Some(n) => {
+                                first_dir_block_num = self.cluster_to_block(n);
+                                Some(n)
+                            }
+                            None => None,
+                        };
                     } else {
                         current_cluster = None;
                     }
@@ -768,29 +824,21 @@ impl FatVolume {
                     _ => Some(dir.cluster),
                 };
                 // Walk the directory
+                let mut block_cache = BlockCache::empty();
+                let mut steps = 0u32;
                 while let Some(cluster) = current_cluster {
                     // Scan the cluster a block at a time
                     let block_idx = self.cluster_to_block(cluster);
                     for block in block_idx.range(BlockCount(u32::from(self.blocks_per_cluster))) {
                         match self.delete_entry_in_block(block_device, match_name, block) {
-                            Err(Error::NotFound) => {
-                                // Carry on
-                                continue;
-                            }
-                            x => {
-                                // Either we deleted it OK, or there was some
-                                // catastrophic error reading/writing the disk.
-                                return x;
-                            }
+                            Ok(Some(())) => return Ok(()),
+                            Ok(None) => return Err(Error::NotFound),
+                            Err(Error::NotFound) => continue,
+                            Err(err) => return Err(err),
                         }
                     }
-                    // Find the next cluster
-                    let mut block_cache = BlockCache::empty();
                     current_cluster =
-                        match self.next_cluster(block_device, cluster, &mut block_cache) {
-                            Ok(n) => Some(n),
-                            _ => None,
-                        }
+                        self.follow_dir(block_device, cluster, &mut block_cache, &mut steps)?;
                 }
                 // Ok, give up
             }
@@ -804,12 +852,14 @@ impl FatVolume {
     ///
     /// Entries are marked as deleted by setting the first byte of the file name
     /// to a special value.
+    /// `Ok(None)` is the end marker. `Ok(Some(()))` deleted the entry.
+    /// `Err(NotFound)` means this block did not contain it.
     fn delete_entry_in_block<D>(
         &self,
         block_device: &D,
         match_name: &ShortFileName,
         block: BlockIdx,
-    ) -> Result<(), Error<D::Error>>
+    ) -> Result<Option<()>, Error<D::Error>>
     where
         D: BlockDevice,
     {
@@ -822,14 +872,14 @@ impl FatVolume {
             let end = (entry + 1) * OnDiskDirEntry::LEN;
             let dir_entry = OnDiskDirEntry::new(&blocks[0][start..end]);
             if dir_entry.is_end() {
-                // Can quit early
-                break;
+                return Ok(None);
             } else if dir_entry.matches(match_name) {
                 let mut blocks = blocks;
                 blocks[0].contents[start] = 0xE5;
-                return block_device
+                block_device
                     .write(&blocks, block)
-                    .map_err(Error::DeviceError);
+                    .map_err(Error::DeviceError)?;
+                return Ok(Some(()));
             }
         }
         Err(Error::NotFound)
@@ -1029,9 +1079,15 @@ impl FatVolume {
             self.next_free_cluster = Some(next);
         }
         self.update_fat(block_device, cluster, ClusterId::END_OF_FILE)?;
+        let mut steps = 0u32;
         loop {
+            steps = steps.saturating_add(1);
+            if steps > self.cluster_count {
+                return Err(Error::BadCluster);
+            }
             let mut block_cache = BlockCache::empty();
             match self.next_cluster(block_device, next, &mut block_cache) {
+                Ok(n) if n == next => return Err(Error::BadCluster),
                 Ok(n) => {
                     self.update_fat(block_device, next, ClusterId::EMPTY)?;
                     next = n;
