@@ -24,6 +24,11 @@ static GOOD: AtomicBool = AtomicBool::new(false);
 static RESTORE: AtomicBool = AtomicBool::new(false);
 static KIND: AtomicU8 = AtomicU8::new(0);
 static AT: AtomicU64 = AtomicU64::new(0);
+static CAUSE: AtomicU32 = AtomicU32::new(0);
+static ROLLBACK: AtomicBool = AtomicBool::new(false);
+static CLASSIFIED: AtomicBool = AtomicBool::new(false);
+static SEEN_STAGE: AtomicU32 = AtomicU32::new(0);
+static MOUNTED: AtomicBool = AtomicBool::new(false);
 
 const ACT_CONTINUE: u32 = 0;
 const ACT_FALLBACK: u32 = 1;
@@ -46,29 +51,65 @@ fn saved() -> Option<Rec> {
     boot_rec::load(boot_slot())
 }
 
-/// Arm the watchdog and count this boot. Called before any other init.
+/// Arm the watchdog. The attempt counter is applied once the firmware
+/// report says which file actually booted.
 pub fn open() {
+    let recorded = saved().map(|rec| rec.reset).unwrap_or(0);
     crate::board::watchdog_arm();
-    ARMED.store(true, Ordering::Release);
-    LAST_PET.store(crate::timer::millis(), Ordering::Release);
-    let (rec, action) = boot_rec::on_boot(saved());
-    ACTION.store(
-        match action {
-            Action::Continue => ACT_CONTINUE,
-            Action::Fallback => ACT_FALLBACK,
-            Action::Stay => ACT_STAY,
-        },
+    CAUSE.store(
+        boot_rec::classify_reset(crate::board::last_rsts(), recorded),
         Ordering::Release,
     );
-    remember(&rec);
+    ARMED.store(true, Ordering::Release);
+    LAST_PET.store(crate::timer::millis(), Ordering::Release);
 }
 
 pub fn stage(stage: u32) {
     pet();
+    SEEN_STAGE.store(stage, Ordering::Release);
+    if !CLASSIFIED.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(mut rec) = saved() {
         rec.stage = stage;
         remember(&rec);
     }
+}
+
+/// Apply the counter now that the tryboot flag and `TRYBOOT.TXT` are known.
+pub fn classify(tryboot: bool, kernel: &str) {
+    let image = boot_rec::image_id(version::BOOT_ID_STR.as_bytes());
+    let prev = saved();
+    let arrival = arrival(tryboot, kernel, prev, image);
+    let (mut rec, action) = boot_rec::reconcile(prev, arrival, image);
+    let seen = SEEN_STAGE.load(Ordering::Acquire);
+    if seen != 0 {
+        rec.stage = seen;
+    }
+    let rollback = boot_rec::allows_rollback(&rec, arrival);
+    ACTION.store(action_code(action), Ordering::Release);
+    ROLLBACK.store(rollback, Ordering::Release);
+    CLASSIFIED.store(true, Ordering::Release);
+    remember(&rec);
+    if arrival == boot_rec::Arrival::Staged || arrival == boot_rec::Arrival::Other {
+        crate::disklog::line("boot record cleared");
+    }
+    if action == Action::Fallback {
+        begin_fallback();
+    }
+}
+
+/// A staged upload or a promote replaces the kernel this streak was counting.
+pub fn forget() {
+    let image = boot_rec::image_id(version::BOOT_ID_STR.as_bytes());
+    let prev_stage = saved().map(|rec| rec.stage).unwrap_or(0);
+    let mut rec = boot_rec::reconcile(None, boot_rec::Arrival::Staged, image).0;
+    rec.prev_stage = prev_stage;
+    ACTION.store(ACT_CONTINUE, Ordering::Release);
+    ROLLBACK.store(false, Ordering::Release);
+    CLASSIFIED.store(true, Ordering::Release);
+    remember(&rec);
+    crate::disklog::line("boot record cleared");
 }
 
 /// Log the previous boot once the console lock exists.
@@ -80,21 +121,36 @@ pub fn report() {
     let mut n = push(&mut line, 0, b"boot attempts ");
     n = push_dec(&mut line, n, rec.attempts as u64);
     n = push(&mut line, n, b" stopped ");
-    n = push(&mut line, n, boot_rec::stage_name(rec.prev_stage).as_bytes());
+    n = push(
+        &mut line,
+        n,
+        boot_rec::stage_name(rec.prev_stage).as_bytes(),
+    );
     if rec.fallback == boot_rec::FB_ACTIVE {
         n = push(&mut line, n, b" fallback");
     }
     if let Ok(text) = core::str::from_utf8(&line[..n]) {
         crate::disklog::line(text);
     }
+    let cause = boot_rec::reset_name(CAUSE.load(Ordering::Acquire));
+    let mut reset_line = [0u8; 32];
+    let mut reset_n = push(&mut reset_line, 0, b"last reset ");
+    reset_n = push(&mut reset_line, reset_n, cause.as_bytes());
+    if let Ok(text) = core::str::from_utf8(&reset_line[..reset_n]) {
+        crate::disklog::line(text);
+    }
 }
 
-/// After the mount returns. A fallback rewrite happens here, not before.
+/// The card is mounted. The fallback file is written from `classify`, after
+/// the firmware report, so a tryboot of `kernel8.new` is not treated as the
+/// backup.
 pub fn after_fs(mounted: bool) {
     stage(boot_rec::STAGE_FS);
-    if ACTION.load(Ordering::Acquire) != ACT_FALLBACK {
-        return;
-    }
+    MOUNTED.store(mounted, Ordering::Release);
+}
+
+fn begin_fallback() {
+    let mounted = MOUNTED.load(Ordering::Acquire);
     #[cfg(feature = "board-pi5")]
     {
         let _ = mounted;
@@ -193,6 +249,8 @@ pub fn status(out: &mut [u8]) -> usize {
         fallback: 0,
         good: 0,
         restored: 0,
+        image: [0; 16],
+        reset: 0,
     });
     let good = u32::from(rec.good != 0 || GOOD.load(Ordering::Acquire));
     out[0..4].copy_from_slice(&rec.attempts.to_le_bytes());
@@ -204,6 +262,8 @@ pub fn status(out: &mut [u8]) -> usize {
     put_text(&mut out[20..36], kernel_name(rec.fallback));
     put_text(&mut out[36..52], boot_rec::stage_name(rec.prev_stage));
     put_text(&mut out[52..68], boot_rec::stage_name(rec.stage));
+    let cause = CAUSE.load(Ordering::Acquire);
+    out[68..72].copy_from_slice(&cause.to_le_bytes());
     80
 }
 
@@ -221,8 +281,17 @@ pub fn check_deadline() {
     if last == 0 {
         return;
     }
-    if crate::timer::millis().saturating_sub(last) < boot_rec::WATCHDOG_MS {
+    let extra = if HELD.load(Ordering::Acquire) && crate::board::pm_watchdog_live() {
+        3_000
+    } else {
+        0
+    };
+    if crate::timer::millis().saturating_sub(last) < boot_rec::WATCHDOG_MS + extra {
         return;
+    }
+    if let Some(mut rec) = saved() {
+        rec.reset = boot_rec::RESET_WATCHDOG;
+        remember(&rec);
     }
     if ARMED
         .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
@@ -266,7 +335,10 @@ fn mark_boot_good() {
     rec = boot_rec::mark_good(rec);
     remember(&rec);
     crate::disklog::line("boot good");
-    if fallback >= boot_rec::FB_ACTIVE && fallback != boot_rec::FB_ABANDONED {
+    if ROLLBACK.load(Ordering::Acquire)
+        && fallback >= boot_rec::FB_ACTIVE
+        && fallback != boot_rec::FB_ABANDONED
+    {
         RESTORE.store(true, Ordering::Release);
         if crate::fw::boot_rollback() {
             crate::disklog::line("boot fallback rollback");
@@ -277,16 +349,18 @@ fn mark_boot_good() {
 }
 
 fn force_fail() {
-    let rec = saved()
-        .map(boot_rec::simulate_fail)
-        .unwrap_or_else(|| boot_rec::simulate_fail(Rec {
+    let rec = saved().map(boot_rec::simulate_fail).unwrap_or_else(|| {
+        boot_rec::simulate_fail(Rec {
             attempts: 0,
             stage: boot_rec::STAGE_SERVE,
             prev_stage: 0,
             fallback: 0,
             good: 0,
             restored: 0,
-        }));
+            image: [0; 16],
+            reset: 0,
+        })
+    });
     remember(&rec);
     crate::disklog::line("boot fail simulated");
     let _ = crate::board::power(true);
@@ -294,6 +368,9 @@ fn force_fail() {
 
 fn hold_hang() {
     HELD.store(true, Ordering::Release);
+    #[cfg(feature = "board-pi4")]
+    crate::act::suspend_watch();
+    crate::disklog::line("watchdog hold");
     raw_line(b"watchdog hold\r\n");
     loop {
         unsafe {
@@ -369,6 +446,44 @@ fn clean(start: u64, len: usize) {
     }
     unsafe {
         core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
+pub fn classify_bytes(tryboot: bool, text: &[u8]) {
+    classify(tryboot, kernel_token(text));
+}
+
+fn kernel_token(text: &[u8]) -> &str {
+    let key = b"kernel=";
+    let Some(at) = text.windows(key.len()).position(|window| window == key) else {
+        return "";
+    };
+    let rest = &text[at + key.len()..];
+    let end = rest
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == b'\r' || *byte == b' ')
+        .unwrap_or(rest.len());
+    core::str::from_utf8(&rest[..end]).unwrap_or("")
+}
+
+fn arrival(tryboot: bool, kernel: &str, prev: Option<Rec>, image: [u8; 16]) -> boot_rec::Arrival {
+    if tryboot && kernel == "kernel8.bak" {
+        return boot_rec::Arrival::Backup;
+    }
+    if tryboot {
+        return boot_rec::Arrival::Staged;
+    }
+    if prev.is_some_and(|rec| rec.image != [0; 16] && rec.image != image) {
+        return boot_rec::Arrival::Other;
+    }
+    boot_rec::Arrival::Same
+}
+
+fn action_code(action: Action) -> u32 {
+    match action {
+        Action::Continue => ACT_CONTINUE,
+        Action::Fallback => ACT_FALLBACK,
+        Action::Stay => ACT_STAY,
     }
 }
 

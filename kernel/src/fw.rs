@@ -586,6 +586,9 @@ fn commit_verified(kind: u8, names: &Names) -> i64 {
     }
     publish(PH_STAGED, total, total);
     note("staged");
+    if image {
+        crate::boot::forget();
+    }
     0
 }
 
@@ -1076,6 +1079,8 @@ fn pi5_promote() -> bool {
 /// Record which kernel the firmware started and replace a leftover
 /// `reboot requested` result. Called once, after the card is mounted.
 pub fn boot_report() {
+    let mut try_file = [0u8; 256];
+    let try_n = crate::fs::read_at("TRYBOOT.TXT", 0, &mut try_file).unwrap_or(0);
     let names = kernel_names();
     let pi4 = cfg!(feature = "board-pi4");
     let _keep_id = version::BOOT_ID[0];
@@ -1097,6 +1102,7 @@ pub fn boot_report() {
     };
     BOOT_TRY.store(dt == Some(true) || mbox_bit, Ordering::Relaxed);
     HW_TRY.store(mbox_bit, Ordering::Relaxed);
+    crate::boot::classify_bytes(mbox_bit, &try_file[..try_n]);
     if pi4 && !crate::board::tryboot_disarmed() {
         if crate::boot::fallback_keeps_backup() {
             crate::disklog::line("tryboot file kernel8.bak");
@@ -1367,6 +1373,7 @@ fn promote(force: bool) -> i64 {
         note("needs tryboot");
         return -12;
     }
+    crate::boot::forget();
     let Some(len) = crate::fs::file_len(names.live).ok() else {
         note("no card");
         return -5;

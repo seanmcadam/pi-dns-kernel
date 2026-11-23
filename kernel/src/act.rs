@@ -95,6 +95,11 @@ pub fn arm_watch() {
     WATCH.store(true, Ordering::Relaxed);
 }
 
+/// The debug watchdog hang is not a stall. Real stalls keep the detector.
+pub fn suspend_watch() {
+    WATCH.store(false, Ordering::Release);
+}
+
 /// Timer tick on every core. A core whose checkpoint is older than
 /// `STALL_MS`, and that is not idle in `wfi`, freezes the panel with
 /// its id and PC. A healthy core 0 also refreshes the heartbeat row.

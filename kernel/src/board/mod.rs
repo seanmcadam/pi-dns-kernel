@@ -482,6 +482,28 @@ pub fn tryboot_disarmed() -> bool {
     <Active as Board>::tryboot_disarmed()
 }
 
+pub fn last_rsts() -> u32 {
+    #[cfg(feature = "board-pi4")]
+    {
+        pi4::last_rsts()
+    }
+    #[cfg(not(feature = "board-pi4"))]
+    {
+        0
+    }
+}
+
+pub fn pm_watchdog_live() -> bool {
+    #[cfg(feature = "board-pi4")]
+    {
+        pi4::pm_watchdog_live()
+    }
+    #[cfg(not(feature = "board-pi4"))]
+    {
+        false
+    }
+}
+
 pub fn board_revision() -> u32 {
     #[cfg(feature = "board-pi4")]
     {

@@ -277,7 +277,7 @@ static BOARD_REV: AtomicU32 = AtomicU32::new(0);
 /// 1 after `SET_REBOOT_FLAGS` 0 is accepted.
 static TRY_CLEAR: AtomicU32 = AtomicU32::new(0);
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 fn disarm_tryboot_early() {
     let part = clear_partition_bits();
@@ -432,7 +432,20 @@ fn set_reboot_flag(flag: u32) -> bool {
 /// cannot make `start4.elf` treat the boot as a power-on. A missing
 /// register is left alone.
 /// `true` means the board is still up.
+static LAST_RSTS: AtomicU32 = AtomicU32::new(0);
+static PM_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn last_rsts() -> u32 {
+    LAST_RSTS.load(Ordering::Acquire)
+}
+
+pub fn pm_watchdog_live() -> bool {
+    PM_LIVE.load(Ordering::Acquire)
+}
+
 /// Watchdog full reset. Does not call the mailbox or the log lock.
+/// Bit 9 of `PM_RSTS` marks a reset this kernel asked for, so a later boot
+/// can tell it from the watchdog counter expiring on its own.
 pub fn crash_reset() -> bool {
     const PM_BASE: u64 = 0xFE10_0000;
     const PM_PASSWORD: u32 = 0x5a00_0000;
@@ -444,7 +457,7 @@ pub fn crash_reset() -> bool {
     unsafe {
         let rsts_raw = core::ptr::read_volatile(rsts_p);
         let rstc_raw = core::ptr::read_volatile(rstc_p);
-        let rsts = rsts_raw & 0xffff_faaa;
+        let rsts = (rsts_raw & 0xffff_faaa) | 0x200;
         let rstc = (rstc_raw & PM_RSTC_WRCFG_CLR) | PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET;
         core::ptr::write_volatile(rsts_p, PM_PASSWORD | rsts);
         core::ptr::write_volatile(wdog_p, PM_PASSWORD | 10);
@@ -463,6 +476,7 @@ const WATCHDOG_TICKS: u32 = 15 << 16;
 
 /// Arm a full reset on expiry. Does not log and does not take a lock.
 pub fn watchdog_arm() {
+    LAST_RSTS.store(read_rsts(), Ordering::Release);
     // QEMU's powermgt device resets the instant the full-reset bit is set.
     // It does not count PM_WDOG down. Its property channel always answers
     // firmware revision 346337, which is not a Pi firmware timestamp, so
@@ -471,6 +485,7 @@ pub fn watchdog_arm() {
     if reboot_mbox(0x0000_0001, None) == Some(QEMU_FIRMWARE_REV) {
         return;
     }
+    PM_LIVE.store(true, Ordering::Release);
     const PM_BASE: u64 = 0xFE10_0000;
     const PM_PASSWORD: u32 = 0x5a00_0000;
     const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
@@ -544,7 +559,7 @@ fn watchdog_power(reset: bool) -> bool {
         // partition bits (0 for a reboot, `0x555` for a halt),
         // `PM_WDOG = password | 10`, `PM_RSTC = password | (rstc & ~0x30) | 0x20`.
         let rsts = if reset {
-            rsts_raw & 0xffff_faaa
+            (rsts_raw & 0xffff_faaa) | 0x200
         } else {
             (rsts_raw & 0xffff_faaa) | PM_RSTS_HALT
         };
@@ -569,6 +584,11 @@ fn watchdog_power(reset: bool) -> bool {
         core::hint::spin_loop();
     }
     true
+}
+
+fn read_rsts() -> u32 {
+    let rsts_p = dev_reg(0xFE10_0000 + 0x20);
+    unsafe { core::ptr::read_volatile(rsts_p) }
 }
 
 fn dev_reg(pa: u64) -> *mut u32 {
