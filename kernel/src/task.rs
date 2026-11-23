@@ -88,6 +88,7 @@ const SD_STATUS: u64 = 68;
 const HDMI_CONSOLE: u64 = 69;
 const CRASH: u64 = 71;
 const BOOT: u64 = 72;
+const BOARD: u64 = 73;
 const POWER: u64 = 58;
 const VNC_CTRL: u64 = 59;
 const THREAD_CREATE: u64 = 34;
@@ -558,7 +559,8 @@ fn syscall() -> u64 {
         | SD_STATUS
         | HDMI_CONSOLE
         | CRASH
-        | BOOT => {
+        | BOOT
+        | BOARD => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME

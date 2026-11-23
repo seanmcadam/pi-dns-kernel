@@ -7,6 +7,8 @@ extern crate alloc;
 mod act;
 mod addr;
 mod board;
+mod board_id;
+mod board_rev;
 mod boot;
 mod boot_rec;
 mod config_manager;
@@ -193,6 +195,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     fw::scrub();
     fw::boot_report();
     let config = config_manager::load_config();
+    board_id::report();
     uart_write("[OK] Config loaded\r\n");
 
     uart_write(dhcp_rx::self_check_line());

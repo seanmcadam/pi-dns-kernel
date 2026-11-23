@@ -267,8 +267,13 @@ impl Board for Pi4 {
     }
 }
 
+pub fn board_revision() -> u32 {
+    BOARD_REV.load(Ordering::Acquire)
+}
+
 /// Mailbox flag bit 0, and bit 1 when `PM_RSTS` partition bits were set.
 static TRY_LATCH: AtomicU32 = AtomicU32::new(0);
+static BOARD_REV: AtomicU32 = AtomicU32::new(0);
 /// 1 after `SET_REBOOT_FLAGS` 0 is accepted.
 static TRY_CLEAR: AtomicU32 = AtomicU32::new(0);
 
@@ -288,6 +293,9 @@ fn disarm_tryboot_early() {
     let cleared = reboot_mbox(0x0003_8064, Some(0)).is_some();
     TRY_CLEAR.store(u32::from(cleared), Ordering::Release);
     let rev = reboot_mbox(0x0001_0002, None);
+    if let Some(word) = rev {
+        BOARD_REV.store(word, Ordering::Release);
+    }
     let mut line = [0u8; 72];
     let mut n = 0;
     push_bytes(&mut line, &mut n, b"tryboot flag ");

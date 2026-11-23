@@ -65,6 +65,7 @@
 //!      line), then a little-endian u32 `vclog_bytes`, then 96 bytes of
 //!      `vclog_status`. The texts are NUL padded. State 0 none, 1 up,
 //!      2 fallback, 3 released. Virt and Pi 5 return zeros and `none`.
+//!  73  board(ptr, cap) -> 40. revision u32, model[16], source[16].
 //!  72  boot(op, kind, ptr, cap). Op 0 arms a test: kind 1 hangs without
 //!      resetting, kind 2 marks this boot failed and reboots. Op 1 copies
 //!      80 status bytes. HTTP task only for op 0.
@@ -138,6 +139,7 @@ const HDMI_CONSOLE: u64 = 69;
 const VCLOG_READ: u64 = 70;
 const CRASH: u64 = 71;
 const BOOT: u64 = 72;
+const BOARD: u64 = 73;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -252,6 +254,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         VCLOG_READ => vclog_read(args[0], args[1], args[2]),
         CRASH => crash_call(args),
         BOOT => boot_call(args),
+        BOARD => crash_copy(args[0], args[1], crate::board_id::status),
         _ => -1,
     };
     value as u64

@@ -191,6 +191,7 @@ need = (
     "sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz",
     "crash_count", "safe_mode", "last_crash",
     "boot_attempts", "boot_good", "fallback_active", "booted_kernel", "boot_stopped",
+    "board", "board_revision", "board_source",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
 extra = (
@@ -242,6 +243,9 @@ for doc in (a, b):
         sys.exit(1)
     if not isinstance(doc["booted_kernel"], str) or not isinstance(doc["boot_stopped"], str):
         print("boot text", doc["booted_kernel"], doc["boot_stopped"])
+        sys.exit(1)
+    if doc["board"] != "virt" or doc["board_source"] != "build" or doc["board_revision"] != "":
+        print("board", doc["board"], doc["board_source"], doc["board_revision"])
         sys.exit(1)
     if doc["sd_state"] != "absent" or doc["fs_mounted"] != 0 or doc["sd_mode"] != "none" or doc["sd_clock_hz"] != 0:
         print("diskless guest", doc["sd_state"], doc["fs_mounted"], doc["sd_error"], doc["sd_mode"], doc["sd_clock_hz"])

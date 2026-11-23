@@ -64,6 +64,7 @@ const HDMI_CONSOLE: u64 = 69;
 const VCLOG_READ: u64 = 70;
 const CRASH: u64 = 71;
 const BOOT: u64 = 72;
+const BOARD: u64 = 73;
 
 const EAGAIN: i64 = -11;
 
@@ -755,6 +756,23 @@ fn handle_debug_boot(request: &HttpRequest) -> HttpResponse {
     response
 }
 
+fn board_fields() -> String {
+    let mut buf = [0u8; 40];
+    let n = sys(BOARD, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0);
+    if n < 40 {
+        return String::from("\"board\":\"\",\"board_revision\":\"\",\"board_source\":\"build\"");
+    }
+    let rev = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let model = crash_token(&buf[4..20]);
+    let source = crash_token(&buf[20..36]);
+    let revision = if rev == 0 {
+        String::new()
+    } else {
+        format!("{rev:08x}")
+    };
+    format!("\"board\":\"{model}\",\"board_revision\":\"{revision}\",\"board_source\":\"{source}\"")
+}
+
 fn boot_fields() -> String {
     let mut buf = [0u8; 80];
     let n = sys(BOOT, 1, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
@@ -931,7 +949,7 @@ fn handle_status() -> HttpResponse {
         vclog_status,
     ) = hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -973,6 +991,7 @@ fn handle_status() -> HttpResponse {
         sd_fields(),
         crash_fields(),
         boot_fields(),
+        board_fields(),
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");

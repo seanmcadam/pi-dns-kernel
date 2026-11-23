@@ -482,6 +482,17 @@ pub fn tryboot_disarmed() -> bool {
     <Active as Board>::tryboot_disarmed()
 }
 
+pub fn board_revision() -> u32 {
+    #[cfg(feature = "board-pi4")]
+    {
+        pi4::board_revision()
+    }
+    #[cfg(not(feature = "board-pi4"))]
+    {
+        0
+    }
+}
+
 /// VideoCore bus address to ARM physical address.
 ///
 /// The Pi 4 firmware returns an alias in the top bits. `bus & 0x3FFF_FFFF`

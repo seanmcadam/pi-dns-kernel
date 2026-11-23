@@ -420,6 +420,14 @@ const DISPLAY_FIELDS: &[Field] = &[
     },
 ];
 
+const BOARD_FIELDS: &[Field] = &[
+    Field {
+        name: "detect",
+        required: true,
+        kind: FieldKind::U64 { min: 0, max: 1 },
+    },
+];
+
 const MAIN_FIELDS: &[Field] = &[
     Field {
         name: "version",
@@ -448,6 +456,11 @@ const MAIN_FIELDS: &[Field] = &[
         name: "display",
         required: true,
         kind: FieldKind::Object(DISPLAY_FIELDS),
+    },
+    Field {
+        name: "board",
+        required: false,
+        kind: FieldKind::Object(BOARD_FIELDS),
     },
 ];
 
@@ -1038,5 +1051,24 @@ mod tests {
         assert!(formatted.starts_with("{\n"));
         assert!(formatted.contains("\"probe_interval_secs\": 5"));
         assert_eq!(parse(&formatted).unwrap(), present);
+    }
+
+    fn with_board(detect: u64) -> String {
+        let base = sample_config("");
+        let mut text = String::from(&base[..base.len() - 1]);
+        text.push_str(",\"board\":{\"detect\":");
+        text.push_str(&alloc::format!("{detect}"));
+        text.push_str("}}");
+        text
+    }
+
+    #[test]
+    fn board_detect_is_optional_and_only_zero_or_one() {
+        let missing = parse(&sample_config("")).unwrap();
+        check(&missing, main_fields()).unwrap();
+        check(&parse(&with_board(0)).unwrap(), main_fields()).unwrap();
+        check(&parse(&with_board(1)).unwrap(), main_fields()).unwrap();
+        let err = check(&parse(&with_board(2)).unwrap(), main_fields()).unwrap_err();
+        assert!(err.message.contains("out of bounds"));
     }
 }
