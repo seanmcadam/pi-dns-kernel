@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.81" qemu/boot-output.txt && \
+   grep -q "version 0.1.82" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.81"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.82"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -189,7 +189,8 @@ need = (
     "hdmi_state", "hdmi_mode", "hdmi_recoveries", "hdmi_diag", "hdmi_last_shut",
     "hdmi_regs", "hdmi_port", "vclog", "vclog_bytes", "vclog_status",
     "sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz",
-    "crash_count", "last_crash",
+    "crash_count", "safe_mode", "last_crash",
+    "boot_attempts", "boot_good", "fallback_active", "booted_kernel", "boot_stopped",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
 extra = (
@@ -232,6 +233,15 @@ for doc in (a, b):
         sys.exit(1)
     if not isinstance(doc["last_crash"], str):
         print("last crash", doc["last_crash"])
+        sys.exit(1)
+    if doc["safe_mode"] not in (0, 1) or doc["boot_good"] not in (0, 1) or doc["fallback_active"] not in (0, 1):
+        print("boot flags", doc["safe_mode"], doc["boot_good"], doc["fallback_active"])
+        sys.exit(1)
+    if not isinstance(doc["boot_attempts"], int) or isinstance(doc["boot_attempts"], bool) or doc["boot_attempts"] < 0:
+        print("boot attempts", doc["boot_attempts"])
+        sys.exit(1)
+    if not isinstance(doc["booted_kernel"], str) or not isinstance(doc["boot_stopped"], str):
+        print("boot text", doc["booted_kernel"], doc["boot_stopped"])
         sys.exit(1)
     if doc["sd_state"] != "absent" or doc["fs_mounted"] != 0 or doc["sd_mode"] != "none" or doc["sd_clock_hz"] != 0:
         print("diskless guest", doc["sd_state"], doc["fs_mounted"], doc["sd_error"], doc["sd_mode"], doc["sd_clock_hz"])
@@ -2161,12 +2171,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.81" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.82" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.81" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.82" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2182,7 +2192,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.81" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.82" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2429,12 +2439,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.81":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.82":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.81" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.82" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3444,6 +3454,121 @@ else
 fi
 kill "$CRASH_PID" 2>/dev/null || true
 wait "$CRASH_PID" 2>/dev/null || true
+
+echo ""
+echo "Test 61: watchdog hold and backup fallback"
+rm -f qemu/boot-disk.img qemu/boot-serial.txt
+dd if=/dev/zero of=qemu/boot-disk.img bs=1M count=32 status=none
+sfdisk --quiet qemu/boot-disk.img <<'EOF'
+label: dos
+start=2048, type=c
+EOF
+DISK_OFF=$((2048 * 512))
+mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/boot-disk.img >/dev/null
+printf 'arm_64bit=1\nkernel=kernel8.img\nenable_uart=1\n' > /tmp/tryboot-live.txt
+printf 'backup-kernel' > /tmp/kernel8.bak
+mcopy -i qemu/boot-disk.img@@${DISK_OFF} /tmp/tryboot-live.txt ::TRYBOOT.TXT
+mcopy -i qemu/boot-disk.img@@${DISK_OFF} /tmp/kernel8.bak ::KERNEL8.BAK
+timeout 180 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/boot-serial.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/boot-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-boot.txt 2>&1 &
+BOOT_PID=$!
+if python3 - "$HTTP_HOST_PORT" qemu/boot-serial.txt "$BOOT_PID" qemu/boot-disk.img <<'PY'
+import json, os, signal, subprocess, sys, time, urllib.error, urllib.request
+http_port, serial_path, pid, disk = sys.argv[1:]
+base = "http://127.0.0.1:%s" % http_port
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def req(method, path, data=None, headers=None, timeout=8):
+    body = data.encode() if isinstance(data, str) else data
+    r = urllib.request.Request(base + path, data=body, method=method)
+    for key, value in (headers or {}).items():
+        r.add_header(key, value)
+    try:
+        with opener.open(r, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+def wait_up(tries=60):
+    for _ in range(tries):
+        status, _ = req("GET", "/status")
+        if status == 200:
+            return
+        time.sleep(0.5)
+    fail("boot guest did not answer")
+
+def wait_serial(needle, tries=80):
+    for _ in range(tries):
+        try:
+            serial = open(serial_path, "rb").read()
+        except OSError:
+            serial = b""
+        if needle in serial:
+            return serial
+        time.sleep(0.5)
+    fail("missing %s" % needle)
+
+def form(kind):
+    return req(
+        "POST",
+        "/debug/boot",
+        "confirm=boot&kind=%s" % kind,
+        {"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+wait_up()
+status, body = req("POST", "/debug/boot", "kind=hang", {"Content-Type": "application/x-www-form-urlencoded"})
+if status != 400 or b"confirm=boot" not in body:
+    fail("boot confirm %s %s" % (status, body[:160]))
+status, body = form("hang")
+if status != 200 or b"armed" not in body:
+    fail("hang %s %s" % (status, body[:160]))
+wait_serial(b"watchdog reset")
+wait_up()
+status, body = form("fail")
+if status != 200 or b"armed" not in body:
+    fail("fail %s %s" % (status, body[:160]))
+wait_serial(b"boot fallback kernel8.bak")
+wait_up()
+status, raw = req("GET", "/status")
+doc = json.loads(raw)
+if status != 200 or doc.get("fallback_active") != 1 or doc.get("boot_attempts", 0) < 3 or doc.get("safe_mode") not in (0, 1):
+    fail("fallback status %s" % {k: doc.get(k) for k in ("boot_attempts", "boot_good", "fallback_active", "booted_kernel", "boot_stopped", "safe_mode")})
+print("fallback", doc.get("boot_attempts"), doc.get("fallback_active"), doc.get("booted_kernel"))
+os.kill(int(pid), signal.SIGTERM)
+time.sleep(0.5)
+off = str(2048 * 512)
+text = subprocess.check_output(["mcopy", "-i", "%s@@%s" % (disk, off), "::TRYBOOT.TXT", "-"], text=True)
+if "kernel=kernel8.bak" not in text or "kernel8.img" in text.split("kernel=")[-1]:
+    fail("tryboot file %s" % text)
+print("tryboot", text.strip().replace("\n", " | "))
+sys.exit(0)
+PY
+then
+    echo "✓ Watchdog hold resets, and three failed boots fall back to kernel8.bak"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Boot fallback failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+kill "$BOOT_PID" 2>/dev/null || true
+wait "$BOOT_PID" 2>/dev/null || true
 
 # Summary
 echo ""

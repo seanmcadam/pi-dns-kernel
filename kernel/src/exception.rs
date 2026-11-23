@@ -332,6 +332,7 @@ fn pin_dec(buf: &mut [u8], n: usize, mut value: u64) -> usize {
 }
 
 fn halt() -> ! {
+    crate::boot::disarm();
     #[cfg(feature = "board-pi4")]
     crate::act::halt_blink();
     #[cfg(not(feature = "board-pi4"))]

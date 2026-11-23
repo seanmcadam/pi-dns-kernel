@@ -450,6 +450,59 @@ pub fn crash_reset() -> bool {
     true
 }
 
+/// Longest countdown the BCM2835 watchdog accepts: 15 seconds.
+const WATCHDOG_TICKS: u32 = 15 << 16;
+
+/// Arm a full reset on expiry. Does not log and does not take a lock.
+pub fn watchdog_arm() {
+    // QEMU's powermgt device resets the instant the full-reset bit is set.
+    // It does not count PM_WDOG down. Its property channel always answers
+    // firmware revision 346337, which is not a Pi firmware timestamp, so
+    // that machine keeps the timer deadline instead of this register.
+    const QEMU_FIRMWARE_REV: u32 = 346337;
+    if reboot_mbox(0x0000_0001, None) == Some(QEMU_FIRMWARE_REV) {
+        return;
+    }
+    const PM_BASE: u64 = 0xFE10_0000;
+    const PM_PASSWORD: u32 = 0x5a00_0000;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x20;
+    let rstc_p = dev_reg(PM_BASE + 0x1c);
+    let wdog_p = dev_reg(PM_BASE + 0x24);
+    unsafe {
+        // Load the counter before the reset config. The other order fires
+        // immediately when the counter is still zero. Leave PM_RSTS alone:
+        // its partition bits are read later by the tryboot clear.
+        let rstc_raw = core::ptr::read_volatile(rstc_p);
+        let rstc = (rstc_raw & PM_RSTC_WRCFG_CLR) | PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET;
+        core::ptr::write_volatile(wdog_p, PM_PASSWORD | WATCHDOG_TICKS);
+        core::ptr::write_volatile(rstc_p, rstc);
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
+pub fn watchdog_pet() {
+    const PM_BASE: u64 = 0xFE10_0000;
+    const PM_PASSWORD: u32 = 0x5a00_0000;
+    let wdog_p = dev_reg(PM_BASE + 0x24);
+    unsafe {
+        core::ptr::write_volatile(wdog_p, PM_PASSWORD | WATCHDOG_TICKS);
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
+pub fn watchdog_disarm() {
+    const PM_BASE: u64 = 0xFE10_0000;
+    const PM_PASSWORD: u32 = 0x5a00_0000;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
+    let rstc_p = dev_reg(PM_BASE + 0x1c);
+    unsafe {
+        let rstc_raw = core::ptr::read_volatile(rstc_p);
+        core::ptr::write_volatile(rstc_p, PM_PASSWORD | (rstc_raw & PM_RSTC_WRCFG_CLR));
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
 fn watchdog_power(reset: bool) -> bool {
     // Halt is not a restart: Linux only notifies the firmware on reboot,
     // and a halt should leave the fault or status text on the panel.
