@@ -435,6 +435,22 @@ pub fn power(reset: bool) -> bool {
     <Active as Board>::power(reset)
 }
 
+/// Reset from a crash. No filesystem lock and no mailbox.
+pub fn crash_reset() -> bool {
+    #[cfg(feature = "board-pi4")]
+    {
+        pi4::crash_reset()
+    }
+    #[cfg(feature = "board-virt")]
+    {
+        virt::crash_reset()
+    }
+    #[cfg(feature = "board-pi5")]
+    {
+        pi5::crash_reset()
+    }
+}
+
 pub fn power_tryboot() -> bool {
     <Active as Board>::power_tryboot()
 }

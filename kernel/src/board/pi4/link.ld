@@ -90,4 +90,13 @@ SECTIONS
     __heap_start = .;
     . += 0x200000; /* 2MB heap */
     __heap_end = .;
+
+    /* Survives a watchdog reset. Not in the image, not in .bss, not zeroed.
+       32 MiB is outside the kernel's fine map and below the GPU split. */
+    .crash 0xFFFF000002000000 (NOLOAD) :
+    {
+        __crash_start = .;
+        . += 8192;
+        __crash_end = .;
+    }
 }

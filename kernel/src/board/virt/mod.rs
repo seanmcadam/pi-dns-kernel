@@ -87,6 +87,10 @@ impl Board for Virt {
     }
 }
 
+pub fn crash_reset() -> bool {
+    smp::reset_now()
+}
+
 fn default_network() -> NetworkMode {
     #[cfg(feature = "dhcp-default")]
     {

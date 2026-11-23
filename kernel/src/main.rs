@@ -8,6 +8,8 @@ mod act;
 mod addr;
 mod board;
 mod config_manager;
+mod crash;
+mod crash_rec;
 mod console;
 mod cpu_stat;
 mod dhcp_rx;
@@ -166,6 +168,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         Ok(()) => uart_write("[OK] Filesystem mounted\r\n"),
         Err(_) => uart_write("[OK] No filesystem, using defaults\r\n"),
     }
+    crash::recover();
     #[cfg(feature = "board-pi4")]
     fb_con::load_last_shut();
     #[cfg(feature = "board-pi4")]
@@ -263,6 +266,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         let _ = task::schedule_one();
         net::poll();
         power::poll();
+        crash::poll();
         fw::poll();
         supervisor::tick();
 
@@ -274,6 +278,10 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         // panel and stop.
         #[cfg(feature = "board-pi4")]
         if net::service::drive_age(now) > 2_000 {
+            crash::note(
+                crash_rec::KIND_HANG,
+                b"owner stuck in NIC poll",
+            );
             act::halt_with(
                 "owner stuck in NIC poll\nDHCP or RX callback did not return\nno reboot",
             );

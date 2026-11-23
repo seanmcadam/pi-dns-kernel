@@ -232,6 +232,16 @@ fn push_recent(recent: &mut Recent, text: &str) {
     recent.len += need;
 }
 
+/// Recent lines when the lock is free. A crash must not wait on it.
+pub fn recent_best_effort(out: &mut [u8]) -> usize {
+    let Some(recent) = RECENT.try_lock() else {
+        return 0;
+    };
+    let n = recent.len.min(out.len());
+    out[..n].copy_from_slice(&recent.buf[..n]);
+    n
+}
+
 pub fn recent(out: &mut [u8]) -> usize {
     let recent = RECENT.lock();
     let n = recent.len.min(out.len());

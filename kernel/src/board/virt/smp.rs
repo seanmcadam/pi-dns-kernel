@@ -23,6 +23,15 @@ pub fn start_secondary(cpu: usize, entry: u64, entry_el: u64) {
 /// the guest. This does not return when the firmware accepts the call.
 /// `true` means the guest is still running: EL2 swallowed HVC, or the call
 /// came back. It never targets the host.
+/// PSCI reset with no log lock. `true` means the guest is still running.
+pub fn reset_now() -> bool {
+    if el2_blocks_psci() {
+        return true;
+    }
+    let _ = psci(PSCI_SYSTEM_RESET, 0, 0, 0, true);
+    true
+}
+
 pub fn system_power(reset: bool) -> bool {
     if el2_blocks_psci() {
         crate::disklog::line("power: psci blocked");

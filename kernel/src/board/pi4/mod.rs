@@ -424,6 +424,32 @@ fn set_reboot_flag(flag: u32) -> bool {
 /// cannot make `start4.elf` treat the boot as a power-on. A missing
 /// register is left alone.
 /// `true` means the board is still up.
+/// Watchdog full reset. Does not call the mailbox or the log lock.
+pub fn crash_reset() -> bool {
+    const PM_BASE: u64 = 0xFE10_0000;
+    const PM_PASSWORD: u32 = 0x5a00_0000;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x20;
+    let rsts_p = dev_reg(PM_BASE + 0x20);
+    let rstc_p = dev_reg(PM_BASE + 0x1c);
+    let wdog_p = dev_reg(PM_BASE + 0x24);
+    unsafe {
+        let rsts_raw = core::ptr::read_volatile(rsts_p);
+        let rstc_raw = core::ptr::read_volatile(rstc_p);
+        let rsts = rsts_raw & 0xffff_faaa;
+        let rstc = (rstc_raw & PM_RSTC_WRCFG_CLR) | PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET;
+        core::ptr::write_volatile(rsts_p, PM_PASSWORD | rsts);
+        core::ptr::write_volatile(wdog_p, PM_PASSWORD | 10);
+        core::ptr::write_volatile(rstc_p, rstc);
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+    let start = crate::timer::millis();
+    while crate::timer::millis().saturating_sub(start) < 50 {
+        core::hint::spin_loop();
+    }
+    true
+}
+
 fn watchdog_power(reset: bool) -> bool {
     // Halt is not a restart: Linux only notifies the firmware on reboot,
     // and a halt should leave the fault or status text on the panel.

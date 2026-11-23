@@ -186,6 +186,10 @@ pub fn read_u32_catching(addr: *const u32) -> Option<u32> {
 /// Print the fault and stop. Called from `exception.s` with a saved frame.
 #[no_mangle]
 pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
+    if crate::crash::busy() {
+        put("\r\nnested fault log\r\n");
+        halt();
+    }
     if !crate::fault_log::enter() {
         put("\r\nnested fault log\r\n");
         halt();
@@ -215,8 +219,9 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
     hex64(far);
     put("\r\nSPSR_EL1: ");
     hex64(spsr);
+    let fault_sp = frame as u64 + 256;
     put("\r\nsp: ");
-    hex64(frame as u64 + 256);
+    hex64(fault_sp);
     put("\r\n");
 
     let frame = unsafe { core::slice::from_raw_parts(frame, 31) };
@@ -247,6 +252,7 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
         let _ = crate::logger::try_queue_fault(line);
     }
     put("halting\r\n");
+    crate::crash::from_exception(esr, elr, far, spsr, fault_sp, frame);
     pin_and_halt(kind, ec, elr, far);
 }
 

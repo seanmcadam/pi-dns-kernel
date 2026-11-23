@@ -123,6 +123,83 @@ pub fn replace_file(name: &str, data: &[u8]) -> Result<(), FsError> {
     }
 }
 
+/// `CRASH/CRASHnnn.TXT`. Creates the directory when it is missing.
+pub fn save_crash(name: &str, data: &[u8]) -> Result<(), FsError> {
+    with_crash_file(name, Mode::ReadWriteCreateOrTruncate, true, |mgr, file| {
+        if !data.is_empty() {
+            mgr.write(file, data).map_err(|err| fs_err("write", err))?;
+        }
+        Ok(())
+    })
+}
+
+pub fn crash_exists(name: &str) -> bool {
+    with_crash_file(name, Mode::ReadOnly, false, |mgr, file| {
+        mgr.file_length(file).map_err(|err| fs_err("file length", err))?;
+        Ok(())
+    })
+    .is_ok()
+}
+
+fn with_crash_file<R>(
+    name: &str,
+    mode: Mode,
+    create_dir: bool,
+    f: impl FnOnce(&mut Mgr, RawFile) -> Result<R, FsError>,
+) -> Result<R, FsError> {
+    let mut guard = FS.lock();
+    let mgr = guard.as_mut().ok_or(FsError::NotInitialized)?;
+    let volume = match mgr.open_raw_volume(VolumeIdx(0)) {
+        Ok(volume) => volume,
+        Err(err) => return Err(fs_err("open volume", err)),
+    };
+    let root = match mgr.open_root_dir(volume) {
+        Ok(dir) => dir,
+        Err(err) => {
+            let _ = mgr.close_volume(volume);
+            return Err(fs_err("open root", err));
+        }
+    };
+    let crash = match mgr.open_dir(root, "CRASH") {
+        Ok(dir) => dir,
+        Err(err) => {
+            if !create_dir {
+                let _ = mgr.close_dir(root);
+                let _ = mgr.close_volume(volume);
+                return Err(fs_err("open crash", err));
+            }
+            if let Err(err) = mgr.make_dir_in_dir(root, "CRASH") {
+                let _ = mgr.close_dir(root);
+                let _ = mgr.close_volume(volume);
+                return Err(fs_err("make crash", err));
+            }
+            match mgr.open_dir(root, "CRASH") {
+                Ok(dir) => dir,
+                Err(err) => {
+                    let _ = mgr.close_dir(root);
+                    let _ = mgr.close_volume(volume);
+                    return Err(fs_err("open crash", err));
+                }
+            }
+        }
+    };
+    let file = match mgr.open_file_in_dir(crash, name, mode) {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = mgr.close_dir(crash);
+            let _ = mgr.close_dir(root);
+            let _ = mgr.close_volume(volume);
+            return Err(fs_err("open file", err));
+        }
+    };
+    let result = f(mgr, file);
+    let _ = mgr.close_file(file);
+    let _ = mgr.close_dir(crash);
+    let _ = mgr.close_dir(root);
+    let _ = mgr.close_volume(volume);
+    result
+}
+
 pub fn file_exists(name: &str) -> Result<bool, FsError> {
     match file_len(name) {
         Ok(_) => Ok(true),

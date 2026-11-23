@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.80" qemu/boot-output.txt && \
+   grep -q "version 0.1.81" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.80"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.81"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -189,6 +189,7 @@ need = (
     "hdmi_state", "hdmi_mode", "hdmi_recoveries", "hdmi_diag", "hdmi_last_shut",
     "hdmi_regs", "hdmi_port", "vclog", "vclog_bytes", "vclog_status",
     "sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz",
+    "crash_count", "last_crash",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
 extra = (
@@ -225,6 +226,12 @@ for doc in (a, b):
         sys.exit(1)
     if not isinstance(doc["sd_clock_hz"], int) or isinstance(doc["sd_clock_hz"], bool) or doc["sd_clock_hz"] < 0:
         print("sd clock", doc["sd_clock_hz"])
+        sys.exit(1)
+    if not isinstance(doc["crash_count"], int) or isinstance(doc["crash_count"], bool) or doc["crash_count"] < 0:
+        print("crash count", doc["crash_count"])
+        sys.exit(1)
+    if not isinstance(doc["last_crash"], str):
+        print("last crash", doc["last_crash"])
         sys.exit(1)
     if doc["sd_state"] != "absent" or doc["fs_mounted"] != 0 or doc["sd_mode"] != "none" or doc["sd_clock_hz"] != 0:
         print("diskless guest", doc["sd_state"], doc["fs_mounted"], doc["sd_error"], doc["sd_mode"], doc["sd_clock_hz"])
@@ -2154,12 +2161,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.80" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.81" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.80" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.81" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2175,7 +2182,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.80" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.81" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2422,12 +2429,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.80":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.81":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.80" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.81" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3322,6 +3329,121 @@ if [ -n "$LEFT" ]; then
     echo "✗ Unrelated QEMU exited:$LEFT"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
+
+echo ""
+echo "Test 60: crash record survives a virt reset"
+DISK_OFF=$((2048 * 512))
+rm -f qemu/crash-disk.img qemu/crash.txt
+dd if=/dev/zero of=qemu/crash-disk.img bs=1M count=32 status=none
+sfdisk --quiet qemu/crash-disk.img <<'EOF'
+label: dos
+start=2048, type=c
+EOF
+mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/crash-disk.img >/dev/null
+python3 -c 'open("/tmp/crash-live.bin","wb").write(b"K"*64)'
+mcopy -i qemu/crash-disk.img@@${DISK_OFF} /tmp/crash-live.bin ::KERNEL8.IMG
+timeout 180 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/crash.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/crash-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-crash.txt 2>&1 &
+CRASH_PID=$!
+CRASH_OK=0
+if python3 - "$HTTP_HOST_PORT" qemu/crash.txt "$CRASH_PID" <<'PY'
+import json, os, signal, sys, time, urllib.error, urllib.request
+http_port, serial_path, pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+base = "http://127.0.0.1:%s" % http_port
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def req(method, path, data=None, headers=None, auth=True, timeout=8):
+    body = data.encode() if isinstance(data, str) else data
+    r = urllib.request.Request(base + path, data=body, method=method)
+    for key, value in (headers or {}).items():
+        r.add_header(key, value)
+    handler = opener if auth else urllib.request.build_opener()
+    try:
+        with handler.open(r, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+def wait_up():
+    for _ in range(40):
+        status, _ = req("GET", "/status")
+        if status == 200:
+            return
+        time.sleep(0.5)
+    fail("crash guest did not answer")
+
+def form(kind):
+    return req(
+        "POST",
+        "/debug/crash",
+        "confirm=crash&kind=%s" % kind,
+        {"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+wait_up()
+status, _ = req("GET", "/crash/last", auth=False)
+if status != 401:
+    fail("crash unauth %s" % status)
+status, body = req("POST", "/debug/crash", "kind=abort", {"Content-Type": "application/x-www-form-urlencoded"})
+if status != 400 or b"confirm=crash" not in body:
+    fail("crash confirm %s %s" % (status, body[:160]))
+for kind, needle in (("abort", b"kind data abort"), ("panic", b"kind panic"), ("hang", b"kind hang")):
+    before = open(serial_path, "rb").read().count(b"crash recovered")
+    status, body = form(kind)
+    if status != 200 or b"crashing" not in body:
+        fail("trigger %s %s %s" % (kind, status, body[:160]))
+    seen = False
+    for _ in range(40):
+        time.sleep(0.5)
+        try:
+            serial = open(serial_path, "rb").read()
+        except OSError:
+            serial = b""
+        if serial.count(b"crash recovered") > before:
+            seen = True
+            break
+    if not seen:
+        fail("no recovery for %s" % kind)
+    wait_up()
+    status, page = req("GET", "/crash/last")
+    if status != 200 or needle not in page:
+        fail("last %s %s %s" % (kind, status, page[:240]))
+    status, listing = req("GET", "/crash/list")
+    if status != 200 or b"CRASH" not in listing:
+        fail("list %s %s" % (status, listing[:200]))
+    status, raw = req("GET", "/status")
+    doc = json.loads(raw)
+    if doc.get("crash_count", 0) < 1 or "CRASH" not in doc.get("last_crash", ""):
+        fail("status crash %s" % doc.get("last_crash"))
+print("crash records", doc.get("crash_count"), doc.get("last_crash"))
+os.kill(pid, signal.SIGTERM)
+sys.exit(0)
+PY
+then
+    echo "✓ Crash records survive reset for abort, panic, and hang"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Crash capture failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+kill "$CRASH_PID" 2>/dev/null || true
+wait "$CRASH_PID" 2>/dev/null || true
 
 # Summary
 echo ""
