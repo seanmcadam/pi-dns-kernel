@@ -7,6 +7,7 @@
 // property tags themselves are built by the HDMI process.
 
 use core::ptr::{addr_of_mut, copy_nonoverlapping};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 const STATUS: u64 = 0x18;
 const WRITE: u64 = 0x20;
@@ -35,6 +36,7 @@ pub fn run(base: u64, words: &mut [u32]) -> i64 {
     if crate::exception::read_u32_catching((base + STATUS) as *const u32).is_none() {
         return -1;
     }
+    SPINS.store(0, Ordering::Relaxed);
     let start = crate::timer::get_ticks();
     unsafe {
         let prop = addr_of_mut!(PROP);
@@ -43,6 +45,9 @@ pub fn run(base: u64, words: &mut [u32]) -> i64 {
         }
         let dst = addr_of_mut!((*prop).words);
         copy_nonoverlapping(words.as_ptr(), dst.cast(), words.len());
+        // The mailbox write is Device memory. Without this barrier the GPU
+        // can observe the buffer address before these stores.
+        core::arch::asm!("dsb sy", options(nostack));
         let virt = prop as *const u8;
         let phys = crate::addr::virt_to_phys(prop as u64);
         if !exchange(base, phys, start) {
@@ -95,12 +100,19 @@ fn reg(base: u64, off: u64) -> Option<u32> {
     crate::exception::read_u32_catching((base + off) as *const u32)
 }
 
+static SPINS: AtomicU32 = AtomicU32::new(0);
+
 fn timed_out(start: u64) -> bool {
     let freq = crate::timer::frequency();
     if freq == 0 {
-        return true;
+        // CNTFRQ is not programmed. A zero frequency used to make every
+        // call an instant timeout, so the flag clear was never sent.
+        return SPINS.fetch_add(1, Ordering::Relaxed) > 2_000_000;
     }
-    crate::timer::get_ticks().wrapping_sub(start) > freq / 5
+    // A fifth of a second was shorter than the VideoCore property channel
+    // needs right after the HDMI mailbox traffic. The early tryboot clear
+    // then timed out and left the EEPROM flag set.
+    crate::timer::get_ticks().wrapping_sub(start) > freq
 }
 
 fn drop_lines(ptr: *const u8, len: usize) {

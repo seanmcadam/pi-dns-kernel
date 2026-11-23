@@ -184,6 +184,9 @@ pub fn digest(name: &str) -> Result<fwupd::Digest, FsError> {
             }
             sha.update(&buf[..n]);
             len = len.saturating_add(n as u32);
+            if len > 8 * 1024 * 1024 {
+                return Err(fs_err("read", "oversized"));
+            }
         }
         Ok(fwupd::Digest {
             len,

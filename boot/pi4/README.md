@@ -59,7 +59,7 @@ that log read. On Pi 4 rev 1.0 and 1.1 the flag is stored in EEPROM and
 survives a power cycle until it is cleared. `fw_tryboot` is 1 only when
 this boot was a tryboot. `fw_tryboot_hw` is the mailbox bit from that
 sample. A normal boot reports 0 for both. `fw_tryboot_file` is whether
-`TRYBOOT.TXT` is still on the card.
+`TRYBOOT.TXT` is still on the card. If `SET_REBOOT_FLAGS` 0 is refused, that file is rewritten in place to `kernel=kernel8.img` and is not renamed away. Promote leaves the same file. The early log includes `rev` from `GET_BOARD_REVISION` (`0x00010002`).
 
 The bases are the `bcm2711.dtsi` bus addresses in low-peripheral mode
 (`0x7e000000` maps to `0xFE000000`, the same window as the mailbox).

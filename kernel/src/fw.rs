@@ -699,7 +699,11 @@ fn fill_status(out: &mut [u8]) {
         out[176] = 1;
         out[177..209].copy_from_slice(&sha);
     }
-    put_u32(out, 212, u32::from(exists("KERNEL8.BAK") || exists("K2712.BAK")));
+    put_u32(
+        out,
+        212,
+        u32::from(exists("KERNEL8.BAK") || exists("K2712.BAK")),
+    );
     put_u32(out, 216, u32::from(tryboot_file));
 }
 
@@ -830,12 +834,7 @@ fn config(kind: u64, ptr: u64, len: u64, commit: u64, err_ptr: u64) -> i64 {
 fn preset(commit: u64) -> i64 {
     let names = kernel_names();
     let mut buf = [0u8; 256];
-    let n = match fwupd::fill_tryboot(
-        &mut buf,
-        names.config_kernel,
-        names.address,
-        names.uart,
-    ) {
+    let n = match fwupd::fill_tryboot(&mut buf, names.config_kernel, names.address, names.uart) {
         Ok(n) => n,
         Err(_) => {
             note("config rejected");
@@ -1020,18 +1019,25 @@ fn exists(name: &str) -> bool {
     crate::fs::file_exists(name).unwrap_or(false)
 }
 
-/// The one-shot flag could not be cleared. Hide `TRYBOOT.TXT` so the next
-/// reset does not load `kernel8.new` again if the firmware still honors it.
-fn disarm_tryboot_file() {
-    if !exists("TRYBOOT.TXT") {
-        return;
+/// The one-shot flag could not be cleared. The bootloader, with that flag
+/// set and no `tryboot.txt`, stays on the rainbow and never loads a kernel.
+/// Rewrite the file in place so it boots `kernel8.img`. The name stays.
+fn install_safe_tryboot() -> bool {
+    let mut raw = [0u8; 512];
+    if let Ok(n) = crate::fs::read_at("CONFIG.TXT", 0, &mut raw) {
+        if (1..=512).contains(&n) {
+            if let Ok(text) = core::str::from_utf8(&raw[..n]) {
+                if points_at(text, "kernel8.img") {
+                    return crate::fs::write_named("TRYBOOT.TXT", &raw[..n], false).is_ok();
+                }
+            }
+        }
     }
-    let _ = crate::fs::delete_file("TRYB.OLD");
-    if crate::fs::rename_file("TRYBOOT.TXT", "TRYB.OLD").is_ok() {
-        crate::disklog::line("tryboot file disarmed");
-    } else {
-        crate::disklog::line("tryboot file stuck");
-    }
+    let mut out = [0u8; 96];
+    let Ok(n) = fwupd::fill_tryboot(&mut out, "kernel8.img", 0x80000, true) else {
+        return false;
+    };
+    crate::fs::write_named("TRYBOOT.TXT", &out[..n], false).is_ok()
 }
 
 fn restore_live(live: &str, side: &str) {
@@ -1080,8 +1086,12 @@ pub fn boot_report() {
     };
     BOOT_TRY.store(dt == Some(true) || mbox_bit, Ordering::Relaxed);
     HW_TRY.store(mbox_bit, Ordering::Relaxed);
-    if pi4 && (dt == Some(true) || mbox_bit) && !crate::board::tryboot_disarmed() {
-        disarm_tryboot_file();
+    if pi4 && !crate::board::tryboot_disarmed() {
+        if install_safe_tryboot() {
+            crate::disklog::line("tryboot file kernel8.img");
+        } else {
+            crate::disklog::line("tryboot file stuck");
+        }
     }
     let (img_id, new_id) = if pi4 {
         let img = tail_has_boot_id(names.live);
@@ -1307,7 +1317,7 @@ fn id_line(img: Option<bool>, new_file: Option<bool>) -> &'static str {
 
 fn tail_has_boot_id(name: &str) -> Option<bool> {
     let len = io(|| crate::fs::file_len(name)).ok()?;
-    if len == 0 {
+    if len == 0 || len > KERNEL_MAX {
         return Some(false);
     }
     let take = len.min(4096);
@@ -1425,7 +1435,11 @@ fn pump_copy() {
             } else if job.offset >= job.total {
                 CopyPlan::Advance
             } else {
-                let name = if job.phase == CP_COPY { job.src } else { job.temp };
+                let name = if job.phase == CP_COPY {
+                    job.src
+                } else {
+                    job.temp
+                };
                 CopyPlan::Io {
                     phase: job.phase,
                     name,
@@ -1468,7 +1482,8 @@ fn pump_copy() {
                     }
                     Ok(got) => got,
                 };
-                if phase == CP_COPY && io(|| crate::fs::write_named(temp, &buf[..got], true)).is_err()
+                if phase == CP_COPY
+                    && io(|| crate::fs::write_named(temp, &buf[..got], true)).is_err()
                 {
                     fail_copy(op);
                     COPY_BUSY.store(false, Ordering::Release);
@@ -1621,7 +1636,7 @@ fn finish_copy(job: CopyJob) {
         OP_INSTALL => {
             let _ = io(|| write_kstat(job.total, &job.expect));
             io(|| {
-                let _ = crate::fs::delete_file("TRYBOOT.TXT");
+                let _ = install_safe_tryboot();
                 let _ = crate::fs::delete_file(kernel_names().dest);
             });
             *COPY.lock() = None;
