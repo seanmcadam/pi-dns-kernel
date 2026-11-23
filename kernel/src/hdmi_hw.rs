@@ -219,71 +219,48 @@ pub struct Ports {
     pub edid_h: u32,
 }
 
-/// Read the diagnostics. No writes. The HDMI register file and its PHY
-/// are read only when `CM_HSMCTL` enable (bit 4) is set and that port's
-/// DVP 108 MHz gate is clear. A gate bit set means the clock is stopped,
-/// and a register access then can lock the bus. `PM_HDMI`, the DVP
-/// block, and the HVS are still read. The 35-bit alias is used for a
-/// later write only when that alias shows hot-plug and the
-/// low-peripheral register does not.
+/// Read the diagnostics. No writes. Every register 0.1.72 sampled is
+/// read here: both hot-plug blocks, both PHYs, both pixel valves, the
+/// HVS, `CM_HSMCTL`, `PM_HDMI`, and the DVP reset and gate words. A
+/// faulting load is `ffffffff` and is not followed by a store. Gating
+/// these reads on `CM_HSMCTL` bit 4 dropped a live HDMI1 picture: that
+/// boot's `hsm` was `0x0000636d` (bit 4 clear) while HVS was on, so the
+/// port, PHY, and valve words stayed at the zero they were initialized
+/// to. `dvp8` equal to 0 means both 108 MHz gates are open.
 pub fn snapshot() -> Snap {
     let hsm = read(CM_HSMCTL);
     let hsd = read(CM_HSMDIV);
     let sw = read(LOW.dvp_clk + DVP_SW_INIT);
     let clk = read(LOW.dvp_clk + DVP_MISC);
     let pm = read(PM_HDMI);
-    let allow0 = port_clock(hsm, clk, 0);
-    let allow1 = port_clock(hsm, clk, 1);
-    let mut snap = Snap {
-        hot: 0,
-        sch: 0,
-        vid: 0,
-        phy: 0,
-        pwr: 0,
+    let snap = Snap {
+        hot: read(LOW.hdmi0 + HOTPLUG),
+        sch: read(LOW.hdmi0 + SCHEDULER),
+        vid: read(LOW.hd + VID_CTL0),
+        phy: read(LOW.phy0 + PHY_RESET),
+        pwr: read(LOW.phy0 + PHY_POWER),
         sw,
         clk,
         hvs: read(HVS),
-        pv: 0,
-        h1: 0,
-        phy1: 0,
-        pwr1: 0,
-        hi: 0,
-        hi1: 0,
-        his: 0,
-        leg: 0,
-        old: 0,
-        ctl: 0,
-        cst: 0,
-        pv4: 0,
+        pv: read(PV2),
+        h1: read(LOW.hdmi1 + HOTPLUG),
+        phy1: read(LOW.phy1 + PHY_RESET),
+        pwr1: read(LOW.phy1 + PHY_POWER),
+        hi: read(HI.hdmi0 + HOTPLUG),
+        hi1: read(HI.hdmi1 + HOTPLUG),
+        his: read(HI.hdmi0 + SCHEDULER),
+        leg: read(LOW.hdmi0 + HOTPLUG_LEGACY),
+        old: read(LOW.hdmi0 + HOTPLUG_2835),
+        ctl: read(LOW.hd),
+        cst: read(LOW.dvp + CLOCK_STOP),
+        pv4: read(PV4),
         hc0: read(HVS_CH0),
         hc2: read(HVS_CH2),
         hsm,
         hsd,
-        aon: 0,
+        aon: read(AON),
         pm,
     };
-    if allow0 {
-        snap.hot = read(LOW.hdmi0 + HOTPLUG);
-        snap.sch = read(LOW.hdmi0 + SCHEDULER);
-        snap.vid = read(LOW.hd + VID_CTL0);
-        snap.phy = read(LOW.phy0 + PHY_RESET);
-        snap.pwr = read(LOW.phy0 + PHY_POWER);
-        snap.hi = read(HI.hdmi0 + HOTPLUG);
-        snap.his = read(HI.hdmi0 + SCHEDULER);
-        snap.leg = read(LOW.hdmi0 + HOTPLUG_LEGACY);
-        snap.old = read(LOW.hdmi0 + HOTPLUG_2835);
-        snap.ctl = read(LOW.hd);
-        snap.cst = read(LOW.dvp + CLOCK_STOP);
-        snap.pv = read(PV2);
-        snap.aon = read(AON);
-    }
-    if allow1 {
-        snap.h1 = read(LOW.hdmi1 + HOTPLUG);
-        snap.phy1 = read(LOW.phy1 + PHY_RESET);
-        snap.pwr1 = read(LOW.phy1 + PHY_POWER);
-        snap.hi1 = read(HI.hdmi1 + HOTPLUG);
-        snap.pv4 = read(PV4);
-    }
     let mask = active_ports(&snap);
     PORT0_HI.store(use_hi_port(snap.hot, snap.hi), Ordering::Relaxed);
     PORT1_HI.store(use_hi_port(snap.h1, snap.hi1), Ordering::Relaxed);
@@ -406,17 +383,6 @@ pub fn boot_recover() -> Ports {
 
 fn use_hi_port(low: u32, hi: u32) -> bool {
     connected(hi) && !connected(low)
-}
-
-/// HSM enable is bit 4. A DVP gate bit set means that port's 108 MHz
-/// clock is stopped (`CLK_GATE_SET_TO_DISABLE`). Either one blocks a
-/// read of that port's HDMI register file.
-fn port_clock(hsm: u32, clk: u32, port: u8) -> bool {
-    if hsm == MISS || hsm & CM_ENABLE == 0 || clk == MISS {
-        return false;
-    }
-    let bit = if port == 0 { DVP_CLK0 } else { DVP_CLK1 };
-    clk & bit == 0
 }
 
 fn connected(value: u32) -> bool {

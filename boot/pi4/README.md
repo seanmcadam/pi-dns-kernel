@@ -11,12 +11,12 @@ report 640x480 and left the rainbow up. The network updater still does
 not rewrite the live `config.txt`. If that line was copied onto the card,
 it has to be removed by mounting the card.
 
-A cold boot does not write the HDMI block. It reads `PM_HDMI`
-(`0xFE100058`) and the DVP reset and clock words (`0xFEF00004` and
-`0xFEF00008`) first. The HDMI register file and PHY are read only when
-`CM_HSMCTL` enable (bit 4) is set and that port's DVP gate is clear.
-A set gate bit means the 108 MHz clock is stopped. `dvp8=0` means both
-gates are open, not that the clock is off. A size the firmware already
+A cold boot does not write the HDMI block. It reads both hot-plug
+registers, both PHYs, both pixel valves, the HVS, `CM_HSMCTL`,
+`PM_HDMI` (`0xFE100058`), and the DVP words (`0xFEF00004` and
+`0xFEF00008`). Those reads are not skipped when `CM_HSMCTL` bit 4 is
+clear. A set DVP gate bit means the 108 MHz clock is stopped.
+`dvp8=0` means both gates are open, not that the clock is off. A size the firmware already
 published is kept. A missed query is retried and then left alone. The
 kernel does not blank, pick a mode, or reset a PHY, a DVP line, or a
 power domain on the way up.
@@ -38,10 +38,11 @@ arms the watchdog the way Linux does: `PM_RSTS` masked with
 back on for an A/B test. The default omits the key. `/status`
 `hdmi_port` is `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or `none`.
 `hdmi_regs` and `hdmi_last_shut` label `h0`/`h1`, `phy0`/`pwr0`,
-`phy1`/`pwr1`, `pv0`/`pv1`, `hsm`, `pm`, `dvp4`, and `dvp8`. `/vclog`
-and the `vclog` field are the firmware message log from `/chosen/log`,
-the same table `vclog -m` prints. Telnet prints `hdmi base` and
-`hdmi regs`.
+`phy1`/`pwr1`, `pv0`/`pv1`, `hvs`, `hc0`, `hsm`, `pm`, `dvp4`, and
+`dvp8`. `/vclog` is the firmware message log. The address comes from
+`/chosen/log` and from mailbox `GET_VC_MEMORY` (`0x00010006`), which is
+the property tag `vclog` sends through `/dev/vcio`. A miss names the
+reason instead of `none`. Telnet prints `hdmi base` and `hdmi regs`.
 
 The bases are the `bcm2711.dtsi` bus addresses in low-peripheral mode
 (`0x7e000000` maps to `0xFE000000`, the same window as the mailbox).
