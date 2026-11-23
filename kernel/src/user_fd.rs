@@ -140,6 +140,8 @@ const VCLOG_READ: u64 = 70;
 const CRASH: u64 = 71;
 const BOOT: u64 = 72;
 const BOARD: u64 = 73;
+const CSRF: u64 = 74;
+const NET_ARM: u64 = 75;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -255,6 +257,8 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         CRASH => crash_call(args),
         BOOT => boot_call(args),
         BOARD => crash_copy(args[0], args[1], crate::board_id::status),
+        CSRF => csrf_token(args[0], args[1]),
+        NET_ARM => i64::from(crate::config_manager::arm_net_pending()),
         _ => -1,
     };
     value as u64
@@ -1557,6 +1561,18 @@ fn config_write(which: u64, ptr: u64, len: u64, err: u64, err_cap: u64) -> i64 {
             let _ = write_err(err, err_cap, &message);
             EINVAL
         }
+    }
+}
+
+fn csrf_token(ptr: u64, cap: u64) -> i64 {
+    if cap < 16 || !crate::mmu::user_write_ok(ptr, 16) {
+        return EFAULT;
+    }
+    let token = crate::config_manager::csrf_bytes();
+    if write_user(ptr, &token) {
+        16
+    } else {
+        EFAULT
     }
 }
 

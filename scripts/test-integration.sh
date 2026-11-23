@@ -1537,6 +1537,40 @@ if status != 200:
 status, now = req("GET", "/config/file/config")
 if now != kept:
     fail("restore bytes %s" % now[:180])
+import urllib.parse
+status, page = req("GET", "/config")
+if status != 200 or b'name="csrf"' not in page or b"<form" not in page or b"CONFIG.BAK" not in page:
+    fail("config page %s" % page[:220])
+mark = b'name="csrf" value="'
+at = page.find(mark)
+token = page[at + len(mark):].split(b'"', 1)[0].decode()
+changed = json.loads(kept)
+changed["dns"]["cache_reap_interval_secs"] = 9
+body = urllib.parse.urlencode({
+    "csrf": token,
+    "reboot": "0",
+    "json": json.dumps(changed, separators=(",", ":")),
+})
+status, saved = req("POST", "/config", body, {"Content-Type": "application/x-www-form-urlencoded"})
+if status != 200 or b"Saved" not in saved:
+    fail("form save %s %s" % (status, saved[:180]))
+status, now = req("GET", "/config/file/config")
+if json.loads(now)["dns"]["cache_reap_interval_secs"] != 9:
+    fail("form round trip %s" % now[:180])
+status, denied = req(
+    "POST",
+    "/config",
+    urllib.parse.urlencode({"reboot": "0", "json": "{}"}),
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 403:
+    fail("csrf %s %s" % (status, denied[:80]))
+status, restored = req("POST", "/config/file/config", kept.decode(), {"Content-Type": "application/json"})
+if status != 200:
+    fail("form restore %s" % restored[:120])
+status, now = req("GET", "/config/file/config")
+if now != kept:
+    fail("form restore bytes")
 print("rejections")
 
 status, saved = req(

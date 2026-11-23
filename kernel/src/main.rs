@@ -290,6 +290,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         power::poll();
         crash::poll();
         boot::poll();
+        config_manager::poll_net_pending();
         fw::poll();
         supervisor::tick();
 

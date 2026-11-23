@@ -882,6 +882,112 @@ fn write_string(buf: &mut DocBuf, text: &str) {
     buf.push_str("\"");
 }
 
+/// Validate a main config and pretty-print it with the same rules as an upload.
+/// Unknown keys are rejected. The saved text is pretty when it fits in 4096.
+pub fn accept_main(text: &str) -> Result<String, Error> {
+    if text.len() > UPLOAD_MAX {
+        return Err(Error::new("$", "upload exceeds 4096 bytes"));
+    }
+    let value = parse(text)?;
+    check(&value, main_fields())?;
+    format_document(&value)
+}
+
+/// Raw `application/x-www-form-urlencoded` value, still percent-encoded.
+pub fn form_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    for pair in body.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name == key {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Percent-decode one form value. `+` is a space. The result must fit in 4096.
+pub fn decode_form_value(raw: &str) -> Result<String, Error> {
+    let bytes = raw.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if out.len() >= UPLOAD_MAX {
+            return Err(Error::new("$", "upload exceeds 4096 bytes"));
+        }
+        match bytes[i] {
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_byte(bytes[i + 1])?;
+                let lo = hex_byte(bytes[i + 2])?;
+                out.push((hi << 4 | lo) as char);
+                i += 3;
+            }
+            b'%' => return Err(Error::new("$", "malformed form")),
+            byte => {
+                out.push(byte as char);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn csrf_matches(expected: &str, body: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    match form_value(body, "csrf").and_then(|raw| decode_form_value(raw).ok()) {
+        Some(got) => got == expected,
+        None => false,
+    }
+}
+
+pub fn reboot_confirmed(body: &str) -> bool {
+    match form_value(body, "reboot") {
+        Some("1") | Some("yes") | Some("on") | Some("true") => true,
+        _ => false,
+    }
+}
+
+pub fn posted_json(body: &str) -> Result<String, Error> {
+    let raw = form_value(body, "json").ok_or_else(|| Error::new("json", "missing"))?;
+    decode_form_value(raw)
+}
+
+/// What to do with a static-network change that was armed before reboot.
+#[derive(Clone, Copy)]
+pub struct NetWatch {
+    pub pending: bool,
+    pub static_mode: bool,
+    pub address_up: bool,
+    pub elapsed_ms: u64,
+    pub limit_ms: u64,
+}
+
+pub fn net_watch(watch: NetWatch) -> &'static str {
+    if !watch.pending || !watch.static_mode {
+        return "idle";
+    }
+    if watch.address_up {
+        return "hold";
+    }
+    if watch.elapsed_ms >= watch.limit_ms {
+        return "revert";
+    }
+    "wait"
+}
+
+fn hex_byte(byte: u8) -> Result<u8, Error> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::new("$", "malformed form")),
+    }
+}
+
 fn hex_digit(n: u32) -> char {
     let n = n as u8;
     if n < 10 {
@@ -1016,6 +1122,55 @@ mod tests {
         assert!(parse(r#"{"version":"\u12"}"#).is_err());
         assert!(parse(r#"{"version":"\uXXXX"}"#).is_err());
         assert!(parse("{\"version\":\"\n\"}").is_err());
+    }
+
+    #[test]
+    fn form_save_rejects_unknown_keys_and_checks_csrf() {
+        let saved = accept_main(&sample_config("")).unwrap();
+        assert!(saved.starts_with("{\n"));
+        let mut extra = parse(&sample_config("")).unwrap();
+        if let Value::Object(items) = &mut extra {
+            items.push((String::from("extra"), Value::Number(1)));
+        }
+        let text = format_document(&extra).unwrap();
+        assert!(accept_main(&text).unwrap_err().message.contains("unknown"));
+        let json = decode_form_value("%7B%22version%22%3A1%7D").unwrap();
+        assert_eq!(json, r#"{"version":1}"#);
+        let body = "csrf=abcdef&reboot=1&json=%7B%7D";
+        assert!(csrf_matches("abcdef", body));
+        assert!(!csrf_matches("abcdef", "reboot=1&json=%7B%7D"));
+        assert!(!csrf_matches("", body));
+        assert!(reboot_confirmed(body));
+        assert!(!reboot_confirmed("reboot=0"));
+        assert_eq!(posted_json(body).unwrap(), "{}");
+    }
+
+    #[test]
+    fn static_network_reverts_only_after_the_timeout() {
+        let wait = NetWatch {
+            pending: true,
+            static_mode: true,
+            address_up: false,
+            elapsed_ms: 1000,
+            limit_ms: 20_000,
+        };
+        assert_eq!(net_watch(wait), "wait");
+        let revert = NetWatch {
+            elapsed_ms: 20_000,
+            ..wait
+        };
+        assert_eq!(net_watch(revert), "revert");
+        let held = NetWatch {
+            address_up: true,
+            elapsed_ms: 20_000,
+            ..wait
+        };
+        assert_eq!(net_watch(held), "hold");
+        let dhcp = NetWatch {
+            static_mode: false,
+            ..wait
+        };
+        assert_eq!(net_watch(dhcp), "idle");
     }
 
     fn sample_config(probe: &str) -> String {
