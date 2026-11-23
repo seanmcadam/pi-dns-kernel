@@ -118,6 +118,9 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     #[cfg(feature = "board-pi4")]
     fb_con::switch_to_nc();
     uart_write("[OK] MMU and caches enabled\r\n");
+    // Before the firmware-log read. A crashed tryboot used to leave the
+    // one-shot flag set, and on Pi 4 rev 1.0/1.1 that flag lives in EEPROM.
+    board::disarm_tryboot();
     #[cfg(feature = "board-pi4")]
     fb_con::load_vclog();
 

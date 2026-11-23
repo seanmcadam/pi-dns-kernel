@@ -15,6 +15,7 @@ struct View {
     backup: u32,
     tryboot: u32,
     hw: u32,
+    file: u32,
     temp: u32,
     sha: String,
     result: String,
@@ -72,12 +73,13 @@ pub(super) fn fields() -> String {
     let version = version::VERSION;
     match view() {
         Some(view) => format!(
-            "\"version\":\"{version}\",\"fw_staged\":{},\"fw_bytes\":{},\"fw_backup\":{},\"fw_tryboot\":{},\"fw_tryboot_hw\":{},\"fw_temp\":{},\"fw_sha256\":\"{}\",\"fw_result\":\"{}\",\"fw_phase\":\"{}\",\"fw_progress\":{},\"fw_total\":{},\"fw_booted\":\"{}\",\"fw_boot_sha256\":\"{}\",\"fw_bak\":{}",
+            "\"version\":\"{version}\",\"fw_staged\":{},\"fw_bytes\":{},\"fw_backup\":{},\"fw_tryboot\":{},\"fw_tryboot_hw\":{},\"fw_tryboot_file\":{},\"fw_temp\":{},\"fw_sha256\":\"{}\",\"fw_result\":\"{}\",\"fw_phase\":\"{}\",\"fw_progress\":{},\"fw_total\":{},\"fw_booted\":\"{}\",\"fw_boot_sha256\":\"{}\",\"fw_bak\":{}",
             view.staged,
             view.bytes,
             view.backup,
             view.tryboot,
             view.hw,
+            view.file,
             view.temp,
             view.sha,
             json_text(&view.result),
@@ -89,21 +91,22 @@ pub(super) fn fields() -> String {
             view.bak
         ),
         None => format!(
-            "\"version\":\"{version}\",\"fw_staged\":0,\"fw_bytes\":0,\"fw_backup\":0,\"fw_tryboot\":0,\"fw_tryboot_hw\":0,\"fw_temp\":0,\"fw_sha256\":\"\",\"fw_result\":\"unavailable\",\"fw_phase\":\"idle\",\"fw_progress\":0,\"fw_total\":0,\"fw_booted\":\"unknown\",\"fw_boot_sha256\":\"\",\"fw_bak\":0"
+            "\"version\":\"{version}\",\"fw_staged\":0,\"fw_bytes\":0,\"fw_backup\":0,\"fw_tryboot\":0,\"fw_tryboot_hw\":0,\"fw_tryboot_file\":0,\"fw_temp\":0,\"fw_sha256\":\"\",\"fw_result\":\"unavailable\",\"fw_phase\":\"idle\",\"fw_progress\":0,\"fw_total\":0,\"fw_booted\":\"unknown\",\"fw_boot_sha256\":\"\",\"fw_bak\":0"
         ),
     }
 }
 
 fn page() -> HttpResponse {
     let view = view();
-    let (hw, name, live, bytes, backup, tryboot, temp, sha, result, phase, booted) = match view {
+    let (flag, name, live, bytes, backup, boot, file, temp, sha, result, phase, booted) = match view {
         Some(view) => (
             if view.hw == 1 { "yes" } else { "no" },
             view.staged_name,
             view.live_name,
             view.bytes,
             view.backup,
-            view.tryboot,
+            if view.tryboot == 1 { "yes" } else { "no" },
+            if view.file == 1 { "yes" } else { "no" },
             view.temp,
             view.sha,
             json_text(&view.result),
@@ -116,7 +119,8 @@ fn page() -> HttpResponse {
             String::from("KERNEL8.IMG"),
             0,
             0,
-            0,
+            "no",
+            "no",
             0,
             String::new(),
             String::from("unavailable"),
@@ -133,8 +137,8 @@ fn page() -> HttpResponse {
 <p>Uploads go to a temp name, are read back, and then replace only the staged file. \
 <code>{live}</code> and <code>config.txt</code> are not written. \
 The test file is <code>FWTEST.BIN</code>. The staged kernel is <code>{name}</code>.</p>\
-<p>staged bytes {bytes}, backup present {backup}, tryboot.txt {tryboot}, temp {temp}</p>\
-<p>tryboot hardware: {hw}</p>\
+<p>staged bytes {bytes}, backup present {backup}, tryboot.txt {file}, temp {temp}</p>\
+<p>tryboot boot: {boot} tryboot flag: {flag}</p>\
 <p>sha256 {sha}</p>\
 <p>result {result}</p>\
 <p id=\"prog\">progress idle</p>\
@@ -625,6 +629,7 @@ fn view() -> Option<View> {
         backup: u32_at(&raw, 8),
         tryboot: u32_at(&raw, 12),
         hw: u32_at(&raw, 16),
+        file: u32_at(&raw, 216),
         temp: u32_at(&raw, 20),
         sha,
         result: cstr(&raw[56..104]).into(),

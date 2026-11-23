@@ -239,9 +239,11 @@ impl Board for Pi4 {
     fn power_tryboot() -> bool {
         // Linux sets this with the mailbox tag SET_REBOOT_FLAGS (bit 0)
         // before the watchdog reset. It is not a PM_RSTS partition bit.
-        // The bootloader consumes the flag and loads tryboot.txt once.
-        // A refused mailbox must not reset, or the machine would boot
-        // config.txt while the caller was told this was a tryboot.
+        // The next boot clears it before the firmware-log read. On Pi 4
+        // rev 1.0 and 1.1 the flag is in EEPROM and survives power loss
+        // until that clear. A refused mailbox must not reset, or the
+        // machine would boot config.txt while the caller was told this
+        // was a tryboot.
         if !set_reboot_flag(1) {
             return true;
         }
@@ -252,9 +254,111 @@ impl Board for Pi4 {
         refused
     }
 
-    fn tryboot_flag() -> Option<u32> {
-        get_reboot_flag()
+    fn disarm_tryboot() {
+        disarm_tryboot_early();
     }
+
+    fn tryboot_latched() -> u32 {
+        TRY_LATCH.load(Ordering::Acquire)
+    }
+
+    fn tryboot_disarmed() -> bool {
+        TRY_CLEAR.load(Ordering::Acquire) == 1
+    }
+}
+
+/// Mailbox flag bit 0, and bit 1 when `PM_RSTS` partition bits were set.
+static TRY_LATCH: AtomicU32 = AtomicU32::new(0);
+/// 1 after `SET_REBOOT_FLAGS` 0 is accepted.
+static TRY_CLEAR: AtomicU32 = AtomicU32::new(0);
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+fn disarm_tryboot_early() {
+    let part = clear_partition_bits();
+    let flag = reboot_mbox(None);
+    let mut latch = 0u32;
+    if flag.is_some_and(|word| word & 1 != 0) {
+        latch |= 1;
+    }
+    if part != 0 {
+        latch |= 2;
+    }
+    TRY_LATCH.store(latch, Ordering::Release);
+    let cleared = reboot_mbox(Some(0)).is_some();
+    TRY_CLEAR.store(u32::from(cleared), Ordering::Release);
+    let mut line = [0u8; 72];
+    let mut n = 0;
+    push_bytes(&mut line, &mut n, b"tryboot flag ");
+    match flag {
+        Some(word) => push_hex(&mut line, &mut n, word),
+        None => push_bytes(&mut line, &mut n, b"none"),
+    }
+    push_bytes(&mut line, &mut n, b" part ");
+    push_hex(&mut line, &mut n, part);
+    push_bytes(&mut line, &mut n, if cleared { b" clear ok" } else { b" clear fail" });
+    if let Ok(text) = core::str::from_utf8(&line[..n]) {
+        crate::disklog::line(text);
+    }
+}
+
+/// Even bits 0, 2, 4, 6, 8 and 10 are the boot partition. Linux clears
+/// them on every restart. A non-zero value left in the register is what
+/// the bootloader reads on the next reset. This write does not touch
+/// `PM_RSTC` or `PM_WDOG`, so it does not reset the board.
+fn clear_partition_bits() -> u32 {
+    let rsts_p = dev_reg(0xFE10_0000 + 0x20);
+    let Some(rsts) = crate::exception::read_u32_catching(rsts_p) else {
+        return 0;
+    };
+    let part = rsts & 0x555;
+    if part != 0 {
+        unsafe {
+            core::ptr::write_volatile(rsts_p, 0x5a00_0000 | (rsts & 0xffff_faaa));
+            core::arch::asm!("dsb sy", options(nostack));
+        }
+    }
+    part
+}
+
+fn push_bytes(buf: &mut [u8], n: &mut usize, bytes: &[u8]) {
+    for byte in bytes {
+        if *n >= buf.len() {
+            return;
+        }
+        buf[*n] = *byte;
+        *n += 1;
+    }
+}
+
+fn push_hex(buf: &mut [u8], n: &mut usize, value: u32) {
+    let digits = b"0123456789abcdef";
+    let raw = value.to_be_bytes();
+    for byte in raw {
+        if *n + 2 > buf.len() {
+            return;
+        }
+        buf[*n] = digits[(byte >> 4) as usize];
+        buf[*n + 1] = digits[(byte & 0xf) as usize];
+        *n += 2;
+    }
+}
+
+/// `GET_REBOOT_FLAGS` when `set` is `None`, otherwise `SET_REBOOT_FLAGS`.
+/// `Some` is a successful reply. The value is the flag word.
+fn reboot_mbox(set: Option<u32>) -> Option<u32> {
+    let mut words = [0u32; 8];
+    words[0] = 7 * 4;
+    words[2] = if set.is_some() { 0x0003_8064 } else { 0x0003_0064 };
+    words[3] = 4;
+    if let Some(flag) = set {
+        words[5] = flag;
+    }
+    let rc = mbox::run(MBOX_BASE, &mut words);
+    if rc != 0 || words[1] != 0x8000_0000 || words[4] & 0x8000_0000 == 0 {
+        return None;
+    }
+    Some(words[5])
 }
 
 /// VideoCore property tag `RPI_FIRMWARE_SET_REBOOT_FLAGS` (`0x00038064`).
@@ -287,25 +391,6 @@ fn set_reboot_flag(flag: u32) -> bool {
         "power: mbox 00038064 refused"
     });
     ok
-}
-
-/// `GET_REBOOT_FLAGS`. `None` means the mailbox did not answer. The value
-/// is the flag word. Bit 0 set means the firmware still has tryboot armed.
-fn get_reboot_flag() -> Option<u32> {
-    checkpoint();
-    let mut words = [0u32; 8];
-    words[0] = 7 * 4;
-    words[2] = 0x0003_0064;
-    words[3] = 4;
-    let rc = crate::interrupts::with_irqs(|| {
-        checkpoint();
-        mbox::run(MBOX_BASE, &mut words)
-    });
-    checkpoint();
-    if rc != 0 || words[1] != 0x8000_0000 || words[4] & 0x8000_0000 == 0 {
-        return None;
-    }
-    Some(words[5])
 }
 
 /// BCM2711 power management at physical `0xFE100000` (bus `0x7E100000`).

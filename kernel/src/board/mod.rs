@@ -244,11 +244,22 @@ pub trait Board {
         true
     }
 
-    /// Mailbox `GET_REBOOT_FLAGS` (`0x00030064`), or nothing on boards
-    /// that do not have that call. Bit 0 is the tryboot flag. The Pi
-    /// bootloader usually clears it before the kernel runs.
-    fn tryboot_flag() -> Option<u32> {
-        None
+    /// Sample the one-shot tryboot flag and clear it. Pi 4 rev 1.0 and
+    /// 1.1 store that flag in EEPROM because their reset drops `PM_RSTS`,
+    /// so a crash that never clears it keeps loading `tryboot.txt` across
+    /// a power cycle. Virt and Pi 5 have nothing to clear.
+    fn disarm_tryboot() {}
+
+    /// Bit 0: mailbox tryboot flag was set when [`disarm_tryboot`] sampled
+    /// it. Bit 1: `PM_RSTS` partition bits were non-zero then. Both are 0
+    /// on a normal boot, including virt.
+    fn tryboot_latched() -> u32 {
+        0
+    }
+
+    /// The early `SET_REBOOT_FLAGS` 0 succeeded, or this board has no flag.
+    fn tryboot_disarmed() -> bool {
+        true
     }
 }
 
@@ -428,8 +439,16 @@ pub fn power_tryboot() -> bool {
     <Active as Board>::power_tryboot()
 }
 
-pub fn tryboot_flag() -> Option<u32> {
-    <Active as Board>::tryboot_flag()
+pub fn disarm_tryboot() {
+    <Active as Board>::disarm_tryboot();
+}
+
+pub fn tryboot_latched() -> u32 {
+    <Active as Board>::tryboot_latched()
+}
+
+pub fn tryboot_disarmed() -> bool {
+    <Active as Board>::tryboot_disarmed()
 }
 
 /// VideoCore bus address to ARM physical address.

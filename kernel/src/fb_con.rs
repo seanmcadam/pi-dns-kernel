@@ -44,9 +44,12 @@
 //!
 //! The firmware message log is copied here, before the allocator, into a
 //! 256 KiB buffer. `vclog -m` walks that whole ring; 0.1.76 kept 240
-//! bytes of the oldest lines and stopped mid-entry. `/vclog` serves the
-//! rendered text. `VCLOG.TXT` is that text. `VCLOGPRE.TXT` is a second
-//! read just before the watchdog.
+//! bytes of the oldest lines and stopped mid-entry. 0.1.77 loaded the
+//! physical address (`ldr` at `ELR 0xffff00000009dc5c`, `FAR 0x3ffa4164`)
+//! with TTBR0 empty, which is a level-0 translation fault. The window is
+//! mapped Device-nGnRE and read-only first, and only through its high
+//! alias. `/vclog` serves the rendered text. `VCLOG.TXT` is that text.
+//! `VCLOGPRE.TXT` is a second read just before the watchdog.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -192,6 +195,13 @@ static LOG_EXPECT: AtomicU32 = AtomicU32::new(0);
 static DT_START: AtomicU32 = AtomicU32::new(0);
 static DT_SIZE: AtomicU32 = AtomicU32::new(0);
 static DT_SEEN: AtomicBool = AtomicBool::new(false);
+static VC_BASE: AtomicU32 = AtomicU32::new(0);
+static VC_SIZE: AtomicU32 = AtomicU32::new(0);
+static VC_SEEN: AtomicBool = AtomicBool::new(false);
+/// Mapped Device window. Reads outside it do not touch the pointer.
+static WIN_LO: AtomicU64 = AtomicU64::new(0);
+static WIN_HI: AtomicU64 = AtomicU64::new(0);
+static WIN_ON: AtomicBool = AtomicBool::new(false);
 static MSG_PHYS: AtomicU64 = AtomicU64::new(0);
 static MSG_BUF: AtomicU64 = AtomicU64::new(0);
 static ASSERT_PHYS: AtomicU64 = AtomicU64::new(0);
@@ -377,40 +387,78 @@ pub fn load_vclog() {
         DT_SEEN.store(true, Ordering::Relaxed);
         DT_START.store(start, Ordering::Relaxed);
         DT_SIZE.store(size, Ordering::Relaxed);
+    }
+    if let Some((base, size)) = mem {
+        VC_SEEN.store(true, Ordering::Relaxed);
+        VC_BASE.store(base, Ordering::Relaxed);
+        VC_SIZE.store(size, Ordering::Relaxed);
+    }
+    let window = match fwupd::vclog_window(dt, mem, crate::board::RAM_END) {
+        Ok(window) => window,
+        Err(deny) => {
+            let why = match deny {
+                fwupd::VclogDeny::NoSource => "nosource",
+                fwupd::VclogDeny::Empty => "empty",
+                fwupd::VclogDeny::Overflow => "overflow",
+                fwupd::VclogDeny::OutsideRam => "outside-ram",
+                fwupd::VclogDeny::OutsideChosen => "outside-dt",
+                fwupd::VclogDeny::OutsideVcMem => "outside-vc",
+            };
+            miss_vclog(why);
+            return;
+        }
+    };
+    if fb_overlaps(window.start, window.end) {
+        miss_vclog("fb-overlap");
+        return;
+    }
+    if !crate::mmu::map_vc_ro(window.start, window.end) {
+        miss_vclog("nomap");
+        return;
+    }
+    WIN_LO.store(window.start, Ordering::Relaxed);
+    WIN_HI.store(window.end, Ordering::Relaxed);
+    WIN_ON.store(true, Ordering::Release);
+    if let Some((start, size)) = dt {
         if publish_log(start, size) {
             save_line("vclog ok");
             return;
         }
     }
-    if let Some((base, size)) = mem {
-        if scan_vlog(base, size) {
-            return;
-        }
+    if scan_mapped() {
+        return;
     }
-    let mut why = Note::new();
-    why.push("vclog ");
-    match dt {
-        Some((start, size)) => {
-            why.push("dt ");
-            why.hex32(start);
-            why.push(" ");
-            why.hex32(size);
-            why.push(" nomsg");
-        }
-        None => why.push("dt-none"),
+    miss_vclog("nomsg");
+}
+
+fn miss_vclog(why: &str) {
+    set_vstatus_counts(why, 0, 0, "");
+    let mut raw = [0u8; VSTATUS_CAP];
+    let n = (VSTATUS_LEN.load(Ordering::Acquire) as usize).min(raw.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(addr_of!(VSTATUS).cast::<u8>(), raw.as_mut_ptr(), n);
     }
-    match mem {
-        Some((base, size)) => {
-            why.push(" vc ");
-            why.hex32(base);
-            why.push(" ");
-            why.hex32(size);
-            why.push(" novlog");
-        }
-        None => why.push(" mbox-fail"),
+    let text = core::str::from_utf8(&raw[..n]).unwrap_or(why);
+    remember_vclog(text);
+}
+
+fn fb_overlaps(start: u64, end: u64) -> bool {
+    let held = lock();
+    if !held {
+        return true;
     }
-    remember_vclog(why.text());
-    set_vstatus(why.text());
+    let overlap = unsafe {
+        let screen = &*addr_of!(SCREEN);
+        if screen.ptr.is_null() || screen.bytes == 0 {
+            false
+        } else {
+            let fb0 = screen.pa;
+            let fb1 = screen.pa.saturating_add(screen.bytes);
+            start < fb1 && fb0 < end
+        }
+    };
+    unlock(held);
+    overlap
 }
 
 /// `GET_VC_MEMORY` (`0x00010006`), the property tag `vclog` sends on
@@ -652,7 +700,7 @@ fn copy_used(base: u64, log_size: usize, read_off: usize, write_off: usize) -> (
         let left = n - i;
         let room = log_size - off;
         if (pa & 3) == 0 && left >= 4 && room >= 4 && ram_holds(pa, 4) {
-            let word = unsafe { core::ptr::read_volatile(pa as *const u32) };
+            let word = unsafe { core::ptr::read_volatile(crate::addr::phys_to_virt(pa) as *const u32) };
             let bytes = word.to_le_bytes();
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -663,7 +711,8 @@ fn copy_used(base: u64, log_size: usize, read_off: usize, write_off: usize) -> (
             }
             i += 4;
         } else if ram_holds(pa, 1) {
-            let byte = unsafe { core::ptr::read_volatile(pa as *const u8) };
+            let byte =
+                unsafe { core::ptr::read_volatile(crate::addr::phys_to_virt(pa) as *const u8) };
             unsafe {
                 addr_of_mut!(RAW).cast::<u8>().add(i).write(byte);
             }
@@ -708,49 +757,32 @@ fn append_assert(dst: *mut u8, cap: usize, at: usize) -> (usize, bool) {
     (n + rendered.bytes, rendered.complete && held.copied >= held.expect)
 }
 
-/// Look for the `VLOG` table in the GPU window from `GET_VC_MEMORY`.
-/// The firmware parks that table at the top of the window (a Pi 3 tree
-/// reports `0x3ff80000`). The walk is read-only: the first 64 KiB, then
-/// the last 1 MiB when the window is larger. A magic word is kept only
-/// when the message header behind it checks out.
-fn scan_vlog(base: u32, size: u32) -> bool {
-    let window = u64::from(size);
-    if window <= 1024 * 1024 {
-        return scan_region(base, 0, window);
+/// Look for the `VLOG` table inside the Device window. The walk is
+/// read-only and stops at the window, so a pointer past `/chosen/log`
+/// or `GET_VC_MEMORY` is never loaded.
+fn scan_mapped() -> bool {
+    if !WIN_ON.load(Ordering::Acquire) {
+        return false;
     }
-    if scan_region(base, 0, 64 * 1024) {
-        return true;
-    }
-    scan_region(base, window - 1024 * 1024, 1024 * 1024)
-}
-
-fn scan_region(base: u32, off: u64, len: u64) -> bool {
-    let mut slot = 0;
-    while slot < 2 {
-        let Some(phys) = vc_phys(base, slot) else {
-            slot += 1;
-            continue;
-        };
-        let mut step = 0u64;
-        while step + 4 <= len {
-            let pa = phys + off + step;
-            if !ram_holds(pa, 4) {
-                break;
-            }
-            let mut word = [0u8; 4];
-            if read_ram(pa, &mut word) && word == fwupd::VC_LOG_MAGIC.to_le_bytes() {
-                let hit = pa as u32;
-                if publish_log(hit, 56) {
-                    let mut line = Line::new();
-                    line.push("vclog scan ");
-                    line.hex32(hit);
-                    save_line(line.text());
-                    return true;
-                }
-            }
-            step += 4;
+    let lo = WIN_LO.load(Ordering::Relaxed);
+    let hi = WIN_HI.load(Ordering::Relaxed);
+    let mut pa = lo;
+    while pa + 4 <= hi {
+        if !ram_holds(pa, 4) {
+            break;
         }
-        slot += 1;
+        let mut word = [0u8; 4];
+        if read_ram(pa, &mut word) && word == fwupd::VC_LOG_MAGIC.to_le_bytes() {
+            let hit = pa as u32;
+            if publish_log(hit, 56) {
+                let mut line = Line::new();
+                line.push("vclog scan ");
+                line.hex32(hit);
+                save_line(line.text());
+                return true;
+            }
+        }
+        pa += 4;
     }
     false
 }
@@ -876,10 +908,17 @@ fn ask_mbox(msg: &mut [u32]) -> bool {
     exchange(msg, false) && msg[1] == REQ_OK
 }
 
+/// The byte range sits in the Device window mapped for this boot.
+/// A physical address is never used as a pointer: TTBR0 is empty, so
+/// `0x3ffa4164` is a level-0 translation fault (0.1.77 `ELR
+/// 0xffff00000009dc5c`).
 fn ram_holds(pa: u64, len: u64) -> bool {
-    let ram0 = crate::board::RAM_START;
-    let ram1 = crate::board::RAM_END;
-    pa >= ram0 && len > 0 && pa.saturating_add(len) <= ram1
+    if !WIN_ON.load(Ordering::Acquire) || len == 0 {
+        return false;
+    }
+    let lo = WIN_LO.load(Ordering::Relaxed);
+    let hi = WIN_HI.load(Ordering::Relaxed);
+    pa >= lo && pa.saturating_add(len) <= hi
 }
 
 fn read_ram(pa: u64, dest: &mut [u8]) -> bool {
@@ -943,6 +982,12 @@ fn set_vstatus_counts(state: &str, copied: u32, expect: u32, extra: &str) {
         push_hex8(&mut buf, &mut n, DT_SIZE.load(Ordering::Relaxed));
     } else {
         push_raw(&mut buf, &mut n, " dt none");
+    }
+    if VC_SEEN.load(Ordering::Relaxed) {
+        push_raw(&mut buf, &mut n, " vc ");
+        push_hex8(&mut buf, &mut n, VC_BASE.load(Ordering::Relaxed));
+        push_raw(&mut buf, &mut n, " ");
+        push_hex8(&mut buf, &mut n, VC_SIZE.load(Ordering::Relaxed));
     }
     push_raw(&mut buf, &mut n, " copied ");
     push_dec_u(&mut buf, &mut n, copied);

@@ -42,12 +42,24 @@ back on for an A/B test. The default omits the key. `/status`
 `dvp8`. `/vclog` is the whole firmware message log, one line per entry,
 plus the assert log when it is present. The address comes from
 `/chosen/log` and from mailbox `GET_VC_MEMORY` (`0x00010006`), which is
-the property tag `vclog` sends through `/dev/vcio`. The kernel keeps
-256 KiB. `/status` `vclog` is the first line, `vclog_bytes` the rendered
-length, and `vclog_status` whether the ring wrapped or the copy was
-short. `VCLOG.TXT` is written at boot. `VCLOGPRE.TXT` is written just
-before reset. A miss names the reason. Telnet prints `hdmi base` and
-`hdmi regs`.
+the property tag `vclog` sends through `/dev/vcio`. That window is
+mapped Device-nGnRE and read-only, and every load uses the high alias.
+0.1.77 loaded physical `0x3ffa4164` directly (`ELR 0xffff00000009dc5c`
+in `read_ring`) and took a level-0 translation fault. A range outside
+the device-tree and mailbox windows is skipped, with the reason in
+`vclog_status`. The kernel keeps 256 KiB. `/status` `vclog` is the
+first line, `vclog_bytes` the rendered length, and `vclog_status`
+whether the ring wrapped or the copy was short, plus the `/chosen/log`
+start, size, and bytes copied. `VCLOG.TXT` is written at boot.
+`VCLOGPRE.TXT` is written just before reset. A miss names the reason.
+Telnet prints `hdmi base` and `hdmi regs`.
+
+The one-shot tryboot flag is cleared as soon as the MMU is on, before
+that log read. On Pi 4 rev 1.0 and 1.1 the flag is stored in EEPROM and
+survives a power cycle until it is cleared. `fw_tryboot` is 1 only when
+this boot was a tryboot. `fw_tryboot_hw` is the mailbox bit from that
+sample. A normal boot reports 0 for both. `fw_tryboot_file` is whether
+`TRYBOOT.TXT` is still on the card.
 
 The bases are the `bcm2711.dtsi` bus addresses in low-peripheral mode
 (`0x7e000000` maps to `0xFE000000`, the same window as the mailbox).

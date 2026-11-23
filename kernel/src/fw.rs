@@ -3,9 +3,14 @@
 //! The live kernel and `config.txt` are never destinations. A kernel upload
 //! lands on `KERNEL8.NEW` (Pi 4 and virt) or `K2712.NEW` (Pi 5). The Pi 4
 //! reboot that should try it asks the VideoCore firmware to load
-//! `tryboot.txt` once. That flag is cleared by the bootloader before
-//! `start.elf`, so a failed boot falls back to `config.txt` and the
-//! untouched `kernel8.img`. An upload never renames onto that live file.
+//! `tryboot.txt` once. The bootloader is supposed to clear that flag
+//! before `start.elf`. Pi 4 rev 1.0 and 1.1 keep it in EEPROM, because
+//! their reset drops `PM_RSTS`, so a kernel that crashes first leaves
+//! the next power cycle on `tryboot.txt`. This kernel samples the flag
+//! and clears it before it reads the firmware log. `fw_tryboot` is 1
+//! only when this boot was a tryboot. `fw_tryboot_hw` is the sampled
+//! mailbox bit, so a normal boot reports 0 even while `TRYBOOT.TXT`
+//! is still on the card. An upload never renames onto the live file.
 //! Promote does, and only after the previous kernel is already stored as
 //! `KERNEL8.BAK` and the new bytes are in a temp file.
 //!
@@ -140,6 +145,10 @@ static COPY: Mutex<Option<CopyJob>> = Mutex::new(None);
 static COPY_BUSY: AtomicBool = AtomicBool::new(false);
 static BOOT_SHA: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 static BOOTED: AtomicU8 = AtomicU8::new(BOOT_UNKNOWN);
+/// This boot loaded through tryboot (device tree or the mailbox bit).
+static BOOT_TRY: AtomicBool = AtomicBool::new(false);
+/// Mailbox tryboot bit at the sample taken before it was cleared.
+static HW_TRY: AtomicBool = AtomicBool::new(false);
 static HASH: Mutex<Option<HashJob>> = Mutex::new(None);
 
 struct CopyJob {
@@ -646,13 +655,13 @@ fn fill_status(out: &mut [u8]) {
         0
     };
     let backup = exists(names.live);
-    let tryboot = exists("TRYBOOT.TXT");
+    let tryboot_file = exists("TRYBOOT.TXT");
     let temp = exists("FWTEST.TMP") || exists(names.temp) || JOB.lock().is_some();
     put_u32(out, 0, u32::from(staged));
     put_u32(out, 4, bytes);
     put_u32(out, 8, u32::from(backup));
-    put_u32(out, 12, u32::from(tryboot));
-    put_u32(out, 16, u32::from(cfg!(feature = "board-pi4")));
+    put_u32(out, 12, u32::from(BOOT_TRY.load(Ordering::Relaxed)));
+    put_u32(out, 16, u32::from(HW_TRY.load(Ordering::Relaxed)));
     put_u32(out, 20, u32::from(temp));
     if staged {
         if let Some((len, sha)) = read_kstat() {
@@ -691,6 +700,7 @@ fn fill_status(out: &mut [u8]) {
         out[177..209].copy_from_slice(&sha);
     }
     put_u32(out, 212, u32::from(exists("KERNEL8.BAK") || exists("K2712.BAK")));
+    put_u32(out, 216, u32::from(tryboot_file));
 }
 
 /// Keep a verify or a promote moving when the page polls status.
@@ -1010,6 +1020,20 @@ fn exists(name: &str) -> bool {
     crate::fs::file_exists(name).unwrap_or(false)
 }
 
+/// The one-shot flag could not be cleared. Hide `TRYBOOT.TXT` so the next
+/// reset does not load `kernel8.new` again if the firmware still honors it.
+fn disarm_tryboot_file() {
+    if !exists("TRYBOOT.TXT") {
+        return;
+    }
+    let _ = crate::fs::delete_file("TRYB.OLD");
+    if crate::fs::rename_file("TRYBOOT.TXT", "TRYB.OLD").is_ok() {
+        crate::disklog::line("tryboot file disarmed");
+    } else {
+        crate::disklog::line("tryboot file stuck");
+    }
+}
+
 fn restore_live(live: &str, side: &str) {
     if exists(live) {
         let _ = crate::fs::delete_file(side);
@@ -1039,20 +1063,26 @@ pub fn boot_report() {
     let pi4 = cfg!(feature = "board-pi4");
     let _keep_id = version::BOOT_ID[0];
     let dt = dtb_tryboot();
-    // The loader clears GET_REBOOT_FLAGS before the kernel runs. A zero
-    // does not mean this was a normal boot. A set bit still means tryboot.
-    let mbox = if pi4 {
-        crate::board::tryboot_flag()
+    // Sampled before the firmware-log read, then cleared. A later
+    // GET_REBOOT_FLAGS is 0 even when this boot was a tryboot.
+    let latched = if pi4 {
+        crate::board::tryboot_latched()
     } else {
-        None
+        0
     };
+    let mbox_bit = latched & 1 != 0;
     let dt_hint = if dt.is_some() {
         dt
-    } else if mbox.is_some_and(|flag| flag & 1 != 0) {
+    } else if mbox_bit {
         Some(true)
     } else {
         None
     };
+    BOOT_TRY.store(dt == Some(true) || mbox_bit, Ordering::Relaxed);
+    HW_TRY.store(mbox_bit, Ordering::Relaxed);
+    if pi4 && (dt == Some(true) || mbox_bit) && !crate::board::tryboot_disarmed() {
+        disarm_tryboot_file();
+    }
     let (img_id, new_id) = if pi4 {
         let img = tail_has_boot_id(names.live);
         let newer = tail_has_boot_id(names.dest);
@@ -1082,12 +1112,12 @@ pub fn boot_report() {
     });
     crate::disklog::line(if !pi4 {
         "tryboot mbox skipped"
+    } else if mbox_bit {
+        "tryboot mbox 1"
+    } else if crate::board::tryboot_disarmed() {
+        "tryboot mbox 0"
     } else {
-        match mbox {
-            Some(flag) if flag & 1 != 0 => "tryboot mbox 1",
-            Some(_) => "tryboot mbox 0",
-            None => "tryboot mbox none",
-        }
+        "tryboot mbox none"
     });
     if pi4 {
         crate::disklog::line(id_line(img_id, new_id));
