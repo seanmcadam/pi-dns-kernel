@@ -13,6 +13,8 @@ struct Info {
     error: &'static str,
     blocks: u32,
     mounted: u32,
+    mode: &'static str,
+    clock_hz: u32,
 }
 
 static INFO: Mutex<Info> = Mutex::new(Info {
@@ -20,9 +22,11 @@ static INFO: Mutex<Info> = Mutex::new(Info {
     error: "",
     blocks: 0,
     mounted: 0,
+    mode: "none",
+    clock_hz: 0,
 });
 
-pub const EXPORT_LEN: usize = 64;
+pub const EXPORT_LEN: usize = 80;
 
 /// One sticky line. Truncated to the preface width.
 pub fn line(text: &str) {
@@ -45,6 +49,16 @@ pub fn set_error(state: &'static str, error: &'static str) {
     info.state = state;
     info.error = error;
     info.blocks = 0;
+    info.mode = "none";
+    info.clock_hz = 0;
+}
+
+/// Negotiated SD bus. `mode` is `hs`, `ds`, or `none`. `clock_hz` is the
+/// card clock after the divider, or 0 when this board has no SD bus.
+pub fn set_speed(mode: &'static str, clock_hz: u32) {
+    let mut info = INFO.lock();
+    info.mode = mode;
+    info.clock_hz = clock_hz;
 }
 
 pub fn set_mounted(on: bool) {
@@ -63,8 +77,9 @@ pub fn note_error(error: &'static str) {
     INFO.lock().error = error;
 }
 
-/// `state` 16 bytes, `error` 32 bytes, then `blocks` and `mounted` as
-/// little-endian u32. Both strings are NUL terminated.
+/// `state` 16 bytes, `error` 32 bytes, `blocks` and `mounted` as
+/// little-endian u32, `mode` 16 bytes, then `clock_hz`. Strings are
+/// NUL terminated.
 pub fn export(out: &mut [u8]) {
     let info = INFO.lock();
     out.fill(0);
@@ -73,6 +88,10 @@ pub fn export(out: &mut [u8]) {
     if out.len() >= 56 {
         out[48..52].copy_from_slice(&info.blocks.to_le_bytes());
         out[52..56].copy_from_slice(&info.mounted.to_le_bytes());
+    }
+    if out.len() >= 76 {
+        copy_cstr(out, 56, 16, info.mode);
+        out[72..76].copy_from_slice(&info.clock_hz.to_le_bytes());
     }
 }
 
@@ -96,13 +115,13 @@ pub fn write_summary(out: &mut [u8]) -> usize {
     n
 }
 
-#[cfg(feature = "board-pi4")]
+#[cfg(any(feature = "board-pi4", feature = "board-pi5"))]
 pub struct Buf {
     data: [u8; 80],
     n: usize,
 }
 
-#[cfg(feature = "board-pi4")]
+#[cfg(any(feature = "board-pi4", feature = "board-pi5"))]
 impl Buf {
     pub fn new() -> Self {
         Self {
@@ -121,6 +140,7 @@ impl Buf {
         }
     }
 
+    #[cfg(feature = "board-pi4")]
     pub fn hex(&mut self, value: u32) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut tmp = [0u8; 8];

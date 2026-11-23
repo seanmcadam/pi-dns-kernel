@@ -200,7 +200,7 @@ RX completion is GIC SPI 157 and 158 (INTID 189 and 190). The handler masks the 
 
 `/status` publishes `nic_irqs`, packet counts, `net_busy_ms`, `net_idle_ms`, ARP counters, RX drops, overruns, and queued frames, `poll_count`, `poll_us`, `poll_max_us`, `irq_rearms`, `tx_full`, and `tx_slow`.
 
-EMMC2 is SPI 126 (INTID 158). The waiter sleeps on `wfe` with a half-second `cntpct` cap. The handler masks the line so a stuck level cannot spin.
+EMMC2 is SPI 126 (INTID 158). Transfers poll with IRQs unmasked. After the card is in transfer state the driver asks CMD6 for high speed (SDR25, 50 MHz, 3.3 V). UHS and the 1.8 V switch are not used. A CRC, a timeout, or a switch status that did not select function 1 leaves the bus at 25 MHz. `/status` reports `sd_mode` and `sd_clock_hz`.
 
 ### DHCP
 
@@ -251,7 +251,7 @@ Virt stages the Pi 4 names. QEMU boots with `-kernel`, so a virt reboot does not
 
 ## Storage and JSON config
 
-The board supplies the block device: virtio-blk, Pi 4 EMMC2 at `0xFE340000` (legacy Arasan at `0xFE300000` only after EMMC2 fails, which is where raspi4b attaches the card), or Pi 5 `sdio1`. The filesystem is FAT32 through `embedded-sdmmc`. One lock covers the volume.
+The board supplies the block device: virtio-blk, Pi 4 EMMC2 at `0xFE340000` (legacy Arasan at `0xFE300000` only after EMMC2 fails, which is where raspi4b attaches the card), or Pi 5 `sdio1`. Pi 4 EMMC2 and Pi 5 `sdio1` try SDR25 and fall back to 25 MHz. The filesystem is FAT32 through `embedded-sdmmc`. One lock covers the volume.
 
 `CONFIG.JSN` is the appliance config. A leftover `CONFIG.TXT` on that volume is migrated once into `CONFIG.JSN`. That file is not the Pi firmware `config.txt` in the boot partition root. `LOG.JSN` is the log service. `LOG.TXT` rotates to `LOG1.TXT` through `LOG16.TXT`.
 

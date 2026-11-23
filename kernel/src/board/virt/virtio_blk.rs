@@ -125,6 +125,7 @@ pub fn probe() -> bool {
     let blocks = dev.capacity.min(u32::MAX as u64) as u32;
     *DISK.lock() = Some(dev);
     crate::disklog::set_card("virtio", blocks);
+    crate::disklog::set_speed("none", 0);
     true
 }
 

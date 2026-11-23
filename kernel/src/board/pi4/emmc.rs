@@ -5,9 +5,14 @@
 //! wired (`broken-cd` in the Pi 4 device tree), so a clear bit is not
 //! treated as an empty slot. Bring-up is a host reset, 3.3 V power, a
 //! 400 kHz identification clock, then CMD0 / CMD8 / ACMD41. The clock
-//! source is mailbox clock id 12 (`EMMC2`). A failed first pass power-cycles
-//! the SD card through the firmware mailbox and tries once more, which
-//! drops a card the firmware left in a high-speed 1.8 V mode back to 3.3 V.
+//! source is mailbox clock id 12 (`EMMC2`). After the card is in transfer
+//! state, CMD6 requests high speed (SDR25, 50 MHz, still at 3.3 V). The
+//! divider is raised only when the 64-byte status says function 1 is
+//! selected and not busy. UHS and the 1.8 V switch are not used. A CRC,
+//! a timeout, or a status that did not stick leaves the bus at 25 MHz.
+//! A failed first pass power-cycles the SD card through the firmware
+//! mailbox and tries once more, which drops a card the firmware left at
+//! 1.8 V back to 3.3 V.
 //!
 //! The legacy Arasan block at `0xFE300000` is only the fallback. QEMU
 //! raspi4b attaches `-drive if=sd` there. On a real Pi 4 that block is
@@ -103,7 +108,13 @@ const RESP_48_BUSY: u32 = 3;
 
 const FALLBACK_HZ: u32 = 100_000_000;
 const ID_HZ: u32 = 400_000;
-const DATA_HZ: u32 = 25_000_000;
+const DATA_HZ: u32 = fwupd::sdhs::DS_HZ;
+/// SDHCI Host Control 1, high-speed timing. Set only after CMD6 accepts
+/// function 1. This is not the 1.8 V bit in Host Control 2.
+const HISPD: u8 = 1 << 2;
+/// R1 bits that mean the card rejected the command.
+const R1_ERR: u32 =
+    (1 << 31) | (1 << 30) | (1 << 29) | (1 << 23) | (1 << 22) | (1 << 19) | (1 << 16);
 
 struct Card {
     high_capacity: bool,
@@ -277,12 +288,13 @@ fn identify_sdhci(base_hz: u32) -> Result<(), &'static str> {
     }
     sd_command(16, 512, RESP_48, false, false, 200)?;
     sd_set_clock(base_hz, DATA_HZ)?;
-    log_data_clock(base_hz);
+    let (mode, hz) = negotiate_hs(base_hz);
     *CARD.lock() = Some(Card {
         high_capacity,
         blocks,
     });
     crate::disklog::set_card("emmc2", blocks);
+    crate::disklog::set_speed(mode, hz);
     crate::gic::arm_spi(EMMC_IRQ, 0x80, crate::gic::online_cpu_mask());
     crate::gic::disable_id(EMMC_IRQ);
     Ok(())
@@ -380,6 +392,7 @@ fn identify_legacy() -> Result<(), &'static str> {
         blocks,
     });
     crate::disklog::set_card("emmc1", blocks);
+    crate::disklog::set_speed("ds", 0);
     Ok(())
 }
 
@@ -625,21 +638,119 @@ fn sd_set_clock(base_hz: u32, target_hz: u32) -> Result<(), &'static str> {
 /// SDHCI 10-bit divisor. The card clock is `base / (2 * n)` for n > 0,
 /// and `base` when n is 0.
 fn clock_div(base_hz: u32, target_hz: u32) -> u16 {
-    if target_hz == 0 || base_hz <= target_hz {
-        return 0;
+    fwupd::sdhs::clock_div(base_hz, target_hz)
+}
+
+/// CMD6 while the bus is still at 25 MHz. A miss keeps that clock.
+/// The card is already identified, so this never fails the probe.
+fn negotiate_hs(base_hz: u32) -> (&'static str, u32) {
+    let ds_hz = fwupd::sdhs::card_hz(base_hz, read16(CLOCK));
+    let reason = match switch_high_speed() {
+        Ok(()) => {
+            write8(HOST_CONTROL, read8(HOST_CONTROL) | HISPD);
+            if sd_set_clock(base_hz, fwupd::sdhs::HS_HZ).is_ok() {
+                let hz = fwupd::sdhs::card_hz(base_hz, read16(CLOCK));
+                log_mode("hs", hz, "");
+                return ("hs", hz);
+            }
+            write8(HOST_CONTROL, read8(HOST_CONTROL) & !HISPD);
+            let _ = sd_set_clock(base_hz, DATA_HZ);
+            "clock"
+        }
+        Err(reason) => reason,
+    };
+    let _ = recover_cmd();
+    let hz = fwupd::sdhs::card_hz(base_hz, read16(CLOCK));
+    let hz = if hz == 0 { ds_hz } else { hz };
+    log_mode("ds", hz, reason);
+    ("ds", hz)
+}
+
+fn switch_high_speed() -> Result<(), &'static str> {
+    let mut status = [0u8; fwupd::sdhs::SWITCH_LEN];
+    read_switch(fwupd::sdhs::CMD6_CHECK_HS, &mut status)?;
+    let parsed = fwupd::sdhs::parse_switch(&status).ok_or("status")?;
+    if !parsed.high_speed_supported {
+        return Err("unsupported");
     }
-    let step = target_hz.saturating_mul(2).max(1);
-    let mut n = base_hz.saturating_add(step - 1) / step;
-    if n == 0 {
-        n = 1;
+    read_switch(fwupd::sdhs::CMD6_SWITCH_HS, &mut status)?;
+    if fwupd::sdhs::switch_accepted(&status) {
+        delay_ms(1);
+        return Ok(());
     }
-    if n > 0x3ff {
-        n = 0x3ff;
+    if fwupd::sdhs::parse_switch(&status).is_some_and(|status| status.group1_busy) {
+        Err("busy")
+    } else {
+        Err("status")
     }
-    // Bits 15:8 are the low 8 divisor bits. Bits 7:6 are divisor bits 9:8.
-    let low = ((n & 0xff) as u16) << 8;
-    let high = ((n & 0x300) >> 8) as u16;
-    low | (high << 6)
+}
+
+fn read_switch(arg: u32, out: &mut [u8; fwupd::sdhs::SWITCH_LEN]) -> Result<(), &'static str> {
+    write(BLKSIZECNT, (1 << 16) | fwupd::sdhs::SWITCH_LEN as u32);
+    let resp = match sd_command(6, arg, RESP_48, true, true, 200) {
+        Ok(resp) => resp,
+        Err(err) => {
+            let _ = recover_cmd();
+            return Err(err);
+        }
+    };
+    if resp & R1_ERR != 0 {
+        let _ = recover_cmd();
+        return Err("status");
+    }
+    if let Err(err) = wait_data(INT_READ_RDY) {
+        let _ = recover_cmd();
+        return Err(err);
+    }
+    for word_index in 0..16 {
+        let word = read(DATA);
+        let offset = word_index * 4;
+        out[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    if let Err(err) = wait_data(INT_DATA_DONE) {
+        let _ = recover_cmd();
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn wait_data(bit: u32) -> Result<(), &'static str> {
+    let status = wait_interrupt(bit, 200)?;
+    if status & INT_ERR != 0 || status & INT_CMD_TIMEOUT != 0 {
+        return Err(data_error(status));
+    }
+    Ok(())
+}
+
+fn data_error(status: u32) -> &'static str {
+    if status & (INT_CMD_TIMEOUT | (1 << 20)) != 0 {
+        "timeout"
+    } else if status & ((1 << 17) | (1 << 21)) != 0 {
+        "crc"
+    } else {
+        "cmd error"
+    }
+}
+
+fn recover_cmd() -> Result<(), &'static str> {
+    write8(SW_RESET, RESET_CMD | RESET_DATA);
+    if !wait_until(20, || read8(SW_RESET) & (RESET_CMD | RESET_DATA) == 0) {
+        return Err("reset timeout");
+    }
+    Ok(())
+}
+
+fn log_mode(mode: &str, hz: u32, why: &str) {
+    let mut line = Buf::new();
+    line.push("sd emmc2 mode ");
+    line.push(mode);
+    line.push(" ");
+    line.dec(hz);
+    if !why.is_empty() {
+        line.push(" ");
+        line.push(why);
+    }
+    line.emit();
 }
 
 fn sd_command(
@@ -821,22 +932,6 @@ fn issue_multi(index: u32, arg: u32, read_data: bool) -> Result<(), &'static str
         return Err(cmd_error(done));
     }
     Ok(())
-}
-
-fn log_data_clock(base_hz: u32) {
-    let reg = read16(CLOCK);
-    let n = ((reg >> 8) & 0xff) as u32 | (((reg as u32) >> 6) & 0x3) << 8;
-    let card = if n == 0 {
-        base_hz
-    } else {
-        base_hz / (2 * n.max(1))
-    };
-    let mut line = Buf::new();
-    line.push("sd emmc2 data hz ");
-    line.dec(card);
-    line.push(" base ");
-    line.dec(base_hz);
-    line.emit();
 }
 
 fn wait_until(budget_ms: u64, ready: impl Fn() -> bool) -> bool {
