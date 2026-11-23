@@ -1032,7 +1032,7 @@ fn net_extra() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u
 /// SD probe outcome. The kernel records this before the log task exists,
 /// so `/status` is the copy that does not scroll off the HDMI console.
 fn sd_fields() -> String {
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 80];
     let n = sys(
         SD_STATUS,
         buf.as_mut_ptr() as u64,
@@ -1044,17 +1044,30 @@ fn sd_fields() -> String {
     );
     if n < 56 {
         return String::from(
-            "\"sd_state\":\"absent\",\"sd_error\":\"unavailable\",\"sd_blocks\":0,\"fs_mounted\":0",
+            "\"sd_state\":\"absent\",\"sd_error\":\"unavailable\",\"sd_blocks\":0,\"fs_mounted\":0,\"sd_mode\":\"none\",\"sd_clock_hz\":0",
         );
     }
     let blocks = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]);
     let mounted = u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]);
+    let mode = if n >= 76 {
+        let mode = json_token(&buf[56..72]);
+        if mode.is_empty() { String::from("none") } else { mode }
+    } else {
+        String::from("none")
+    };
+    let clock_hz = if n >= 76 {
+        u32::from_le_bytes([buf[72], buf[73], buf[74], buf[75]])
+    } else {
+        0
+    };
     format!(
-        "\"sd_state\":\"{}\",\"sd_error\":\"{}\",\"sd_blocks\":{},\"fs_mounted\":{}",
+        "\"sd_state\":\"{}\",\"sd_error\":\"{}\",\"sd_blocks\":{},\"fs_mounted\":{},\"sd_mode\":\"{}\",\"sd_clock_hz\":{}",
         json_token(&buf[..16]),
         json_token(&buf[16..48]),
         blocks,
-        mounted
+        mounted,
+        mode,
+        clock_hz
     )
 }
 

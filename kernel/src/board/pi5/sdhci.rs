@@ -11,8 +11,11 @@
 //! not program those pins or the pin mux. It assumes the firmware left the
 //! slot powered, which is true only if the firmware itself used the card.
 //!
-//! UHS modes, the 1.8 V switch, and the command-queue engine are not
-//! implemented. This driver has not been run on hardware.
+//! After identification, CMD6 requests high speed (SDR25, 50 MHz, 3.3 V).
+//! The divider moves only when the switch status selects function 1.
+//! UHS, the 1.8 V switch, and the command-queue engine are not
+//! implemented. A failed switch stays at 25 MHz and does not fail the
+//! probe. This driver has not been run on hardware.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -194,7 +197,9 @@ fn identify() -> Result<Card, &'static str> {
     }
     command(16, 512, RESP_48, false, false)?;
     write8(HOST_CONTROL, read8(HOST_CONTROL) | (1 << 1));
-    set_clock(25_000_000)?;
+    set_clock(fwupd::sdhs::DS_HZ)?;
+    let (mode, hz) = negotiate_hs();
+    crate::disklog::set_speed(mode, hz);
     Ok(Card {
         rca,
         high_capacity,
@@ -323,20 +328,112 @@ fn base_hz() -> u32 {
 
 /// SDHCI 10-bit divisor. Frequency is `base / (2 * n)` for n > 0.
 fn clock_div(base_hz: u32, target_hz: u32) -> u16 {
-    if target_hz == 0 || base_hz <= target_hz {
-        return 0;
+    fwupd::sdhs::clock_div(base_hz, target_hz)
+}
+
+fn negotiate_hs() -> (&'static str, u32) {
+    let base = base_hz();
+    let ds_hz = fwupd::sdhs::card_hz(base, read16(CLOCK));
+    let reason = match switch_high_speed() {
+        Ok(()) => {
+            write8(HOST_CONTROL, read8(HOST_CONTROL) | (1 << 2));
+            if set_clock(fwupd::sdhs::HS_HZ).is_ok() {
+                let hz = fwupd::sdhs::card_hz(base, read16(CLOCK));
+                log_mode("hs", hz, "");
+                return ("hs", hz);
+            }
+            write8(HOST_CONTROL, read8(HOST_CONTROL) & !(1 << 2));
+            let _ = set_clock(fwupd::sdhs::DS_HZ);
+            "clock"
+        }
+        Err(reason) => reason,
+    };
+    let hz = fwupd::sdhs::card_hz(base, read16(CLOCK));
+    let hz = if hz == 0 { ds_hz } else { hz };
+    log_mode("ds", hz, reason);
+    ("ds", hz)
+}
+
+fn switch_high_speed() -> Result<(), &'static str> {
+    let mut status = [0u8; fwupd::sdhs::SWITCH_LEN];
+    read_switch(fwupd::sdhs::CMD6_CHECK_HS, &mut status)?;
+    if !fwupd::sdhs::parse_switch(&status).is_some_and(|status| status.high_speed_supported) {
+        return Err("unsupported");
     }
-    let step = target_hz.saturating_mul(2).max(1);
-    let mut n = base_hz.saturating_add(step - 1) / step;
-    if n == 0 {
-        n = 1;
+    read_switch(fwupd::sdhs::CMD6_SWITCH_HS, &mut status)?;
+    if fwupd::sdhs::switch_accepted(&status) {
+        delay_ms(1);
+        return Ok(());
     }
-    if n > 0x3ff {
-        n = 0x3ff;
+    if fwupd::sdhs::parse_switch(&status).is_some_and(|status| status.group1_busy) {
+        Err("busy")
+    } else {
+        Err("status")
     }
-    let low = ((n & 0xff) as u16) << 8;
-    let high = (((n & 0x300) >> 2) as u16) << 6;
-    low | high
+}
+
+fn read_switch(arg: u32, out: &mut [u8; fwupd::sdhs::SWITCH_LEN]) -> Result<(), &'static str> {
+    write32(BLK, (1 << 16) | fwupd::sdhs::SWITCH_LEN as u32);
+    let resp = command(6, arg, RESP_48, true, true).map_err(|_| "cmd error")?;
+    const R1_ERR: u32 =
+        (1 << 31) | (1 << 30) | (1 << 29) | (1 << 23) | (1 << 22) | (1 << 19) | (1 << 16);
+    if resp & R1_ERR != 0 {
+        return Err("status");
+    }
+    wait_data(INT_READ_RDY)?;
+    for word_index in 0..16 {
+        let word = read32(DATA);
+        let offset = word_index * 4;
+        out[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    wait_data(INT_DATA_DONE)
+}
+
+fn wait_data(bit: u32) -> Result<(), &'static str> {
+    let status = wait_interrupt(bit)?;
+    if status & INT_ERR != 0 || status & INT_CMD_TIMEOUT != 0 {
+        if status & ((1 << 17) | (1 << 21)) != 0 {
+            Err("crc")
+        } else if status & (INT_CMD_TIMEOUT | (1 << 20)) != 0 {
+            Err("timeout")
+        } else {
+            Err("cmd error")
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn delay_ms(ms: u64) {
+    let start = crate::timer::get_ticks();
+    let freq = crate::timer::frequency();
+    let budget = if freq == 0 {
+        0
+    } else {
+        freq.saturating_mul(ms) / 1000
+    };
+    if budget == 0 {
+        for _ in 0..50_000 {
+            core::hint::spin_loop();
+        }
+        return;
+    }
+    while crate::timer::get_ticks().wrapping_sub(start) < budget {
+        core::hint::spin_loop();
+    }
+}
+
+fn log_mode(mode: &str, hz: u32, why: &str) {
+    let mut line = crate::disklog::Buf::new();
+    line.push("sd sdhci mode ");
+    line.push(mode);
+    line.push(" ");
+    line.dec(hz);
+    if !why.is_empty() {
+        line.push(" ");
+        line.push(why);
+    }
+    line.emit();
 }
 
 fn command(
