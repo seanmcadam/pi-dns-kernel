@@ -41,9 +41,15 @@
 //! `NOTIFY_REBOOT` (`0x00030048`, no payload), and arms the watchdog the
 //! way Linux does. No HDMI shutdown unless `display.hdmi_reset` is 1.
 //! Halt and panic do not reboot. None of this runs on virt or Pi 5.
+//!
+//! The firmware message log is copied here, before the allocator, into a
+//! 256 KiB buffer. `vclog -m` walks that whole ring; 0.1.76 kept 240
+//! bytes of the oldest lines and stopped mid-entry. `/vclog` serves the
+//! rendered text. `VCLOG.TXT` is that text. `VCLOGPRE.TXT` is a second
+//! read just before the watchdog.
 
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 mod glyphs {
     include!("../../display-console/src/font.rs");
@@ -172,7 +178,30 @@ static PORT_LEN: AtomicU8 = AtomicU8::new(0);
 const VCLOG_CAP: usize = 240;
 static mut VCLOG: [u8; VCLOG_CAP] = [0; VCLOG_CAP];
 static VCLOG_LEN: AtomicU8 = AtomicU8::new(0);
+/// Raw used range, then the rendered `vclog -m` / `vclog -a` text, then
+/// the pre-reset copy. 256 KiB is the whole log when it is tens of KB.
+/// A larger ring sets the truncated status and keeps the oldest bytes.
+const LOG_BYTES: usize = 256 * 1024;
+static mut RAW: [u8; LOG_BYTES] = [0; LOG_BYTES];
+static mut VLOG: [u8; LOG_BYTES] = [0; LOG_BYTES];
+static mut PRE: [u8; LOG_BYTES] = [0; LOG_BYTES];
+static VLOG_LEN: AtomicU32 = AtomicU32::new(0);
+static PRE_LEN: AtomicU32 = AtomicU32::new(0);
+static LOG_COPIED: AtomicU32 = AtomicU32::new(0);
+static LOG_EXPECT: AtomicU32 = AtomicU32::new(0);
+static DT_START: AtomicU32 = AtomicU32::new(0);
+static DT_SIZE: AtomicU32 = AtomicU32::new(0);
+static DT_SEEN: AtomicBool = AtomicBool::new(false);
+static MSG_PHYS: AtomicU64 = AtomicU64::new(0);
+static MSG_BUF: AtomicU64 = AtomicU64::new(0);
+static ASSERT_PHYS: AtomicU64 = AtomicU64::new(0);
+static ASSERT_BUF: AtomicU64 = AtomicU64::new(0);
+const VSTATUS_CAP: usize = 96;
+static mut VSTATUS: [u8; VSTATUS_CAP] = [0; VSTATUS_CAP];
+static VSTATUS_LEN: AtomicU8 = AtomicU8::new(0);
 const SHUT_FILE: &str = "HDMISHUT.TXT";
+const VCLOG_FILE: &str = "VCLOG.TXT";
+const VCLOG_PRE_FILE: &str = "VCLOGPRE.TXT";
 /// Set when a fault has painted the pinned rows. Later log lines and the
 /// status refresh must not scroll that text off the panel.
 static FROZEN: AtomicBool = AtomicBool::new(false);
@@ -247,8 +276,9 @@ pub fn copy_port(out: &mut [u8]) -> usize {
     )
 }
 
-/// Firmware message log (`vclog -m`), or a short reason the log could not
-/// be read. Empty until [`load_vclog`]. The caller prints `none`.
+/// First line of the firmware log, or a short reason it could not be
+/// read. Empty until [`load_vclog`]. The caller prints `none`. The whole
+/// log is [`copy_vclog_at`].
 pub fn copy_vclog(out: &mut [u8]) -> usize {
     copy_text(
         out,
@@ -256,6 +286,66 @@ pub fn copy_vclog(out: &mut [u8]) -> usize {
         VCLOG_LEN.load(Ordering::Acquire) as usize,
         VCLOG_CAP,
     )
+}
+
+/// Rendered bytes in the boot log (`/vclog`).
+pub fn vclog_bytes() -> u32 {
+    VLOG_LEN.load(Ordering::Acquire)
+}
+
+/// `ok`, `wrapped`, `truncated`, or `miss`, plus the `/chosen/log` pair,
+/// bytes copied, and the ring's used size.
+pub fn copy_vclog_status(out: &mut [u8]) -> usize {
+    copy_text(
+        out,
+        addr_of!(VSTATUS).cast::<u8>(),
+        VSTATUS_LEN.load(Ordering::Acquire) as usize,
+        VSTATUS_CAP,
+    )
+}
+
+/// A window of the rendered boot log. `offset` is a byte offset into
+/// that text. Returns 0 at the end.
+pub fn copy_vclog_at(offset: u64, out: &mut [u8]) -> usize {
+    let len = VLOG_LEN.load(Ordering::Acquire) as u64;
+    if offset >= len || out.is_empty() {
+        return 0;
+    }
+    let n = ((len - offset) as usize).min(out.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            addr_of!(VLOG).cast::<u8>().add(offset as usize),
+            out.as_mut_ptr(),
+            n,
+        );
+    }
+    n
+}
+
+/// Write `VCLOG.TXT` once the FAT volume is mounted. Overwrites the
+/// previous boot. A miss still writes the reason line.
+pub fn store_vclog() {
+    let n = VLOG_LEN.load(Ordering::Acquire) as usize;
+    if n > 0 {
+        write_log_file(VCLOG_FILE, addr_of!(VLOG).cast(), n);
+        return;
+    }
+    let n = VSTATUS_LEN.load(Ordering::Acquire) as usize;
+    if n > 0 {
+        write_log_file(VCLOG_FILE, addr_of!(VSTATUS).cast(), n);
+    }
+}
+
+/// Re-read the firmware log and write `VCLOGPRE.TXT`. Called after the
+/// register snapshot and before the watchdog. No HDMI register write.
+pub fn store_vclog_pre() {
+    let n = reread_pre();
+    if n > 0 {
+        write_log_file(VCLOG_PRE_FILE, addr_of!(PRE).cast(), n);
+        return;
+    }
+    let text = b"vclog pre unread\n";
+    write_log_file(VCLOG_PRE_FILE, text.as_ptr(), text.len());
 }
 
 /// Read `HDMISHUT.TXT` after the filesystem is mounted. A missing file
@@ -284,6 +374,9 @@ pub fn load_vclog() {
     let mem = vc_memory();
     let dt = crate::fw::dtb_bytes().and_then(fwupd::chosen_log);
     if let Some((start, size)) = dt {
+        DT_SEEN.store(true, Ordering::Relaxed);
+        DT_START.store(start, Ordering::Relaxed);
+        DT_SIZE.store(size, Ordering::Relaxed);
         if publish_log(start, size) {
             save_line("vclog ok");
             return;
@@ -317,6 +410,7 @@ pub fn load_vclog() {
         None => why.push(" mbox-fail"),
     }
     remember_vclog(why.text());
+    set_vstatus(why.text());
 }
 
 /// `GET_VC_MEMORY` (`0x00010006`), the property tag `vclog` sends on
@@ -393,6 +487,7 @@ fn read_log(phys: u64) -> bool {
     let Some(msg_vc) = fwupd::vclog_msg_addr(&toc) else {
         return false;
     };
+    let assert_vc = fwupd::vclog_assert_addr(&toc);
     let mut saw = false;
     let mut slot = 0;
     while slot < 2 {
@@ -400,7 +495,7 @@ fn read_log(phys: u64) -> bool {
             slot += 1;
             continue;
         };
-        if finish_log(msg_phys) {
+        if finish_log(msg_phys, assert_vc) {
             saw = true;
             break;
         }
@@ -409,20 +504,116 @@ fn read_log(phys: u64) -> bool {
     saw
 }
 
-fn finish_log(msg_phys: u64) -> bool {
-    if !ram_holds(msg_phys, 20) {
-        return false;
-    }
-    let mut hdr = [0u8; 20];
-    if !read_ram(msg_phys, &mut hdr) {
-        return false;
-    }
-    let Some((start, end, write, read)) = fwupd::vclog_msg_range(&hdr) else {
+fn finish_log(msg_phys: u64, assert_vc: Option<u32>) -> bool {
+    let Some(held) = read_ring(msg_phys, false) else {
         return false;
     };
+    MSG_PHYS.store(msg_phys, Ordering::Relaxed);
+    MSG_BUF.store(held.buf, Ordering::Relaxed);
+    let (mut text_len, mut complete) =
+        paint_messages(addr_of_mut!(VLOG).cast(), LOG_BYTES, held.copied as usize);
+    if let Some(addr) = assert_vc {
+        if let Some(assert_held) = locate_assert(addr) {
+            ASSERT_PHYS.store(assert_held.hdr, Ordering::Relaxed);
+            ASSERT_BUF.store(assert_held.buf, Ordering::Relaxed);
+            let (n, ok) = append_assert(addr_of_mut!(VLOG).cast(), LOG_BYTES, text_len);
+            text_len = n;
+            complete = complete && ok && assert_held.copied >= assert_held.expect;
+        }
+    }
+    VLOG_LEN.store(text_len as u32, Ordering::Release);
+    LOG_COPIED.store(held.copied, Ordering::Relaxed);
+    LOG_EXPECT.store(held.expect, Ordering::Relaxed);
+    let truncated = !complete || held.copied < held.expect;
+    let state = match (held.wrapped, truncated) {
+        (true, true) => "wrapped truncated",
+        (true, false) => "wrapped",
+        (false, true) => "truncated",
+        (false, false) => "ok",
+    };
+    set_vstatus_counts(state, held.copied, held.expect, "");
+    if text_len == 0 {
+        let mut raw = [0u8; VSTATUS_CAP];
+        let n = (VSTATUS_LEN.load(Ordering::Acquire) as usize).min(raw.len());
+        unsafe {
+            core::ptr::copy_nonoverlapping(addr_of!(VSTATUS).cast::<u8>(), raw.as_mut_ptr(), n);
+        }
+        let text = core::str::from_utf8(&raw[..n]).unwrap_or("ok");
+        store_text(text, addr_of_mut!(VCLOG).cast(), VCLOG_CAP, &VCLOG_LEN);
+    } else {
+        let summary = unsafe {
+            core::str::from_utf8(core::slice::from_raw_parts(
+                addr_of!(VLOG).cast::<u8>(),
+                text_len,
+            ))
+            .unwrap_or("")
+        };
+        store_text(
+            summary,
+            addr_of_mut!(VCLOG).cast(),
+            VCLOG_CAP,
+            &VCLOG_LEN,
+        );
+    }
+    let mut line = Line::new();
+    line.push("vclog ");
+    line.dec(u64::from(held.copied));
+    line.push("/");
+    line.dec(u64::from(held.expect));
+    save_line(line.text());
+    true
+}
+
+struct Held {
+    hdr: u64,
+    buf: u64,
+    copied: u32,
+    expect: u32,
+    wrapped: bool,
+}
+
+fn locate_assert(addr: u32) -> Option<Held> {
+    if addr == 0 {
+        return None;
+    }
+    let mut slot = 0;
+    while slot < 2 {
+        let Some(hdr) = vc_phys(addr, slot) else {
+            slot += 1;
+            continue;
+        };
+        if let Some(held) = read_ring(hdr, true) {
+            return Some(held);
+        }
+        slot += 1;
+    }
+    None
+}
+
+/// Read a `vclog` ring header and copy its used bytes into `RAW`.
+fn read_ring(hdr_phys: u64, assert_log: bool) -> Option<Held> {
+    if !ram_holds(hdr_phys, 20) {
+        return None;
+    }
+    let mut hdr = [0u8; 20];
+    if !read_ram(hdr_phys, &mut hdr) {
+        return None;
+    }
+    let range = if assert_log {
+        fwupd::vclog_assert_range(&hdr)
+    } else {
+        fwupd::vclog_msg_range(&hdr)
+    }?;
+    let (start, end, write, read) = range;
     let log_size = end.wrapping_sub(start);
     if log_size == 0 || log_size > 1024 * 1024 {
-        return false;
+        return None;
+    }
+    let read_off = read.wrapping_sub(start) as usize;
+    let write_off = write.wrapping_sub(start) as usize;
+    let log_size = log_size as usize;
+    if read_off >= log_size || write_off >= log_size {
+        return None;
     }
     let mut slot = 0;
     while slot < 2 {
@@ -430,29 +621,91 @@ fn finish_log(msg_phys: u64) -> bool {
             slot += 1;
             continue;
         };
-        if !ram_holds(base, u64::from(log_size).min(4096)) {
+        if !ram_holds(base, log_size as u64) {
             slot += 1;
             continue;
         }
-        let read_off = read.wrapping_sub(start) as usize;
-        let write_off = write.wrapping_sub(start) as usize;
-        if read_off >= log_size as usize || write_off >= log_size as usize {
-            slot += 1;
-            continue;
-        }
-        let mut linear = [0u8; 4096];
-        let copied = copy_log(&mut linear, base, log_size as usize, read_off, write_off);
-        let mut text = [0u8; VCLOG_CAP];
-        let n = fwupd::vclog_tail(&linear[..copied], 0, copied, &mut text);
-        if n == 0 {
-            slot += 1;
-            continue;
-        }
-        let shown = core::str::from_utf8(&text[..n]).unwrap_or("");
-        remember_vclog(shown);
-        return true;
+        let (copied, expect, wrapped) = copy_used(base, log_size, read_off, write_off);
+        return Some(Held {
+            hdr: hdr_phys,
+            buf: base,
+            copied,
+            expect,
+            wrapped,
+        });
     }
-    false
+    None
+}
+
+fn copy_used(base: u64, log_size: usize, read_off: usize, write_off: usize) -> (u32, u32, bool) {
+    let expect = if write_off >= read_off {
+        write_off - read_off
+    } else {
+        log_size - read_off + write_off
+    };
+    let n = expect.min(LOG_BYTES);
+    let wrapped = write_off < read_off;
+    let mut i = 0;
+    while i < n {
+        let off = (read_off + i) % log_size;
+        let pa = base + off as u64;
+        let left = n - i;
+        let room = log_size - off;
+        if (pa & 3) == 0 && left >= 4 && room >= 4 && ram_holds(pa, 4) {
+            let word = unsafe { core::ptr::read_volatile(pa as *const u32) };
+            let bytes = word.to_le_bytes();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    addr_of_mut!(RAW).cast::<u8>().add(i),
+                    4,
+                );
+            }
+            i += 4;
+        } else if ram_holds(pa, 1) {
+            let byte = unsafe { core::ptr::read_volatile(pa as *const u8) };
+            unsafe {
+                addr_of_mut!(RAW).cast::<u8>().add(i).write(byte);
+            }
+            i += 1;
+        } else {
+            return (i as u32, expect as u32, wrapped);
+        }
+    }
+    (n as u32, expect as u32, wrapped)
+}
+
+/// `RAW` holds `msg_copied` message-log bytes. Render them before any
+/// assert read reuses that buffer.
+fn paint_messages(dst: *mut u8, cap: usize, msg_copied: usize) -> (usize, bool) {
+    let src_n = msg_copied.min(LOG_BYTES);
+    let msg = unsafe { core::slice::from_raw_parts(addr_of!(RAW).cast::<u8>(), src_n) };
+    let out = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
+    let rendered = fwupd::vclog_render_messages(msg, out);
+    (rendered.bytes, rendered.complete)
+}
+
+fn append_assert(dst: *mut u8, cap: usize, at: usize) -> (usize, bool) {
+    let hdr = ASSERT_PHYS.load(Ordering::Relaxed);
+    if hdr == 0 || ASSERT_BUF.load(Ordering::Relaxed) == 0 || at > cap {
+        return (at, true);
+    }
+    let Some(held) = read_ring(hdr, true) else {
+        return (at, false);
+    };
+    let mark = b"# assert\n";
+    if at + mark.len() > cap {
+        return (at, false);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(mark.as_ptr(), dst.add(at), mark.len());
+    }
+    let n = at + mark.len();
+    let src_n = (held.copied as usize).min(LOG_BYTES);
+    let src = unsafe { core::slice::from_raw_parts(addr_of!(RAW).cast::<u8>(), src_n) };
+    let rest = unsafe { core::slice::from_raw_parts_mut(dst.add(n), cap - n) };
+    let rendered = fwupd::vclog_render_asserts(src, rest);
+    (n + rendered.bytes, rendered.complete && held.copied >= held.expect)
 }
 
 /// Look for the `VLOG` table in the GPU window from `GET_VC_MEMORY`.
@@ -643,36 +896,108 @@ fn read_ram(pa: u64, dest: &mut [u8]) -> bool {
     true
 }
 
-/// Copy the oldest bytes of the circular message log, unwrapped, into
-/// `dest`. Stops at `dest.len()` so the boot lines fit.
-fn copy_log(
-    dest: &mut [u8],
-    base: u64,
-    log_size: usize,
-    read_off: usize,
-    write_off: usize,
-) -> usize {
-    if log_size == 0 {
+fn reread_pre() -> usize {
+    let hdr = MSG_PHYS.load(Ordering::Relaxed);
+    if hdr == 0 || MSG_BUF.load(Ordering::Relaxed) == 0 {
         return 0;
     }
-    let available = if write_off >= read_off {
-        write_off - read_off
-    } else {
-        log_size - read_off + write_off
+    let Some(held) = read_ring(hdr, false) else {
+        return 0;
     };
-    let n = available.min(dest.len()).min(log_size);
-    let mut i = 0;
-    while i < n {
-        let off = (read_off + i) % log_size;
-        let pa = base + off as u64;
-        if !ram_holds(pa, 1) {
+    let (mut n, _) = paint_messages(addr_of_mut!(PRE).cast(), LOG_BYTES, held.copied as usize);
+    if ASSERT_PHYS.load(Ordering::Relaxed) != 0 {
+        let (next, _) = append_assert(addr_of_mut!(PRE).cast(), LOG_BYTES, n);
+        n = next;
+    }
+    PRE_LEN.store(n as u32, Ordering::Release);
+    n
+}
+
+fn write_log_file(name: &str, ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    if crate::fs::write_named(name, bytes, false).is_err() {
+        save_line("vclog file miss");
+    }
+}
+
+fn set_vstatus(text: &str) {
+    store_text(
+        text,
+        addr_of_mut!(VSTATUS).cast(),
+        VSTATUS_CAP,
+        &VSTATUS_LEN,
+    );
+}
+
+fn set_vstatus_counts(state: &str, copied: u32, expect: u32, extra: &str) {
+    let mut buf = [0u8; VSTATUS_CAP];
+    let mut n = 0usize;
+    push_raw(&mut buf, &mut n, state);
+    if DT_SEEN.load(Ordering::Relaxed) {
+        push_raw(&mut buf, &mut n, " dt ");
+        push_hex8(&mut buf, &mut n, DT_START.load(Ordering::Relaxed));
+        push_raw(&mut buf, &mut n, " ");
+        push_hex8(&mut buf, &mut n, DT_SIZE.load(Ordering::Relaxed));
+    } else {
+        push_raw(&mut buf, &mut n, " dt none");
+    }
+    push_raw(&mut buf, &mut n, " copied ");
+    push_dec_u(&mut buf, &mut n, copied);
+    push_raw(&mut buf, &mut n, " expect ");
+    push_dec_u(&mut buf, &mut n, expect);
+    if !extra.is_empty() {
+        push_raw(&mut buf, &mut n, " ");
+        push_raw(&mut buf, &mut n, extra);
+    }
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or(state);
+    set_vstatus(text);
+}
+
+fn push_raw(buf: &mut [u8], n: &mut usize, text: &str) {
+    for byte in text.bytes() {
+        if *n >= buf.len() {
+            return;
+        }
+        buf[*n] = byte;
+        *n += 1;
+    }
+}
+
+fn push_hex8(buf: &mut [u8], n: &mut usize, value: u32) {
+    let bytes = value.to_be_bytes();
+    let hex = b"0123456789abcdef";
+    for byte in bytes {
+        if *n + 2 > buf.len() {
+            return;
+        }
+        buf[*n] = hex[(byte >> 4) as usize];
+        buf[*n + 1] = hex[(byte & 0xf) as usize];
+        *n += 2;
+    }
+}
+
+fn push_dec_u(buf: &mut [u8], n: &mut usize, mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut d = 0usize;
+    loop {
+        digits[d] = b'0' + (value % 10) as u8;
+        value /= 10;
+        d += 1;
+        if value == 0 {
             break;
         }
-        let ptr = crate::addr::phys_to_virt(pa) as *const u8;
-        dest[i] = unsafe { core::ptr::read_volatile(ptr) };
-        i += 1;
     }
-    i
+    while d > 0 {
+        d -= 1;
+        if *n >= buf.len() {
+            return;
+        }
+        buf[*n] = digits[d];
+        *n += 1;
+    }
 }
 
 /// Tell the firmware a restart is coming. IRQs stay unmasked. The
@@ -730,6 +1055,7 @@ pub fn prepare_reboot() {
         READY.store(false, Ordering::Release);
         HDMI_STATE.store(HDMI_RELEASED, Ordering::Relaxed);
     }
+    store_vclog_pre();
 }
 
 /// Allocate the framebuffer and paint one line, before the strict map.

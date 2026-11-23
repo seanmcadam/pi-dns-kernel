@@ -212,6 +212,24 @@ pub trait Board {
         n
     }
 
+    /// Rendered firmware-log bytes. Virt and Pi 5 report 0.
+    fn hdmi_vclog_bytes() -> u32 {
+        0
+    }
+
+    /// `ok`, `wrapped`, `truncated`, `miss`, or `none`.
+    fn hdmi_vclog_status(out: &mut [u8]) -> usize {
+        let text = b"none";
+        let n = text.len().min(out.len());
+        out[..n].copy_from_slice(&text[..n]);
+        n
+    }
+
+    /// Window of the rendered firmware log. Virt and Pi 5 return 0.
+    fn hdmi_vclog_at(_offset: u64, _out: &mut [u8]) -> usize {
+        0
+    }
+
     /// Shut down or reboot this guest. `reset` selects reboot.
     /// A successful call does not return. `true` means the platform refused
     /// and this guest is still running.
@@ -388,6 +406,18 @@ pub fn hdmi_port(out: &mut [u8]) -> usize {
 
 pub fn hdmi_vclog(out: &mut [u8]) -> usize {
     <Active as Board>::hdmi_vclog(out)
+}
+
+pub fn hdmi_vclog_bytes() -> u32 {
+    <Active as Board>::hdmi_vclog_bytes()
+}
+
+pub fn hdmi_vclog_status(out: &mut [u8]) -> usize {
+    <Active as Board>::hdmi_vclog_status(out)
+}
+
+pub fn hdmi_vclog_at(offset: u64, out: &mut [u8]) -> usize {
+    <Active as Board>::hdmi_vclog_at(offset, out)
 }
 
 pub fn power(reset: bool) -> bool {

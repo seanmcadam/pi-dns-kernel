@@ -61,6 +61,7 @@ const NET_COUNTERS: u64 = 64;
 const NET_EXTRA: u64 = 66;
 const SD_STATUS: u64 = 68;
 const HDMI_CONSOLE: u64 = 69;
+const VCLOG_READ: u64 = 70;
 
 const EAGAIN: i64 = -11;
 
@@ -764,7 +765,7 @@ fn handle_index() -> HttpResponse {
     <h2>Management</h2>
     <ul>
         <li><a href="/status">System Status (JSON)</a></li>
-        <li><a href="/vclog">Firmware log (JSON)</a></li>
+        <li><a href="/vclog">Firmware log</a></li>
         <li><a href="/firmware">Firmware update</a></li>
         <li><a href="/config">Configuration</a></li>
         <li><a href="/records">DNS Records (JSON)</a></li>
@@ -802,10 +803,20 @@ fn handle_status() -> HttpResponse {
         tx_full,
         tx_slow,
     ) = net_extra();
-    let (hdmi_state, hdmi_mode, hdmi_recoveries, hdmi_diag, hdmi_last_shut, hdmi_regs, hdmi_port, vclog) =
-        hdmi_status();
+    let (
+        hdmi_state,
+        hdmi_mode,
+        hdmi_recoveries,
+        hdmi_diag,
+        hdmi_last_shut,
+        hdmi_regs,
+        hdmi_port,
+        vclog,
+        vclog_bytes,
+        vclog_status,
+    ) = hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}",{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -841,6 +852,8 @@ fn handle_status() -> HttpResponse {
         hdmi_regs,
         hdmi_port,
         vclog,
+        vclog_bytes,
+        vclog_status,
         firmware::fields(),
         sd_fields()
     );
@@ -853,10 +866,12 @@ fn handle_status() -> HttpResponse {
 /// `hdmi_diag` is this boot's mailbox summary. `hdmi_last_shut` is the
 /// previous reboot's pre-write register dump. `hdmi_regs` is this boot's
 /// read-only dump. `hdmi_port` is `hdmi0`, `hdmi1`, `hdmi0+hdmi1`, or
-/// `none`. `vclog` is the firmware message log. Virt and Pi 5 report
-/// none, 0x0, zero recoveries, and `none`.
-fn hdmi_status() -> (String, String, u64, String, String, String, String, String) {
-    let mut buf = [0u8; 736];
+/// `none`. `vclog` is the first firmware-log line. `vclog_bytes` is the
+/// rendered log `GET /vclog` returns. `vclog_status` says whether that
+/// copy wrapped or was truncated, and the `/chosen/log` size. Virt and
+/// Pi 5 report none, 0x0, zero recoveries, and `none`.
+fn hdmi_status() -> (String, String, u64, String, String, String, String, String, u64, String) {
+    let mut buf = [0u8; 836];
     let n = sys(
         HDMI_CONSOLE,
         buf.as_mut_ptr() as u64,
@@ -866,7 +881,7 @@ fn hdmi_status() -> (String, String, u64, String, String, String, String, String
         0,
         0,
     );
-    if n != 736 {
+    if n != 836 {
         return (
             String::from("none"),
             String::from("0x0"),
@@ -875,6 +890,8 @@ fn hdmi_status() -> (String, String, u64, String, String, String, String, String
             String::from("none"),
             String::from("none"),
             String::from("none"),
+            String::from("none"),
+            0,
             String::from("none"),
         );
     }
@@ -895,6 +912,8 @@ fn hdmi_status() -> (String, String, u64, String, String, String, String, String
     let regs = text_field(&buf[288..480]);
     let port = text_field(&buf[480..496]);
     let vclog = text_field(&buf[496..736]);
+    let vclog_bytes = u32::from_le_bytes([buf[736], buf[737], buf[738], buf[739]]);
+    let vclog_status = text_field(&buf[740..836]);
     (
         String::from(state),
         format!("{}x{}", word(1), word(2)),
@@ -904,14 +923,48 @@ fn hdmi_status() -> (String, String, u64, String, String, String, String, String
         regs,
         port,
         vclog,
+        u64::from(vclog_bytes),
+        vclog_status,
     )
 }
 
 fn handle_vclog() -> HttpResponse {
-    let (_, _, _, _, _, _, _, vclog) = hdmi_status();
-    let json = format!(r#"{{"vclog":"{}"}}"#, vclog);
-    let mut response = HttpResponse::ok(&json);
-    response.add_header("Content-Type", "application/json");
+    let mut body = Vec::new();
+    let mut off = 0u64;
+    loop {
+        let mut buf = [0u8; 2048];
+        let n = sys(
+            VCLOG_READ,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            off,
+            0,
+            0,
+            0,
+        );
+        if n <= 0 {
+            break;
+        }
+        let n = n as usize;
+        if n > buf.len() {
+            break;
+        }
+        body.extend_from_slice(&buf[..n]);
+        off += n as u64;
+        if body.len() > 256 * 1024 {
+            break;
+        }
+    }
+    if body.is_empty() {
+        let (_, _, _, _, _, _, _, vclog, _, _) = hdmi_status();
+        body.extend_from_slice(vclog.as_bytes());
+        if !vclog.ends_with('\n') {
+            body.push(b'\n');
+        }
+    }
+    let mut response = HttpResponse::new(200, "OK");
+    response.set_body(&body);
+    response.add_header("Content-Type", "text/plain; charset=utf-8");
     response
 }
 

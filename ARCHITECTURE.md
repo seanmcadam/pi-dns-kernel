@@ -98,7 +98,8 @@ Syscall numbers are in `x8`, arguments in `x0`–`x5`, and the result in `x0`. A
 | 66 | `net_extra`. ARP, DNS load, RX faults, poll time, IRQ rearms, TX stalls |
 | 67 | `firmware`. Staged SD updates. Op 10 promotes, op 11 rolls back |
 | 68 | `sd_status` |
-| 69 | `hdmi_console`. 736 bytes: state, size, recoveries, diag, last shut, regs, port, vclog |
+| 69 | `hdmi_console`. 836 bytes: state, size, recoveries, diag, last shut, regs, port, vclog line, `vclog_bytes`, `vclog_status` |
+| 70 | `vclog_read`. A window of the rendered firmware log |
 
 `log_publish` is the log task only. It copies one line into a kernel ring and returns. `thread_create` checks that `entry` is a 4-byte-aligned address in the user code window and that the top 256 bytes of `stack` are writable and 16-byte aligned.
 
@@ -171,7 +172,7 @@ Syscall 69 and `GET /status` publish:
 - `hdmi_diag`, `hdmi_port`
 - `hdmi_regs` and `hdmi_last_shut`: `h0`/`h1`, `phy0`/`pwr0`, `phy1`/`pwr1`, `pv0`/`pv1`, `hvs`, `hsm`, `pm`, `dvp4`, `dvp8`
 
-`hdmi_last_shut` is the line stored in `HDMISHUT.TXT` before any optional HDMI write. `GET /vclog` and the `vclog` field are the firmware message log, or a short reason it could not be read. `vclog` (raspberrypi/utils) takes the table from `/chosen/log` and, through `/dev/vcio`, the property tag `GET_VC_MEMORY` (`0x00010006`). Linux `rpi-6.12.y` has no VC_LOG tag. `RPI_FIRMWARE_VCHIQ_INIT` (`0x00048010`) only enables VCHIQ. The kernel asks for that memory tag, then reads the device-tree pair, and loads the `VLOG` / `MESS` table with volatile reads. An address already in RAM is used as-is. The legacy alias is `bus & 0x3fffffff`. With no device-tree pair it searches the start and the top of the VC window for `VLOG`. Virt and Pi 5 report `none`. Boot and the reboot path also log the raw replies for `GET_DISPLAY_SETTINGS` (`0x00040014`), the framebuffer GET tags, and EDID block 0 (`0x00030020` and `0x00030023`). Those tags do not set a mode.
+`hdmi_last_shut` is the line stored in `HDMISHUT.TXT` before any optional HDMI write. `GET /vclog` is the whole firmware message log as text, one `vclog -m` line per entry, then the assert log (`vclog -a`) when that ring is present. The rings are copied into a 256 KiB buffer as soon as the MMU is on. `/status` `vclog` is the first line. `vclog_bytes` is the rendered length. `vclog_status` is `ok`, `wrapped`, `truncated`, or `miss`, plus the `/chosen/log` start and size, the bytes copied, and the used ring size. `VCLOG.TXT` is the boot copy. `VCLOGPRE.TXT` is a second read just before the watchdog. A miss names the reason. `vclog` (raspberrypi/utils) takes the table from `/chosen/log` and, through `/dev/vcio`, the property tag `GET_VC_MEMORY` (`0x00010006`). Linux `rpi-6.12.y` has no VC_LOG tag. `RPI_FIRMWARE_VCHIQ_INIT` (`0x00048010`) only enables VCHIQ. The kernel asks for that memory tag, then reads the device-tree pair, and loads the `VLOG` / `MESS` table with volatile reads. An address already in RAM is used as-is. The legacy alias is `bus & 0x3fffffff`. With no device-tree pair it searches the start and the top of the VC window for `VLOG`. Virt and Pi 5 report `none`. Boot and the reboot path also log the raw replies for `GET_DISPLAY_SETTINGS` (`0x00040014`), the framebuffer GET tags, and EDID block 0 (`0x00030020` and `0x00030023`). Those tags do not set a mode.
 
 ### VNC and the optional HDMI process
 
@@ -225,7 +226,7 @@ Eight names, eight types, and eight sources are counted in the resolver. A new k
 | --- | --- |
 | `GET /` | Dashboard: records, VNC, shutdown, reboot |
 | `GET /status` | Runtime JSON: uptime, ticks, cache, NIC counters, upstreams, HDMI fields, `vclog`, version |
-| `GET /vclog` | `{"vclog":"..."}` only |
+| `GET /vclog` | Firmware log, `text/plain`, one line per entry |
 | `GET /logs` | Recent log |
 | `/log-config`, `/dns-config`, `/display` | Forms for `LOG.JSN` and the matching `CONFIG.JSN` objects |
 | `/config`, `/records` | Config and record JSON |

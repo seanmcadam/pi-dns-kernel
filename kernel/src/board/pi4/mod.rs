@@ -220,6 +220,18 @@ impl Board for Pi4 {
         crate::fb_con::copy_vclog(out)
     }
 
+    fn hdmi_vclog_bytes() -> u32 {
+        crate::fb_con::vclog_bytes()
+    }
+
+    fn hdmi_vclog_status(out: &mut [u8]) -> usize {
+        crate::fb_con::copy_vclog_status(out)
+    }
+
+    fn hdmi_vclog_at(offset: u64, out: &mut [u8]) -> usize {
+        crate::fb_con::copy_vclog_at(offset, out)
+    }
+
     fn power(reset: bool) -> bool {
         watchdog_power(reset)
     }

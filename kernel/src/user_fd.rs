@@ -58,12 +58,16 @@
 //!      irq_rearms, tx_full, tx_slow. `dns_inflight` is the forward queue depth.
 //!  67  firmware(op, ...). Staged SD updates. Op 10 promotes, op 11 rolls back. See `fw::syscall`.
 //!  68  sd_status(buf, cap) -> 64. state[16], error[32], blocks u32, mounted u32.
-//!  69  hdmi_console(buf, cap) -> 736. Four little-endian u32s
+//!  69  hdmi_console(buf, cap) -> 836. Four little-endian u32s
 //!      (state, width, height, recoveries), then 80 bytes of `hdmi_diag`,
 //!      then 192 bytes of `hdmi_last_shut`, then 192 bytes of `hdmi_regs`,
-//!      then 16 bytes of `hdmi_port`, then 240 bytes of `vclog`. The
-//!      texts are NUL padded. State 0 none, 1 up, 2 fallback, 3 released.
-//!      Virt and Pi 5 return zeros and the text `none`.
+//!      then 16 bytes of `hdmi_port`, then 240 bytes of `vclog` (the first
+//!      line), then a little-endian u32 `vclog_bytes`, then 96 bytes of
+//!      `vclog_status`. The texts are NUL padded. State 0 none, 1 up,
+//!      2 fallback, 3 released. Virt and Pi 5 return zeros and `none`.
+//!  70  vclog_read(buf, cap, offset) -> n. The next bytes of the rendered
+//!      firmware log (`vclog -m`, then `vclog -a`). `cap` is at most 4096.
+//!      0 is the end. Virt and Pi 5 return 0.
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
@@ -128,6 +132,7 @@ const NET_EXTRA: u64 = 66;
 const FW: u64 = 67;
 const SD_STATUS: u64 = 68;
 const HDMI_CONSOLE: u64 = 69;
+const VCLOG_READ: u64 = 70;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -239,6 +244,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         FW => crate::fw::syscall(args),
         SD_STATUS => sd_status(args[0], args[1]),
         HDMI_CONSOLE => hdmi_console(args[0], args[1]),
+        VCLOG_READ => vclog_read(args[0], args[1], args[2]),
         _ => -1,
     };
     value as u64
@@ -1175,10 +1181,11 @@ fn config_remove(ptr: u64, len: u64) -> i64 {
 
 /// Four little-endian u32s, 80 bytes of `hdmi_diag`, 192 bytes of
 /// `hdmi_last_shut`, 192 bytes of `hdmi_regs`, 16 bytes of `hdmi_port`,
-/// then 240 bytes of `vclog`. State is 0 none, 1 up, 2 fallback, 3
-/// released. Virt and Pi 5 write zeros and `none`.
+/// 240 bytes of `vclog`, a u32 byte count, and 96 bytes of status.
+/// State is 0 none, 1 up, 2 fallback, 3 released. Virt and Pi 5 write
+/// zeros and `none`.
 fn hdmi_console(ptr: u64, cap: u64) -> i64 {
-    const N: usize = 736;
+    const N: usize = 836;
     if cap < N as u64 || !crate::mmu::user_write_ok(ptr, N as u64) {
         return EFAULT;
     }
@@ -1194,7 +1201,33 @@ fn hdmi_console(ptr: u64, cap: u64) -> i64 {
     let _ = crate::board::hdmi_regs(&mut raw[288..480]);
     let _ = crate::board::hdmi_port(&mut raw[480..496]);
     let _ = crate::board::hdmi_vclog(&mut raw[496..736]);
+    let bytes = crate::board::hdmi_vclog_bytes();
+    raw[736..740].copy_from_slice(&bytes.to_le_bytes());
+    let _ = crate::board::hdmi_vclog_status(&mut raw[740..836]);
     if write_user(ptr, &raw) { N as i64 } else { EFAULT }
+}
+
+fn vclog_read(ptr: u64, cap: u64, offset: u64) -> i64 {
+    let cap = cap.min(4096) as usize;
+    if cap == 0 || !crate::mmu::user_write_ok(ptr, cap as u64) {
+        return EFAULT;
+    }
+    let mut wrote = 0usize;
+    let mut off = offset;
+    while wrote < cap {
+        let mut chunk = [0u8; 512];
+        let want = (cap - wrote).min(chunk.len());
+        let n = crate::board::hdmi_vclog_at(off, &mut chunk[..want]);
+        if n == 0 {
+            break;
+        }
+        if !write_user(ptr + wrote as u64, &chunk[..n]) {
+            return EFAULT;
+        }
+        wrote += n;
+        off += n as u64;
+    }
+    wrote as i64
 }
 
 fn sd_status(ptr: u64, cap: u64) -> i64 {

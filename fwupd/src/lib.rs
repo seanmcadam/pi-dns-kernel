@@ -542,6 +542,8 @@ fn u32be(blob: &[u8], off: usize) -> Option<u32> {
 pub const VC_LOG_MAGIC: u32 = 0x564c_4f47;
 /// Message-log header. The fourcc is `MESS`.
 pub const VC_MSG_MAGIC: u32 = 0x5353_454d;
+/// Assert-log header. `vclog -a` checks this before the message log's `MESS`.
+pub const VC_ASSERT_MAGIC: u32 = 0x5452_5341;
 
 /// `/chosen/log` from a flattened device tree: VideoCore start and size,
 /// both big-endian, as `vclog` reads them. `None` if the node or the
@@ -635,6 +637,15 @@ pub fn vclog_msg_addr(toc: &[u8]) -> Option<u32> {
     u32_le(toc, 44)
 }
 
+/// VideoCore address of the assert log. Same table, the word before the
+/// message-log address (`vclog` `log_toc_t.assert_addr`).
+pub fn vclog_assert_addr(toc: &[u8]) -> Option<u32> {
+    if toc.len() < 56 || u32_le(toc, 0)? != VC_LOG_MAGIC {
+        return None;
+    }
+    u32_le(toc, 36)
+}
+
 /// `(start, end, write, read)` VideoCore addresses from a message-log
 /// header (`vclog` `log_hdr_t`).
 pub fn vclog_msg_range(hdr: &[u8]) -> Option<(u32, u32, u32, u32)> {
@@ -647,6 +658,267 @@ pub fn vclog_msg_range(hdr: &[u8]) -> Option<(u32, u32, u32, u32)> {
         u32_le(hdr, 12)?,
         u32_le(hdr, 16)?,
     ))
+}
+
+/// `(start, end, write, read)` from an assert-log header (`vclog -a`).
+pub fn vclog_assert_range(hdr: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    if hdr.len() < 20 || u32_le(hdr, 0)? != VC_ASSERT_MAGIC {
+        return None;
+    }
+    Some((
+        u32_le(hdr, 4)?,
+        u32_le(hdr, 8)?,
+        u32_le(hdr, 12)?,
+        u32_le(hdr, 16)?,
+    ))
+}
+
+/// One `vclog` render of a linear (already unwrapped) log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VclogRender {
+    /// Bytes written. A line that does not fit is left out entirely.
+    pub bytes: usize,
+    /// Lines written.
+    pub entries: u32,
+    /// Every byte of `src` was an entry, and every entry became a line.
+    pub complete: bool,
+}
+
+/// Used bytes of a circular log, oldest first. The bool is set when `out`
+/// could not hold the whole range from `read_off` to `write_off`.
+pub fn vclog_linearize(
+    ring: &[u8],
+    read_off: usize,
+    write_off: usize,
+    out: &mut [u8],
+) -> (usize, bool) {
+    if ring.is_empty() || read_off > ring.len() || write_off > ring.len() {
+        return (0, false);
+    }
+    let available = if write_off >= read_off {
+        write_off - read_off
+    } else {
+        ring.len() - read_off + write_off
+    };
+    let n = available.min(out.len());
+    let mut i = 0;
+    while i < n {
+        out[i] = ring[(read_off + i) % ring.len()];
+        i += 1;
+    }
+    (n, n < available)
+}
+
+/// `vclog -m` lines. `src` is the used range, oldest byte first, not the
+/// spare capacity of the ring. Each entry is one line:
+/// `SSSSSS.mmm: text`.
+pub fn vclog_render_messages(src: &[u8], out: &mut [u8]) -> VclogRender {
+    render_log(src, out, false)
+}
+
+/// `vclog -a` lines. Same ring layout as the message log. Each entry is
+/// `SSSSSS.mmm: assert( cond ) failed; file line N`.
+pub fn vclog_render_asserts(src: &[u8], out: &mut [u8]) -> VclogRender {
+    render_log(src, out, true)
+}
+
+fn render_log(src: &[u8], out: &mut [u8], assert_log: bool) -> VclogRender {
+    if src.is_empty() {
+        return VclogRender {
+            bytes: 0,
+            entries: 0,
+            complete: true,
+        };
+    }
+    let mut pos = 0usize;
+    let mut n = 0usize;
+    let mut entries = 0u32;
+    while pos + 8 <= src.len() {
+        let time = u32::from_le_bytes([src[pos], src[pos + 1], src[pos + 2], src[pos + 3]]);
+        let size = u16::from_le_bytes([src[pos + 6], src[pos + 7]]) as usize;
+        if size < 8 || pos + size > src.len() {
+            return VclogRender {
+                bytes: n,
+                entries,
+                complete: false,
+            };
+        }
+        let payload = &src[pos + 8..pos + size];
+        let wrote = if assert_log {
+            write_assert_line(time, payload, out, &mut n)
+        } else {
+            write_msg_line(time, payload, out, &mut n)
+        };
+        if !wrote {
+            return VclogRender {
+                bytes: n,
+                entries,
+                complete: false,
+            };
+        }
+        entries += 1;
+        pos += size;
+    }
+    VclogRender {
+        bytes: n,
+        entries,
+        complete: pos == src.len(),
+    }
+}
+
+fn write_msg_line(time: u32, payload: &[u8], out: &mut [u8], n: &mut usize) -> bool {
+    let text = if payload.len() > 4 { &payload[4..] } else { &[] };
+    let end = text.iter().position(|byte| *byte == 0).unwrap_or(text.len());
+    let text = &text[..end];
+    write_stamped(time, out, n, |dst, at| {
+        let at = copy_literal(b": ", dst, at);
+        finish_line(text, dst, at)
+    })
+}
+
+fn write_assert_line(time: u32, payload: &[u8], out: &mut [u8], n: &mut usize) -> bool {
+    let Some((file, line, cond)) = assert_parts(payload) else {
+        return false;
+    };
+    write_stamped(time, out, n, |dst, at| {
+        let mut i = at;
+        i = copy_literal(b": assert( ", dst, i);
+        i = copy_visible(cond, dst, i);
+        i = copy_literal(b" ) failed; ", dst, i);
+        i = copy_visible(file, dst, i);
+        i = copy_literal(b" line ", dst, i);
+        write_u_pad(dst, &mut i, line, 1);
+        if i >= dst.len() {
+            return i;
+        }
+        dst[i] = b'\n';
+        i + 1
+    })
+}
+
+fn assert_parts(payload: &[u8]) -> Option<(&[u8], u32, &[u8])> {
+    let file_len = payload.iter().position(|byte| *byte == 0)?;
+    let cond_at = file_len + 1 + 4;
+    if cond_at >= payload.len() {
+        return None;
+    }
+    let line = u32::from_le_bytes([
+        payload[file_len + 1],
+        payload[file_len + 2],
+        payload[file_len + 3],
+        payload[file_len + 4],
+    ]);
+    let cond = &payload[cond_at..];
+    let cond_end = cond.iter().position(|byte| *byte == 0).unwrap_or(cond.len());
+    Some((&payload[..file_len], line, &cond[..cond_end]))
+}
+
+/// `body` writes the text after the timestamp and returns the new length.
+/// The timestamp is `vclog`'s `%06i.%03i`. A line that does not fit is not
+/// started.
+fn write_stamped(time: u32, out: &mut [u8], n: &mut usize, body: impl FnOnce(&mut [u8], usize) -> usize) -> bool {
+    let start = *n;
+    let sec_len = digit_len(time / 1000).max(6);
+    let prefix = sec_len + 1 + 3;
+    if start + prefix > out.len() {
+        return false;
+    }
+    write_u_pad(out, n, time / 1000, 6);
+    if *n >= out.len() {
+        *n = start;
+        return false;
+    }
+    out[*n] = b'.';
+    *n += 1;
+    write_u_pad(out, n, time % 1000, 3);
+    let after = body(out, *n);
+    if after < *n || after > out.len() || after == *n || out.get(after - 1) != Some(&b'\n') {
+        *n = start;
+        return false;
+    }
+    *n = after;
+    true
+}
+
+fn copy_literal(literal: &[u8], dst: &mut [u8], at: usize) -> usize {
+    let mut i = 0;
+    let mut n = at;
+    while i < literal.len() {
+        if n >= dst.len() {
+            return n;
+        }
+        dst[n] = literal[i];
+        n += 1;
+        i += 1;
+    }
+    n
+}
+
+fn copy_visible(text: &[u8], dst: &mut [u8], at: usize) -> usize {
+    let mut i = 0;
+    let mut n = at;
+    while i < text.len() {
+        if n >= dst.len() {
+            return n;
+        }
+        let byte = text[i];
+        dst[n] = if byte.is_ascii_graphic() || byte == b' ' {
+            byte
+        } else {
+            b' '
+        };
+        n += 1;
+        i += 1;
+    }
+    n
+}
+
+fn finish_line(text: &[u8], dst: &mut [u8], at: usize) -> usize {
+    let n = copy_visible(text, dst, at);
+    if n >= dst.len() {
+        return n;
+    }
+    dst[n] = b'\n';
+    n + 1
+}
+
+fn digit_len(mut value: u32) -> usize {
+    let mut n = 1;
+    while value >= 10 {
+        value /= 10;
+        n += 1;
+    }
+    n
+}
+
+fn write_u_pad(out: &mut [u8], n: &mut usize, mut value: u32, width: usize) {
+    let mut digits = [0u8; 10];
+    let mut d = 0usize;
+    loop {
+        digits[d] = b'0' + (value % 10) as u8;
+        value /= 10;
+        d += 1;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut pad = width;
+    while pad > d {
+        if *n >= out.len() {
+            return;
+        }
+        out[*n] = b'0';
+        *n += 1;
+        pad -= 1;
+    }
+    while d > 0 {
+        d -= 1;
+        if *n >= out.len() {
+            return;
+        }
+        out[*n] = digits[d];
+        *n += 1;
+    }
 }
 
 /// Oldest firmware messages that fit in `out`. `buf` is the circular
@@ -1413,7 +1685,10 @@ mod fat {
 
 #[cfg(test)]
 mod fdt_tests {
-    use super::{bootloader_tryboot, chosen_log, vclog_msg_addr, vclog_msg_range, vclog_tail};
+    use super::{
+        bootloader_tryboot, chosen_log, vclog_assert_addr, vclog_linearize, vclog_msg_addr,
+        vclog_msg_range, vclog_render_asserts, vclog_render_messages, vclog_tail,
+    };
 
     fn be(n: u32) -> [u8; 4] {
         n.to_be_bytes()
@@ -1600,6 +1875,85 @@ mod fdt_tests {
         let mut out = [0u8; 64];
         let n = vclog_tail(&buf, 0, buf.len(), &mut out);
         assert_eq!(&out[..n], b"HDMI1:EDID | hdmi: clock off  x ");
+    }
+
+    fn push_entry(buf: &mut Vec<u8>, time_ms: u32, text: &str) {
+        let payload = 4 + text.len() + 1;
+        let size = 8 + payload;
+        buf.extend_from_slice(&time_ms.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(size as u16).to_le_bytes());
+        buf.extend_from_slice(&[9, 9, 9, 9]);
+        buf.extend_from_slice(text.as_bytes());
+        buf.push(0);
+    }
+
+    #[test]
+    fn vclog_renders_every_message_on_its_own_line() {
+        let mut buf = Vec::new();
+        push_entry(&mut buf, 1500, "HDMI1:EDID");
+        push_entry(&mut buf, 0, "hdmi: clock off \"x\"");
+        let mut out = [0u8; 128];
+        let got = vclog_render_messages(&buf, &mut out);
+        assert!(got.complete);
+        assert_eq!(got.entries, 2);
+        assert_eq!(
+            &out[..got.bytes],
+            b"000001.500: HDMI1:EDID\n000000.000: hdmi: clock off \"x\"\n"
+        );
+        let short = vclog_render_messages(&buf, &mut out[..12]);
+        assert!(!short.complete);
+        assert_eq!(short.entries, 0);
+        assert_eq!(short.bytes, 0);
+    }
+
+    #[test]
+    fn vclog_unwraps_the_ring_oldest_first() {
+        let mut older = Vec::new();
+        push_entry(&mut older, 1000, "older");
+        let mut newer = Vec::new();
+        push_entry(&mut newer, 2000, "newer");
+        let mut ring = vec![0u8; newer.len() + 8 + older.len()];
+        ring[..newer.len()].copy_from_slice(&newer);
+        let read_off = newer.len() + 8;
+        ring[read_off..read_off + older.len()].copy_from_slice(&older);
+        let write_off = newer.len();
+        let mut linear = [0u8; 64];
+        let (n, truncated) = vclog_linearize(&ring, read_off, write_off, &mut linear);
+        assert!(!truncated);
+        let mut text = [0u8; 128];
+        let got = vclog_render_messages(&linear[..n], &mut text);
+        assert!(got.complete);
+        assert_eq!(got.entries, 2);
+        assert_eq!(
+            &text[..got.bytes],
+            b"000001.000: older\n000002.000: newer\n"
+        );
+    }
+
+    #[test]
+    fn vclog_renders_an_assert_line() {
+        let mut toc = [0u8; 56];
+        toc[0..4].copy_from_slice(&0x564c_4f47u32.to_le_bytes());
+        toc[36..40].copy_from_slice(&0x2000u32.to_le_bytes());
+        assert_eq!(vclog_assert_addr(&toc), Some(0x2000));
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"hdmi.c\0");
+        payload.extend_from_slice(&42u32.to_le_bytes());
+        payload.extend_from_slice(b"hpd\0");
+        let mut buf = Vec::new();
+        let size = 8 + payload.len();
+        buf.extend_from_slice(&2500u32.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(size as u16).to_le_bytes());
+        buf.extend_from_slice(&payload);
+        let mut out = [0u8; 96];
+        let got = vclog_render_asserts(&buf, &mut out);
+        assert!(got.complete);
+        assert_eq!(
+            &out[..got.bytes],
+            b"000002.500: assert( hpd ) failed; hdmi.c line 42\n"
+        );
     }
 }
 
