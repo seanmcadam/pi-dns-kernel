@@ -160,8 +160,37 @@ pub fn call(op: u64, args: [u64; 5]) -> i64 {
             }
             0
         }
+        14 => clear_rows(args[0]),
         _ => -22,
     }
+}
+
+/// Drop a published list set. Lookups fail open until the process loads the
+/// lists that the new config still names.
+pub fn drop_lists() {
+    let _ = clear_rows(0);
+    let mut try_n = 0;
+    while try_n < 8 {
+        if begin() == 0 {
+            let _ = commit();
+            return;
+        }
+        try_n += 1;
+    }
+}
+
+fn clear_rows(from: u64) -> i64 {
+    let start = from as usize;
+    if start > URL_MAX {
+        return -22;
+    }
+    let mut rows = ROWS.lock();
+    let mut i = start;
+    while i < URL_MAX {
+        rows[i] = UrlRow::empty();
+        i += 1;
+    }
+    0
 }
 
 fn begin() -> i64 {

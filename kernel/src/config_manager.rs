@@ -124,7 +124,13 @@ static HDMI_CMD: AtomicU8 = AtomicU8::new(0);
 static HDMI_RESET: AtomicBool = AtomicBool::new(false);
 
 fn publish(config: &Config) {
+    let previous = CURRENT.lock().clone();
     crate::block_tab::set_allow(&config.block.allow);
+    if let Some(old) = previous.as_ref() {
+        if old.block.enabled != config.block.enabled || old.block.urls != config.block.urls {
+            crate::block_tab::drop_lists();
+        }
+    }
     BOARD_DETECT.store(config.board_detect, Ordering::Relaxed);
     NTP_SERVE.store(config.ntp.serve, Ordering::Relaxed);
     NTP_TOKEN.store(ntp_hash(&config.ntp), Ordering::Relaxed);
@@ -458,7 +464,7 @@ pub fn arm_net_pending() -> bool {
     if !static_mode {
         return false;
     }
-    if crate::fs::write_named("NET.PEND", b"static\n", false).is_err() {
+    if crate::fs::write_named("NET.PND", b"static\n", false).is_err() {
         log::info!("network config pending file failed");
         return false;
     }
@@ -476,7 +482,7 @@ pub fn poll_net_pending() {
     }
     let now = crate::timer::millis();
     if look == 0 {
-        let pending = crate::fs::read_text("NET.PEND").is_ok();
+        let pending = crate::fs::read_text("NET.PND").is_ok();
         if !pending {
             NET_LOOK.store(2, Ordering::Release);
             return;
@@ -505,7 +511,7 @@ pub fn poll_net_pending() {
     });
     match word {
         "hold" => {
-            let _ = crate::fs::delete_file("NET.PEND");
+            let _ = crate::fs::delete_file("NET.PND");
             NET_LOOK.store(2, Ordering::Release);
             log::info!("network config held");
         }
@@ -519,7 +525,7 @@ pub fn poll_net_pending() {
                     }
                 }
             }
-            let _ = crate::fs::delete_file("NET.PEND");
+            let _ = crate::fs::delete_file("NET.PND");
             NET_LOOK.store(2, Ordering::Release);
             log::info!("network config reverted");
             let _ = crate::board::power(true);
