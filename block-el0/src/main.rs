@@ -637,6 +637,9 @@ pub extern "C" fn rust_main() -> ! {
     let mut seen = [false; 8];
     let mut fresh = [false; 8];
     let mut stamp = [0i64; 8];
+    // A download that could not commit the table has to be published on a
+    // later pass. The config epoch does not change for that case.
+    let mut pending = false;
     loop {
         let now = time_ms();
         let unix = unix_now();
@@ -667,6 +670,7 @@ pub extern "C" fn rust_main() -> ! {
                 // The 60s hold belongs to the previous URL. A new list should
                 // download on this pass, not after that timer.
                 hold = [0; 8];
+                pending = false;
             }
         }
         if cfg.enabled && sys(NET_READY, 0, 0, 0, 0, 0, 0) == 1 {
@@ -720,12 +724,16 @@ pub extern "C" fn rust_main() -> ! {
             if changed {
                 cfg = load_cfg();
                 write_index(&cfg);
-                let _ = block(13, 1, 0, 0, 0, 0);
-                if let Some(next_counts) = publish(&cfg) {
-                    counts = next_counts;
-                    applied = Some(cfg.epoch);
-                    let _ = block(13, 2, 0, 0, 0, 0);
-                }
+                pending = true;
+            }
+        }
+        if pending {
+            let _ = block(13, 1, 0, 0, 0, 0);
+            if let Some(next_counts) = publish(&cfg) {
+                counts = next_counts;
+                applied = Some(cfg.epoch);
+                pending = false;
+                let _ = block(13, 2, 0, 0, 0, 0);
             }
         }
         if cfg.enabled {
