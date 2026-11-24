@@ -618,6 +618,11 @@ pub extern "C" fn rust_main() -> ! {
     let mut errors = [""; 8];
     let mut next = [0i64; 8];
     let mut hold = [0u64; 8];
+    // Directory time and the sidecar are read once. The steady loop then
+    // sleeps, so a DNS query is not queued behind a FAT stat.
+    let mut seen = [false; 8];
+    let mut fresh = [false; 8];
+    let mut stamp = [0i64; 8];
     loop {
         let now = time_ms();
         let unix = unix_now();
@@ -633,6 +638,9 @@ pub extern "C" fn rust_main() -> ! {
             let _ = block(13, 2, 0, 0, 0, 0);
             errors = [""; 8];
             next = [0; 8];
+            seen = [false; 8];
+            fresh = [false; 8];
+            stamp = [0; 8];
             // The 60s hold belongs to the previous URL. A new list should
             // download on this pass, not after that timer.
             hold = [0; 8];
@@ -643,16 +651,23 @@ pub extern "C" fn rust_main() -> ! {
             let mut changed = false;
             for (i, url) in cfg.urls.iter().enumerate().take(8) {
                 let name = list_name(url);
-                let mtime = file_mtime(&name);
-                let fresh = cache_complete(url);
-                let aged = mtime <= 0 || (unix > 0 && unix >= mtime.saturating_add(cfg.refresh));
+                if !seen[i] {
+                    stamp[i] = file_mtime(&name);
+                    fresh[i] = cache_complete(url);
+                    seen[i] = true;
+                    if stamp[i] > 0 && !fresh[i] && errors[i].is_empty() {
+                        errors[i] = "stale";
+                    }
+                }
+                let aged =
+                    stamp[i] <= 0 || (unix > 0 && unix >= stamp[i].saturating_add(cfg.refresh));
                 // A truncated cache is due even when its directory time is
                 // still inside the refresh window. HTTPS waits for a clock
                 // so the certificate can be checked.
                 let due = if url.starts_with("https://") {
-                    unix > 0 && (!fresh || aged)
+                    unix > 0 && (!fresh[i] || aged)
                 } else {
-                    !fresh || aged
+                    !fresh[i] || aged
                 };
                 if !due || (next[i] != 0 && (unix <= 0 || unix < next[i])) || now < hold[i] {
                     continue;
@@ -663,6 +678,9 @@ pub extern "C" fn rust_main() -> ! {
                         changed = true;
                         next[i] = 0;
                         hold[i] = now.saturating_add(60_000);
+                        stamp[i] = file_mtime(&name);
+                        fresh[i] = true;
+                        seen[i] = true;
                         log("block fetched\n");
                     }
                     Err(err) => {
@@ -684,14 +702,9 @@ pub extern "C" fn rust_main() -> ! {
             }
         }
         if cfg.enabled {
-            let cached = index_lines();
             for (i, url) in cfg.urls.iter().enumerate().take(8) {
                 let name = list_name(url);
-                let mtime = if cached.iter().any(|(file, _)| file == &name) {
-                    file_mtime(&name)
-                } else {
-                    0
-                };
+                let mtime = stamp[i];
                 let due = if mtime > 0 {
                     mtime.saturating_add(cfg.refresh)
                 } else if next[i] != 0 {

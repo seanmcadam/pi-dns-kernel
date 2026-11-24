@@ -539,6 +539,86 @@ pub fn commit(region: &mut [u8]) {
     write_u64(region, 8, published);
 }
 
+/// Two block tables in one region. Lookups read the active half. A rebuild
+/// writes the other half and flips only after that half is committed, so a
+/// probe never walks a table that is being zeroed.
+pub const PAIR_HEAD: usize = 8;
+
+fn pair_half_len(region_len: usize) -> Option<usize> {
+    if region_len < PAIR_HEAD + (HEADER + 8) * 2 {
+        return None;
+    }
+    let half = ((region_len - PAIR_HEAD) / 2) & !7;
+    if half < HEADER + 8 {
+        return None;
+    }
+    Some(half)
+}
+
+fn active_word(region: &[u8]) -> Option<&core::sync::atomic::AtomicU64> {
+    if region.len() < PAIR_HEAD || region.as_ptr() as usize % 8 != 0 {
+        return None;
+    }
+    Some(unsafe { &*region.as_ptr().cast::<core::sync::atomic::AtomicU64>() })
+}
+
+pub fn pair_active(region: &[u8]) -> u64 {
+    active_word(region)
+        .map(|word| word.load(core::sync::atomic::Ordering::Acquire) & 1)
+        .unwrap_or(0)
+}
+
+pub fn pair_inactive(region: &[u8]) -> u64 {
+    1 - pair_active(region)
+}
+
+pub fn pair_set_active(region: &mut [u8], index: u64) {
+    if region.len() < PAIR_HEAD || region.as_ptr() as usize % 8 != 0 {
+        return;
+    }
+    unsafe {
+        (*region.as_mut_ptr().cast::<core::sync::atomic::AtomicU64>())
+            .store(index & 1, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn pair_half(region: &[u8], index: u64) -> Option<&[u8]> {
+    let half = pair_half_len(region.len())?;
+    let start = PAIR_HEAD + (index as usize & 1) * half;
+    region.get(start..start + half)
+}
+
+pub fn pair_half_mut(region: &mut [u8], index: u64) -> Option<&mut [u8]> {
+    let half = pair_half_len(region.len())?;
+    let start = PAIR_HEAD + (index as usize & 1) * half;
+    region.get_mut(start..start + half)
+}
+
+/// Probe the published half. A flip during the probe fails open.
+pub fn pair_lookup(region: &[u8], name: &str) -> bool {
+    let active = pair_active(region);
+    let Some(half) = pair_half(region, active) else {
+        return false;
+    };
+    let hit = lookup(half, name);
+    if pair_active(region) != active {
+        return false;
+    }
+    hit
+}
+
+pub fn pair_count(region: &[u8]) -> u64 {
+    let active = pair_active(region);
+    let Some(half) = pair_half(region, active) else {
+        return 0;
+    };
+    let n = count(half);
+    if pair_active(region) != active {
+        return 0;
+    }
+    n
+}
+
 pub fn lookup(region: &[u8], name: &str) -> bool {
     let before = generation(region);
     if before == 0 || before % 2 != 0 {
@@ -829,6 +909,60 @@ not a domain line
         let issuer = cert_name(yr, false).expect("issuer");
         assert_eq!(subject, issuer);
         assert!(subject.windows(7).any(|window| window == b"Root YR"));
+    }
+
+    #[test]
+    fn a_rebuild_does_not_hide_the_published_half() {
+        let half = HEADER + 64;
+        let bytes = PAIR_HEAD + half * 2;
+        let (mut buf, offset) = aligned(bytes);
+        let region = &mut buf[offset..offset + bytes];
+        region.fill(0);
+        let inactive = pair_inactive(region);
+        {
+            let half = pair_half_mut(region, inactive).unwrap();
+            assert!(open_rebuild(half));
+            assert!(scrub(half, 0, usize::MAX).is_some());
+            assert!(insert(half, name_hash("ads.example")));
+            commit(half);
+        }
+        pair_set_active(region, inactive);
+        assert!(pair_lookup(region, "ads.example"));
+        assert_eq!(pair_count(region), 1);
+        let other = pair_inactive(region);
+        {
+            let half = pair_half_mut(region, other).unwrap();
+            assert!(open_rebuild(half));
+        }
+        let mut at = 0;
+        loop {
+            let (next, len) = {
+                let half = pair_half_mut(region, other).unwrap();
+                scrub(half, at, 3).unwrap()
+            };
+            assert!(
+                pair_lookup(region, "ads.example"),
+                "live half stays published"
+            );
+            if next >= len {
+                break;
+            }
+            at = next;
+        }
+        {
+            let half = pair_half_mut(region, other).unwrap();
+            assert!(insert(half, name_hash("other.example")));
+        }
+        assert!(pair_lookup(region, "ads.example"));
+        assert!(!pair_lookup(region, "other.example"));
+        {
+            let half = pair_half_mut(region, other).unwrap();
+            commit(half);
+        }
+        pair_set_active(region, other);
+        assert!(pair_lookup(region, "other.example"));
+        assert!(!pair_lookup(region, "ads.example"));
+        assert_eq!(pair_count(region), 1);
     }
 
     #[test]
