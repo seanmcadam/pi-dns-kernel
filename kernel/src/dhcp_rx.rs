@@ -316,6 +316,9 @@ pub fn verdict(frame: &[u8], mac: &[u8; 6]) -> Verdict {
         return Verdict::Ignore;
     }
     if frame[70..76] == *mac {
+        // The host fault-log crate compiles this file without the client.
+        #[cfg(target_os = "none")]
+        crate::ntp_client::note_bootreply(frame);
         Verdict::Pass
     } else {
         Verdict::DropChaddr

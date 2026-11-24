@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.84" qemu/boot-output.txt && \
+   grep -q "version 0.1.85" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.84"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.85"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -192,6 +192,7 @@ need = (
     "crash_count", "safe_mode", "last_crash",
     "boot_attempts", "boot_good", "fallback_active", "booted_kernel", "boot_stopped", "last_reset",
     "board", "board_revision", "board_source",
+    "time_synced", "utc", "last_sync", "ntp_server", "offset_ms", "stratum",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
 extra = (
@@ -250,6 +251,15 @@ for doc in (a, b):
     if doc["board"] != "virt" or doc["board_source"] != "build" or doc["board_revision"] != "":
         print("board", doc["board"], doc["board_source"], doc["board_revision"])
         sys.exit(1)
+    if doc["time_synced"] not in (0, 1) or not isinstance(doc["stratum"], int) or isinstance(doc["stratum"], bool):
+        print("time", doc["time_synced"], doc["stratum"])
+        sys.exit(1)
+    if not isinstance(doc["offset_ms"], int) or isinstance(doc["offset_ms"], bool):
+        print("offset", doc["offset_ms"])
+        sys.exit(1)
+    if not isinstance(doc["utc"], str) or not isinstance(doc["last_sync"], str) or not isinstance(doc["ntp_server"], str):
+        print("clock text", doc["utc"], doc["last_sync"], doc["ntp_server"])
+        sys.exit(1)
     if doc["sd_state"] != "absent" or doc["fs_mounted"] != 0 or doc["sd_mode"] != "none" or doc["sd_clock_hz"] != 0:
         print("diskless guest", doc["sd_state"], doc["fs_mounted"], doc["sd_error"], doc["sd_mode"], doc["sd_clock_hz"])
         sys.exit(1)
@@ -291,7 +301,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.84" not in html:
+if forced.get("version") != plain.get("version") or "0.1.85" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 print("status html", len(html), "json", plain.get("version"))
@@ -2245,12 +2255,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.84" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.85" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.84" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.85" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2266,7 +2276,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.84" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.85" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2513,12 +2523,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.84":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.85":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.84" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.85" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3647,6 +3657,150 @@ else
 fi
 kill "$BOOT_PID" 2>/dev/null || true
 wait "$BOOT_PID" 2>/dev/null || true
+
+echo ""
+echo "Test 63: SNTP syncs from a stub and answers one LAN query"
+NTP_STUB_PORT=18123
+NTP_HOST_PORT=18124
+NTP_HTTP_PORT=18080
+NTP_DNS_PORT=18053
+python3 - "$NTP_STUB_PORT" <<'PY' &
+import socket, struct, sys
+port = int(sys.argv[1])
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", port))
+unix = 1764000000
+delta = 2208988800
+secs = unix + delta
+while True:
+    data, addr = sock.recvfrom(512)
+    if len(data) < 48 or (data[0] & 7) != 3:
+        continue
+    pkt = bytearray(48)
+    pkt[0] = (4 << 3) | 4
+    pkt[1] = 2
+    pkt[2] = 6
+    pkt[12:16] = bytes([10, 0, 2, 2])
+    raw = struct.pack(">I", secs)
+    pkt[16:20] = raw
+    pkt[24:32] = data[40:48]
+    pkt[32:36] = raw
+    pkt[40:44] = raw
+    sock.sendto(pkt, addr)
+PY
+NTP_STUB_PID=$!
+sleep 0.2
+rm -f qemu/ntp-disk.img qemu/ntp-serial.txt
+dd if=/dev/zero of=qemu/ntp-disk.img bs=1M count=64 status=none
+sfdisk --quiet qemu/ntp-disk.img <<'EOF'
+label: dos
+start=2048, type=c
+EOF
+mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/ntp-disk.img >/dev/null
+NTP_OFF=$((2048 * 512))
+cat > /tmp/ntp-config.json <<EOF
+{"version":1,"network":{"mode":"dhcp","ip":"10.0.2.15","netmask":"255.255.255.0","gateway":"10.0.2.2","timeout_ms":3000},"dns":{"cache_size":1024,"cache_reap_interval_secs":5,"upstreams":["8.8.8.8","10.0.2.3"],"blocklist":[],"records":[{"name":"test.local","type":"A","value":"192.168.1.100","ttl":300}]},"http":{"port":80,"username":"admin","password":"admin"},"display":{"vnc":0,"vnc_port":5900,"vnc_password":"","hdmi":0},"ntp":{"servers":["10.0.2.2:${NTP_STUB_PORT}"],"interval_secs":30,"serve":1}}
+EOF
+mcopy -i qemu/ntp-disk.img@@${NTP_OFF} /tmp/ntp-config.json ::CONFIG.JSN
+NTP_FWD="hostfwd=udp::${NTP_DNS_PORT}-:53,hostfwd=tcp::${NTP_HTTP_PORT}-:80,hostfwd=udp::${NTP_HOST_PORT}-:123"
+timeout 90 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/ntp-serial.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${NTP_FWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/ntp-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-ntp.txt 2>&1 &
+NTP_PID=$!
+if python3 - "$NTP_HTTP_PORT" "$NTP_DNS_PORT" "$NTP_HOST_PORT" <<'PY'
+import json, socket, struct, subprocess, sys, time
+http, dns, ntp = sys.argv[1:]
+
+def status():
+    try:
+        raw = subprocess.check_output(
+            ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
+             "http://127.0.0.1:%s/json/status" % http],
+            stderr=subprocess.DEVNULL,
+        )
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def dig():
+    try:
+        return subprocess.check_output(
+            ["dig", "@127.0.0.1", "-p", dns, "test.local", "+short", "+time=2", "+tries=1"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        return str(exc)
+
+doc = None
+dns_ok = False
+for _ in range(40):
+    doc = status()
+    if doc is not None:
+        looked = dig()
+        if "192.168.1.100" not in looked:
+            print("dns", looked)
+            sys.exit(1)
+        dns_ok = True
+        if doc.get("time_synced") == 1 and "10.0.2.2" in doc.get("ntp_server", ""):
+            break
+    time.sleep(0.5)
+else:
+    print("status", doc, "dns", dns_ok)
+    sys.exit(1)
+if doc.get("stratum") != 2 or len(doc.get("utc") or "") != 20 or not str(doc.get("utc")).endswith("Z"):
+    print("clock", doc.get("stratum"), doc.get("utc"), doc.get("last_sync"), doc.get("offset_ms"))
+    sys.exit(1)
+if not isinstance(doc.get("offset_ms"), int) or isinstance(doc.get("offset_ms"), bool):
+    print("offset", doc.get("offset_ms"))
+    sys.exit(1)
+
+def once(payload, timeout):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.2)
+    sock.sendto(payload, ("127.0.0.1", int(ntp)))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            reply, _ = sock.recvfrom(128)
+        except socket.timeout:
+            continue
+        if len(reply) >= 48 and reply[24:32] == payload[40:48]:
+            return reply
+    return None
+
+query = bytearray(48)
+query[0] = (4 << 3) | 3
+query[40:44] = struct.pack(">I", 1)
+reply = once(query, 2)
+if reply is None or (reply[0] & 7) != 4 or reply[1] != 3:
+    print("reply", None if reply is None else reply[:16].hex())
+    sys.exit(1)
+query[40] ^= 1
+if once(query, 0.6) is not None:
+    print("rate limit answered")
+    sys.exit(1)
+print("synced", doc.get("utc"), "stratum", doc.get("stratum"), "offset", doc.get("offset_ms"))
+sys.exit(0)
+PY
+then
+    echo "✓ SNTP synced, DNS still answered, and the LAN server is rate limited"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ SNTP sync failed"
+    tail -40 qemu/ntp-serial.txt 2>/dev/null || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+kill "$NTP_PID" "$NTP_STUB_PID" 2>/dev/null || true
+wait "$NTP_PID" 2>/dev/null || true
+wait "$NTP_STUB_PID" 2>/dev/null || true
 
 # Summary
 echo ""

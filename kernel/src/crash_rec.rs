@@ -26,7 +26,9 @@ const NAME_MAX: usize = 16;
 const ID_MAX: usize = 32;
 
 /// Full record size. A loop-only slot is [`LOOP_LEN`] bytes.
-pub const RECORD_LEN: usize = 1328;
+/// 1328 is the previous layout, still accepted. 1336 adds `unix_secs`.
+pub const RECORD_LEN_V1: usize = 1328;
+pub const RECORD_LEN: usize = 1336;
 
 pub fn kind_name(kind: u16) -> &'static str {
     match kind {
@@ -108,6 +110,8 @@ pub struct Draft<'a> {
     pub summary: &'a [u8],
     pub version: &'a [u8],
     pub boot_id: &'a [u8],
+    /// Unix seconds at the crash, or 0 when the clock was not synced.
+    pub unix_secs: u64,
 }
 
 pub struct Record {
@@ -133,6 +137,7 @@ pub struct Record {
     pub version_n: usize,
     pub boot_id: [u8; ID_MAX],
     pub boot_n: usize,
+    pub unix_secs: u64,
 }
 
 /// `None` when the slot is empty, short, or the checksum does not match.
@@ -147,7 +152,7 @@ pub fn load_loop(raw: &[u8]) -> Option<LoopState> {
     if len < LOOP_LEN || len as usize > raw.len() {
         return None;
     }
-    if len != LOOP_LEN && len as usize != RECORD_LEN {
+    if len != LOOP_LEN && len as usize != RECORD_LEN && len as usize != RECORD_LEN_V1 {
         return None;
     }
     if read_u32(raw, OFF_SUM) != checksum(&raw[..len as usize]) {
@@ -162,7 +167,8 @@ pub fn load_loop(raw: &[u8]) -> Option<LoopState> {
 
 pub fn load_record(raw: &[u8]) -> Option<Record> {
     let state = load_loop(raw)?;
-    if read_u32(raw, 8) as usize != RECORD_LEN || raw.len() < RECORD_LEN {
+    let len = read_u32(raw, 8) as usize;
+    if (len != RECORD_LEN && len != RECORD_LEN_V1) || raw.len() < len {
         return None;
     }
     let kind = read_u16(raw, 6);
@@ -197,6 +203,11 @@ pub fn load_record(raw: &[u8]) -> Option<Record> {
     version[..ver_n].copy_from_slice(&raw[1276..1276 + ver_n]);
     let mut boot_id = [0u8; ID_MAX];
     boot_id[..id_n].copy_from_slice(&raw[1296..1296 + id_n]);
+    let unix_secs = if len >= RECORD_LEN {
+        read_u64(raw, RECORD_LEN_V1)
+    } else {
+        0
+    };
     Some(Record {
         state,
         kind,
@@ -220,6 +231,7 @@ pub fn load_record(raw: &[u8]) -> Option<Record> {
         version_n: ver_n,
         boot_id,
         boot_n: id_n,
+        unix_secs,
     })
 }
 
@@ -282,6 +294,7 @@ pub fn store_record(raw: &mut [u8], draft: &Draft<'_>) -> bool {
     let id_n = draft.boot_id.len().min(ID_MAX);
     write_u32(raw, 1292, id_n as u32);
     raw[1296..1296 + id_n].copy_from_slice(&draft.boot_id[..id_n]);
+    write_u64(raw, RECORD_LEN_V1, draft.unix_secs);
     let sum = checksum(&raw[..RECORD_LEN]);
     write_u32(raw, OFF_SUM, sum);
     true
@@ -297,6 +310,14 @@ pub fn render(view: &Record, out: &mut [u8]) -> usize {
     n = push(out, n, kind_name(view.kind).as_bytes());
     n = push(out, n, b"\nuptime_ms ");
     n = push_dec(out, n, view.uptime_ms);
+    if view.unix_secs > 0 {
+        let mut utc = [0u8; 20];
+        let utc_n = ntp::format_utc(view.unix_secs as i64, &mut utc);
+        if utc_n == 20 {
+            n = push(out, n, b"\nutc ");
+            n = push(out, n, &utc[..utc_n]);
+        }
+    }
     n = push(out, n, b"\ncore ");
     n = push_dec(out, n, view.core as u64);
     n = push(out, n, b"\nesr ");
@@ -484,6 +505,7 @@ mod tests {
             summary: b"data abort ec=25",
             version: b"0.1.81",
             boot_id: b"pi4dns-boot-id:0.1.81",
+            unix_secs: 0,
         };
         let mut raw = [0u8; SLOT];
         assert!(store_record(&mut raw, &draft));

@@ -1,0 +1,11 @@
+[package]
+name = "ntp"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []

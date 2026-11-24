@@ -120,6 +120,7 @@ dependencies = [
 name = "fault-log"
 version = "0.1.0"
 dependencies = [
+ "ntp",
  "smoltcp",
 ]
 
@@ -184,6 +185,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
+name = "ntp"
+version = "0.1.0"
+
+[[package]]
 name = "pi4-dns-kernel"
 version = "0.1.0"
 dependencies = [
@@ -197,6 +202,7 @@ dependencies = [
  "fwupd",
  "heapless",
  "log",
+ "ntp",
  "smoltcp",
  "spin",
  "tock-registers 0.9.0",

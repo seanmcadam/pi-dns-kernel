@@ -33,6 +33,8 @@ struct DhcpClient {
 
 /// How long to wait for a PHY link before the configured DHCP timeout runs.
 const LINK_HOLD_MS: u64 = 15_000;
+/// Subnet, router, DNS, and NTP. The NTP option is 42.
+const DHCP_PARAMS: &[u8] = &[1, 3, 6, 42];
 
 /// 0 absent, 1 waiting, 2 leased, 3 fallback, 4 static.
 static DHCP_PHASE: AtomicU8 = AtomicU8::new(0);
@@ -139,6 +141,7 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
             // to give up at 3 s, so the wire saw one frame and then the
             // static address. One second here, four seconds below.
             let mut dhcp = dhcpv4::Socket::new();
+            dhcp.set_parameter_request_list(DHCP_PARAMS);
             let mut retry = dhcpv4::RetryConfig::default();
             retry.discover_timeout = Duration::from_secs(1);
             retry.initial_request_timeout = Duration::from_secs(1);
@@ -189,8 +192,8 @@ pub fn polling_here() -> bool {
 
 pub(crate) fn poll_device(state: &mut NetworkState) {
     poll_device_inner(state);
-    // The handler masks the GENET line. Arm it only after the receive
-    // above has drained frames that arrived while it was masked.
+    // After the stack has taken frames. One SNTP step, then the line is armed.
+    crate::ntp_client::drive(&mut state.stack, &mut state.device);
     crate::board::arm_nic();
 }
 
@@ -325,6 +328,7 @@ fn poll_device_inner(state: &mut NetworkState) {
             console_line_ip("[OK] DHCP gateway", gateway);
         }
         DhcpAction::Timeout => {
+            crate::ntp_client::clear_dhcp();
             crate::config_manager::note_dhcp_dns(&[]);
             state.stack.sockets_mut().remove(handle);
             state

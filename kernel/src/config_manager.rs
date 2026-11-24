@@ -17,6 +17,14 @@ pub struct Config {
     pub timeout_ms: u64,
     /// `board.detect`. Missing means on. Off reports the build-time board.
     pub board_detect: bool,
+    pub ntp: NtpConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct NtpConfig {
+    pub servers: Vec<String>,
+    pub interval_secs: u64,
+    pub serve: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,8 +116,133 @@ static HDMI_RESET: AtomicBool = AtomicBool::new(false);
 
 fn publish(config: &Config) {
     BOARD_DETECT.store(config.board_detect, Ordering::Relaxed);
+    NTP_SERVE.store(config.ntp.serve, Ordering::Relaxed);
+    NTP_TOKEN.store(ntp_hash(&config.ntp), Ordering::Relaxed);
     #[cfg(feature = "board-pi4")]
     HDMI_RESET.store(config.display.hdmi_reset, Ordering::Relaxed);
+}
+
+static NTP_SERVE: AtomicBool = AtomicBool::new(true);
+static NTP_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn ntp_serve() -> bool {
+    NTP_SERVE.load(Ordering::Relaxed)
+}
+
+pub struct NtpView {
+    pub servers: [[u8; 64]; 4],
+    pub lens: [u8; 4],
+    pub ports: [u16; 4],
+    pub ips: [[u8; 4]; 4],
+    pub have_ip: [bool; 4],
+    pub count: u8,
+    pub interval_secs: u64,
+    pub serve: bool,
+    pub token: u64,
+}
+
+pub fn ntp_view() -> NtpView {
+    let current = CURRENT.lock();
+    let ntp = current.as_ref().map(|config| &config.ntp);
+    let mut view = NtpView {
+        servers: [[0; 64]; 4],
+        lens: [0; 4],
+        ports: [123; 4],
+        ips: [[0; 4]; 4],
+        have_ip: [false; 4],
+        count: 0,
+        interval_secs: config::NTP_INTERVAL_DEFAULT,
+        serve: true,
+        token: NTP_TOKEN.load(Ordering::Relaxed),
+    };
+    let Some(ntp) = ntp else {
+        return view;
+    };
+    view.interval_secs = ntp.interval_secs;
+    view.serve = ntp.serve;
+    view.token = ntp_hash(ntp);
+    for server in &ntp.servers {
+        if view.count as usize >= view.servers.len() {
+            break;
+        }
+        let Some(parsed) = config::parse_ntp_server(server) else {
+            continue;
+        };
+        let index = view.count as usize;
+        let bytes = parsed.host.as_bytes();
+        let n = bytes.len().min(view.servers[index].len());
+        view.servers[index][..n].copy_from_slice(&bytes[..n]);
+        view.lens[index] = n as u8;
+        view.ports[index] = parsed.port;
+        if let Some(ip) = parsed.ip {
+            view.ips[index] = ip;
+            view.have_ip[index] = true;
+        }
+        view.count += 1;
+    }
+    view
+}
+
+pub fn copy_resolvers(out: &mut [[u8; 4]]) -> usize {
+    let current = CURRENT.lock();
+    let Some(config) = current.as_ref() else {
+        return 0;
+    };
+    let mut nout = 0;
+    let mut seen = [[0u8; 4]; 8];
+    let mut nseen = 0usize;
+    let lease = LEASE_IP.load(Ordering::Relaxed).to_be_bytes();
+    let mut index = 0;
+    while index < DHCP_DNS.len() && nout < out.len() {
+        let raw = DHCP_DNS[index].load(Ordering::Relaxed);
+        index += 1;
+        if raw == 0 {
+            continue;
+        }
+        let ip = raw.to_be_bytes();
+        if crate::dhcp_rx::omit_slirp_dns(ip, lease) || seen[..nseen].contains(&ip) {
+            continue;
+        }
+        out[nout] = ip;
+        nout += 1;
+        if nseen < seen.len() {
+            seen[nseen] = ip;
+            nseen += 1;
+        }
+    }
+    for ip in &config.dns.upstreams {
+        if nout >= out.len() {
+            break;
+        }
+        if crate::dhcp_rx::omit_slirp_dns(*ip, lease) || seen[..nseen].contains(ip) {
+            continue;
+        }
+        out[nout] = *ip;
+        nout += 1;
+        if nseen < seen.len() {
+            seen[nseen] = *ip;
+            nseen += 1;
+        }
+    }
+    nout
+}
+
+fn ntp_hash(ntp: &NtpConfig) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for server in &ntp.servers {
+        for byte in server.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    for byte in ntp.interval_secs.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash ^= u64::from(ntp.serve);
+    hash
 }
 
 /// `board.detect` from JSON. Missing means the build still reads the revision.
@@ -922,6 +1055,18 @@ fn default_config() -> Config {
         },
         timeout_ms: 3_000,
         board_detect: crate::board_rev::DETECT_DEFAULT,
+        ntp: default_ntp(),
+    }
+}
+
+fn default_ntp() -> NtpConfig {
+    NtpConfig {
+        servers: config::NTP_DEFAULT_SERVERS
+            .iter()
+            .map(|server| String::from(*server))
+            .collect(),
+        interval_secs: config::NTP_INTERVAL_DEFAULT,
+        serve: true,
     }
 }
 
@@ -1181,6 +1326,36 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
             config::VNC_PASS_MAX
         ));
     }
+    let ntp = match value.get("ntp") {
+        None => default_ntp(),
+        Some(ntp) => {
+            let mut servers = Vec::new();
+            if let Some(items) = ntp.get("servers").and_then(Value::as_array) {
+                for (index, item) in items.iter().enumerate() {
+                    let text = item.as_str().unwrap_or("");
+                    if config::parse_ntp_server(text).is_none() {
+                        return Err(alloc::format!(
+                            "ntp.servers[{index}]: expected host or ipv4"
+                        ));
+                    }
+                    servers.push(text.to_string());
+                }
+            }
+            if servers.is_empty() {
+                return Err(String::from("ntp.servers: missing field"));
+            }
+            let interval_secs = ntp
+                .get("interval_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(config::NTP_INTERVAL_DEFAULT);
+            let serve = ntp.get("serve").and_then(Value::as_u64).unwrap_or(1) != 0;
+            NtpConfig {
+                servers,
+                interval_secs,
+                serve,
+            }
+        }
+    };
     let network = if mode == "dhcp" {
         NetworkMode::Dhcp {
             fallback_ip: ip,
@@ -1219,6 +1394,7 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         },
         timeout_ms,
         board_detect,
+        ntp,
     })
 }
 
@@ -1474,6 +1650,24 @@ fn config_value(config: &Config) -> Value {
             Value::Object(display_fields(config)),
         ),
     ];
+    let mut ntp_servers = Vec::new();
+    for server in &config.ntp.servers {
+        ntp_servers.push(Value::String(server.clone()));
+    }
+    fields.push((
+        String::from("ntp"),
+        Value::Object(vec![
+            (String::from("servers"), Value::Array(ntp_servers)),
+            (
+                String::from("interval_secs"),
+                Value::Number(config.ntp.interval_secs),
+            ),
+            (
+                String::from("serve"),
+                Value::Number(u64::from(config.ntp.serve)),
+            ),
+        ]),
+    ));
     if !config.board_detect {
         fields.push((
             String::from("board"),

@@ -43,13 +43,14 @@ struct Clock;
 
 impl TimeSource for Clock {
     fn get_timestamp(&self) -> Timestamp {
+        let (year, month, day, hours, minutes, seconds) = crate::clock::fat_parts();
         Timestamp {
-            year_since_1970: 56,
-            zero_indexed_month: 10,
-            zero_indexed_day: 4,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
+            year_since_1970: (year - 1970) as u8,
+            zero_indexed_month: month - 1,
+            zero_indexed_day: day - 1,
+            hours,
+            minutes,
+            seconds,
         }
     }
 }
