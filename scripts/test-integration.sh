@@ -4029,6 +4029,7 @@ raw = subprocess.check_output(
      "http://127.0.0.1:%s/config/file/config" % http],
     stderr=subprocess.DEVNULL,
 )
+original = json.loads(raw)
 stored = json.loads(raw)
 stored.pop("block", None)
 subprocess.check_output(
@@ -4053,7 +4054,52 @@ else:
 if dig("test.local") != "192.168.1.100":
     print("local after clear", dig("test.local"))
     sys.exit(1)
-print("blocked", doc.get("block_domains"), "mtime", listed[0].get("mtime"), "allow", plain, "crash", listed_crash.decode().strip())
+
+def post_config(doc):
+    subprocess.check_output(
+        ["curl", "-sf", "-u", "admin:admin", "--max-time", "5",
+         "-H", "Content-Type: application/json",
+         "--data-binary", json.dumps(doc),
+         "http://127.0.0.1:%s/config/file/config" % http],
+        stderr=subprocess.DEVNULL,
+    )
+
+def wait_lists(present):
+    for _ in range(40):
+        snap = status()
+        urls = (snap or {}).get("block_urls") or []
+        domains = (snap or {}).get("block_domains")
+        if present and snap and domains >= 2 and urls:
+            return snap
+        if not present and snap and urls == [] and domains == 0:
+            return snap
+        time.sleep(0.5)
+    return None
+
+# A new URL each cycle forces a new download. Parked sockets are reused,
+# so the heap after the later cycles stays with the first one.
+base_url = original["block"]["urls"][0]
+used = []
+for cycle in range(3):
+    again = json.loads(json.dumps(original))
+    again["block"]["urls"] = [base_url + "?n=%d" % cycle]
+    post_config(again)
+    if wait_lists(True) is None:
+        print("reload", cycle)
+        sys.exit(1)
+    post_config(stored)
+    snap = wait_lists(False)
+    if snap is None:
+        print("reclear", cycle)
+        sys.exit(1)
+    used.append(snap["heap_used"])
+    if snap["heap_used"] > snap["heap_peak"] or snap["heap_peak"] > snap["heap_size"]:
+        print("heap water", snap["heap_used"], snap["heap_peak"], snap["heap_size"])
+        sys.exit(1)
+if used[-1] > used[0] + 8192:
+    print("heap grew", used)
+    sys.exit(1)
+print("blocked", doc.get("block_domains"), "mtime", listed[0].get("mtime"), "allow", plain, "crash", listed_crash.decode().strip(), "heap", used)
 sys.exit(0)
 PY
 then

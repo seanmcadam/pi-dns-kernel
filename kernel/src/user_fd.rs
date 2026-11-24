@@ -1144,8 +1144,11 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
 }
 
 /// Socket buffers are parked here on teardown and taken again the next time
-/// a port is bound, so a restart does not allocate another set. Touched only
-/// from the network owner.
+/// a port is bound, so a restart does not allocate another set. A block-list
+/// download parks the TCP buffers it used. The pools are capped, and the
+/// next download takes a parked socket instead of allocating another, so
+/// repeating an add/remove cycle does not grow the heap. Touched only from
+/// the network owner.
 const TCP_POOL: usize = 64;
 const UDP_POOL: usize = 16;
 static mut TCP_POOL_H: [Option<SocketHandle>; TCP_POOL] = [None; TCP_POOL];
