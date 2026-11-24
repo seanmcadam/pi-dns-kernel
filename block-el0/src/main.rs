@@ -275,55 +275,45 @@ fn resolvers(out: &mut [[u8; 4]]) -> usize {
     ntp::parse_resolvers(&buf[..end], out)
 }
 
-fn load_file(name: &str) -> u32 {
+fn read_soft(name: &str, off: u64, buf: &mut [u8]) -> i64 {
+    let mut tries = 0;
+    loop {
+        let n = file_read(name, off, buf);
+        if n >= 0 || tries >= 4 {
+            return n;
+        }
+        tries += 1;
+        let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+fn load_file(name: &str) -> Result<u32, &'static str> {
     let mut off = 0u64;
     let mut chunk = [0u8; 1024];
-    let mut hold = [0u8; 300];
-    let mut hold_n = 0usize;
+    let mut split = blocklist::LineSplit::new();
     let mut count = 0u32;
     loop {
-        let n = file_read(name, off, &mut chunk);
+        let n = read_soft(name, off, &mut chunk);
         if n < 0 {
-            break;
+            return Err("disk");
         }
         if n == 0 || count >= blocklist::LIST_MAX_ENTRIES as u32 {
             break;
         }
         off += n as u64;
-        let bytes = &chunk[..n as usize];
-        let mut start = 0;
-        for (i, byte) in bytes.iter().enumerate() {
-            if *byte != b'\n' {
-                continue;
-            }
-            if hold_n > 0 {
-                let room = hold.len() - hold_n;
-                let take = i.min(room);
-                hold[hold_n..hold_n + take].copy_from_slice(&bytes[..take]);
-                count += feed_line(&hold[..hold_n + take]);
-                hold_n = 0;
-            } else {
-                count += feed_line(&bytes[start..i]);
-            }
-            start = i + 1;
-        }
-        let tail = &bytes[start..];
-        if hold_n + tail.len() <= hold.len() {
-            hold[hold_n..hold_n + tail.len()].copy_from_slice(tail);
-            hold_n += tail.len();
-        } else {
-            hold_n = 0;
-        }
+        split.push(&chunk[..n as usize], |line| {
+            count = count.saturating_add(feed_line(line));
+        });
         if off > blocklist::LIST_MAX_BYTES as u64 {
             break;
         }
         // Back to the owner so a query is not stuck behind the rest of the file.
         let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
     }
-    if hold_n > 0 {
-        count += feed_line(&hold[..hold_n]);
-    }
-    count
+    split.finish(|line| {
+        count = count.saturating_add(feed_line(line));
+    });
+    Ok(count)
 }
 
 fn list_name(url: &str) -> alloc::string::String {
@@ -337,11 +327,28 @@ fn feed_line(line: &[u8]) -> u32 {
     };
     let mut added = 0u32;
     blocklist::parse_line(text, |name| {
-        if block(1, blocklist::name_hash(name), 0, 0, 0, 0) == 1 {
+        if insert_name(name) {
             added += 1;
         }
     });
     added
+}
+
+fn insert_name(name: &str) -> bool {
+    let hash = blocklist::name_hash(name);
+    let mut tries = 0;
+    loop {
+        match block(1, hash, 0, 0, 0, 0) {
+            1 => return true,
+            // The lookup path holds the table lock for one probe. Retry
+            // instead of dropping the name.
+            -11 if tries < 8 => {
+                tries += 1;
+                let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn index_lines() -> Vec<(alloc::string::String, alloc::string::String)> {
@@ -402,7 +409,13 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
         for (i, url) in cfg.urls.iter().enumerate().take(8) {
             let name = list_name(url);
             if cached.iter().any(|(file, _)| file == &name) {
-                counts[i] = load_file(&name);
+                match load_file(&name) {
+                    Ok(n) => counts[i] = n,
+                    // A short read must not be reported as a full list. The
+                    // generation is still committed below so lookups are not
+                    // left fail-open until the next refresh.
+                    Err(_) => counts[i] = 0,
+                }
             }
         }
     }
@@ -447,11 +460,11 @@ fn fnv(data: &[u8], hash: u64) -> u64 {
 fn names_in_temp() -> Result<u32, &'static str> {
     let mut off = 0u64;
     let mut chunk = [0u8; 1024];
-    let mut hold = [0u8; 300];
-    let mut hold_n = 0usize;
+    let mut split = blocklist::LineSplit::new();
     let mut count = 0u32;
+    let mut failed = false;
     loop {
-        let n = file_read(TEMP, off, &mut chunk);
+        let n = read_soft(TEMP, off, &mut chunk);
         if n < 0 {
             return Err("disk");
         }
@@ -459,40 +472,20 @@ fn names_in_temp() -> Result<u32, &'static str> {
             break;
         }
         off += n as u64;
-        let bytes = &chunk[..n as usize];
-        let mut start = 0usize;
-        for (i, byte) in bytes.iter().enumerate() {
-            if *byte != b'\n' {
-                continue;
-            }
-            let line = if hold_n > 0 {
-                let room = hold.len() - hold_n;
-                let take = i.min(room);
-                hold[hold_n..hold_n + take].copy_from_slice(&bytes[..take]);
-                let n = hold_n + take;
-                hold_n = 0;
-                &hold[..n]
-            } else {
-                &bytes[start..i]
-            };
+        split.push(&chunk[..n as usize], |line| {
             count = count.saturating_add(names_in_line(line));
             if count > blocklist::LIST_MAX_ENTRIES as u32 {
-                return Ok(count);
+                failed = true;
             }
-            start = i + 1;
-        }
-        let tail = &bytes[start..];
-        if hold_n + tail.len() <= hold.len() {
-            hold[hold_n..hold_n + tail.len()].copy_from_slice(tail);
-            hold_n += tail.len();
-        } else {
-            hold_n = 0;
+        });
+        if failed {
+            return Ok(count);
         }
         let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
     }
-    if hold_n > 0 {
-        count = count.saturating_add(names_in_line(&hold[..hold_n]));
-    }
+    split.finish(|line| {
+        count = count.saturating_add(names_in_line(line));
+    });
     Ok(count)
 }
 
@@ -510,13 +503,14 @@ fn read_back(expect: u64, len: u64) -> bool {
     let mut got = 0u64;
     let mut buf = [0u8; 1024];
     while got < len {
-        let n = file_read(TEMP, got, &mut buf);
+        let n = read_soft(TEMP, got, &mut buf);
         if n <= 0 {
             return false;
         }
         let take = (n as u64).min(len - got) as usize;
         check = fnv(&buf[..take], check);
         got += take as u64;
+        let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
     }
     check == expect
 }

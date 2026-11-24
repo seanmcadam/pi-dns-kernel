@@ -151,6 +151,141 @@ pub fn feed(text: &str, mut emit: impl FnMut(&str)) -> usize {
     count
 }
 
+/// Bytes kept when a line is split across reads. A hosts name is at most
+/// 253 bytes, and `0.0.0.0 ` in front of it still fits. A longer line is
+/// skipped through its newline so the next line is not lost with it.
+pub const LINE_HOLD: usize = 512;
+
+pub struct LineSplit {
+    hold: [u8; LINE_HOLD],
+    n: usize,
+    skip: bool,
+}
+
+impl LineSplit {
+    pub const fn new() -> Self {
+        Self {
+            hold: [0; LINE_HOLD],
+            n: 0,
+            skip: false,
+        }
+    }
+
+    /// Emit every complete line in `chunk`. A trailing fragment stays
+    /// buffered until [`Self::finish`] or the next chunk.
+    pub fn push(&mut self, chunk: &[u8], mut emit: impl FnMut(&[u8])) {
+        let mut i = 0;
+        while i < chunk.len() {
+            if self.skip {
+                match chunk[i..].iter().position(|byte| *byte == b'\n') {
+                    Some(rel) => {
+                        self.skip = false;
+                        i += rel + 1;
+                    }
+                    None => return,
+                }
+                continue;
+            }
+            match chunk[i..].iter().position(|byte| *byte == b'\n') {
+                Some(rel) => {
+                    let end = i + rel;
+                    self.emit_line(&chunk[i..end], &mut emit);
+                    i = end + 1;
+                }
+                None => {
+                    self.keep(&chunk[i..]);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn finish(&mut self, mut emit: impl FnMut(&[u8])) {
+        if !self.skip && self.n > 0 {
+            let n = self.n;
+            self.n = 0;
+            emit(&self.hold[..n]);
+        }
+        self.n = 0;
+        self.skip = false;
+    }
+
+    fn emit_line(&mut self, tail: &[u8], emit: &mut impl FnMut(&[u8])) {
+        if self.n == 0 {
+            emit(tail);
+            return;
+        }
+        if self.n + tail.len() <= self.hold.len() {
+            let n = self.n;
+            self.hold[n..n + tail.len()].copy_from_slice(tail);
+            self.n = 0;
+            emit(&self.hold[..n + tail.len()]);
+        } else {
+            self.n = 0;
+        }
+    }
+
+    fn keep(&mut self, tail: &[u8]) {
+        if self.n + tail.len() <= self.hold.len() {
+            self.hold[self.n..self.n + tail.len()].copy_from_slice(tail);
+            self.n += tail.len();
+        } else {
+            self.n = 0;
+            self.skip = true;
+        }
+    }
+}
+
+/// How a download read ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadEnd {
+    /// TCP EOF or a TLS close_notify.
+    Clean,
+    /// Timeout or a broken stream. The bytes so far are not a whole body.
+    Fail,
+}
+
+/// `true` when `got` is a complete HTTP body.
+///
+/// A short read against Content-Length is incomplete even on a clean close.
+/// A failure is incomplete even when the server never sent a length. Callers
+/// that already have every Content-Length byte can stop before this.
+pub fn body_complete(content_length: Option<usize>, got: usize, end: ReadEnd) -> bool {
+    match end {
+        ReadEnd::Fail => false,
+        ReadEnd::Clean => match content_length {
+            Some(n) => got >= n,
+            None => true,
+        },
+    }
+}
+
+/// `Content-Length` from a header block, if the field is present and numeric.
+pub fn content_length(headers: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < headers.len() {
+        let end = headers[i..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|rel| i + rel)
+            .unwrap_or(headers.len());
+        let mut line = &headers[i..end];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        let key = b"content-length:";
+        if line.len() >= key.len() && line[..key.len()].eq_ignore_ascii_case(key) {
+            let text = core::str::from_utf8(line[key.len()..].trim_ascii()).ok()?;
+            return text.parse().ok();
+        }
+        if end == headers.len() {
+            break;
+        }
+        i = end + 1;
+    }
+    None
+}
+
 /// `true` only for a stable published hit. Down, loading, and a generation
 /// that moves during the probe all return false so DNS answers normally.
 pub fn fail_open(gen_before: u64, gen_after: u64, hit: bool) -> bool {
@@ -455,6 +590,76 @@ not a domain line
                 "plain.example.com"
             ]
         );
+    }
+
+    #[test]
+    fn hosts_split_across_chunk_boundaries_match_one_feed() {
+        let mut body = String::new();
+        let mut i = 0;
+        while i < 20_000 {
+            if i % 17 == 0 {
+                body.push_str("# a comment that is not a name\r\n");
+            } else if i % 19 == 0 {
+                body.push('\n');
+            } else if i % 23 == 0 {
+                body.push_str("0.0.0.0 one.example two.example\n");
+            } else if i % 29 == 0 {
+                body.push_str("plain.example\n");
+            } else {
+                body.push_str(&format!("127.0.0.1 host{i}.example\n"));
+            }
+            i += 1;
+        }
+        body.push_str(&"x".repeat(600));
+        body.push_str("\n0.0.0.0 after-long.example\n");
+        body.push_str("0.0.0.0 tail.example");
+        let reference = feed(&body, |_| {});
+        assert!(reference > 18_000, "reference {reference}");
+        let sizes = [
+            1usize, 2, 3, 7, 17, 63, 64, 127, 128, 255, 256, 299, 300, 301, 511, 512, 513, 1024,
+            1400, 16384,
+        ];
+        let bytes = body.as_bytes();
+        for size in sizes {
+            let mut split = LineSplit::new();
+            let mut got = 0usize;
+            let mut off = 0;
+            while off < bytes.len() {
+                let end = (off + size).min(bytes.len());
+                split.push(&bytes[off..end], |line| {
+                    let Ok(text) = core::str::from_utf8(line) else {
+                        return;
+                    };
+                    parse_line(text, |_| got += 1);
+                });
+                off = end;
+            }
+            split.finish(|line| {
+                let Ok(text) = core::str::from_utf8(line) else {
+                    return;
+                };
+                parse_line(text, |_| got += 1);
+            });
+            assert_eq!(got, reference, "chunk {size}");
+        }
+    }
+
+    #[test]
+    fn a_short_body_is_not_a_complete_download() {
+        assert_eq!(
+            content_length(b"HTTP/1.1 200 OK\r\nContent-Length: 2505650\r\n\r\n"),
+            Some(2_505_650)
+        );
+        assert_eq!(
+            content_length(b"HTTP/1.0 200 OK\r\ncontent-length: 12\r\n"),
+            Some(12)
+        );
+        assert_eq!(content_length(b"HTTP/1.0 200 OK\r\n\r\n"), None);
+        assert!(!body_complete(Some(100), 80, ReadEnd::Clean));
+        assert!(body_complete(Some(100), 100, ReadEnd::Clean));
+        assert!(!body_complete(Some(100), 50, ReadEnd::Fail));
+        assert!(body_complete(None, 10, ReadEnd::Clean));
+        assert!(!body_complete(None, 10, ReadEnd::Fail));
     }
 
     #[test]
