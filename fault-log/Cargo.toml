@@ -8,5 +8,8 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+ntp = { path = "../ntp" }
+
 [dev-dependencies]
 smoltcp = { workspace = true }

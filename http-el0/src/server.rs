@@ -56,6 +56,7 @@ const DISPLAY_IO: u64 = 55;
 const DISPLAY_SET: u64 = 56;
 const POWER: u64 = 58;
 const CSRF: u64 = 74;
+const CLOCK: u64 = 76;
 const NET_ARM: u64 = 75;
 const VNC_CTRL: u64 = 59;
 const UPSTREAM_HEALTH: u64 = 61;
@@ -971,6 +972,8 @@ a{{color:#0645ad}}
 <h2>System</h2>
 <dl>
 <dt>Uptime</dt><dd id="uptime">…</dd>
+<dt>UTC</dt><dd id="utc">…</dd>
+<dt>NTP</dt><dd id="ntp">…</dd>
 <dt>Board</dt><dd id="board">…</dd>
 </dl>
 <h2>Network</h2>
@@ -1014,6 +1017,8 @@ function text(id, value) {{
 function fill(d) {{
   text("version", d.version);
   text("uptime", d.uptime + " s");
+  text("utc", d.time_synced ? d.utc : "not synced");
+  text("ntp", (d.ntp_server || "") + " stratum " + d.stratum + " offset " + d.offset_ms + " last " + (d.last_sync || ""));
   text("board", d.board + " " + d.board_revision + " " + d.board_source);
   text("nic_irqs", d.nic_irqs);
   text("rxtx", d.rx_packets + " / " + d.tx_packets);
@@ -1044,6 +1049,26 @@ setInterval(load, 5000);
 </body></html>"#
     );
     html_response(&html)
+}
+
+fn time_fields() -> String {
+    let mut buf = [0u8; 100];
+    let n = sys(CLOCK, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0);
+    if n != 100 {
+        return String::from(
+            r#""time_synced":0,"utc":"","last_sync":"","ntp_server":"","offset_ms":0,"stratum":0"#,
+        );
+    }
+    let synced = u64::from(buf[0]);
+    let stratum = u64::from(buf[1]);
+    let offset = i64::from_le_bytes(buf[4..12].try_into().unwrap_or([0; 8]));
+    let utc = text_field(&buf[12..32]);
+    let last = text_field(&buf[32..52]);
+    let server = text_field(&buf[52..100]);
+    format!(
+        r#""time_synced":{},"utc":"{}","last_sync":"{}","ntp_server":"{}","offset_ms":{},"stratum":{}"#,
+        synced, utc, last, server, offset, stratum
+    )
 }
 
 fn status_json() -> HttpResponse {
@@ -1080,7 +1105,7 @@ fn status_json() -> HttpResponse {
         vclog_status,
     ) = hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -1123,6 +1148,7 @@ fn status_json() -> HttpResponse {
         crash_fields(),
         boot_fields(),
         board_fields(),
+        time_fields(),
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
@@ -1457,6 +1483,9 @@ button{{margin-top:.6rem;padding:.4rem .8rem}}
 <label>HTTP port <input id="port" name="port" required></label>
 <label>HTTP user <input id="user" name="user" required></label>
 <label>HTTP password <input id="password" name="password" required></label>
+<label>NTP servers, one host per line (1..=4) <textarea id="ntp_servers" name="ntp_servers"></textarea></label>
+<label>NTP interval seconds (30..=86400) <input id="ntp_interval" name="ntp_interval" required></label>
+<label>Answer NTP on the LAN (0 or 1) <input id="ntp_serve" name="ntp_serve" value="1" required></label>
 <label><input id="reboot" name="reboot" type="checkbox" value="1" style="width:auto"> Reboot now. Required before a new static address, HTTP port, or cache size is used. A static address that does not come up within 20 seconds is restored from CONFIG.BAK.</label>
 <textarea id="json" name="json">{escaped}</textarea>
 <button type="submit">Save</button>
@@ -1490,6 +1519,11 @@ function fill() {{
   setv("port", http.port || 80);
   setv("user", http.username || "");
   setv("password", http.password || "");
+  var ntp = base.ntp || {{}};
+  var servers = ntp.servers || ["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org"];
+  setv("ntp_servers", servers.join("\n"));
+  setv("ntp_interval", ntp.interval_secs || 3600);
+  setv("ntp_serve", ntp.serve === 0 ? "0" : "1");
 }}
 function bounds(n, lo, hi, name) {{
   if (!Number.isInteger(n) || n < lo || n > hi) return name + " out of bounds";
@@ -1501,7 +1535,10 @@ function build() {{
     || bounds(Number(val("reap")), 1, 3600, "reap")
     || bounds(Number(val("probe")), 1, 3600, "probe")
     || bounds(Number(val("port")), 1, 65535, "port")
-    || bounds(Number(val("detect")), 0, 1, "detect");
+    || bounds(Number(val("detect")), 0, 1, "detect")
+    || bounds(Number(val("ntp_interval")), 30, 86400, "ntp_interval")
+    || bounds(Number(val("ntp_serve")), 0, 1, "ntp_serve")
+    || ntpServers(lines(val("ntp_servers")));
   if (val("mode") !== "dhcp" && val("mode") !== "static") err = err || "mode";
   if (err) return err;
   base.network.mode = val("mode");
@@ -1523,6 +1560,21 @@ function build() {{
   base.http.password = val("password");
   if (Number(val("detect")) === 0) base.board = {{detect:0}};
   else delete base.board;
+  base.ntp = {{
+    servers: lines(val("ntp_servers")),
+    interval_secs: Number(val("ntp_interval")),
+    serve: Number(val("ntp_serve"))
+  }};
+  return "";
+}}
+function ntpServers(list) {{
+  if (list.length < 1 || list.length > 4) return "ntp servers";
+  for (var i = 0; i < list.length; i++) {{
+    if (list[i].length < 1 || list[i].length > 64) return "ntp server";
+    if (!/^[A-Za-z0-9.-]+(?::[0-9]{{1,5}})?$/.test(list[i])) return "ntp server";
+    var port = list[i].split(":")[1];
+    if (port && (Number(port) < 1 || Number(port) > 65535)) return "ntp port";
+  }}
   return "";
 }}
 fill();

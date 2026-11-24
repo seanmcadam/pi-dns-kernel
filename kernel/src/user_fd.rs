@@ -142,6 +142,10 @@ const BOOT: u64 = 72;
 const BOARD: u64 = 73;
 const CSRF: u64 = 74;
 const NET_ARM: u64 = 75;
+/// 76 clock(buf, cap) -> 100. synced, stratum, offset_ms, utc, last sync, server.
+/// 77 clock_prefix(buf, cap) -> n. Empty until time is synced.
+const CLOCK: u64 = 76;
+const CLOCK_PREFIX: u64 = 77;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -259,9 +263,38 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         BOARD => crash_copy(args[0], args[1], crate::board_id::status),
         CSRF => csrf_token(args[0], args[1]),
         NET_ARM => i64::from(crate::config_manager::arm_net_pending()),
+        CLOCK => clock_status(args[0], args[1]),
+        CLOCK_PREFIX => clock_prefix(args[0], args[1]),
         _ => -1,
     };
     value as u64
+}
+
+fn clock_status(ptr: u64, cap: u64) -> i64 {
+    if cap < crate::clock::STATUS_LEN as u64 || !crate::mmu::user_write_ok(ptr, crate::clock::STATUS_LEN as u64)
+    {
+        return EFAULT;
+    }
+    let mut raw = [0u8; crate::clock::STATUS_LEN];
+    let n = crate::clock::status(&mut raw);
+    if n == raw.len() && write_user(ptr, &raw) {
+        n as i64
+    } else {
+        EFAULT
+    }
+}
+
+fn clock_prefix(ptr: u64, cap: u64) -> i64 {
+    if cap == 0 || cap > 64 || !crate::mmu::user_write_ok(ptr, cap) {
+        return EFAULT;
+    }
+    let mut raw = [0u8; 64];
+    let n = crate::clock::prefix(&mut raw[..cap as usize]);
+    if write_user(ptr, &raw[..n]) {
+        n as i64
+    } else {
+        EFAULT
+    }
 }
 
 fn config_out(ptr: u64, cap: u64, write: fn(&mut [u8]) -> Option<usize>) -> i64 {

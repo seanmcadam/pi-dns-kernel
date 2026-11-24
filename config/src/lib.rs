@@ -58,6 +58,18 @@ pub const VNC_PORT_DEFAULT: u64 = 5900;
 pub const VNC_PASS_MAX: usize = 8;
 pub const TIMEOUT_MIN: u64 = 100;
 pub const TIMEOUT_MAX: u64 = 60_000;
+/// SNTP servers. Missing `ntp` means these three, a one hour interval, and
+/// the LAN server enabled.
+pub const NTP_SERVER_MAX: usize = 4;
+pub const NTP_NAME_MAX: usize = 64;
+pub const NTP_INTERVAL_MIN: u64 = 30;
+pub const NTP_INTERVAL_MAX: u64 = 86_400;
+pub const NTP_INTERVAL_DEFAULT: u64 = 3_600;
+pub const NTP_DEFAULT_SERVERS: &[&str] = &[
+    "0.pool.ntp.org",
+    "1.pool.ntp.org",
+    "2.pool.ntp.org",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -420,6 +432,34 @@ const DISPLAY_FIELDS: &[Field] = &[
     },
 ];
 
+const NTP_FIELDS: &[Field] = &[
+    Field {
+        name: "servers",
+        required: true,
+        kind: FieldKind::Array {
+            min: 1,
+            max: NTP_SERVER_MAX,
+            of: ArrayOf::Str {
+                min: 1,
+                max: NTP_NAME_MAX,
+            },
+        },
+    },
+    Field {
+        name: "interval_secs",
+        required: true,
+        kind: FieldKind::U64 {
+            min: NTP_INTERVAL_MIN,
+            max: NTP_INTERVAL_MAX,
+        },
+    },
+    Field {
+        name: "serve",
+        required: true,
+        kind: FieldKind::U64 { min: 0, max: 1 },
+    },
+];
+
 const BOARD_FIELDS: &[Field] = &[
     Field {
         name: "detect",
@@ -456,6 +496,11 @@ const MAIN_FIELDS: &[Field] = &[
         name: "display",
         required: true,
         kind: FieldKind::Object(DISPLAY_FIELDS),
+    },
+    Field {
+        name: "ntp",
+        required: false,
+        kind: FieldKind::Object(NTP_FIELDS),
     },
     Field {
         name: "board",
@@ -890,7 +935,108 @@ pub fn accept_main(text: &str) -> Result<String, Error> {
     }
     let value = parse(text)?;
     check(&value, main_fields())?;
+    check_ntp(&value)?;
     format_document(&value)
+}
+
+/// Host or IPv4, with an optional `:port`. The port defaults to 123.
+pub struct NtpHost {
+    pub host: String,
+    pub port: u16,
+    pub ip: Option<[u8; 4]>,
+}
+
+pub fn parse_ntp_server(text: &str) -> Option<NtpHost> {
+    let text = text.trim().trim_end_matches('.');
+    if text.is_empty() || text.len() > NTP_NAME_MAX {
+        return None;
+    }
+    let (host, port) = match text.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(':') && !port.is_empty() => {
+            if !port.bytes().all(|byte| byte.is_ascii_digit()) || port.len() > 5 {
+                return None;
+            }
+            let port: u16 = port.parse().ok()?;
+            if port == 0 {
+                return None;
+            }
+            (host, port)
+        }
+        Some(_) => return None,
+        None => (text, 123),
+    };
+    if host_ok(host) {
+        Some(NtpHost {
+            ip: ipv4(host),
+            host: host.to_string(),
+            port,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn check_ntp(value: &Value) -> Result<(), Error> {
+    let Some(ntp) = value.get("ntp") else {
+        return Ok(());
+    };
+    let Some(items) = ntp.get("servers").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, item) in items.iter().enumerate() {
+        let text = item.as_str().unwrap_or("");
+        if parse_ntp_server(text).is_none() {
+            return Err(Error::new(
+                &alloc::format!("ntp.servers[{index}]"),
+                "expected host or ipv4",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn host_ok(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    if ipv4(host).is_some() {
+        return true;
+    }
+    let mut labels = 0;
+    for label in host.split('.') {
+        labels += 1;
+        let bytes = label.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63 {
+            return false;
+        }
+        if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+            return false;
+        }
+        if !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return false;
+        }
+    }
+    labels > 0
+}
+
+fn ipv4(text: &str) -> Option<[u8; 4]> {
+    let mut parts = text.split('.');
+    let mut out = [0u8; 4];
+    for slot in &mut out {
+        let part = parts.next()?;
+        if part.is_empty() || part.len() > 3 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *slot = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Raw `application/x-www-form-urlencoded` value, still percent-encoded.
@@ -1171,6 +1317,54 @@ mod tests {
             ..wait
         };
         assert_eq!(net_watch(dhcp), "idle");
+    }
+
+    #[test]
+    fn ntp_servers_keep_the_config_bounds() {
+        let host = parse_ntp_server("0.pool.ntp.org").unwrap();
+        assert_eq!(host.host, "0.pool.ntp.org");
+        assert_eq!(host.port, 123);
+        assert!(host.ip.is_none());
+        let ip = parse_ntp_server("10.0.2.2:1123").unwrap();
+        assert_eq!(ip.ip, Some([10, 0, 2, 2]));
+        assert_eq!(ip.port, 1123);
+        assert!(parse_ntp_server("10.0.2.2:0").is_none());
+        assert!(parse_ntp_server("").is_none());
+        assert!(parse_ntp_server("-bad.example").is_none());
+        let mut doc = parse(&sample_config("")).unwrap();
+        if let Value::Object(items) = &mut doc {
+            items.push((
+                String::from("ntp"),
+                Value::Object(alloc::vec![
+                    (
+                        String::from("servers"),
+                        Value::Array(alloc::vec![Value::String(String::from("not a host"))]),
+                    ),
+                    (String::from("interval_secs"), Value::Number(30)),
+                    (String::from("serve"), Value::Number(1)),
+                ]),
+            ));
+        }
+        let text = format_document(&doc).unwrap();
+        assert!(accept_main(&text).unwrap_err().message.contains("host"));
+        let mut ok = parse(&sample_config("")).unwrap();
+        if let Value::Object(items) = &mut ok {
+            items.push((
+                String::from("ntp"),
+                Value::Object(alloc::vec![
+                    (
+                        String::from("servers"),
+                        Value::Array(alloc::vec![Value::String(String::from(
+                            "0.pool.ntp.org",
+                        ))]),
+                    ),
+                    (String::from("interval_secs"), Value::Number(NTP_INTERVAL_DEFAULT)),
+                    (String::from("serve"), Value::Number(1)),
+                ]),
+            ));
+        }
+        assert!(accept_main(&format_document(&ok).unwrap()).is_ok());
+        assert!(accept_main(&sample_config("")).is_ok());
     }
 
     fn sample_config(probe: &str) -> String {

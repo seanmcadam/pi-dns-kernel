@@ -546,6 +546,11 @@ fn arm_deadline(state: &mut super::NetworkState) {
             deadline = at;
         }
     }
+    if let Some(at) = crate::ntp_client::next_wake_ms() {
+        if at < deadline {
+            deadline = at;
+        }
+    }
     // Pi 4 used to clip every sleep to 10 ms so a missed RX IRQ could not
     // wait out the 2 s gratuitous ARP. The line wakes the owner now, and
     // that clip made `drive` run on every timer tick. A quiet poll was

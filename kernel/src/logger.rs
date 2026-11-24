@@ -282,6 +282,11 @@ impl log::Log for Logger {
             Level::Debug => "DEBUG",
             Level::Trace => "TRACE",
         };
+        let mut pre = [0u8; 48];
+        let n = crate::clock::prefix(&mut pre);
+        if n > 0 {
+            crate::console::write_str(core::str::from_utf8(&pre[..n]).unwrap_or(""));
+        }
         let _ = writeln!(UartWriter, "[{label}] {}\r", record.args());
     }
 

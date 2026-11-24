@@ -12,6 +12,7 @@ const EMIT: u64 = 30;
 const PUBLISH: u64 = 39;
 const FILE_WRITE: u64 = 33;
 const LOG_RELOAD: u64 = 45;
+const CLOCK_PREFIX: u64 = 77;
 const YIELD: u64 = 1;
 const EXIT: u64 = 3;
 
@@ -39,16 +40,35 @@ fn run() -> ! {
             continue;
         }
         let mut line = [0u8; 96];
+        let mut stamp = [0u8; 40];
+        let stamp_n = sys(
+            CLOCK_PREFIX,
+            stamp.as_mut_ptr() as u64,
+            stamp.len() as u64,
+            0,
+            0,
+            0,
+            0,
+        );
+        let stamp_n = if stamp_n > 0 {
+            stamp_n as usize
+        } else {
+            0
+        };
         let prefix: &[u8] = match level {
             3 => b"[ERROR] ",
             2 => b"[WARN ] ",
             _ => b"[INFO ] ",
         };
-        let room = line.len() - prefix.len();
-        let take = msg.len().min(room);
-        line[..prefix.len()].copy_from_slice(prefix);
-        line[prefix.len()..prefix.len() + take].copy_from_slice(&msg[..take]);
-        let end = prefix.len() + take;
+        let head = stamp_n.min(40);
+        line[..head].copy_from_slice(&stamp[..head]);
+        let mut at = head;
+        let tag = prefix.len().min(line.len() - at);
+        line[at..at + tag].copy_from_slice(&prefix[..tag]);
+        at += tag;
+        let take = msg.len().min(line.len() - at);
+        line[at..at + take].copy_from_slice(&msg[..take]);
+        let end = at + take;
         let _ = sys(EMIT, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
         let _ = sys(PUBLISH, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
         if flags & PERSIST != 0 {
@@ -64,8 +84,20 @@ fn run() -> ! {
 
 fn persist(msg: &[u8]) {
     let mut line = [b' '; 73];
-    let take = msg.len().min(72);
-    line[..take].copy_from_slice(&msg[..take]);
+    let mut stamp = [0u8; 40];
+    let stamp_n = sys(
+        CLOCK_PREFIX,
+        stamp.as_mut_ptr() as u64,
+        stamp.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    let stamp_n = if stamp_n > 0 { (stamp_n as usize).min(40) } else { 0 };
+    line[..stamp_n].copy_from_slice(&stamp[..stamp_n]);
+    let take = msg.len().min(72 - stamp_n);
+    line[stamp_n..stamp_n + take].copy_from_slice(&msg[..take]);
     line[72] = b'\n';
     let _ = file_write(b"LOG.TXT", &line, true);
 }

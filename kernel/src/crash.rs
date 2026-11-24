@@ -416,6 +416,7 @@ fn capture(
         summary,
         version: version::VERSION.as_bytes(),
         boot_id: version::BOOT_ID_STR.as_bytes(),
+        unix_secs: crate::clock::unix_secs().unwrap_or(0).max(0) as u64,
     };
     if !crash_rec::store_record(raw, &draft) {
         BUSY.store(false, Ordering::Release);
