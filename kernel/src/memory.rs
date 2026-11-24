@@ -1,5 +1,5 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::ptr::null_mut;
+use kalloc::Heap;
 use spin::Mutex;
 
 extern "C" {
@@ -7,67 +7,20 @@ extern "C" {
     static __heap_end: u8;
 }
 
-struct BumpAllocator {
-    heap_start: usize,
-    heap_end: usize,
-    next: usize,
-    peak: usize,
-}
-
-impl BumpAllocator {
-    pub const fn new() -> Self {
-        Self {
-            heap_start: 0,
-            heap_end: 0,
-            next: 0,
-            peak: 0,
-        }
-    }
-
-    pub unsafe fn init(&mut self) {
-        self.heap_start = &__heap_start as *const u8 as usize;
-        self.heap_end = &__heap_end as *const u8 as usize;
-        self.next = self.heap_start;
-    }
-
-    fn alloc(&mut self, layout: Layout) -> *mut u8 {
-        let alloc_start = align_up(self.next, layout.align());
-        let alloc_end = match alloc_start.checked_add(layout.size()) {
-            Some(end) => end,
-            None => return null_mut(),
-        };
-
-        if alloc_end > self.heap_end {
-            #[cfg(feature = "board-pi4")]
-            crate::fb_con::emergency("LOCKUP heap");
-            null_mut()
-        } else {
-            self.next = alloc_end;
-            let used = alloc_end.saturating_sub(self.heap_start);
-            if used > self.peak {
-                self.peak = used;
-            }
-            alloc_start as *mut u8
-        }
-    }
-}
-
-fn align_up(addr: usize, align: usize) -> usize {
-    (addr + align - 1) & !(align - 1)
-}
-
-pub struct LockedAllocator(Mutex<BumpAllocator>);
+pub struct LockedAllocator(Mutex<Heap>);
 
 impl LockedAllocator {
     pub const fn new() -> Self {
-        Self(Mutex::new(BumpAllocator::new()))
+        Self(Mutex::new(Heap::empty()))
     }
 
     pub unsafe fn init(&self) {
-        self.0.lock().init();
+        self.0
+            .lock()
+            .init(&__heap_start as *const u8 as *mut u8, &__heap_end as *const u8 as *mut u8);
     }
 
-    /// `(used, size)` in bytes. The bump allocator never frees, so `used` only grows.
+    /// `(used, size)` in bytes. `used` falls when allocations are freed.
     pub fn usage(&self) -> (usize, usize) {
         let (used, _peak, size) = self.stats();
         (used, size)
@@ -75,22 +28,23 @@ impl LockedAllocator {
 
     /// `(used, peak, size)`. `peak` is the high water of `used`.
     pub fn stats(&self) -> (usize, usize, usize) {
-        let bump = self.0.lock();
-        (
-            bump.next.saturating_sub(bump.heap_start),
-            bump.peak,
-            bump.heap_end.saturating_sub(bump.heap_start),
-        )
+        let heap = self.0.lock();
+        (heap.used(), heap.peak(), heap.size())
     }
 }
 
 unsafe impl GlobalAlloc for LockedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.0.lock().alloc(layout)
+        let ptr = self.0.lock().alloc(layout);
+        if ptr.is_null() {
+            #[cfg(feature = "board-pi4")]
+            crate::fb_con::emergency("LOCKUP heap");
+        }
+        ptr
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator doesn't support deallocation
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.0.lock().dealloc(ptr, layout);
     }
 }
 

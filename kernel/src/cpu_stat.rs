@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const CPUS: usize = crate::percpu::NCPU;
-const SLOTS: usize = 7;
+const SLOTS: usize = 8;
 
 static USER: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
 static KERN: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];

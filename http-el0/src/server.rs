@@ -264,6 +264,8 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/debug/crash/spin" => handle_crash(2, 0),
         "/debug/crash/log" => handle_crash(3, 0),
         "/debug/crash/telnet" => handle_crash(4, 0),
+        "/debug/crash/block" => handle_crash(7, 0),
+        "/blocklist" => blocklist_json(),
         "/debug/crash/telnet-worker" => handle_crash(4, 1),
         "/debug/fault/guard" => {
             let _ = sys(FAULT_GUARD, 0, 0, 0, 0, 0, 0);
@@ -976,6 +978,7 @@ a{{color:#0645ad}}
 <dt>UTC</dt><dd id="utc">…</dd>
 <dt>NTP</dt><dd id="ntp">…</dd>
 <dt>Heap</dt><dd id="heap">…</dd>
+<dt>Blocker</dt><dd id="block">…</dd>
 <dt>Board</dt><dd id="board">…</dd>
 </dl>
 <h2>Network</h2>
@@ -1022,6 +1025,14 @@ function fill(d) {{
   text("utc", d.time_synced ? d.utc : "not synced");
   text("ntp", (d.ntp_server || "") + " stratum " + d.stratum + " offset " + d.offset_ms + " last " + (d.last_sync || ""));
   text("heap", d.heap_used + " / " + d.heap_peak + " / " + d.heap_size);
+  var lines = (d.block_state || "down") + " domains " + d.block_domains + " blocked " + d.block_queries + " mem " + d.block_used + "/" + d.block_size;
+  var urls = d.block_urls || [];
+  for (var i = 0; i < urls.length; i++) {{
+    var u = urls[i];
+    lines += "\\n" + u.url + " entries " + u.entries + " mtime " + u.mtime + " next " + u.next;
+    if (u.error) lines += " " + u.error;
+  }}
+  text("block", lines);
   text("board", d.board + " " + d.board_revision + " " + d.board_source);
   text("nic_irqs", d.nic_irqs);
   text("rxtx", d.rx_packets + " / " + d.tx_packets);
@@ -1052,6 +1063,106 @@ setInterval(load, 5000);
 </body></html>"#
     );
     html_response(&html)
+}
+
+fn block_stats() -> Option<Vec<u8>> {
+    let mut buf = [0u8; 2048];
+    let n = sys(80, 4, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    if n < 48 {
+        return None;
+    }
+    Some(buf[..n as usize].to_vec())
+}
+
+fn json_escape(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in bytes {
+        match byte {
+            b'"' | b'\\' => {
+                out.push('\\');
+                out.push(*byte as char);
+            }
+            0x20..=0x7e => out.push(*byte as char),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn block_fields() -> String {
+    let Some(buf) = block_stats() else {
+        return String::from(
+            r#""block_state":"down","block_domains":0,"block_queries":0,"block_used":0,"block_size":0,"block_urls":[]"#,
+        );
+    };
+    block_json(&buf, true)
+}
+
+fn blocklist_json() -> HttpResponse {
+    let body = match block_stats() {
+        Some(buf) => block_json(&buf, false),
+        None => String::from(
+            r#"{"block_state":"down","block_domains":0,"block_queries":0,"block_used":0,"block_size":0,"block_urls":[]}"#,
+        ),
+    };
+    let mut response = HttpResponse::ok(&body);
+    response.add_header("Content-Type", "application/json");
+    response
+}
+
+fn block_json(buf: &[u8], fragment: bool) -> String {
+    let state = match buf[0] {
+        1 => "loading",
+        2 => "up",
+        _ => "down",
+    };
+    let domains = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+    let queries = u64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8]));
+    let used = u64::from_le_bytes(buf[24..32].try_into().unwrap_or([0; 8]));
+    let size = u64::from_le_bytes(buf[32..40].try_into().unwrap_or([0; 8]));
+    let count = buf[40] as usize;
+    let mut urls = String::from("[");
+    let mut n = 48;
+    let mut seen = 0;
+    while seen < count && n + 36 <= buf.len() {
+        let name = json_escape(&buf[n..n + 12]);
+        let ul = buf[n + 12] as usize;
+        let el = buf[n + 13] as usize;
+        let entries = u32::from_le_bytes(buf[n + 16..n + 20].try_into().unwrap_or([0; 4]));
+        let mtime = i64::from_le_bytes(buf[n + 20..n + 28].try_into().unwrap_or([0; 8]));
+        let next = i64::from_le_bytes(buf[n + 28..n + 36].try_into().unwrap_or([0; 8]));
+        n += 36;
+        if n + ul + el > buf.len() {
+            break;
+        }
+        let url = json_escape(&buf[n..n + ul]);
+        n += ul;
+        let err = json_escape(&buf[n..n + el]);
+        n += el;
+        if seen > 0 {
+            urls.push(',');
+        }
+        urls.push_str(&format!(
+            r#"{{"name":"{}","url":"{}","entries":{},"mtime":{},"next":{},"error":"{}"}}"#,
+            name.trim_end_matches('\u{0}'),
+            url,
+            entries,
+            mtime,
+            next,
+            err
+        ));
+        seen += 1;
+    }
+    urls.push(']');
+    let body = format!(
+        r#""block_state":"{}","block_domains":{},"block_queries":{},"block_used":{},"block_size":{},"block_urls":{}"#,
+        state, domains, queries, used, size, urls
+    );
+    if fragment {
+        body
+    } else {
+        format!("{{{body}}}")
+    }
 }
 
 fn heap_fields() -> String {
@@ -1123,7 +1234,7 @@ fn status_json() -> HttpResponse {
         vclog_status,
     ) = hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -1168,6 +1279,7 @@ fn status_json() -> HttpResponse {
         board_fields(),
         time_fields(),
         heap_fields(),
+        block_fields(),
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");
@@ -1498,6 +1610,10 @@ button{{margin-top:.6rem;padding:.4rem .8rem}}
 <label>Upstreams, one address per line <textarea id="upstreams" name="upstreams"></textarea></label>
 <label>Local records, one per line: name type value ttl <textarea id="records" name="records"></textarea></label>
 <label>Block list, one name per line <textarea id="blocklist" name="blocklist"></textarea></label>
+<label>Block lists enabled (0 or 1) <input id="block_enabled" name="block_enabled" value="0" required></label>
+<label>Block list refresh seconds (3600..=604800, default 86400) <input id="block_refresh" name="block_refresh" value="86400" required></label>
+<label>Block list URLs, one http(s) URL per line (at most 8) <textarea id="block_urls" name="block_urls"></textarea></label>
+<label>Allow list, one domain per line <textarea id="block_allow" name="block_allow"></textarea></label>
 <label>board.detect (0 or 1, 1 is the default) <input id="detect" name="detect" value="1" required></label>
 <label>HTTP port <input id="port" name="port" required></label>
 <label>HTTP user <input id="user" name="user" required></label>
@@ -1531,6 +1647,11 @@ function fill() {{
   setv("probe", dns.probe_interval_secs || 5);
   setv("upstreams", (dns.upstreams || []).join("\n"));
   setv("blocklist", (dns.blocklist || []).join("\n"));
+  var block = base.block || {{}};
+  setv("block_enabled", block.enabled === 1 ? "1" : "0");
+  setv("block_refresh", block.refresh_secs || 86400);
+  setv("block_urls", (block.urls || []).join("\n"));
+  setv("block_allow", (block.allow || []).join("\n"));
   setv("records", (dns.records || []).map(function(r) {{
     return r.name + " " + r.type + " " + r.value + " " + r.ttl;
   }}).join("\n"));
@@ -1557,7 +1678,11 @@ function build() {{
     || bounds(Number(val("detect")), 0, 1, "detect")
     || bounds(Number(val("ntp_interval")), 30, 86400, "ntp_interval")
     || bounds(Number(val("ntp_serve")), 0, 1, "ntp_serve")
-    || ntpServers(lines(val("ntp_servers")));
+    || bounds(Number(val("block_enabled")), 0, 1, "block_enabled")
+    || bounds(Number(val("block_refresh")), 3600, 604800, "block_refresh")
+    || ntpServers(lines(val("ntp_servers")))
+    || blockUrls(lines(val("block_urls")))
+    || blockAllow(lines(val("block_allow")));
   if (val("mode") !== "dhcp" && val("mode") !== "static") err = err || "mode";
   if (err) return err;
   base.network.mode = val("mode");
@@ -1584,6 +1709,32 @@ function build() {{
     interval_secs: Number(val("ntp_interval")),
     serve: Number(val("ntp_serve"))
   }};
+  var urls = lines(val("block_urls"));
+  var allow = lines(val("block_allow"));
+  var enabled = Number(val("block_enabled"));
+  var refresh = Number(val("block_refresh"));
+  if (enabled === 0 && refresh === 86400 && urls.length === 0 && allow.length === 0) delete base.block;
+  else base.block = {{enabled: enabled, refresh_secs: refresh, urls: urls, allow: allow}};
+  return "";
+}}
+function blockUrls(list) {{
+  if (list.length > 8) return "block urls";
+  for (var i = 0; i < list.length; i++) {{
+    var url = list[i];
+    if (url.length < 8 || url.length > 160) return "block url";
+    if (url.indexOf("@") >= 0 || url.indexOf(" ") >= 0) return "block url";
+    if (!/^https?:\/\/[A-Za-z0-9.-]+(:[0-9]{{1,5}})?(\/[A-Za-z0-9._~/?=&%+-]*)?$/.test(url)) return "block url";
+    var port = url.replace(/^https?:\/\//, "").split("/")[0].split(":")[1];
+    if (port && (Number(port) < 1 || Number(port) > 65535)) return "block url";
+  }}
+  return "";
+}}
+function blockAllow(list) {{
+  if (list.length > 32) return "block allow";
+  for (var i = 0; i < list.length; i++) {{
+    if (list[i].length < 1 || list[i].length > 253) return "block allow";
+    if (!/^[A-Za-z0-9.-]+$/.test(list[i])) return "block allow";
+  }}
   return "";
 }}
 function ntpServers(list) {{

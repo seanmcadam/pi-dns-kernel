@@ -22,7 +22,7 @@ const HEALTHY_MS: u64 = 60_000;
 const BACKOFF_START_MS: u64 = 100;
 const BACKOFF_CAP_MS: u64 = 10_000;
 const PAGE_POOL: u32 = 4096;
-const SLOTS: usize = 7;
+const SLOTS: usize = 8;
 
 const OFF: u8 = 0;
 const RUNNING: u8 = 1;
@@ -126,6 +126,7 @@ pub fn launch(slot: usize) -> Result<(), ()> {
         4 => crate::task::start_telnet(),
         5 => crate::task::start_vnc(),
         6 => crate::task::start_hdmi(),
+        7 => crate::task::start_block(),
         _ => Err(()),
     }
 }
@@ -666,6 +667,7 @@ fn pages(slot: usize) -> u32 {
         4 => 101,
         5 => 357,
         6 => crate::board::hdmi_pages(),
+        7 => 544,
         _ => 0,
     }
 }
@@ -679,6 +681,7 @@ fn name(slot: usize) -> &'static str {
         4 => "telnet",
         5 => "vnc",
         6 => "hdmi",
+        7 => "block",
         _ => "task",
     }
 }

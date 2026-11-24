@@ -526,13 +526,6 @@ fn handle_bytes(
     traffic.note(name.as_bytes(), qtype, &ip);
     let qclass = question.qclass as u16;
 
-    if blocked(&name) {
-        if let Some(bytes) = error_response(&query, 3) {
-            replies.push((bytes, ip, port));
-        }
-        return;
-    }
-
     if let Some(answer) = lookup_local(&question.name, question.qtype) {
         let mut response = DnsPacket::new(query.header.id);
         response.header.qr = true;
@@ -542,6 +535,22 @@ fn handle_bytes(
         response.questions.push(question.clone());
         response.answers.push(answer);
         if let Ok(bytes) = response.to_bytes() {
+            replies.push((bytes, ip, port));
+        }
+        return;
+    }
+
+    // 2 means the configured allow list covers this name. A down, crashed,
+    // or still-loading blocker returns 0 and the query is answered normally.
+    let decision = block_decision(&name);
+    if decision == 1 {
+        if let Some(bytes) = sink_response(&query) {
+            replies.push((bytes, ip, port));
+        }
+        return;
+    }
+    if decision != 2 && blocked(&name) {
+        if let Some(bytes) = error_response(&query, 3) {
             replies.push((bytes, ip, port));
         }
         return;
@@ -1036,6 +1045,37 @@ fn normalize_name(name: &str) -> String {
         out.pop();
     }
     out
+}
+
+fn block_decision(name: &str) -> i64 {
+    if name.is_empty() {
+        return 0;
+    }
+    let rc = sys(80, 3, name.as_ptr() as u64, name.len() as u64, 0, 0, 0);
+    if rc < 0 { 0 } else { rc }
+}
+
+fn sink_response(query: &DnsPacket) -> Option<Vec<u8>> {
+    let question = query.questions.first()?;
+    let rdata = match question.qtype {
+        QueryType::A => RData::A([0, 0, 0, 0]),
+        QueryType::AAAA => RData::AAAA([0; 16]),
+        _ => return error_response(query, 3),
+    };
+    let mut response = DnsPacket::new(query.header.id);
+    response.header.qr = true;
+    response.header.aa = true;
+    response.header.rd = query.header.rd;
+    response.header.ra = true;
+    response.questions.push(question.clone());
+    response.answers.push(ResourceRecord {
+        name: question.name.clone(),
+        rtype: question.qtype,
+        rclass: RecordClass::IN,
+        ttl: 60,
+        rdata,
+    });
+    response.to_bytes().ok()
 }
 
 fn blocked(name: &str) -> bool {

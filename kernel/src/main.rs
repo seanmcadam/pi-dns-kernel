@@ -32,6 +32,8 @@ mod hdmi_hw;
 mod http;
 mod interrupts;
 mod logger;
+mod block_mem;
+mod block_tab;
 mod memory;
 mod mmu;
 mod net;
@@ -235,8 +237,13 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         Ok(()) => uart_write("[OK] Log task running\r\n"),
         Err(()) => uart_write("[ERROR] Log task failed\r\n"),
     }
+    match supervisor::launch(task::BLOCK_SLOT) {
+        Ok(()) => uart_write("[OK] Block task running\r\n"),
+        Err(()) => uart_write("[WARN] Block task failed\r\n"),
+    }
     log::info!("{}", version::VERSION_LINE);
     log::info!("boot {}", fw::booted_name());
+    log::info!("block region {}", block_mem::size());
     if net_up {
         match supervisor::launch(task::DNS_SLOT) {
             Ok(()) => uart_write("[OK] DNS user program running\r\n"),
@@ -283,6 +290,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         net::poll();
         task::poll_dns();
         task::poll_http();
+        task::poll_block();
         task::poll_log();
         task::poll_telnet();
         task::poll_spin();

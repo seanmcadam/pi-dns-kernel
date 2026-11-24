@@ -50,6 +50,7 @@ pub fn task_name(slot: usize) -> &'static str {
         4 => "telnet",
         5 => "vnc",
         6 => "hdmi",
+        7 => "block",
         _ => "task",
     }
 }

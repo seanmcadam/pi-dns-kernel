@@ -70,6 +70,16 @@ pub const NTP_DEFAULT_SERVERS: &[&str] = &[
     "1.pool.ntp.org",
     "2.pool.ntp.org",
 ];
+/// Downloaded block lists. Missing `block` means off, no URLs, a 24 hour
+/// refresh, and an empty allow list. `dns.blocklist` is still the small
+/// exact-name list and is unrelated.
+pub const BLOCK_URL_MAX: usize = 8;
+pub const BLOCK_URL_LEN: usize = 160;
+pub const BLOCK_ALLOW_MAX: usize = 32;
+pub const BLOCK_ALLOW_LEN: usize = 253;
+pub const BLOCK_REFRESH_MIN: u64 = 3_600;
+pub const BLOCK_REFRESH_MAX: u64 = 604_800;
+pub const BLOCK_REFRESH_DEFAULT: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -432,6 +442,46 @@ const DISPLAY_FIELDS: &[Field] = &[
     },
 ];
 
+const BLOCK_FIELDS: &[Field] = &[
+    Field {
+        name: "enabled",
+        required: true,
+        kind: FieldKind::U64 { min: 0, max: 1 },
+    },
+    Field {
+        name: "refresh_secs",
+        required: true,
+        kind: FieldKind::U64 {
+            min: BLOCK_REFRESH_MIN,
+            max: BLOCK_REFRESH_MAX,
+        },
+    },
+    Field {
+        name: "urls",
+        required: true,
+        kind: FieldKind::Array {
+            min: 0,
+            max: BLOCK_URL_MAX,
+            of: ArrayOf::Str {
+                min: 8,
+                max: BLOCK_URL_LEN,
+            },
+        },
+    },
+    Field {
+        name: "allow",
+        required: true,
+        kind: FieldKind::Array {
+            min: 0,
+            max: BLOCK_ALLOW_MAX,
+            of: ArrayOf::Str {
+                min: 1,
+                max: BLOCK_ALLOW_LEN,
+            },
+        },
+    },
+];
+
 const NTP_FIELDS: &[Field] = &[
     Field {
         name: "servers",
@@ -501,6 +551,11 @@ const MAIN_FIELDS: &[Field] = &[
         name: "ntp",
         required: false,
         kind: FieldKind::Object(NTP_FIELDS),
+    },
+    Field {
+        name: "block",
+        required: false,
+        kind: FieldKind::Object(BLOCK_FIELDS),
     },
     Field {
         name: "board",
@@ -936,7 +991,95 @@ pub fn accept_main(text: &str) -> Result<String, Error> {
     let value = parse(text)?;
     check(&value, main_fields())?;
     check_ntp(&value)?;
+    check_block(&value)?;
     format_document(&value)
+}
+
+/// `http://` or `https://`, a host or IPv4, an optional port, and an optional
+/// path. Userinfo (`@`) and whitespace are rejected.
+pub fn check_block_url(text: &str) -> bool {
+    if text.len() < 8 || text.len() > BLOCK_URL_LEN {
+        return false;
+    }
+    if text.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f) {
+        return false;
+    }
+    if text.contains('@') || text.contains('\\') || text.contains('#') {
+        return false;
+    }
+    let rest = if let Some(rest) = text.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = text.strip_prefix("http://") {
+        rest
+    } else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() {
+        return false;
+    }
+    let host = if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.is_empty()
+            || port.len() > 5
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return false;
+        }
+        let Ok(port) = port.parse::<u16>() else {
+            return false;
+        };
+        if port == 0 {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    if !host_ok(host) {
+        return false;
+    }
+    path.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'.' | b'-' | b'_' | b'~' | b'?' | b'=' | b'&' | b'%' | b'+'
+            )
+    })
+}
+
+pub fn check_block(value: &Value) -> Result<(), Error> {
+    let Some(block) = value.get("block") else {
+        return Ok(());
+    };
+    if let Some(items) = block.get("urls").and_then(Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            let text = item.as_str().unwrap_or("");
+            if !check_block_url(text) {
+                return Err(Error::new(
+                    &alloc::format!("block.urls[{index}]"),
+                    "expected http or https url",
+                ));
+            }
+        }
+    }
+    if let Some(items) = block.get("allow").and_then(Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            let text = item.as_str().unwrap_or("");
+            if !host_ok(text) {
+                return Err(Error::new(
+                    &alloc::format!("block.allow[{index}]"),
+                    "expected hostname",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Host or IPv4, with an optional `:port`. The port defaults to 123.
@@ -1385,6 +1528,73 @@ mod tests {
         }
         assert!(accept_main(&format_document(&ok).unwrap()).is_ok());
         assert!(accept_main(&sample_config("")).is_ok());
+    }
+
+    #[test]
+    fn block_urls_are_capped_and_checked() {
+        assert!(check_block_url("https://example.com/hosts.txt"));
+        assert!(check_block_url("http://10.0.2.2:8443/list.txt"));
+        assert!(!check_block_url("https://user:pass@example.com/a"));
+        assert!(!check_block_url("ftp://example.com/a"));
+        assert!(!check_block_url("https://"));
+        assert!(!check_block_url("http://bad host/a"));
+        let mut doc = parse(&sample_config("")).unwrap();
+        if let Value::Object(items) = &mut doc {
+            items.push((
+                String::from("block"),
+                Value::Object(alloc::vec![
+                    (String::from("enabled"), Value::Number(1)),
+                    (String::from("refresh_secs"), Value::Number(86_400)),
+                    (
+                        String::from("urls"),
+                        Value::Array(alloc::vec![Value::String(String::from(
+                            "https://example.com/hosts",
+                        ))]),
+                    ),
+                    (String::from("allow"), Value::Array(alloc::vec![])),
+                ]),
+            ));
+        }
+        assert!(accept_main(&format_document(&doc).unwrap()).is_ok());
+        let mut bad = parse(&sample_config("")).unwrap();
+        if let Value::Object(items) = &mut bad {
+            items.push((
+                String::from("block"),
+                Value::Object(alloc::vec![
+                    (String::from("enabled"), Value::Number(1)),
+                    (String::from("refresh_secs"), Value::Number(86_400)),
+                    (
+                        String::from("urls"),
+                        Value::Array(alloc::vec![Value::String(String::from(
+                            "https://not a url",
+                        ))]),
+                    ),
+                    (String::from("allow"), Value::Array(alloc::vec![])),
+                ]),
+            ));
+        }
+        assert!(accept_main(&format_document(&bad).unwrap())
+            .unwrap_err()
+            .message
+            .contains("url"));
+        let mut nine = parse(&sample_config("")).unwrap();
+        if let Value::Object(items) = &mut nine {
+            let urls = (0..9)
+                .map(|index| {
+                    Value::String(alloc::format!("https://example.com/{index}"))
+                })
+                .collect();
+            items.push((
+                String::from("block"),
+                Value::Object(alloc::vec![
+                    (String::from("enabled"), Value::Number(1)),
+                    (String::from("refresh_secs"), Value::Number(86_400)),
+                    (String::from("urls"), Value::Array(urls)),
+                    (String::from("allow"), Value::Array(alloc::vec![])),
+                ]),
+            ));
+        }
+        assert!(accept_main(&format_document(&nine).unwrap()).is_err());
     }
 
     fn sample_config(probe: &str) -> String {
