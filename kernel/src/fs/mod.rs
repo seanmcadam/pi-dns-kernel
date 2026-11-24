@@ -556,3 +556,38 @@ fn release(
         None => Ok(()),
     }
 }
+
+pub fn write_new(name: &str, data: &[u8]) -> Result<(), FsError> {
+    with_file(name, Mode::ReadWriteCreateOrTruncate, |mgr, file| {
+        if !data.is_empty() {
+            mgr.write(file, data).map_err(|err| fs_err("write", err))?;
+        }
+        Ok(())
+    })
+}
+
+pub fn append_bytes(name: &str, data: &[u8]) -> Result<(), FsError> {
+    with_file(name, Mode::ReadWriteCreateOrAppend, |mgr, file| {
+        if data.is_empty() {
+            return Ok(());
+        }
+        mgr.write(file, data).map_err(|err| fs_err("write", err))?;
+        Ok(())
+    })
+}
+
+pub fn file_time(name: &str) -> Result<Timestamp, FsError> {
+    with_dir(|mgr, dir| {
+        let entry = mgr
+            .find_directory_entry(dir, name)
+            .map_err(|err| fs_err("stat", err))?;
+        Ok(entry.mtime)
+    })
+}
+
+pub fn swing_file(from: &str, to: &str) -> Result<(), FsError> {
+    if file_exists(to)? {
+        delete_file(to)?;
+    }
+    rename_file(from, to)
+}
