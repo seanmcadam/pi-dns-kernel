@@ -578,9 +578,16 @@ pub fn append_bytes(name: &str, data: &[u8]) -> Result<(), FsError> {
 
 pub fn file_time(name: &str) -> Result<Timestamp, FsError> {
     with_dir(|mgr, dir| {
-        let entry = mgr
-            .find_directory_entry(dir, name)
-            .map_err(|err| fs_err("stat", err))?;
+        let entry = mgr.find_directory_entry(dir, name).map_err(|err| {
+            if matches!(err, embedded_sdmmc::Error::NotFound) {
+                FsError::Io {
+                    op: "stat",
+                    detail: String::from("NotFound"),
+                }
+            } else {
+                fs_err("stat", err)
+            }
+        })?;
         Ok(entry.mtime)
     })
 }

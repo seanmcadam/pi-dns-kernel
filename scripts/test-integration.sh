@@ -3834,6 +3834,7 @@ BLOCK_DNS_PORT=18055
 openssl req -x509 -newkey rsa:2048 -keyout /tmp/block-key.pem -out /tmp/block-cert.pem \
     -days 3650 -nodes -subj "/CN=10.0.2.2" >/dev/null 2>&1
 openssl x509 -in /tmp/block-cert.pem -outform DER -out /tmp/TESTCA.DER
+rm -f /tmp/block-tls-ready /tmp/block-ntp-ready
 python3 - "$BLOCK_TLS_PORT" <<'PY' &
 import http.server, ssl, sys
 port = int(sys.argv[1])
@@ -3852,6 +3853,7 @@ httpd = http.server.HTTPServer(("0.0.0.0", port), Handler)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain("/tmp/block-cert.pem", "/tmp/block-key.pem")
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+open("/tmp/block-tls-ready", "w").write("ok")
 httpd.serve_forever()
 PY
 BLOCK_TLS_PID=$!
@@ -3860,6 +3862,7 @@ import socket, struct, sys
 port = int(sys.argv[1])
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("0.0.0.0", port))
+open("/tmp/block-ntp-ready", "w").write("ok")
 unix = 1800000000
 delta = 2208988800
 secs = unix + delta
@@ -3880,7 +3883,17 @@ while True:
     sock.sendto(pkt, addr)
 PY
 BLOCK_NTP_PID=$!
-sleep 0.2
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -f /tmp/block-tls-ready ] && [ -f /tmp/block-ntp-ready ]; then
+        break
+    fi
+    sleep 0.2
+done
+if [ ! -f /tmp/block-tls-ready ] || [ ! -f /tmp/block-ntp-ready ]; then
+    echo "✗ block list ports are busy"
+    kill "$BLOCK_TLS_PID" "$BLOCK_NTP_PID" 2>/dev/null || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+else
 rm -f qemu/block-disk.img qemu/block-serial.txt
 dd if=/dev/zero of=qemu/block-disk.img bs=1M count=64 status=none
 sfdisk --quiet qemu/block-disk.img <<'EOF'
@@ -3981,6 +3994,7 @@ kill "$BLOCK_PID" "$BLOCK_TLS_PID" "$BLOCK_NTP_PID" 2>/dev/null || true
 wait "$BLOCK_PID" 2>/dev/null || true
 wait "$BLOCK_TLS_PID" 2>/dev/null || true
 wait "$BLOCK_NTP_PID" 2>/dev/null || true
+fi
 
 # Summary
 echo ""
