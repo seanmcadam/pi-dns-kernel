@@ -32,6 +32,7 @@ mod hdmi_hw;
 mod http;
 mod interrupts;
 mod logger;
+mod block_mem;
 mod memory;
 mod mmu;
 mod net;
@@ -237,6 +238,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     }
     log::info!("{}", version::VERSION_LINE);
     log::info!("boot {}", fw::booted_name());
+    log::info!("block region {}", block_mem::size());
     if net_up {
         match supervisor::launch(task::DNS_SLOT) {
             Ok(()) => uart_write("[OK] DNS user program running\r\n"),

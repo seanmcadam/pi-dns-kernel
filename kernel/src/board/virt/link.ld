@@ -92,4 +92,15 @@ SECTIONS
         . += 8192;
         __crash_end = .;
     }
+
+    /* Domain table for the 512 MiB guest. Above the crash slot.
+       Not loaded, not zeroed. */
+    .block 0xFFFF000043000000 (NOLOAD) :
+    {
+        __block_start = .;
+        . += 0x1000000; /* 16 MiB */
+        __block_end = .;
+    }
+    ASSERT(__block_start > __heap_end, "block region overlaps the heap")
+    ASSERT(__block_start > __crash_end, "block region overlaps crash")
 }

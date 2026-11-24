@@ -1044,9 +1044,9 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
     table[listen_fd] = Kind::TcpListen(slots, port);
 }
 
-/// The kernel heap never frees. Socket buffers are parked here on teardown
-/// and taken again the next time a port is bound, so a restart does not
-/// allocate another set. Touched only from the network owner.
+/// Socket buffers are parked here on teardown and taken again the next time
+/// a port is bound, so a restart does not allocate another set. Touched only
+/// from the network owner.
 const TCP_POOL: usize = 64;
 const UDP_POOL: usize = 16;
 static mut TCP_POOL_H: [Option<SocketHandle>; TCP_POOL] = [None; TCP_POOL];
