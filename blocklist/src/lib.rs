@@ -157,6 +157,18 @@ pub fn decode_cache_meta(text: &[u8]) -> Option<CacheMeta> {
 
 /// A truncated download and a list written by an older build have no
 /// matching marker. Callers re-download those instead of publishing them.
+/// The table must be rebuilt until `applied` is the config epoch and the
+/// enabled flag and URL list match what was published. A failed publish
+/// leaves `applied` unset so the next pass tries again.
+pub fn needs_table_reload(
+    applied: Option<u64>,
+    epoch: u64,
+    enabled_changed: bool,
+    urls_changed: bool,
+) -> bool {
+    applied != Some(epoch) || enabled_changed || urls_changed
+}
+
 pub fn cache_is_complete(meta: Option<CacheMeta>, file_len: u32) -> bool {
     let Some(meta) = meta else {
         return false;
@@ -866,6 +878,15 @@ not a domain line
             "empty is not a finished list"
         );
         assert_eq!(decode_cache_meta(b"not a marker\n"), None);
+    }
+
+    #[test]
+    fn a_failed_publish_is_tried_again() {
+        assert!(needs_table_reload(None, 0, false, false));
+        assert!(needs_table_reload(Some(1), 2, false, false));
+        assert!(needs_table_reload(Some(2), 2, true, false));
+        assert!(needs_table_reload(Some(2), 2, false, true));
+        assert!(!needs_table_reload(Some(2), 2, false, false));
     }
 
     #[test]

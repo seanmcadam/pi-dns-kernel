@@ -210,6 +210,7 @@ fn unix_now() -> i64 {
 
 struct Cfg {
     enabled: bool,
+    epoch: u64,
     refresh: i64,
     urls: Vec<alloc::string::String>,
     allow: Vec<alloc::string::String>,
@@ -225,6 +226,7 @@ fn load_cfg() -> Cfg {
     };
     let mut cfg = Cfg {
         enabled: false,
+        epoch: 0,
         refresh: 86400,
         urls: Vec::new(),
         allow: Vec::new(),
@@ -232,6 +234,8 @@ fn load_cfg() -> Cfg {
     for line in text.split('\n') {
         if let Some(rest) = line.strip_prefix("enabled ") {
             cfg.enabled = rest.trim() == "1";
+        } else if let Some(rest) = line.strip_prefix("epoch ") {
+            cfg.epoch = rest.trim().parse().unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("refresh ") {
             cfg.refresh = rest.trim().parse().unwrap_or(86400);
         } else if let Some(rest) = line.strip_prefix("url ") {
@@ -423,9 +427,10 @@ fn index_lines() -> Vec<(alloc::string::String, alloc::string::String)> {
     out
 }
 
-fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
+fn publish(cfg: &Cfg) -> Option<[u32; 8]> {
     let latest = load_cfg();
-    let cfg = if latest.enabled != cfg.enabled || latest.urls != cfg.urls {
+    let cfg = if latest.epoch != cfg.epoch || latest.enabled != cfg.enabled || latest.urls != cfg.urls
+    {
         &latest
     } else {
         cfg
@@ -442,7 +447,9 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
             _ => {
                 misses += 1;
                 if misses >= 8 {
-                    return previous;
+                    // The inactive half is unfinished. Leave the published
+                    // half in place and let the caller try again.
+                    return None;
                 }
                 let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
             }
@@ -466,10 +473,12 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
             }
         }
     }
-    let _ = block(2, 0, 0, 0, 0, 0);
+    if block(2, 0, 0, 0, 0, 0) < 0 {
+        return None;
+    }
     let tail = if cfg.enabled { cfg.urls.len() as u64 } else { 0 };
     let _ = block(14, tail, 0, 0, 0, 0);
-    counts
+    Some(counts)
 }
 
 fn write_index(cfg: &Cfg) {
@@ -613,8 +622,13 @@ pub extern "C" fn rust_main() -> ! {
     fetch::set_dns(sys(UDP_BIND, 5353, 0, 0, 0, 0, 0));
     let _ = block(13, 1, 0, 0, 0, 0);
     let mut cfg = load_cfg();
-    let mut counts = publish(&cfg, [0; 8]);
-    let _ = block(13, 2, 0, 0, 0, 0);
+    let mut applied: Option<u64> = None;
+    let mut counts = [0u32; 8];
+    if let Some(next) = publish(&cfg) {
+        counts = next;
+        applied = Some(cfg.epoch);
+        let _ = block(13, 2, 0, 0, 0, 0);
+    }
     let mut errors = [""; 8];
     let mut next = [0i64; 8];
     let mut hold = [0u64; 8];
@@ -627,23 +641,29 @@ pub extern "C" fn rust_main() -> ! {
         let now = time_ms();
         let unix = unix_now();
         let loaded = load_cfg();
-        if loaded.enabled != cfg.enabled
-            || loaded.refresh != cfg.refresh
-            || loaded.urls != cfg.urls
+        if blocklist::needs_table_reload(
+            applied,
+            loaded.epoch,
+            loaded.enabled != cfg.enabled,
+            loaded.urls != cfg.urls,
+        ) || loaded.refresh != cfg.refresh
             || loaded.allow != cfg.allow
         {
-            cfg = loaded;
             let _ = block(13, 1, 0, 0, 0, 0);
-            counts = publish(&cfg, counts);
-            let _ = block(13, 2, 0, 0, 0, 0);
-            errors = [""; 8];
-            next = [0; 8];
-            seen = [false; 8];
-            fresh = [false; 8];
-            stamp = [0; 8];
-            // The 60s hold belongs to the previous URL. A new list should
-            // download on this pass, not after that timer.
-            hold = [0; 8];
+            if let Some(published) = publish(&loaded) {
+                cfg = loaded;
+                applied = Some(cfg.epoch);
+                counts = published;
+                let _ = block(13, 2, 0, 0, 0, 0);
+                errors = [""; 8];
+                next = [0; 8];
+                seen = [false; 8];
+                fresh = [false; 8];
+                stamp = [0; 8];
+                // The 60s hold belongs to the previous URL. A new list should
+                // download on this pass, not after that timer.
+                hold = [0; 8];
+            }
         }
         if cfg.enabled && sys(NET_READY, 0, 0, 0, 0, 0, 0) == 1 {
             let mut servers = [[0u8; 4]; 16];
@@ -697,8 +717,11 @@ pub extern "C" fn rust_main() -> ! {
                 cfg = load_cfg();
                 write_index(&cfg);
                 let _ = block(13, 1, 0, 0, 0, 0);
-                counts = publish(&cfg, counts);
-                let _ = block(13, 2, 0, 0, 0, 0);
+                if let Some(next_counts) = publish(&cfg) {
+                    counts = next_counts;
+                    applied = Some(cfg.epoch);
+                    let _ = block(13, 2, 0, 0, 0, 0);
+                }
             }
         }
         if cfg.enabled {
