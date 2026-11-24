@@ -317,6 +317,83 @@ pub fn region_size(region: &[u8]) -> usize {
     region.len()
 }
 
+fn read_tlv(input: &[u8]) -> Option<(u8, usize, usize)> {
+    if input.len() < 2 {
+        return None;
+    }
+    let tag = input[0];
+    let (len, header) = if input[1] & 0x80 == 0 {
+        (input[1] as usize, 2usize)
+    } else {
+        let nbytes = (input[1] & 0x7f) as usize;
+        if nbytes == 0 || nbytes > 3 || input.len() < 2 + nbytes {
+            return None;
+        }
+        let mut len = 0usize;
+        let mut i = 0;
+        while i < nbytes {
+            len = (len << 8) | input[2 + i] as usize;
+            i += 1;
+        }
+        (len, 2 + nbytes)
+    };
+    if input.len() < header + len {
+        return None;
+    }
+    Some((tag, header, len))
+}
+
+fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (tag, header, len) = read_tlv(input)?;
+    Some((tag, &input[header..header + len], &input[header + len..]))
+}
+
+/// Issuer (`subject` false) or subject Name, including its tag and length.
+pub fn cert_name(cert: &[u8], subject: bool) -> Option<&[u8]> {
+    let (tag, value, _) = tlv(cert)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, tbs, _) = tlv(value)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let mut rest = tbs;
+    let (tag, _, next) = tlv(rest)?;
+    if tag == 0xA0 {
+        rest = next;
+    }
+    let (tag, _, next) = tlv(rest)?;
+    if tag != 0x02 {
+        return None;
+    }
+    rest = next;
+    let (tag, _, next) = tlv(rest)?;
+    if tag != 0x30 {
+        return None;
+    }
+    rest = next;
+    let (tag, _, next) = tlv(rest)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let issuer = &rest[..rest.len() - next.len()];
+    if !subject {
+        return Some(issuer);
+    }
+    rest = next;
+    let (tag, _, next) = tlv(rest)?;
+    if tag != 0x30 {
+        return None;
+    }
+    rest = next;
+    let (tag, _, next) = tlv(rest)?;
+    if tag != 0x30 {
+        return None;
+    }
+    Some(&rest[..rest.len() - next.len()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +480,19 @@ not a domain line
         }
         assert_eq!(added, 4);
         assert_eq!(count(region), 4);
+    }
+
+    #[test]
+    fn root_subject_matches_its_issuer() {
+        for der in [
+            include_bytes!("../../block-el0/roots/isrgx1.der").as_slice(),
+            include_bytes!("../../block-el0/roots/isrgx2.der").as_slice(),
+            include_bytes!("../../block-el0/roots/digicertg2.der").as_slice(),
+        ] {
+            let subject = cert_name(der, true).unwrap();
+            let issuer = cert_name(der, false).unwrap();
+            assert_eq!(subject, issuer);
+            assert!(subject.len() > 8);
+        }
     }
 }
