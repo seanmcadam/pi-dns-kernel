@@ -77,6 +77,9 @@ struct Client {
     interval_ms: u64,
     client: Option<SocketHandle>,
     server: Option<SocketHandle>,
+    /// A failed bind is not retried. Each try would leak another buffer.
+    client_stop: bool,
+    server_stop: bool,
     failed: bool,
     resolvers: [[u8; 4]; 4],
     resolver_n: u8,
@@ -94,6 +97,8 @@ static CLIENT: spin::Mutex<Client> = spin::Mutex::new(Client {
     interval_ms: 3_600_000,
     client: None,
     server: None,
+    client_stop: false,
+    server_stop: false,
     failed: false,
     resolvers: [[0; 4]; 4],
     resolver_n: 0,
@@ -155,16 +160,20 @@ pub fn drive(stack: &mut crate::net::NetworkStack, device: &mut crate::net::Ethe
 }
 
 fn ensure_sockets(client: &mut Client, stack: &mut NetworkStack) {
-    if client.client.is_none() {
+    if client.client.is_none() && !client.client_stop {
         client.client = bind(stack, CLIENT_PORT);
         if client.client.is_some() {
             log::info!("ntp client socket {CLIENT_PORT}");
+        } else {
+            client.client_stop = true;
         }
     }
-    if client.server.is_none() {
+    if client.server.is_none() && !client.server_stop {
         client.server = bind(stack, SERVER_PORT);
         if client.server.is_some() {
             log::info!("ntp server socket {SERVER_PORT}");
+        } else {
+            client.server_stop = true;
         }
     }
 }
@@ -226,10 +235,7 @@ fn load_targets(client: &mut Client, view: &crate::config_manager::NtpView) {
 
 fn push_ip(client: &mut Client, ip: [u8; 4], port: u16) {
     let mut target = Target::empty();
-    let text = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-    let n = text.len().min(target.host.len());
-    target.host[..n].copy_from_slice(&text.as_bytes()[..n]);
-    target.host_len = n as u8;
+    target.host_len = write_ip(&mut target.host, ip) as u8;
     target.port = port;
     target.ip = ip;
     target.have_ip = true;
@@ -303,18 +309,54 @@ fn begin(client: &mut Client, stack: &mut NetworkStack, now: u64) {
     send_dns(client, stack, index, 0, now);
 }
 
+fn write_ip(out: &mut [u8], ip: [u8; 4]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < 4 {
+        if i > 0 && n < out.len() {
+            out[n] = b'.';
+            n += 1;
+        }
+        n = write_dec(out, n, ip[i]);
+        i += 1;
+    }
+    n
+}
+
+fn write_dec(out: &mut [u8], mut n: usize, mut value: u8) -> usize {
+    let mut tmp = [0u8; 3];
+    let mut i = 3;
+    if value == 0 {
+        i -= 1;
+        tmp[i] = b'0';
+    }
+    while value > 0 && i > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (value % 10);
+        value /= 10;
+    }
+    while i < 3 && n < out.len() {
+        out[n] = tmp[i];
+        n += 1;
+        i += 1;
+    }
+    n
+}
+
 fn send_dns(client: &mut Client, stack: &mut NetworkStack, index: u8, resolver: u8, now: u64) {
     let Some(handle) = client.client else {
         advance(client, stack, now);
         return;
     };
-    let host = {
+    let mut host = [0u8; 64];
+    let host_n = {
         let target = &client.targets[index as usize];
-        let n = target.host_len as usize;
-        target.host[..n].to_vec()
+        let n = (target.host_len as usize).min(host.len());
+        host[..n].copy_from_slice(&target.host[..n]);
+        n
     };
     let id = (now as u16) ^ 0x51a7 ^ u16::from(index);
-    let Some(len) = ntp::write_a_query(&mut client.packet, id, &host) else {
+    let Some(len) = ntp::write_a_query(&mut client.packet, id, &host[..host_n]) else {
         advance(client, stack, now);
         return;
     };
@@ -425,9 +467,6 @@ fn take_ntp(
             // are the SNTP offset against that running clock.
             let reported = if synced { fix.offset_ms } else { 0 };
             crate::clock::sync(fix.unix_ms, reported, fix.stratum, name, now);
-            client.interval_ms = crate::config_manager::ntp_view()
-                .interval_secs
-                .saturating_mul(1000);
             client.next_ms = now.saturating_add(client.interval_ms);
             client.step = Step::Idle;
             client.failed = false;

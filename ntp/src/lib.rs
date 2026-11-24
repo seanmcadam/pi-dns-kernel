@@ -601,6 +601,43 @@ mod tests {
     }
 
     #[test]
+    fn many_clients_and_syncs_do_not_grow() {
+        let mut table = [RateSlot::empty(); RATE_SLOTS];
+        let mut i = 0u32;
+        while i < 10_000 {
+            let ip = 0x0a00_0001u32.wrapping_add(i);
+            let now = 1_000 + u64::from(i) * RATE_GAP_MS;
+            assert!(rate_allow(&mut table, ip, now));
+            let mut filled = 0usize;
+            let mut slot = 0;
+            while slot < table.len() {
+                if table[slot].ip != 0 {
+                    filled += 1;
+                }
+                slot += 1;
+            }
+            assert_eq!(table.len(), RATE_SLOTS);
+            assert_eq!(filled, (i as usize + 1).min(RATE_SLOTS));
+            i += 1;
+        }
+        assert!(table
+            .iter()
+            .any(|slot| slot.ip == 0x0a00_0001u32.wrapping_add(9_999)));
+        assert!(table.iter().all(|slot| slot.ip != 0x0a00_0001));
+
+        let server = ntp_ms(1_609_459_200);
+        let mut packet = [0u8; PACKET_LEN];
+        let sent = write_client(&mut packet, 1_000);
+        write_server(&mut packet, &sent, 2, [10, 0, 2, 2], server, server);
+        let mut n = 0;
+        while n < 1_000 {
+            let fix = evaluate(&packet, &sent, 1_000, 1_100, n > 0, 1_609_459_200_000).unwrap();
+            assert_eq!(fix.stratum, 2);
+            n += 1;
+        }
+    }
+
+    #[test]
     fn rate_limit_keeps_one_reply_per_gap() {
         let mut table = [RateSlot::empty(); RATE_SLOTS];
         assert!(rate_allow(&mut table, 0x0a000001, 1_000));

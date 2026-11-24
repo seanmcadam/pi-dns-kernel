@@ -427,7 +427,11 @@ fn capture(
         raw_line(b"crash reset\r\n");
         let _ = crate::board::crash_reset();
     } else {
-        crate::boot::disarm();
+        // Already in safe mode. Parking with the watchdog cleared is how
+        // the board went dark: no network poll and no reset. Leave the
+        // countdown that `boot::open` armed. Pets stop once the CPU halts.
+        raw_line(b"crash stay, watchdog armed\r\n");
+        crate::boot::hold_watchdog();
     }
     BUSY.store(false, Ordering::Release);
 }

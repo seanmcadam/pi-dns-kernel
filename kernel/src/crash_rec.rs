@@ -57,7 +57,9 @@ pub struct Decision {
 
 /// Three quick crashes arm safe mode and still reboot once, so the next
 /// boot can bring the network up. A later quick crash on that boot does
-/// not. A crash after `QUICK_MS` starts the streak over and resets again.
+/// not reboot immediately. The caller leaves the PM watchdog counting:
+/// parking the CPU after disarming it leaves no network and no reset.
+/// A crash after `QUICK_MS` starts the streak over and resets again.
 pub fn decide(prev: LoopState, uptime_ms: u64) -> Decision {
     let quick = uptime_ms < QUICK_MS;
     let streak = if quick {

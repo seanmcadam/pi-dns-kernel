@@ -18,6 +18,9 @@ static ACTION: AtomicU32 = AtomicU32::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static HELD: AtomicBool = AtomicBool::new(false);
 static STOPPED: AtomicBool = AtomicBool::new(false);
+/// A crash that stays up must not clear the PM watchdog. The CPU is about
+/// to park, and a disarmed watchdog would leave the board dark.
+static HOLD_WATCHDOG: AtomicBool = AtomicBool::new(false);
 static LAST_PET: AtomicU64 = AtomicU64::new(0);
 static SERVE_AT: AtomicU64 = AtomicU64::new(0);
 static GOOD: AtomicBool = AtomicBool::new(false);
@@ -284,8 +287,17 @@ pub fn status(out: &mut [u8]) -> usize {
     80
 }
 
+/// Park is next, and this crash is not asking for an immediate reboot.
+/// Leave the countdown running so the halt still resets the board.
+pub fn hold_watchdog() {
+    HOLD_WATCHDOG.store(true, Ordering::Release);
+}
+
 pub fn disarm() {
     STOPPED.store(true, Ordering::Release);
+    if HOLD_WATCHDOG.load(Ordering::Acquire) {
+        return;
+    }
     ARMED.store(false, Ordering::Release);
     crate::board::watchdog_disarm();
 }

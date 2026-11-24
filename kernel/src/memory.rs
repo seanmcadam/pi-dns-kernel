@@ -11,6 +11,7 @@ struct BumpAllocator {
     heap_start: usize,
     heap_end: usize,
     next: usize,
+    peak: usize,
 }
 
 impl BumpAllocator {
@@ -19,6 +20,7 @@ impl BumpAllocator {
             heap_start: 0,
             heap_end: 0,
             next: 0,
+            peak: 0,
         }
     }
 
@@ -41,6 +43,10 @@ impl BumpAllocator {
             null_mut()
         } else {
             self.next = alloc_end;
+            let used = alloc_end.saturating_sub(self.heap_start);
+            if used > self.peak {
+                self.peak = used;
+            }
             alloc_start as *mut u8
         }
     }
@@ -63,9 +69,16 @@ impl LockedAllocator {
 
     /// `(used, size)` in bytes. The bump allocator never frees, so `used` only grows.
     pub fn usage(&self) -> (usize, usize) {
+        let (used, _peak, size) = self.stats();
+        (used, size)
+    }
+
+    /// `(used, peak, size)`. `peak` is the high water of `used`.
+    pub fn stats(&self) -> (usize, usize, usize) {
         let bump = self.0.lock();
         (
             bump.next.saturating_sub(bump.heap_start),
+            bump.peak,
             bump.heap_end.saturating_sub(bump.heap_start),
         )
     }

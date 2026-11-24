@@ -9,7 +9,7 @@
 
 macro_rules! release {
     () => {
-        "0.1.85"
+        "0.1.86"
     };
 }
 
@@ -43,11 +43,11 @@ mod tests {
 
     #[test]
     fn release_names_the_pull_request() {
-        assert_eq!(VERSION, "0.1.85");
-        assert_eq!(VERSION_LINE, "version 0.1.85");
+        assert_eq!(VERSION, "0.1.86");
+        assert_eq!(VERSION_LINE, "version 0.1.86");
         assert!(VERSION.starts_with("0.1."));
         let patch: u32 = VERSION[4..].parse().expect("patch");
-        assert_eq!(patch, 85);
+        assert_eq!(patch, 86);
         assert!(BOOT_ID_STR.ends_with(VERSION));
         assert!(BOOT_ID.starts_with(BOOT_ID_STR.as_bytes()));
         assert_eq!(BOOT_ID[BOOT_ID_STR.len()], 0);
