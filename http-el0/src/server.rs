@@ -264,6 +264,8 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/debug/crash/spin" => handle_crash(2, 0),
         "/debug/crash/log" => handle_crash(3, 0),
         "/debug/crash/telnet" => handle_crash(4, 0),
+        "/debug/crash/block" => handle_crash(7, 0),
+        "/blocklist" => blocklist_json(),
         "/debug/crash/telnet-worker" => handle_crash(4, 1),
         "/debug/fault/guard" => {
             let _ = sys(FAULT_GUARD, 0, 0, 0, 0, 0, 0);
@@ -976,6 +978,7 @@ a{{color:#0645ad}}
 <dt>UTC</dt><dd id="utc">…</dd>
 <dt>NTP</dt><dd id="ntp">…</dd>
 <dt>Heap</dt><dd id="heap">…</dd>
+<dt>Blocker</dt><dd id="block">…</dd>
 <dt>Board</dt><dd id="board">…</dd>
 </dl>
 <h2>Network</h2>
@@ -1022,6 +1025,14 @@ function fill(d) {{
   text("utc", d.time_synced ? d.utc : "not synced");
   text("ntp", (d.ntp_server || "") + " stratum " + d.stratum + " offset " + d.offset_ms + " last " + (d.last_sync || ""));
   text("heap", d.heap_used + " / " + d.heap_peak + " / " + d.heap_size);
+  var lines = (d.block_state || "down") + " domains " + d.block_domains + " blocked " + d.block_queries + " mem " + d.block_used + "/" + d.block_size;
+  var urls = d.block_urls || [];
+  for (var i = 0; i < urls.length; i++) {{
+    var u = urls[i];
+    lines += "\\n" + u.url + " entries " + u.entries + " mtime " + u.mtime + " next " + u.next;
+    if (u.error) lines += " " + u.error;
+  }}
+  text("block", lines);
   text("board", d.board + " " + d.board_revision + " " + d.board_source);
   text("nic_irqs", d.nic_irqs);
   text("rxtx", d.rx_packets + " / " + d.tx_packets);
@@ -1052,6 +1063,106 @@ setInterval(load, 5000);
 </body></html>"#
     );
     html_response(&html)
+}
+
+fn block_stats() -> Option<Vec<u8>> {
+    let mut buf = [0u8; 2048];
+    let n = sys(80, 4, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    if n < 48 {
+        return None;
+    }
+    Some(buf[..n as usize].to_vec())
+}
+
+fn json_escape(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in bytes {
+        match byte {
+            b'"' | b'\\' => {
+                out.push('\\');
+                out.push(*byte as char);
+            }
+            0x20..=0x7e => out.push(*byte as char),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn block_fields() -> String {
+    let Some(buf) = block_stats() else {
+        return String::from(
+            r#""block_state":"down","block_domains":0,"block_queries":0,"block_used":0,"block_size":0,"block_urls":[]"#,
+        );
+    };
+    block_json(&buf, true)
+}
+
+fn blocklist_json() -> HttpResponse {
+    let body = match block_stats() {
+        Some(buf) => block_json(&buf, false),
+        None => String::from(
+            r#"{"block_state":"down","block_domains":0,"block_queries":0,"block_used":0,"block_size":0,"block_urls":[]}"#,
+        ),
+    };
+    let mut response = HttpResponse::ok(&body);
+    response.add_header("Content-Type", "application/json");
+    response
+}
+
+fn block_json(buf: &[u8], fragment: bool) -> String {
+    let state = match buf[0] {
+        1 => "loading",
+        2 => "up",
+        _ => "down",
+    };
+    let domains = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+    let queries = u64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8]));
+    let used = u64::from_le_bytes(buf[24..32].try_into().unwrap_or([0; 8]));
+    let size = u64::from_le_bytes(buf[32..40].try_into().unwrap_or([0; 8]));
+    let count = buf[40] as usize;
+    let mut urls = String::from("[");
+    let mut n = 48;
+    let mut seen = 0;
+    while seen < count && n + 36 <= buf.len() {
+        let name = json_escape(&buf[n..n + 12]);
+        let ul = buf[n + 12] as usize;
+        let el = buf[n + 13] as usize;
+        let entries = u32::from_le_bytes(buf[n + 16..n + 20].try_into().unwrap_or([0; 4]));
+        let mtime = i64::from_le_bytes(buf[n + 20..n + 28].try_into().unwrap_or([0; 8]));
+        let next = i64::from_le_bytes(buf[n + 28..n + 36].try_into().unwrap_or([0; 8]));
+        n += 36;
+        if n + ul + el > buf.len() {
+            break;
+        }
+        let url = json_escape(&buf[n..n + ul]);
+        n += ul;
+        let err = json_escape(&buf[n..n + el]);
+        n += el;
+        if seen > 0 {
+            urls.push(',');
+        }
+        urls.push_str(&format!(
+            r#"{{"name":"{}","url":"{}","entries":{},"mtime":{},"next":{},"error":"{}"}}"#,
+            name.trim_end_matches('\u{0}'),
+            url,
+            entries,
+            mtime,
+            next,
+            err
+        ));
+        seen += 1;
+    }
+    urls.push(']');
+    let body = format!(
+        r#""block_state":"{}","block_domains":{},"block_queries":{},"block_used":{},"block_size":{},"block_urls":{}"#,
+        state, domains, queries, used, size, urls
+    );
+    if fragment {
+        body
+    } else {
+        format!("{{{body}}}")
+    }
 }
 
 fn heap_fields() -> String {
@@ -1123,7 +1234,7 @@ fn status_json() -> HttpResponse {
         vclog_status,
     ) = hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -1168,6 +1279,7 @@ fn status_json() -> HttpResponse {
         board_fields(),
         time_fields(),
         heap_fields(),
+        block_fields(),
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");

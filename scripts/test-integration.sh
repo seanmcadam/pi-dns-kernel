@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.86" qemu/boot-output.txt && \
+   grep -q "version 0.1.87" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.86"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.87"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -194,6 +194,7 @@ need = (
     "board", "board_revision", "board_source",
     "time_synced", "utc", "last_sync", "ntp_server", "offset_ms", "stratum",
     "heap_used", "heap_peak", "heap_size",
+    "block_state", "block_domains", "block_queries", "block_used", "block_size", "block_urls",
 )
 counts = ("nic_irqs", "rx_packets", "tx_packets", "net_busy_ms", "net_idle_ms")
 extra = (
@@ -268,6 +269,13 @@ for doc in (a, b):
     if doc["heap_used"] > doc["heap_peak"] or doc["heap_peak"] > doc["heap_size"] or doc["heap_size"] != 2 * 1024 * 1024:
         print("heap water", doc["heap_used"], doc["heap_peak"], doc["heap_size"])
         sys.exit(1)
+    if doc["block_state"] not in ("up", "down", "loading") or not isinstance(doc["block_urls"], list):
+        print("block", doc["block_state"], doc.get("block_urls"))
+        sys.exit(1)
+    for key in ("block_domains", "block_queries", "block_used", "block_size"):
+        if not isinstance(doc[key], int) or isinstance(doc[key], bool) or doc[key] < 0:
+            print("block", key, doc[key])
+            sys.exit(1)
     if doc["sd_state"] != "absent" or doc["fs_mounted"] != 0 or doc["sd_mode"] != "none" or doc["sd_clock_hz"] != 0:
         print("diskless guest", doc["sd_state"], doc["fs_mounted"], doc["sd_error"], doc["sd_mode"], doc["sd_clock_hz"])
         sys.exit(1)
@@ -309,7 +317,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.86" not in html:
+if forced.get("version") != plain.get("version") or "0.1.87" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 print("status html", len(html), "json", plain.get("version"))
@@ -2263,12 +2271,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.86" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.87" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.86" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.87" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2284,7 +2292,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.86" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.87" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2531,12 +2539,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.86":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.87":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.86" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.87" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3816,6 +3824,163 @@ fi
 kill "$NTP_PID" "$NTP_STUB_PID" 2>/dev/null || true
 wait "$NTP_PID" 2>/dev/null || true
 wait "$NTP_STUB_PID" 2>/dev/null || true
+
+echo ""
+echo "Test 64: HTTPS block list, local records win, DNS fails open"
+BLOCK_TLS_PORT=18443
+BLOCK_NTP_PORT=18126
+BLOCK_HTTP_PORT=18082
+BLOCK_DNS_PORT=18055
+openssl req -x509 -newkey rsa:2048 -keyout /tmp/block-key.pem -out /tmp/block-cert.pem \
+    -days 3650 -nodes -subj "/CN=10.0.2.2" >/dev/null 2>&1
+openssl x509 -in /tmp/block-cert.pem -outform DER -out /tmp/TESTCA.DER
+python3 - "$BLOCK_TLS_PORT" <<'PY' &
+import http.server, ssl, sys
+port = int(sys.argv[1])
+body = b"0.0.0.0 ads.example\n0.0.0.0 test.local\nplain.example\n"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_args):
+        return
+
+httpd = http.server.HTTPServer(("0.0.0.0", port), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain("/tmp/block-cert.pem", "/tmp/block-key.pem")
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PY
+BLOCK_TLS_PID=$!
+python3 - "$BLOCK_NTP_PORT" <<'PY' &
+import socket, struct, sys
+port = int(sys.argv[1])
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", port))
+unix = 1800000000
+delta = 2208988800
+secs = unix + delta
+while True:
+    data, addr = sock.recvfrom(512)
+    if len(data) < 48 or (data[0] & 7) != 3:
+        continue
+    pkt = bytearray(48)
+    pkt[0] = (4 << 3) | 4
+    pkt[1] = 2
+    pkt[2] = 6
+    pkt[12:16] = bytes([10, 0, 2, 2])
+    raw = struct.pack(">I", secs)
+    pkt[16:20] = raw
+    pkt[24:32] = data[40:48]
+    pkt[32:36] = raw
+    pkt[40:44] = raw
+    sock.sendto(pkt, addr)
+PY
+BLOCK_NTP_PID=$!
+sleep 0.2
+rm -f qemu/block-disk.img qemu/block-serial.txt
+dd if=/dev/zero of=qemu/block-disk.img bs=1M count=64 status=none
+sfdisk --quiet qemu/block-disk.img <<'EOF'
+label: dos
+start=2048, type=c
+EOF
+mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/block-disk.img >/dev/null
+BLOCK_OFF=$((2048 * 512))
+cat > /tmp/block-config.json <<EOF
+{"version":1,"network":{"mode":"dhcp","ip":"10.0.2.15","netmask":"255.255.255.0","gateway":"10.0.2.2","timeout_ms":3000},"dns":{"cache_size":1024,"cache_reap_interval_secs":5,"upstreams":["8.8.8.8","10.0.2.3"],"blocklist":[],"records":[{"name":"test.local","type":"A","value":"192.168.1.100","ttl":300}]},"http":{"port":80,"username":"admin","password":"admin"},"display":{"vnc":0,"vnc_port":5900,"vnc_password":"","hdmi":0},"ntp":{"servers":["10.0.2.2:${BLOCK_NTP_PORT}"],"interval_secs":30,"serve":0},"block":{"enabled":1,"refresh_secs":86400,"urls":["https://10.0.2.2:${BLOCK_TLS_PORT}/list.txt"],"allow":["plain.example"]}}
+EOF
+mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/block-config.json ::CONFIG.JSN
+mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/TESTCA.DER ::TESTCA.DER
+BLOCK_FWD="hostfwd=udp::${BLOCK_DNS_PORT}-:53,hostfwd=tcp::${BLOCK_HTTP_PORT}-:80"
+timeout 120 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/block-serial.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${BLOCK_FWD} \
+    -device virtio-net-device,netdev=net0 \
+    -drive file=qemu/block-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
+    -device virtio-blk-device,drive=hd0 \
+    >/tmp/qemu-block.txt 2>&1 &
+BLOCK_PID=$!
+if python3 - "$BLOCK_HTTP_PORT" "$BLOCK_DNS_PORT" <<'PY'
+import json, subprocess, sys, time
+http, dns = sys.argv[1:]
+
+def status():
+    try:
+        raw = subprocess.check_output(
+            ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
+             "http://127.0.0.1:%s/json/status" % http],
+            stderr=subprocess.DEVNULL,
+        )
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def dig(name):
+    try:
+        return subprocess.check_output(
+            ["dig", "@127.0.0.1", "-p", dns, name, "A", "+short", "+time=2", "+tries=1"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception as exc:
+        return str(exc)
+
+doc = None
+for _ in range(50):
+    doc = status()
+    if doc and doc.get("time_synced") == 1 and doc.get("block_domains", 0) >= 2:
+        break
+    time.sleep(0.5)
+else:
+    print("status", None if doc is None else {
+        "synced": doc.get("time_synced"),
+        "state": doc.get("block_state"),
+        "domains": doc.get("block_domains"),
+        "urls": doc.get("block_urls"),
+    })
+    sys.exit(1)
+if dig("test.local") != "192.168.1.100":
+    print("local", dig("test.local"))
+    sys.exit(1)
+if dig("ads.example") != "0.0.0.0":
+    print("ads", dig("ads.example"), doc.get("block_urls"))
+    sys.exit(1)
+plain = dig("plain.example")
+if plain == "0.0.0.0":
+    print("allow", plain)
+    sys.exit(1)
+listed = doc.get("block_urls") or []
+if not listed or listed[0].get("entries", 0) < 2 or listed[0].get("mtime", 0) <= 0:
+    print("url", listed)
+    sys.exit(1)
+subprocess.check_output(
+    ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
+     "http://127.0.0.1:%s/debug/crash/block" % http],
+    stderr=subprocess.DEVNULL,
+)
+if dig("test.local") != "192.168.1.100":
+    print("dns after crash", dig("test.local"))
+    sys.exit(1)
+print("blocked", doc.get("block_domains"), "mtime", listed[0].get("mtime"), "allow", plain)
+sys.exit(0)
+PY
+then
+    echo "✓ Block list downloaded over HTTPS, local names win, DNS survives a blocker crash"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Block list test failed"
+    tail -50 qemu/block-serial.txt 2>/dev/null || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+kill "$BLOCK_PID" "$BLOCK_TLS_PID" "$BLOCK_NTP_PID" 2>/dev/null || true
+wait "$BLOCK_PID" 2>/dev/null || true
+wait "$BLOCK_TLS_PID" 2>/dev/null || true
+wait "$BLOCK_NTP_PID" 2>/dev/null || true
 
 # Summary
 echo ""
