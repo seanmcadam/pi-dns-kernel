@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.89" qemu/boot-output.txt && \
+   grep -q "version 0.1.90" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.89"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.90"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -317,7 +317,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.89" not in html:
+if forced.get("version") != plain.get("version") or "0.1.90" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 print("status html", len(html), "json", plain.get("version"))
@@ -2271,12 +2271,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.89" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.90" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.89" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.90" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2292,7 +2292,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.89" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.90" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2539,12 +2539,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.89":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.90":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.89" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.90" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3907,6 +3907,24 @@ cat > /tmp/block-config.json <<EOF
 EOF
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/block-config.json ::CONFIG.JSN
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/TESTCA.DER ::TESTCA.DER
+# A previous build saved a short list and a fresh directory time. There is
+# no completeness sidecar, so this file must be fetched again.
+python3 - "$BLOCK_TLS_PORT" <<'PY'
+import sys
+port = sys.argv[1]
+url = "https://10.0.2.2:%s/list.txt" % port
+h = 0x811C9DC5
+for byte in url.encode():
+    h ^= byte
+    h = (h * 0x01000193) & 0xFFFFFFFF
+name = "%08X.LST" % h
+open("/tmp/block-list-name", "w").write(name)
+open("/tmp/truncated.lst", "wb").write(b"0.0.0.0 ads.example\n")
+open("/tmp/BLOCK.IDX", "w").write("%s %s\n" % (name, url))
+PY
+LIST_NAME=$(cat /tmp/block-list-name)
+mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/truncated.lst "::$LIST_NAME"
+mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/BLOCK.IDX ::BLOCK.IDX
 # A wiped RAM sequence must not rewrite this file. The fault writes the next slot.
 mmd -i qemu/block-disk.img@@${BLOCK_OFF} ::CRASH
 printf 'OLDCRASH\n' > /tmp/CRASH000.TXT

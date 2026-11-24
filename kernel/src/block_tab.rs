@@ -166,6 +166,7 @@ pub fn call(op: u64, args: [u64; 5]) -> i64 {
             0
         }
         14 => clear_rows(args[0]),
+        15 => file_len(args[0], args[1]),
         _ => -22,
     }
 }
@@ -399,7 +400,7 @@ fn safe_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() == 12
         && bytes[8] == b'.'
-        && &bytes[9..] == b"LST"
+        && (&bytes[9..] == b"LST" || &bytes[9..] == b"NFO")
         && bytes[..8]
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
@@ -432,7 +433,7 @@ fn write_file(name_ptr: u64, name_len: u64, buf: u64, len: u64, flags: u64) -> i
         return -22;
     };
     let name = name.trim_end_matches('\0');
-    if name != "BLOCK.TMP" && name != "BLOCK.IDX" {
+    if name != "BLOCK.TMP" && name != "BLOCK.IDX" && !name.ends_with(".NFO") {
         return -22;
     }
     if len > 1024 || !crate::mmu::user_slice_ok(buf, len) {
@@ -467,6 +468,20 @@ fn swing(from_ptr: u64, from_len: u64, to_ptr: u64, to_len: u64) -> i64 {
         return -22;
     }
     if crate::fs::swing_file(from, to).is_ok() { 0 } else { -5 }
+}
+
+fn file_len(ptr: u64, len: u64) -> i64 {
+    let Some(name) = file_name(ptr, len) else {
+        return -22;
+    };
+    let Ok(name) = core::str::from_utf8(&name) else {
+        return -22;
+    };
+    let name = name.trim_end_matches('\0');
+    match crate::fs::file_len(name) {
+        Ok(n) => n as i64,
+        Err(_) => 0,
+    }
 }
 
 fn mtime(ptr: u64, len: u64) -> i64 {

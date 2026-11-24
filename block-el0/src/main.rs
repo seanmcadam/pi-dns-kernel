@@ -200,6 +200,10 @@ fn file_mtime(name: &str) -> i64 {
     block(10, name.as_ptr() as u64, name.len() as u64, 0, 0, 0)
 }
 
+fn file_len(name: &str) -> i64 {
+    block(15, name.as_ptr() as u64, name.len() as u64, 0, 0, 0)
+}
+
 fn unix_now() -> i64 {
     block(11, 0, 0, 0, 0, 0)
 }
@@ -321,6 +325,47 @@ fn list_name(url: &str) -> alloc::string::String {
     alloc::string::String::from(core::str::from_utf8(&raw).unwrap_or("BAD.LST"))
 }
 
+fn meta_name(url: &str) -> alloc::string::String {
+    let raw = blocklist::meta_file(url);
+    alloc::string::String::from(core::str::from_utf8(&raw).unwrap_or("BAD.NFO"))
+}
+
+/// The list file matches a version-1 sidecar. A short file from an older
+/// build has no sidecar and is not loaded.
+fn cache_complete(url: &str) -> bool {
+    let list = list_name(url);
+    let len = file_len(&list);
+    if len <= 0 {
+        return false;
+    }
+    let meta = meta_name(url);
+    let mut buf = [0u8; 64];
+    let n = file_read(&meta, 0, &mut buf);
+    if n <= 0 {
+        return false;
+    }
+    blocklist::cache_is_complete(
+        blocklist::decode_cache_meta(&buf[..n as usize]),
+        len as u32,
+    )
+}
+
+fn write_meta(url: &str, version: u32, bytes: u32, entries: u32) {
+    let name = meta_name(url);
+    let mut buf = [0u8; 64];
+    let Some(n) = blocklist::encode_cache_meta(
+        &blocklist::CacheMeta {
+            version,
+            bytes,
+            entries,
+        },
+        &mut buf,
+    ) else {
+        return;
+    };
+    let _ = file_write(&name, &buf[..n], true);
+}
+
 fn feed_line(line: &[u8]) -> u32 {
     let Ok(text) = core::str::from_utf8(line) else {
         return 0;
@@ -408,7 +453,9 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
         let cached = index_lines();
         for (i, url) in cfg.urls.iter().enumerate().take(8) {
             let name = list_name(url);
-            if cached.iter().any(|(file, _)| file == &name) {
+            // The index only records that a download was attempted. A file
+            // without a matching sidecar is a truncated or pre-0.1.90 cache.
+            if cached.iter().any(|(file, _)| file == &name) && cache_complete(url) {
                 match load_file(&name) {
                     Ok(n) => counts[i] = n,
                     // A short read must not be reported as a full list. The
@@ -537,10 +584,14 @@ fn refresh_one(url: &str, dns: &[[u8; 4]], unix: i64) -> Result<(), &'static str
     if total == 0 || !read_back(hash, total as u64) {
         return Err(if total == 0 { "empty" } else { "disk" });
     }
-    if names_in_temp()? > blocklist::LIST_MAX_ENTRIES as u32 {
+    let names = names_in_temp()?;
+    if names > blocklist::LIST_MAX_ENTRIES as u32 {
         return Err("full");
     }
     let name = list_name(url);
+    // Drop any previous marker before the file moves, so a crash cannot
+    // pair the new bytes with an old length.
+    write_meta(url, 0, 0, 0);
     if block(
         9,
         TEMP.as_ptr() as u64,
@@ -552,6 +603,7 @@ fn refresh_one(url: &str, dns: &[[u8; 4]], unix: i64) -> Result<(), &'static str
     {
         return Err("disk");
     }
+    write_meta(url, blocklist::CACHE_META_VERSION, total as u32, names);
     Ok(())
 }
 
@@ -592,10 +644,15 @@ pub extern "C" fn rust_main() -> ! {
             for (i, url) in cfg.urls.iter().enumerate().take(8) {
                 let name = list_name(url);
                 let mtime = file_mtime(&name);
+                let fresh = cache_complete(url);
+                let aged = mtime <= 0 || (unix > 0 && unix >= mtime.saturating_add(cfg.refresh));
+                // A truncated cache is due even when its directory time is
+                // still inside the refresh window. HTTPS waits for a clock
+                // so the certificate can be checked.
                 let due = if url.starts_with("https://") {
-                    unix > 0 && (mtime <= 0 || unix >= mtime.saturating_add(cfg.refresh))
+                    unix > 0 && (!fresh || aged)
                 } else {
-                    mtime <= 0 || (unix > 0 && unix >= mtime.saturating_add(cfg.refresh))
+                    !fresh || aged
                 };
                 if !due || (next[i] != 0 && (unix <= 0 || unix < next[i])) || now < hold[i] {
                     continue;

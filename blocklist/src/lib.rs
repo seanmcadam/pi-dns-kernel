@@ -67,6 +67,103 @@ pub fn list_file(url: &str) -> [u8; 12] {
     out
 }
 
+/// `XXXXXXXX.NFO`, the completeness sidecar for [`list_file`].
+pub fn meta_file(url: &str) -> [u8; 12] {
+    let mut out = list_file(url);
+    out[9] = b'N';
+    out[10] = b'F';
+    out[11] = b'O';
+    out
+}
+
+/// Written only after a download is verified. Version 1 is this format.
+/// A missing sidecar, a different version, or a length that does not match
+/// the list file means the cache is stale and must not be published.
+pub const CACHE_META_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheMeta {
+    pub version: u32,
+    pub bytes: u32,
+    pub entries: u32,
+}
+
+/// `v<version> <bytes> <entries>\n`.
+pub fn encode_cache_meta(meta: &CacheMeta, out: &mut [u8]) -> Option<usize> {
+    let mut n = 0usize;
+    if !push_bytes(out, &mut n, b"v") {
+        return None;
+    }
+    if !push_u32(out, &mut n, meta.version) {
+        return None;
+    }
+    if !push_bytes(out, &mut n, b" ") {
+        return None;
+    }
+    if !push_u32(out, &mut n, meta.bytes) {
+        return None;
+    }
+    if !push_bytes(out, &mut n, b" ") {
+        return None;
+    }
+    if !push_u32(out, &mut n, meta.entries) {
+        return None;
+    }
+    if !push_bytes(out, &mut n, b"\n") {
+        return None;
+    }
+    Some(n)
+}
+
+fn push_bytes(out: &mut [u8], n: &mut usize, bytes: &[u8]) -> bool {
+    if *n + bytes.len() > out.len() {
+        return false;
+    }
+    out[*n..*n + bytes.len()].copy_from_slice(bytes);
+    *n += bytes.len();
+    true
+}
+
+fn push_u32(out: &mut [u8], n: &mut usize, mut value: u32) -> bool {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    if value == 0 {
+        return push_bytes(out, n, b"0");
+    }
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    push_bytes(out, n, &buf[i..])
+}
+
+pub fn decode_cache_meta(text: &[u8]) -> Option<CacheMeta> {
+    let text = core::str::from_utf8(text).ok()?.trim();
+    let mut parts = text.split_whitespace();
+    let version = parts.next()?;
+    let version = version.strip_prefix('v')?.parse().ok()?;
+    let bytes = parts.next()?.parse().ok()?;
+    let entries = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(CacheMeta {
+        version,
+        bytes,
+        entries,
+    })
+}
+
+/// A truncated download and a list written by an older build have no
+/// matching marker. Callers re-download those instead of publishing them.
+pub fn cache_is_complete(meta: Option<CacheMeta>, file_len: u32) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    meta.version == CACHE_META_VERSION && file_len > 0 && meta.bytes == file_len && meta.entries > 0
+}
+
 /// Lowercase, strip one trailing dot, and keep a DNS label sequence.
 pub fn normalize_into(name: &str, out: &mut [u8]) -> Option<usize> {
     let name = name.trim().trim_end_matches('.');
@@ -642,6 +739,53 @@ not a domain line
             });
             assert_eq!(got, reference, "chunk {size}");
         }
+    }
+
+    #[test]
+    fn a_truncated_cache_is_not_complete() {
+        let url = "https://example.com/hosts";
+        let list = list_file(url);
+        let meta = meta_file(url);
+        assert_eq!(&list[8..], b".LST");
+        assert_eq!(&meta[8..], b".NFO");
+        assert_eq!(&list[..8], &meta[..8]);
+        let mut buf = [0u8; 64];
+        let full = CacheMeta {
+            version: CACHE_META_VERSION,
+            bytes: 2_505_650,
+            entries: 81_677,
+        };
+        let n = encode_cache_meta(&full, &mut buf).unwrap();
+        assert_eq!(decode_cache_meta(&buf[..n]), Some(full));
+        assert!(cache_is_complete(Some(full), 2_505_650));
+        assert!(
+            !cache_is_complete(Some(full), 1_800_000),
+            "shorter than the marker"
+        );
+        assert!(!cache_is_complete(None, 2_505_650), "no marker");
+        assert!(
+            !cache_is_complete(
+                Some(CacheMeta {
+                    version: 0,
+                    bytes: 100,
+                    entries: 10,
+                }),
+                100
+            ),
+            "older or invalidated marker"
+        );
+        assert!(
+            !cache_is_complete(
+                Some(CacheMeta {
+                    version: CACHE_META_VERSION,
+                    bytes: 100,
+                    entries: 0,
+                }),
+                100
+            ),
+            "empty is not a finished list"
+        );
+        assert_eq!(decode_cache_meta(b"not a marker\n"), None);
     }
 
     #[test]
