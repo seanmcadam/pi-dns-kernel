@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 blocklist = { path = "../blocklist" }
 ntp = { path = "../ntp" }
-embedded-tls = { version = "0.19", default-features = false, features = ["alloc", "rsa", "rustpki"] }
+embedded-tls = { version = "0.19", default-features = false, features = ["alloc", "rsa", "rustpki", "p384"] }
 embedded-io = { version = "0.7", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }

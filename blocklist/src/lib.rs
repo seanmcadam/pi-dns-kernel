@@ -11,7 +11,7 @@
 pub const URL_MAX: usize = 8;
 pub const URL_LEN_MAX: usize = 160;
 /// One downloaded list. Larger bodies are refused and the old file is kept.
-pub const LIST_MAX_BYTES: usize = 1024 * 1024;
+pub const LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Names taken from one list. The table's own load cap still applies.
 pub const LIST_MAX_ENTRIES: usize = 400_000;
 pub const ALLOW_MAX: usize = 32;
@@ -443,8 +443,18 @@ not a domain line
         assert!(a[..8].iter().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(a.len(), 12);
         assert!(URL_MAX <= 8);
-        assert!(LIST_MAX_BYTES <= 1024 * 1024);
+        assert!(LIST_MAX_BYTES >= 4 * 1024 * 1024);
+        assert!(LIST_MAX_BYTES <= 8 * 1024 * 1024);
         assert!(LIST_MAX_ENTRIES <= 400_000);
+    }
+
+    #[test]
+    fn isrg_root_yr_is_a_self_signed_trust_anchor() {
+        let yr = include_bytes!("../../block-el0/roots/isrgyr.der");
+        let subject = cert_name(yr, true).expect("subject");
+        let issuer = cert_name(yr, false).expect("issuer");
+        assert_eq!(subject, issuer);
+        assert!(subject.windows(7).any(|window| window == b"Root YR"));
     }
 
     #[test]
