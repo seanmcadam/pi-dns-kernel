@@ -989,6 +989,12 @@ fn tcp_close_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::St
             let _lock = FD_LOCK[task].lock();
             table_of(task)[fd] = Kind::Empty;
         }
+        4 => {
+            // A second close of a client socket that never had a listener.
+            give_tcp(stack, handle);
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Empty;
+        }
         5 => {
             give_tcp(stack, handle);
             let _lock = FD_LOCK[task].lock();
@@ -1104,6 +1110,9 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
     let table = table_of(task);
     let Some(listen_fd) = (0..MAX_FD).find(|index| matches!(table[*index], Kind::TcpListen(_, _)))
     else {
+        // A client task (the blocker) has no listener to absorb a closed
+        // connection. Park the finished socket or its buffers stay allocated.
+        reap_clients(table, stack);
         return;
     };
     let Kind::TcpListen(mut slots, port) = table[listen_fd] else {
@@ -1141,6 +1150,29 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
         }
     }
     table[listen_fd] = Kind::TcpListen(slots, port);
+}
+
+fn reap_clients(table: &mut [Kind], stack: &mut crate::net::NetworkStack) {
+    for index in 0..MAX_FD {
+        let Kind::Closing(handle) = table[index] else {
+            continue;
+        };
+        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+        if socket.send_queue() > 0 {
+            continue;
+        }
+        if matches!(
+            socket.state(),
+            tcp::State::Established
+                | tcp::State::CloseWait
+                | tcp::State::SynReceived
+                | tcp::State::SynSent
+        ) {
+            continue;
+        }
+        give_tcp(stack, handle);
+        table[index] = Kind::Empty;
+    }
 }
 
 /// Socket buffers are parked here on teardown and taken again the next time
