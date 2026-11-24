@@ -1498,6 +1498,10 @@ button{{margin-top:.6rem;padding:.4rem .8rem}}
 <label>Upstreams, one address per line <textarea id="upstreams" name="upstreams"></textarea></label>
 <label>Local records, one per line: name type value ttl <textarea id="records" name="records"></textarea></label>
 <label>Block list, one name per line <textarea id="blocklist" name="blocklist"></textarea></label>
+<label>Block lists enabled (0 or 1) <input id="block_enabled" name="block_enabled" value="0" required></label>
+<label>Block list refresh seconds (3600..=604800, default 86400) <input id="block_refresh" name="block_refresh" value="86400" required></label>
+<label>Block list URLs, one http(s) URL per line (at most 8) <textarea id="block_urls" name="block_urls"></textarea></label>
+<label>Allow list, one domain per line <textarea id="block_allow" name="block_allow"></textarea></label>
 <label>board.detect (0 or 1, 1 is the default) <input id="detect" name="detect" value="1" required></label>
 <label>HTTP port <input id="port" name="port" required></label>
 <label>HTTP user <input id="user" name="user" required></label>
@@ -1531,6 +1535,11 @@ function fill() {{
   setv("probe", dns.probe_interval_secs || 5);
   setv("upstreams", (dns.upstreams || []).join("\n"));
   setv("blocklist", (dns.blocklist || []).join("\n"));
+  var block = base.block || {{}};
+  setv("block_enabled", block.enabled === 1 ? "1" : "0");
+  setv("block_refresh", block.refresh_secs || 86400);
+  setv("block_urls", (block.urls || []).join("\n"));
+  setv("block_allow", (block.allow || []).join("\n"));
   setv("records", (dns.records || []).map(function(r) {{
     return r.name + " " + r.type + " " + r.value + " " + r.ttl;
   }}).join("\n"));
@@ -1557,7 +1566,11 @@ function build() {{
     || bounds(Number(val("detect")), 0, 1, "detect")
     || bounds(Number(val("ntp_interval")), 30, 86400, "ntp_interval")
     || bounds(Number(val("ntp_serve")), 0, 1, "ntp_serve")
-    || ntpServers(lines(val("ntp_servers")));
+    || bounds(Number(val("block_enabled")), 0, 1, "block_enabled")
+    || bounds(Number(val("block_refresh")), 3600, 604800, "block_refresh")
+    || ntpServers(lines(val("ntp_servers")))
+    || blockUrls(lines(val("block_urls")))
+    || blockAllow(lines(val("block_allow")));
   if (val("mode") !== "dhcp" && val("mode") !== "static") err = err || "mode";
   if (err) return err;
   base.network.mode = val("mode");
@@ -1584,6 +1597,32 @@ function build() {{
     interval_secs: Number(val("ntp_interval")),
     serve: Number(val("ntp_serve"))
   }};
+  var urls = lines(val("block_urls"));
+  var allow = lines(val("block_allow"));
+  var enabled = Number(val("block_enabled"));
+  var refresh = Number(val("block_refresh"));
+  if (enabled === 0 && refresh === 86400 && urls.length === 0 && allow.length === 0) delete base.block;
+  else base.block = {{enabled: enabled, refresh_secs: refresh, urls: urls, allow: allow}};
+  return "";
+}}
+function blockUrls(list) {{
+  if (list.length > 8) return "block urls";
+  for (var i = 0; i < list.length; i++) {{
+    var url = list[i];
+    if (url.length < 8 || url.length > 160) return "block url";
+    if (url.indexOf("@") >= 0 || url.indexOf(" ") >= 0) return "block url";
+    if (!/^https?:\/\/[A-Za-z0-9.-]+(:[0-9]{{1,5}})?(\/[A-Za-z0-9._~/?=&%+-]*)?$/.test(url)) return "block url";
+    var port = url.replace(/^https?:\/\//, "").split("/")[0].split(":")[1];
+    if (port && (Number(port) < 1 || Number(port) > 65535)) return "block url";
+  }}
+  return "";
+}}
+function blockAllow(list) {{
+  if (list.length > 32) return "block allow";
+  for (var i = 0; i < list.length; i++) {{
+    if (list[i].length < 1 || list[i].length > 253) return "block allow";
+    if (!/^[A-Za-z0-9.-]+$/.test(list[i])) return "block allow";
+  }}
   return "";
 }}
 function ntpServers(list) {{

@@ -18,6 +18,15 @@ pub struct Config {
     /// `board.detect`. Missing means on. Off reports the build-time board.
     pub board_detect: bool,
     pub ntp: NtpConfig,
+    pub block: BlockConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockConfig {
+    pub enabled: bool,
+    pub refresh_secs: u64,
+    pub urls: Vec<String>,
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1056,6 +1065,16 @@ fn default_config() -> Config {
         timeout_ms: 3_000,
         board_detect: crate::board_rev::DETECT_DEFAULT,
         ntp: default_ntp(),
+        block: default_block(),
+    }
+}
+
+fn default_block() -> BlockConfig {
+    BlockConfig {
+        enabled: false,
+        refresh_secs: config::BLOCK_REFRESH_DEFAULT,
+        urls: Vec::new(),
+        allow: Vec::new(),
     }
 }
 
@@ -1326,6 +1345,59 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
             config::VNC_PASS_MAX
         ));
     }
+    config::check_block(value).map_err(|err| err.text())?;
+    let block = match value.get("block") {
+        None => default_block(),
+        Some(block) => {
+            let enabled = block.get("enabled").and_then(Value::as_u64).unwrap_or(0) != 0;
+            let refresh_secs = block
+                .get("refresh_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(config::BLOCK_REFRESH_DEFAULT);
+            let mut urls = Vec::new();
+            if let Some(items) = block.get("urls").and_then(Value::as_array) {
+                for (index, item) in items.iter().enumerate() {
+                    let text = item.as_str().unwrap_or("");
+                    if !config::check_block_url(text) {
+                        return Err(alloc::format!(
+                            "block.urls[{index}]: expected http or https url"
+                        ));
+                    }
+                    urls.push(text.to_string());
+                }
+            }
+            if urls.len() > 1 {
+                let mut index = 0;
+                while index < urls.len() {
+                    let name = blocklist::list_file(&urls[index]);
+                    let mut other = index + 1;
+                    while other < urls.len() {
+                        if blocklist::list_file(&urls[other]) == name {
+                            return Err(String::from("block.urls: filename collision"));
+                        }
+                        other += 1;
+                    }
+                    index += 1;
+                }
+            }
+            let mut allow = Vec::new();
+            if let Some(items) = block.get("allow").and_then(Value::as_array) {
+                for (index, item) in items.iter().enumerate() {
+                    let text = item.as_str().unwrap_or("");
+                    if text.is_empty() || text.len() > config::BLOCK_ALLOW_LEN {
+                        return Err(alloc::format!("block.allow[{index}]: out of bounds"));
+                    }
+                    allow.push(text.to_string());
+                }
+            }
+            BlockConfig {
+                enabled,
+                refresh_secs,
+                urls,
+                allow,
+            }
+        }
+    };
     let ntp = match value.get("ntp") {
         None => default_ntp(),
         Some(ntp) => {
@@ -1395,6 +1467,7 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         timeout_ms,
         board_detect,
         ntp,
+        block,
     })
 }
 
@@ -1668,6 +1741,35 @@ fn config_value(config: &Config) -> Value {
             ),
         ]),
     ));
+    if config.block.enabled
+        || !config.block.urls.is_empty()
+        || !config.block.allow.is_empty()
+        || config.block.refresh_secs != config::BLOCK_REFRESH_DEFAULT
+    {
+        let mut urls = Vec::new();
+        for url in &config.block.urls {
+            urls.push(Value::String(url.clone()));
+        }
+        let mut allow = Vec::new();
+        for name in &config.block.allow {
+            allow.push(Value::String(name.clone()));
+        }
+        fields.push((
+            String::from("block"),
+            Value::Object(vec![
+                (
+                    String::from("enabled"),
+                    Value::Number(u64::from(config.block.enabled)),
+                ),
+                (
+                    String::from("refresh_secs"),
+                    Value::Number(config.block.refresh_secs),
+                ),
+                (String::from("urls"), Value::Array(urls)),
+                (String::from("allow"), Value::Array(allow)),
+            ]),
+        ));
+    }
     if !config.board_detect {
         fields.push((
             String::from("board"),

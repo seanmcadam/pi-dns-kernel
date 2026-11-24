@@ -13,6 +13,7 @@ members = [
     "version",
     "ntp",
     "kalloc",
+    "blocklist",
 ]
 exclude = ["user-test", "dns-el0", "http-el0", "log-el0"]
 resolver = "2"

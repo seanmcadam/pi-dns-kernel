@@ -35,6 +35,7 @@ embedded-sdmmc = { path = "../vendor/embedded-sdmmc", default-features = false }
 embedded-hal = { workspace = true }
 
 kalloc = { path = "../kalloc" }
+blocklist = { path = "../blocklist" }
 config = { path = "../config", default-features = false }
 ntp = { path = "../ntp" }
 fwupd = { path = "../fwupd", default-features = false }
