@@ -13,11 +13,11 @@ extern "C" {
 }
 
 pub fn start() -> *mut u8 {
-    &__block_start as *const u8 as *mut u8
+    unsafe { &__block_start as *const u8 as *mut u8 }
 }
 
 pub fn end() -> *mut u8 {
-    &__block_end as *const u8 as *mut u8
+    unsafe { &__block_end as *const u8 as *mut u8 }
 }
 
 pub fn size() -> usize {

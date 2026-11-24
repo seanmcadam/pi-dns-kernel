@@ -59,6 +59,25 @@ impl NetworkStack {
     pub fn sockets_mut(&mut self) -> &mut SocketSet<'static> {
         &mut self.sockets
     }
+
+    pub fn connect_tcp(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+        ip: [u8; 4],
+        port: u16,
+        local: u16,
+    ) -> Result<(), ()> {
+        use smoltcp::socket::tcp;
+        use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+        let remote = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(ip)), port);
+        let local_ep = IpListenEndpoint {
+            addr: None,
+            port: local,
+        };
+        let cx = self.iface.context();
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        socket.connect(cx, remote, local_ep).map_err(|_| ())
+    }
 }
 
 fn netmask_to_prefix_len(netmask: [u8; 4]) -> u8 {

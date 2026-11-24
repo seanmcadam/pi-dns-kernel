@@ -124,6 +124,7 @@ static HDMI_CMD: AtomicU8 = AtomicU8::new(0);
 static HDMI_RESET: AtomicBool = AtomicBool::new(false);
 
 fn publish(config: &Config) {
+    crate::block_tab::set_allow(&config.block.allow);
     BOARD_DETECT.store(config.board_detect, Ordering::Relaxed);
     NTP_SERVE.store(config.ntp.serve, Ordering::Relaxed);
     NTP_TOKEN.store(ntp_hash(&config.ntp), Ordering::Relaxed);
@@ -914,6 +915,28 @@ pub fn write_http_info(out: &mut [u8]) -> Option<usize> {
     used = push_slice(out, used, b" ")?;
     used = push_slice(out, used, config.http.username.as_bytes())?;
     push_slice(out, used, b"\n")
+}
+
+pub fn block_text() -> Result<alloc::string::String, alloc::string::String> {
+    let config = CURRENT.lock().clone().unwrap_or_else(default_config);
+    let mut out = alloc::string::String::new();
+    out.push_str(if config.block.enabled {
+        "enabled 1\n"
+    } else {
+        "enabled 0\n"
+    });
+    out.push_str(&alloc::format!("refresh {}\n", config.block.refresh_secs));
+    for url in &config.block.urls {
+        out.push_str("url ");
+        out.push_str(url);
+        out.push('\n');
+    }
+    for name in &config.block.allow {
+        out.push_str("allow ");
+        out.push_str(name);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 pub fn write_blocklist(out: &mut [u8]) -> Option<usize> {

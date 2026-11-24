@@ -40,6 +40,7 @@ fn main() {
     build_user(&out_dir, &manifest_dir);
     build_dns(&out_dir, &manifest_dir);
     build_http(&out_dir, &manifest_dir);
+    build_block(&out_dir, &manifest_dir);
     build_log(&out_dir, &manifest_dir);
     build_telnet(&out_dir, &manifest_dir);
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
@@ -787,6 +788,111 @@ fn compile_rlib(rustc: &str, src: &Path, name: &str, out: &Path) {
     }
 }
 
+fn build_block(out_dir: &Path, manifest_dir: &Path) {
+    let dir = manifest_dir.join("../block-el0");
+    for rel in [
+        "src/main.rs",
+        "src/fetch.rs",
+        "src/start.s",
+        "link.ld",
+        "Cargo.toml",
+        "roots/isrgx1.der",
+        "roots/isrgx2.der",
+        "roots/digicertg2.der",
+    ] {
+        println!("cargo:rerun-if-changed={}", dir.join(rel).display());
+    }
+    let link = dir.join("link.ld");
+    let target_dir = out_dir.join("block-target");
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(cargo)
+        .arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg("aarch64-unknown-none")
+        .arg("--manifest-path")
+        .arg(dir.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_DIR")
+        .env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            format!(
+                "-D\u{1f}warnings\u{1f}-C\u{1f}panic=abort\u{1f}-C\u{1f}opt-level=z\u{1f}-C\u{1f}relocation-model=static\u{1f}-C\u{1f}linker=aarch64-linux-gnu-ld\u{1f}-C\u{1f}link-arg=-T{}",
+                link.display()
+            ),
+        )
+        .current_dir(&dir)
+        .status()
+        .unwrap_or_else(|err| panic!("block-el0 cargo: {err}"));
+    if !status.success() {
+        panic!("block-el0 build failed");
+    }
+    let elf = target_dir.join("aarch64-unknown-none/release/block-el0");
+    let nm = Command::new("aarch64-linux-gnu-nm")
+        .arg(&elf)
+        .output()
+        .unwrap_or_else(|err| panic!("nm block-el0: {err}"));
+    let listing = String::from_utf8_lossy(&nm.stdout);
+    let start = listing
+        .lines()
+        .find(|line| line.ends_with(" _start"))
+        .unwrap_or_else(|| panic!("block-el0 has no _start:\n{listing}"));
+    let addr = start.split_whitespace().next().unwrap_or("");
+    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
+        panic!("block-el0 _start is {addr}, expected 0x100000000");
+    }
+    let bin = out_dir.join("block.bin");
+    let status = Command::new("aarch64-linux-gnu-objcopy")
+        .args(["-O", "binary"])
+        .arg(&elf)
+        .arg(&bin)
+        .status()
+        .unwrap_or_else(|err| panic!("objcopy block-el0: {err}"));
+    if !status.success() {
+        panic!("block-el0 objcopy failed");
+    }
+    let sections = elf_sections(&elf);
+    let code_limit = 0x1_0008_0000u64;
+    let data_base = 0x1_0009_0000u64;
+    let data_limit = 0x1_000A_0000u64;
+    let mut data_off = 0usize;
+    let mut data_len = 0usize;
+    let mut data_place = 0usize;
+    for (name, addr, size) in &sections {
+        if *size == 0
+            || *addr == 0
+            || name.starts_with(".comment")
+            || name.starts_with(".ARM")
+            || name.starts_with(".debug")
+        {
+            continue;
+        }
+        let end = addr + size;
+        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
+        let in_data = *addr >= data_base && end <= data_limit;
+        if !in_code && !in_data {
+            panic!(
+                "block-el0 section {name} at {addr:#x} size {size:#x} is outside the user window"
+            );
+        }
+        if name == ".data" {
+            data_off = (*addr - 0x1_0000_0000) as usize;
+            data_len = *size as usize;
+            data_place = (*addr - data_base) as usize;
+        }
+    }
+    fs::write(
+        out_dir.join("block_meta.rs"),
+        format!(
+            "const BLOCK_DATA_OFF: usize = {data_off};\nconst BLOCK_DATA_LEN: usize = {data_len};\nconst BLOCK_DATA_PLACE: usize = {data_place};\n"
+        ),
+    )
+    .unwrap();
+}
+
 fn elf_sections(elf: &Path) -> Vec<(String, u64, u64)> {
     let output = Command::new("aarch64-linux-gnu-readelf")
         .args(["-S", "-W"])
@@ -801,7 +907,10 @@ fn elf_sections(elf: &Path) -> Vec<(String, u64, u64)> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let _nr = parts.next();
+        let first = parts.next().unwrap_or("");
+        if first == "[" {
+            let _nr = parts.next();
+        }
         let name = parts.next().unwrap_or("").to_string();
         let kind = parts.next().unwrap_or("");
         if kind != "PROGBITS" && kind != "NOBITS" {

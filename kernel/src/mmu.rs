@@ -127,11 +127,13 @@ struct Table {
     entries: [u64; 512],
 }
 
+const FINE_L3: usize = 12;
+
 struct Tables {
     l0: Table,
     l1: Table,
     l2: [Table; 4],
-    l3: [Table; 8],
+    l3: [Table; FINE_L3],
     // One TTBR0 root per EL0 task. The tasks use the same virtual window
     // and different physical pages, so each root has its own tables.
     // Level-1 index 4 is the 4 GiB point. Two level-3 tables cover the window.
@@ -142,7 +144,7 @@ struct Tables {
     user_l1: [Table; USER_SLOTS],
 }
 
-pub const USER_SLOTS: usize = 7;
+pub const USER_SLOTS: usize = 8;
 
 /// Level-2 tables for physical addresses at 4 GiB and above. The BCM2712
 /// device window needs two of these (gigabytes 0x40 and 0x41). Pi 4 uses
@@ -175,16 +177,7 @@ static mut TABLES: Tables = Tables {
         Table { entries: [0; 512] },
         Table { entries: [0; 512] },
     ],
-    l3: [
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-        Table { entries: [0; 512] },
-    ],
+    l3: [const { Table { entries: [0; 512] } }; FINE_L3],
     l2_user: [const { Table { entries: [0; 512] } }; USER_SLOTS],
     l3_user: [const { [const { Table { entries: [0; 512] } }; 2] }; USER_SLOTS],
     user_l0: [const { Table { entries: [0; 512] } }; USER_SLOTS],
@@ -780,7 +773,7 @@ unsafe fn l3_for(pa: u64) -> *mut Table {
         return phys_to_virt(entry & 0x0000_ffff_ffff_f000) as *mut Table;
     }
     let slot = NEXT_L3;
-    if slot >= 8 {
+    if slot >= FINE_L3 {
         give_up("ran out of level-3 page tables");
     }
     NEXT_L3 = slot + 1;

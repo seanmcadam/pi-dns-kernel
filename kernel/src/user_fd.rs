@@ -148,6 +148,10 @@ const NET_ARM: u64 = 75;
 const CLOCK: u64 = 76;
 const CLOCK_PREFIX: u64 = 77;
 const HEAP: u64 = 78;
+/// 79 tcp_connect(ip_be, port) -> fd. The handshake waits in the socket job.
+const TCP_CONNECT: u64 = 79;
+/// 80 block(op, ...). Lookups fail open and do not wait on the blocker.
+const BLOCK: u64 = 80;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -173,7 +177,7 @@ enum Kind {
     Closing(SocketHandle),
 }
 
-const TASKS: usize = 7;
+const TASKS: usize = 8;
 
 static mut FDS: [[Kind; MAX_FD]; TASKS] = [[Kind::Empty; MAX_FD]; TASKS];
 static mut TASK_SLOT: [usize; 4] = [0; 4];
@@ -268,6 +272,8 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         CLOCK => clock_status(args[0], args[1]),
         CLOCK_PREFIX => clock_prefix(args[0], args[1]),
         HEAP => heap_stats(args[0], args[1]),
+        TCP_CONNECT => tcp_connect(args[0], args[1]),
+        BLOCK => crate::block_tab::call(args[0], [args[1], args[2], args[3], args[4], args[5]]),
         _ => -1,
     };
     value as u64
@@ -422,6 +428,98 @@ fn udp_send(fd: u64, buf: u64, len: u64, ip: u64, port: u64) -> i64 {
         return EAGAIN;
     }
     0
+}
+
+fn tcp_connect(ip_be: u64, port: u64) -> i64 {
+    let Some(port) = port_ok(port) else {
+        return EINVAL;
+    };
+    let ip = (ip_be as u32).to_be_bytes();
+    if ip == [0, 0, 0, 0] {
+        return EINVAL;
+    }
+    let Some(fd) = find_free() else {
+        return EMFILE;
+    };
+    let task = slot();
+    set_kind(fd, Kind::Reserved);
+    bump_gen(task, fd);
+    if service::submit(service::OP_TCP_CONNECT, |body| {
+        body.fd = fd as u8;
+        body.port = port;
+        body.ip = u32::from_be_bytes(ip);
+        body.gen = gen_at(task, fd);
+        body.handle_raw = 0;
+        body.conn_fd = 0;
+        body.user_aux = crate::timer::millis();
+    })
+    .is_none()
+    {
+        set_kind(fd, Kind::Empty);
+        return EAGAIN;
+    }
+    0
+}
+
+fn tcp_connect_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step {
+    let body = service::body(id);
+    let task = body.task as usize;
+    let fd = body.fd as usize;
+    let gen = body.gen;
+    let ip = body.ip.to_be_bytes();
+    let port = body.port;
+    let started = body.user_aux;
+    if !live(task, fd, gen) {
+        return service::Step::Done(EBADF);
+    }
+    if crate::timer::millis().saturating_sub(started) > 10_000 && body.conn_fd != 0 {
+        let handle = service::handle_of(body.handle_raw);
+        give_tcp(stack, handle);
+        let _lock = FD_LOCK[task].lock();
+        table_of(task)[fd] = Kind::Empty;
+        return service::Step::Done(EIO);
+    }
+    if body.conn_fd == 0 {
+        let handle = take_tcp(stack);
+        let local = next_local_port();
+        if stack.connect_tcp(handle, ip, port, local).is_err() {
+            give_tcp(stack, handle);
+            let _lock = FD_LOCK[task].lock();
+            table_of(task)[fd] = Kind::Empty;
+            return service::Step::Done(EIO);
+        }
+        service::body(id).handle_raw = service::handle_raw(handle);
+        service::body(id).conn_fd = 1;
+        return service::Step::Pending;
+    }
+    let handle = service::handle_of(service::body(id).handle_raw);
+    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+    if socket.can_send() || socket.state() == tcp::State::Established {
+        let _lock = FD_LOCK[task].lock();
+        table_of(task)[fd] = Kind::TcpConn(handle);
+        return service::Step::Done(fd as i64);
+    }
+    if matches!(
+        socket.state(),
+        tcp::State::SynSent | tcp::State::SynReceived
+    ) {
+        return service::Step::Pending;
+    }
+    give_tcp(stack, handle);
+    let _lock = FD_LOCK[task].lock();
+    table_of(task)[fd] = Kind::Empty;
+    service::Step::Done(EIO)
+}
+
+fn next_local_port() -> u16 {
+    use core::sync::atomic::{AtomicU16, Ordering};
+    static PORT: AtomicU16 = AtomicU16::new(40000);
+    let port = PORT.fetch_add(1, Ordering::Relaxed);
+    if port < 40000 {
+        40000
+    } else {
+        port
+    }
 }
 
 fn tcp_listen(port: u64) -> i64 {
@@ -604,6 +702,7 @@ pub fn perform(id: usize, stack: &mut crate::net::NetworkStack) -> service::Step
         service::OP_TCP_RECV => tcp_recv_job(id, stack),
         service::OP_TCP_SEND => tcp_send_job(id, stack),
         service::OP_TCP_CLOSE => tcp_close_job(id, stack),
+        service::OP_TCP_CONNECT => tcp_connect_job(id, stack),
         _ => service::Step::Done(EBADF),
     }
 }

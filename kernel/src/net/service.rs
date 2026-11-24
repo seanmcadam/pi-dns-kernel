@@ -50,6 +50,7 @@ pub const OP_TCP_ACCEPT: u8 = 5;
 pub const OP_TCP_CLOSE: u8 = 6;
 pub const OP_UDP_BIND: u8 = 7;
 pub const OP_TCP_LISTEN: u8 = 8;
+pub const OP_TCP_CONNECT: u8 = 9;
 
 pub enum Step {
     Pending,
