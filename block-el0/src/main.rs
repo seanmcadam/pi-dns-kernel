@@ -200,12 +200,17 @@ fn file_mtime(name: &str) -> i64 {
     block(10, name.as_ptr() as u64, name.len() as u64, 0, 0, 0)
 }
 
+fn file_len(name: &str) -> i64 {
+    block(15, name.as_ptr() as u64, name.len() as u64, 0, 0, 0)
+}
+
 fn unix_now() -> i64 {
     block(11, 0, 0, 0, 0, 0)
 }
 
 struct Cfg {
     enabled: bool,
+    epoch: u64,
     refresh: i64,
     urls: Vec<alloc::string::String>,
     allow: Vec<alloc::string::String>,
@@ -221,6 +226,7 @@ fn load_cfg() -> Cfg {
     };
     let mut cfg = Cfg {
         enabled: false,
+        epoch: 0,
         refresh: 86400,
         urls: Vec::new(),
         allow: Vec::new(),
@@ -228,6 +234,8 @@ fn load_cfg() -> Cfg {
     for line in text.split('\n') {
         if let Some(rest) = line.strip_prefix("enabled ") {
             cfg.enabled = rest.trim() == "1";
+        } else if let Some(rest) = line.strip_prefix("epoch ") {
+            cfg.epoch = rest.trim().parse().unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("refresh ") {
             cfg.refresh = rest.trim().parse().unwrap_or(86400);
         } else if let Some(rest) = line.strip_prefix("url ") {
@@ -321,6 +329,47 @@ fn list_name(url: &str) -> alloc::string::String {
     alloc::string::String::from(core::str::from_utf8(&raw).unwrap_or("BAD.LST"))
 }
 
+fn meta_name(url: &str) -> alloc::string::String {
+    let raw = blocklist::meta_file(url);
+    alloc::string::String::from(core::str::from_utf8(&raw).unwrap_or("BAD.NFO"))
+}
+
+/// The list file matches a version-1 sidecar. A short file from an older
+/// build has no sidecar and is not loaded.
+fn cache_complete(url: &str) -> bool {
+    let list = list_name(url);
+    let len = file_len(&list);
+    if len <= 0 {
+        return false;
+    }
+    let meta = meta_name(url);
+    let mut buf = [0u8; 64];
+    let n = file_read(&meta, 0, &mut buf);
+    if n <= 0 {
+        return false;
+    }
+    blocklist::cache_is_complete(
+        blocklist::decode_cache_meta(&buf[..n as usize]),
+        len as u32,
+    )
+}
+
+fn write_meta(url: &str, version: u32, bytes: u32, entries: u32) {
+    let name = meta_name(url);
+    let mut buf = [0u8; 64];
+    let Some(n) = blocklist::encode_cache_meta(
+        &blocklist::CacheMeta {
+            version,
+            bytes,
+            entries,
+        },
+        &mut buf,
+    ) else {
+        return;
+    };
+    let _ = file_write(&name, &buf[..n], true);
+}
+
 fn feed_line(line: &[u8]) -> u32 {
     let Ok(text) = core::str::from_utf8(line) else {
         return 0;
@@ -378,9 +427,10 @@ fn index_lines() -> Vec<(alloc::string::String, alloc::string::String)> {
     out
 }
 
-fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
+fn publish(cfg: &Cfg) -> Option<[u32; 8]> {
     let latest = load_cfg();
-    let cfg = if latest.enabled != cfg.enabled || latest.urls != cfg.urls {
+    let cfg = if latest.epoch != cfg.epoch || latest.enabled != cfg.enabled || latest.urls != cfg.urls
+    {
         &latest
     } else {
         cfg
@@ -397,7 +447,9 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
             _ => {
                 misses += 1;
                 if misses >= 8 {
-                    return previous;
+                    // The inactive half is unfinished. Leave the published
+                    // half in place and let the caller try again.
+                    return None;
                 }
                 let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
             }
@@ -408,7 +460,9 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
         let cached = index_lines();
         for (i, url) in cfg.urls.iter().enumerate().take(8) {
             let name = list_name(url);
-            if cached.iter().any(|(file, _)| file == &name) {
+            // The index only records that a download was attempted. A file
+            // without a matching sidecar is a truncated or pre-0.1.90 cache.
+            if cached.iter().any(|(file, _)| file == &name) && cache_complete(url) {
                 match load_file(&name) {
                     Ok(n) => counts[i] = n,
                     // A short read must not be reported as a full list. The
@@ -419,10 +473,12 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
             }
         }
     }
-    let _ = block(2, 0, 0, 0, 0, 0);
+    if block(2, 0, 0, 0, 0, 0) < 0 {
+        return None;
+    }
     let tail = if cfg.enabled { cfg.urls.len() as u64 } else { 0 };
     let _ = block(14, tail, 0, 0, 0, 0);
-    counts
+    Some(counts)
 }
 
 fn write_index(cfg: &Cfg) {
@@ -537,10 +593,14 @@ fn refresh_one(url: &str, dns: &[[u8; 4]], unix: i64) -> Result<(), &'static str
     if total == 0 || !read_back(hash, total as u64) {
         return Err(if total == 0 { "empty" } else { "disk" });
     }
-    if names_in_temp()? > blocklist::LIST_MAX_ENTRIES as u32 {
+    let names = names_in_temp()?;
+    if names > blocklist::LIST_MAX_ENTRIES as u32 {
         return Err("full");
     }
     let name = list_name(url);
+    // Drop any previous marker before the file moves, so a crash cannot
+    // pair the new bytes with an old length.
+    write_meta(url, 0, 0, 0);
     if block(
         9,
         TEMP.as_ptr() as u64,
@@ -552,6 +612,7 @@ fn refresh_one(url: &str, dns: &[[u8; 4]], unix: i64) -> Result<(), &'static str
     {
         return Err("disk");
     }
+    write_meta(url, blocklist::CACHE_META_VERSION, total as u32, names);
     Ok(())
 }
 
@@ -561,29 +622,56 @@ pub extern "C" fn rust_main() -> ! {
     fetch::set_dns(sys(UDP_BIND, 5353, 0, 0, 0, 0, 0));
     let _ = block(13, 1, 0, 0, 0, 0);
     let mut cfg = load_cfg();
-    let mut counts = publish(&cfg, [0; 8]);
-    let _ = block(13, 2, 0, 0, 0, 0);
+    let mut applied: Option<u64> = None;
+    let mut counts = [0u32; 8];
+    if let Some(next) = publish(&cfg) {
+        counts = next;
+        applied = Some(cfg.epoch);
+        let _ = block(13, 2, 0, 0, 0, 0);
+    }
     let mut errors = [""; 8];
     let mut next = [0i64; 8];
     let mut hold = [0u64; 8];
+    // Directory time and the sidecar are read once. The steady loop then
+    // sleeps, so a DNS query is not queued behind a FAT stat.
+    let mut seen = [false; 8];
+    let mut fresh = [false; 8];
+    let mut stamp = [0i64; 8];
+    // A download that could not commit the table has to be published on a
+    // later pass. The config epoch does not change for that case.
+    let mut pending = false;
     loop {
         let now = time_ms();
         let unix = unix_now();
         let loaded = load_cfg();
-        if loaded.enabled != cfg.enabled
-            || loaded.refresh != cfg.refresh
-            || loaded.urls != cfg.urls
-            || loaded.allow != cfg.allow
-        {
-            cfg = loaded;
+        if loaded.refresh != cfg.refresh || loaded.allow != cfg.allow {
+            // The kernel already installed the allow list. Rebuilding the
+            // domain table here would unpublish names that did not change.
+            cfg.refresh = loaded.refresh;
+            cfg.allow = loaded.allow.clone();
+        }
+        if blocklist::needs_table_reload(
+            applied,
+            loaded.epoch,
+            loaded.enabled != cfg.enabled,
+            loaded.urls != cfg.urls,
+        ) {
             let _ = block(13, 1, 0, 0, 0, 0);
-            counts = publish(&cfg, counts);
-            let _ = block(13, 2, 0, 0, 0, 0);
-            errors = [""; 8];
-            next = [0; 8];
-            // The 60s hold belongs to the previous URL. A new list should
-            // download on this pass, not after that timer.
-            hold = [0; 8];
+            if let Some(published) = publish(&loaded) {
+                cfg = loaded;
+                applied = Some(cfg.epoch);
+                counts = published;
+                let _ = block(13, 2, 0, 0, 0, 0);
+                errors = [""; 8];
+                next = [0; 8];
+                seen = [false; 8];
+                fresh = [false; 8];
+                stamp = [0; 8];
+                // The 60s hold belongs to the previous URL. A new list should
+                // download on this pass, not after that timer.
+                hold = [0; 8];
+                pending = false;
+            }
         }
         if cfg.enabled && sys(NET_READY, 0, 0, 0, 0, 0, 0) == 1 {
             let mut servers = [[0u8; 4]; 16];
@@ -591,11 +679,23 @@ pub extern "C" fn rust_main() -> ! {
             let mut changed = false;
             for (i, url) in cfg.urls.iter().enumerate().take(8) {
                 let name = list_name(url);
-                let mtime = file_mtime(&name);
+                if !seen[i] {
+                    stamp[i] = file_mtime(&name);
+                    fresh[i] = cache_complete(url);
+                    seen[i] = true;
+                    if stamp[i] > 0 && !fresh[i] && errors[i].is_empty() {
+                        errors[i] = "stale";
+                    }
+                }
+                let aged =
+                    stamp[i] <= 0 || (unix > 0 && unix >= stamp[i].saturating_add(cfg.refresh));
+                // A truncated cache is due even when its directory time is
+                // still inside the refresh window. HTTPS waits for a clock
+                // so the certificate can be checked.
                 let due = if url.starts_with("https://") {
-                    unix > 0 && (mtime <= 0 || unix >= mtime.saturating_add(cfg.refresh))
+                    unix > 0 && (!fresh[i] || aged)
                 } else {
-                    mtime <= 0 || (unix > 0 && unix >= mtime.saturating_add(cfg.refresh))
+                    !fresh[i] || aged
                 };
                 if !due || (next[i] != 0 && (unix <= 0 || unix < next[i])) || now < hold[i] {
                     continue;
@@ -606,6 +706,9 @@ pub extern "C" fn rust_main() -> ! {
                         changed = true;
                         next[i] = 0;
                         hold[i] = now.saturating_add(60_000);
+                        stamp[i] = file_mtime(&name);
+                        fresh[i] = true;
+                        seen[i] = true;
                         log("block fetched\n");
                     }
                     Err(err) => {
@@ -621,20 +724,22 @@ pub extern "C" fn rust_main() -> ! {
             if changed {
                 cfg = load_cfg();
                 write_index(&cfg);
-                let _ = block(13, 1, 0, 0, 0, 0);
-                counts = publish(&cfg, counts);
+                pending = true;
+            }
+        }
+        if pending {
+            let _ = block(13, 1, 0, 0, 0, 0);
+            if let Some(next_counts) = publish(&cfg) {
+                counts = next_counts;
+                applied = Some(cfg.epoch);
+                pending = false;
                 let _ = block(13, 2, 0, 0, 0, 0);
             }
         }
         if cfg.enabled {
-            let cached = index_lines();
             for (i, url) in cfg.urls.iter().enumerate().take(8) {
                 let name = list_name(url);
-                let mtime = if cached.iter().any(|(file, _)| file == &name) {
-                    file_mtime(&name)
-                } else {
-                    0
-                };
+                let mtime = stamp[i];
                 let due = if mtime > 0 {
                     mtime.saturating_add(cfg.refresh)
                 } else if next[i] != 0 {

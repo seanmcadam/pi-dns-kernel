@@ -128,7 +128,7 @@ fn publish(config: &Config) {
     crate::block_tab::set_allow(&config.block.allow);
     if let Some(old) = previous.as_ref() {
         if old.block.enabled != config.block.enabled || old.block.urls != config.block.urls {
-            crate::block_tab::drop_lists();
+            BLOCK_EPOCH.fetch_add(1, Ordering::Release);
         }
     }
     BOARD_DETECT.store(config.board_detect, Ordering::Relaxed);
@@ -140,6 +140,10 @@ fn publish(config: &Config) {
 
 static NTP_SERVE: AtomicBool = AtomicBool::new(true);
 static NTP_TOKEN: AtomicU64 = AtomicU64::new(0);
+/// Bumped when the block URL list or enabled flag changes. The blocker
+/// publishes until it has applied this value. An allow-list edit does not
+/// bump it.
+static BLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub fn ntp_serve() -> bool {
     NTP_SERVE.load(Ordering::Relaxed)
@@ -931,6 +935,10 @@ pub fn block_text() -> Result<alloc::string::String, alloc::string::String> {
     } else {
         "enabled 0\n"
     });
+    out.push_str(&alloc::format!(
+        "epoch {}\n",
+        BLOCK_EPOCH.load(Ordering::Acquire)
+    ));
     out.push_str(&alloc::format!("refresh {}\n", config.block.refresh_secs));
     for url in &config.block.urls {
         out.push_str("url ");

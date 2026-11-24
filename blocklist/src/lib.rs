@@ -67,6 +67,115 @@ pub fn list_file(url: &str) -> [u8; 12] {
     out
 }
 
+/// `XXXXXXXX.NFO`, the completeness sidecar for [`list_file`].
+pub fn meta_file(url: &str) -> [u8; 12] {
+    let mut out = list_file(url);
+    out[9] = b'N';
+    out[10] = b'F';
+    out[11] = b'O';
+    out
+}
+
+/// Written only after a download is verified. Version 1 is this format.
+/// A missing sidecar, a different version, or a length that does not match
+/// the list file means the cache is stale and must not be published.
+pub const CACHE_META_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheMeta {
+    pub version: u32,
+    pub bytes: u32,
+    pub entries: u32,
+}
+
+/// `v<version> <bytes> <entries>\n`.
+pub fn encode_cache_meta(meta: &CacheMeta, out: &mut [u8]) -> Option<usize> {
+    let mut n = 0usize;
+    if !push_bytes(out, &mut n, b"v") {
+        return None;
+    }
+    if !push_u32(out, &mut n, meta.version) {
+        return None;
+    }
+    if !push_bytes(out, &mut n, b" ") {
+        return None;
+    }
+    if !push_u32(out, &mut n, meta.bytes) {
+        return None;
+    }
+    if !push_bytes(out, &mut n, b" ") {
+        return None;
+    }
+    if !push_u32(out, &mut n, meta.entries) {
+        return None;
+    }
+    if !push_bytes(out, &mut n, b"\n") {
+        return None;
+    }
+    Some(n)
+}
+
+fn push_bytes(out: &mut [u8], n: &mut usize, bytes: &[u8]) -> bool {
+    if *n + bytes.len() > out.len() {
+        return false;
+    }
+    out[*n..*n + bytes.len()].copy_from_slice(bytes);
+    *n += bytes.len();
+    true
+}
+
+fn push_u32(out: &mut [u8], n: &mut usize, mut value: u32) -> bool {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    if value == 0 {
+        return push_bytes(out, n, b"0");
+    }
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    push_bytes(out, n, &buf[i..])
+}
+
+pub fn decode_cache_meta(text: &[u8]) -> Option<CacheMeta> {
+    let text = core::str::from_utf8(text).ok()?.trim();
+    let mut parts = text.split_whitespace();
+    let version = parts.next()?;
+    let version = version.strip_prefix('v')?.parse().ok()?;
+    let bytes = parts.next()?.parse().ok()?;
+    let entries = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(CacheMeta {
+        version,
+        bytes,
+        entries,
+    })
+}
+
+/// A truncated download and a list written by an older build have no
+/// matching marker. Callers re-download those instead of publishing them.
+/// The table must be rebuilt until `applied` is the config epoch and the
+/// enabled flag and URL list match what was published. A failed publish
+/// leaves `applied` unset so the next pass tries again.
+pub fn needs_table_reload(
+    applied: Option<u64>,
+    epoch: u64,
+    enabled_changed: bool,
+    urls_changed: bool,
+) -> bool {
+    applied != Some(epoch) || enabled_changed || urls_changed
+}
+
+pub fn cache_is_complete(meta: Option<CacheMeta>, file_len: u32) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    meta.version == CACHE_META_VERSION && file_len > 0 && meta.bytes == file_len && meta.entries > 0
+}
+
 /// Lowercase, strip one trailing dot, and keep a DNS label sequence.
 pub fn normalize_into(name: &str, out: &mut [u8]) -> Option<usize> {
     let name = name.trim().trim_end_matches('.');
@@ -442,6 +551,86 @@ pub fn commit(region: &mut [u8]) {
     write_u64(region, 8, published);
 }
 
+/// Two block tables in one region. Lookups read the active half. A rebuild
+/// writes the other half and flips only after that half is committed, so a
+/// probe never walks a table that is being zeroed.
+pub const PAIR_HEAD: usize = 8;
+
+fn pair_half_len(region_len: usize) -> Option<usize> {
+    if region_len < PAIR_HEAD + (HEADER + 8) * 2 {
+        return None;
+    }
+    let half = ((region_len - PAIR_HEAD) / 2) & !7;
+    if half < HEADER + 8 {
+        return None;
+    }
+    Some(half)
+}
+
+fn active_word(region: &[u8]) -> Option<&core::sync::atomic::AtomicU64> {
+    if region.len() < PAIR_HEAD || region.as_ptr() as usize % 8 != 0 {
+        return None;
+    }
+    Some(unsafe { &*region.as_ptr().cast::<core::sync::atomic::AtomicU64>() })
+}
+
+pub fn pair_active(region: &[u8]) -> u64 {
+    active_word(region)
+        .map(|word| word.load(core::sync::atomic::Ordering::Acquire) & 1)
+        .unwrap_or(0)
+}
+
+pub fn pair_inactive(region: &[u8]) -> u64 {
+    1 - pair_active(region)
+}
+
+pub fn pair_set_active(region: &mut [u8], index: u64) {
+    if region.len() < PAIR_HEAD || region.as_ptr() as usize % 8 != 0 {
+        return;
+    }
+    unsafe {
+        (*region.as_mut_ptr().cast::<core::sync::atomic::AtomicU64>())
+            .store(index & 1, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn pair_half(region: &[u8], index: u64) -> Option<&[u8]> {
+    let half = pair_half_len(region.len())?;
+    let start = PAIR_HEAD + (index as usize & 1) * half;
+    region.get(start..start + half)
+}
+
+pub fn pair_half_mut(region: &mut [u8], index: u64) -> Option<&mut [u8]> {
+    let half = pair_half_len(region.len())?;
+    let start = PAIR_HEAD + (index as usize & 1) * half;
+    region.get_mut(start..start + half)
+}
+
+/// Probe the published half. A flip during the probe fails open.
+pub fn pair_lookup(region: &[u8], name: &str) -> bool {
+    let active = pair_active(region);
+    let Some(half) = pair_half(region, active) else {
+        return false;
+    };
+    let hit = lookup(half, name);
+    if pair_active(region) != active {
+        return false;
+    }
+    hit
+}
+
+pub fn pair_count(region: &[u8]) -> u64 {
+    let active = pair_active(region);
+    let Some(half) = pair_half(region, active) else {
+        return 0;
+    };
+    let n = count(half);
+    if pair_active(region) != active {
+        return 0;
+    }
+    n
+}
+
 pub fn lookup(region: &[u8], name: &str) -> bool {
     let before = generation(region);
     if before == 0 || before % 2 != 0 {
@@ -645,6 +834,62 @@ not a domain line
     }
 
     #[test]
+    fn a_truncated_cache_is_not_complete() {
+        let url = "https://example.com/hosts";
+        let list = list_file(url);
+        let meta = meta_file(url);
+        assert_eq!(&list[8..], b".LST");
+        assert_eq!(&meta[8..], b".NFO");
+        assert_eq!(&list[..8], &meta[..8]);
+        let mut buf = [0u8; 64];
+        let full = CacheMeta {
+            version: CACHE_META_VERSION,
+            bytes: 2_505_650,
+            entries: 81_677,
+        };
+        let n = encode_cache_meta(&full, &mut buf).unwrap();
+        assert_eq!(decode_cache_meta(&buf[..n]), Some(full));
+        assert!(cache_is_complete(Some(full), 2_505_650));
+        assert!(
+            !cache_is_complete(Some(full), 1_800_000),
+            "shorter than the marker"
+        );
+        assert!(!cache_is_complete(None, 2_505_650), "no marker");
+        assert!(
+            !cache_is_complete(
+                Some(CacheMeta {
+                    version: 0,
+                    bytes: 100,
+                    entries: 10,
+                }),
+                100
+            ),
+            "older or invalidated marker"
+        );
+        assert!(
+            !cache_is_complete(
+                Some(CacheMeta {
+                    version: CACHE_META_VERSION,
+                    bytes: 100,
+                    entries: 0,
+                }),
+                100
+            ),
+            "empty is not a finished list"
+        );
+        assert_eq!(decode_cache_meta(b"not a marker\n"), None);
+    }
+
+    #[test]
+    fn a_failed_publish_is_tried_again() {
+        assert!(needs_table_reload(None, 0, false, false));
+        assert!(needs_table_reload(Some(1), 2, false, false));
+        assert!(needs_table_reload(Some(2), 2, true, false));
+        assert!(needs_table_reload(Some(2), 2, false, true));
+        assert!(!needs_table_reload(Some(2), 2, false, false));
+    }
+
+    #[test]
     fn a_short_body_is_not_a_complete_download() {
         assert_eq!(
             content_length(b"HTTP/1.1 200 OK\r\nContent-Length: 2505650\r\n\r\n"),
@@ -685,6 +930,60 @@ not a domain line
         let issuer = cert_name(yr, false).expect("issuer");
         assert_eq!(subject, issuer);
         assert!(subject.windows(7).any(|window| window == b"Root YR"));
+    }
+
+    #[test]
+    fn a_rebuild_does_not_hide_the_published_half() {
+        let half = HEADER + 64;
+        let bytes = PAIR_HEAD + half * 2;
+        let (mut buf, offset) = aligned(bytes);
+        let region = &mut buf[offset..offset + bytes];
+        region.fill(0);
+        let inactive = pair_inactive(region);
+        {
+            let half = pair_half_mut(region, inactive).unwrap();
+            assert!(open_rebuild(half));
+            assert!(scrub(half, 0, usize::MAX).is_some());
+            assert!(insert(half, name_hash("ads.example")));
+            commit(half);
+        }
+        pair_set_active(region, inactive);
+        assert!(pair_lookup(region, "ads.example"));
+        assert_eq!(pair_count(region), 1);
+        let other = pair_inactive(region);
+        {
+            let half = pair_half_mut(region, other).unwrap();
+            assert!(open_rebuild(half));
+        }
+        let mut at = 0;
+        loop {
+            let (next, len) = {
+                let half = pair_half_mut(region, other).unwrap();
+                scrub(half, at, 3).unwrap()
+            };
+            assert!(
+                pair_lookup(region, "ads.example"),
+                "live half stays published"
+            );
+            if next >= len {
+                break;
+            }
+            at = next;
+        }
+        {
+            let half = pair_half_mut(region, other).unwrap();
+            assert!(insert(half, name_hash("other.example")));
+        }
+        assert!(pair_lookup(region, "ads.example"));
+        assert!(!pair_lookup(region, "other.example"));
+        {
+            let half = pair_half_mut(region, other).unwrap();
+            commit(half);
+        }
+        pair_set_active(region, other);
+        assert!(pair_lookup(region, "other.example"));
+        assert!(!pair_lookup(region, "ads.example"));
+        assert_eq!(pair_count(region), 1);
     }
 
     #[test]

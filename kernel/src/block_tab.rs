@@ -1,8 +1,8 @@
 //! Domain table in the dedicated block region, plus the blocker's syscalls.
 //!
-//! A lookup tries the lock once. If the blocker is rebuilding, not running,
-//! or the generation is unpublished, the answer is "not blocked" and DNS
-//! keeps going.
+//! A lookup reads the published half and does not take the rebuild lock.
+//! If the blocker is not running, or that half is unpublished, the answer
+//! is "not blocked" and DNS keeps going.
 
 use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
@@ -16,11 +16,16 @@ const URL_KEEP: usize = 160;
 const ERR_KEEP: usize = 48;
 
 static LOCK: Mutex<()> = Mutex::new(());
-/// Slots already zeroed in the current rebuild. Zero means the next
-/// `begin` starts a new generation. Cleared when the table is fully zero.
+/// Slots already zeroed in the inactive half. Zero means the next `begin`
+/// opens that half. Cleared when the half is fully zero. The active half
+/// is not touched, so a lookup does not take this lock.
 static SCRUB_AT: AtomicUsize = AtomicUsize::new(0);
-/// Two mebibytes of slots per syscall, so the owner can poll DNS between them.
-const SCRUB_CHUNK: usize = 256 * 1024;
+/// Which half `begin` opened. Inserts and `commit` keep using it after
+/// `SCRUB_AT` returns to zero.
+static SCRUB_HALF: AtomicU64 = AtomicU64::new(0);
+/// 256 KiB per syscall. The owner polls DNS between chunks, and the chunk
+/// itself stays short enough that a query is not stuck behind it.
+const SCRUB_CHUNK: usize = 32 * 1024;
 static BLOCKED: AtomicU64 = AtomicU64::new(0);
 static STATE: AtomicU8 = AtomicU8::new(0);
 static ALLOW_N: AtomicU8 = AtomicU8::new(0);
@@ -90,6 +95,10 @@ fn running() -> bool {
 }
 
 /// `0` not blocked, `1` blocked, `2` allow-listed. Anything else fails open.
+///
+/// The probe does not take the table lock. It reads the half that is
+/// already published, so a rebuild of the other half cannot stall it or
+/// make a listed name fail open.
 pub fn lookup(name: &str) -> u8 {
     if !running() {
         return 0;
@@ -97,13 +106,10 @@ pub fn lookup(name: &str) -> u8 {
     if allowed(name) {
         return 2;
     }
-    let Some(_guard) = LOCK.try_lock() else {
-        return 0;
-    };
     let Some(mem) = region() else {
         return 0;
     };
-    if blocklist::lookup(mem, name) {
+    if blocklist::pair_lookup(mem, name) {
         BLOCKED.fetch_add(1, Ordering::Relaxed);
         1
     } else {
@@ -166,30 +172,8 @@ pub fn call(op: u64, args: [u64; 5]) -> i64 {
             0
         }
         14 => clear_rows(args[0]),
+        15 => file_len(args[0], args[1]),
         _ => -22,
-    }
-}
-
-/// Drop a published list set. Lookups fail open until the process loads the
-/// lists that the new config still names.
-pub fn drop_lists() {
-    let _ = clear_rows(0);
-    let mut try_n = 0;
-    loop {
-        match begin() {
-            0 => {
-                let _ = commit();
-                return;
-            }
-            // More of the table still needs zeroing. The lock is not held.
-            1 => continue,
-            _ => {
-                try_n += 1;
-                if try_n >= 8 {
-                    return;
-                }
-            }
-        }
     }
 }
 
@@ -214,15 +198,25 @@ fn begin() -> i64 {
     let Some(mem) = region() else {
         return -5;
     };
-    let len = mem.len().saturating_sub(32) / 8;
     let mut at = SCRUB_AT.load(Ordering::Relaxed);
+    let idx = if at == 0 {
+        let idx = blocklist::pair_inactive(mem);
+        SCRUB_HALF.store(idx, Ordering::Relaxed);
+        idx
+    } else {
+        SCRUB_HALF.load(Ordering::Relaxed)
+    };
+    let Some(half) = blocklist::pair_half_mut(mem, idx) else {
+        return -5;
+    };
+    let len = half.len().saturating_sub(32) / 8;
     if at > len {
         at = 0;
     }
-    if at == 0 && !blocklist::open_rebuild(mem) {
+    if at == 0 && !blocklist::open_rebuild(half) {
         return -5;
     }
-    let Some((end, slots)) = blocklist::scrub(mem, at, SCRUB_CHUNK) else {
+    let Some((end, slots)) = blocklist::scrub(half, at, SCRUB_CHUNK) else {
         SCRUB_AT.store(0, Ordering::Relaxed);
         return -5;
     };
@@ -242,7 +236,10 @@ fn insert(hash: u64) -> i64 {
     let Some(mem) = region() else {
         return -5;
     };
-    if blocklist::insert(mem, hash) { 1 } else { 0 }
+    let Some(half) = blocklist::pair_half_mut(mem, SCRUB_HALF.load(Ordering::Relaxed)) else {
+        return -5;
+    };
+    if blocklist::insert(half, hash) { 1 } else { 0 }
 }
 
 fn commit() -> i64 {
@@ -252,7 +249,20 @@ fn commit() -> i64 {
     let Some(mem) = region() else {
         return -5;
     };
-    blocklist::commit(mem);
+    let idx = SCRUB_HALF.load(Ordering::Relaxed);
+    let gen = {
+        let Some(half) = blocklist::pair_half_mut(mem, idx) else {
+            return -5;
+        };
+        let gen = blocklist::generation(half);
+        if gen != 0 && gen % 2 == 1 {
+            blocklist::commit(half);
+        }
+        gen
+    };
+    if gen != 0 && gen % 2 == 1 {
+        blocklist::pair_set_active(mem, idx);
+    }
     0
 }
 
@@ -287,15 +297,10 @@ fn fill_stats(out: &mut [u8]) -> usize {
     }
     let state = if running() { STATE.load(Ordering::Relaxed) } else { 0 };
     out[0] = state;
-    let (domains, size) = match LOCK.try_lock() {
-        None => (0u64, block_mem::size() as u64),
-        Some(_guard) => {
-            if let Some(mem) = region() {
-                (blocklist::count(mem), mem.len() as u64)
-            } else {
-                (0, block_mem::size() as u64)
-            }
-        }
+    let (domains, size) = if let Some(mem) = region() {
+        (blocklist::pair_count(mem), mem.len() as u64)
+    } else {
+        (0, block_mem::size() as u64)
     };
     out[8..16].copy_from_slice(&domains.to_le_bytes());
     out[16..24].copy_from_slice(&BLOCKED.load(Ordering::Relaxed).to_le_bytes());
@@ -399,7 +404,7 @@ fn safe_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() == 12
         && bytes[8] == b'.'
-        && &bytes[9..] == b"LST"
+        && (&bytes[9..] == b"LST" || &bytes[9..] == b"NFO")
         && bytes[..8]
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
@@ -432,7 +437,7 @@ fn write_file(name_ptr: u64, name_len: u64, buf: u64, len: u64, flags: u64) -> i
         return -22;
     };
     let name = name.trim_end_matches('\0');
-    if name != "BLOCK.TMP" && name != "BLOCK.IDX" {
+    if name != "BLOCK.TMP" && name != "BLOCK.IDX" && !name.ends_with(".NFO") {
         return -22;
     }
     if len > 1024 || !crate::mmu::user_slice_ok(buf, len) {
@@ -467,6 +472,20 @@ fn swing(from_ptr: u64, from_len: u64, to_ptr: u64, to_len: u64) -> i64 {
         return -22;
     }
     if crate::fs::swing_file(from, to).is_ok() { 0 } else { -5 }
+}
+
+fn file_len(ptr: u64, len: u64) -> i64 {
+    let Some(name) = file_name(ptr, len) else {
+        return -22;
+    };
+    let Ok(name) = core::str::from_utf8(&name) else {
+        return -22;
+    };
+    let name = name.trim_end_matches('\0');
+    match crate::fs::file_len(name) {
+        Ok(n) => n as i64,
+        Err(_) => 0,
+    }
 }
 
 fn mtime(ptr: u64, len: u64) -> i64 {
