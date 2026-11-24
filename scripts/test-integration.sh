@@ -3985,6 +3985,31 @@ if dig("test.local") != "192.168.1.100":
 if dig("ads.example") != "0.0.0.0":
     print("ads", dig("ads.example"), doc.get("block_urls"))
     sys.exit(1)
+# An allow-list edit must not unpublish the table. ads.example stays blocked.
+raw_cfg = subprocess.check_output(
+    ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
+     "http://127.0.0.1:%s/config/file/config" % http],
+    stderr=subprocess.DEVNULL,
+)
+allow_edit = json.loads(raw_cfg)
+allow_edit["block"]["allow"] = ["plain.example", "auth.split.io"]
+subprocess.check_output(
+    ["curl", "-sf", "-u", "admin:admin", "--max-time", "5",
+     "-H", "Content-Type: application/json",
+     "--data-binary", json.dumps(allow_edit),
+     "http://127.0.0.1:%s/config/file/config" % http],
+    stderr=subprocess.DEVNULL,
+)
+for n in range(8):
+    ans = dig("ads.example")
+    if ans != "0.0.0.0":
+        print("allow gap", n, ans)
+        sys.exit(1)
+    time.sleep(0.05)
+held = status()
+if not held or held.get("block_domains", 0) < 2:
+    print("allow domains", None if held is None else held.get("block_domains"))
+    sys.exit(1)
 plain = dig("plain.example")
 if plain == "0.0.0.0":
     print("allow", plain)

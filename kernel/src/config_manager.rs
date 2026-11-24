@@ -129,7 +129,6 @@ fn publish(config: &Config) {
     if let Some(old) = previous.as_ref() {
         if old.block.enabled != config.block.enabled || old.block.urls != config.block.urls {
             BLOCK_EPOCH.fetch_add(1, Ordering::Release);
-            crate::block_tab::drop_lists();
         }
     }
     BOARD_DETECT.store(config.board_detect, Ordering::Relaxed);

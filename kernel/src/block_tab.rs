@@ -1,8 +1,8 @@
 //! Domain table in the dedicated block region, plus the blocker's syscalls.
 //!
-//! A lookup tries the lock once. If the blocker is rebuilding, not running,
-//! or the generation is unpublished, the answer is "not blocked" and DNS
-//! keeps going.
+//! A lookup reads the published half and does not take the rebuild lock.
+//! If the blocker is not running, or that half is unpublished, the answer
+//! is "not blocked" and DNS keeps going.
 
 use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
@@ -174,29 +174,6 @@ pub fn call(op: u64, args: [u64; 5]) -> i64 {
         14 => clear_rows(args[0]),
         15 => file_len(args[0], args[1]),
         _ => -22,
-    }
-}
-
-/// Drop a published list set. Lookups fail open until the process loads the
-/// lists that the new config still names.
-pub fn drop_lists() {
-    let _ = clear_rows(0);
-    let mut try_n = 0;
-    loop {
-        match begin() {
-            0 => {
-                let _ = commit();
-                return;
-            }
-            // More of the table still needs zeroing. The lock is not held.
-            1 => continue,
-            _ => {
-                try_n += 1;
-                if try_n >= 8 {
-                    return;
-                }
-            }
-        }
     }
 }
 

@@ -641,14 +641,18 @@ pub extern "C" fn rust_main() -> ! {
         let now = time_ms();
         let unix = unix_now();
         let loaded = load_cfg();
+        if loaded.refresh != cfg.refresh || loaded.allow != cfg.allow {
+            // The kernel already installed the allow list. Rebuilding the
+            // domain table here would unpublish names that did not change.
+            cfg.refresh = loaded.refresh;
+            cfg.allow = loaded.allow.clone();
+        }
         if blocklist::needs_table_reload(
             applied,
             loaded.epoch,
             loaded.enabled != cfg.enabled,
             loaded.urls != cfg.urls,
-        ) || loaded.refresh != cfg.refresh
-            || loaded.allow != cfg.allow
-        {
+        ) {
             let _ = block(13, 1, 0, 0, 0, 0);
             if let Some(published) = publish(&loaded) {
                 cfg = loaded;
