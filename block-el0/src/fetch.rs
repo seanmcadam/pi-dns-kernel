@@ -32,6 +32,7 @@ const BLOCK: u64 = 80;
 
 const ISRG1: &[u8] = include_bytes!("../roots/isrgx1.der");
 const ISRG2: &[u8] = include_bytes!("../roots/isrgx2.der");
+const ISRG_YR: &[u8] = include_bytes!("../roots/isrgyr.der");
 const DIGI: &[u8] = include_bytes!("../roots/digicertg2.der");
 
 static UNIX: AtomicI64 = AtomicI64::new(0);
@@ -96,6 +97,7 @@ struct Roots<'a> {
     a: Box<Verifier<'a>>,
     b: Box<Verifier<'a>>,
     c: Box<Verifier<'a>>,
+    yr: Box<Verifier<'a>>,
     extra: Option<Box<Verifier<'a>>>,
     winner: u8,
 }
@@ -105,6 +107,7 @@ impl TlsVerifier<Aes128GcmSha256> for Roots<'_> {
         self.a.set_hostname_verification(hostname)?;
         self.b.set_hostname_verification(hostname)?;
         self.c.set_hostname_verification(hostname)?;
+        self.yr.set_hostname_verification(hostname)?;
         if let Some(extra) = self.extra.as_mut() {
             extra.set_hostname_verification(hostname)?;
         }
@@ -126,10 +129,12 @@ impl TlsVerifier<Aes128GcmSha256> for Roots<'_> {
             1
         } else if issuer == blocklist::cert_name(DIGI, true) {
             2
+        } else if issuer == blocklist::cert_name(ISRG_YR, true) {
+            3
         } else if self.extra.is_some()
             && issuer == blocklist::cert_name(extra_bytes(), true)
         {
-            3
+            4
         } else {
             return Err(TlsError::InvalidCertificate);
         };
@@ -138,6 +143,7 @@ impl TlsVerifier<Aes128GcmSha256> for Roots<'_> {
             0 => self.a.verify_certificate(transcript, cert),
             1 => self.b.verify_certificate(transcript, cert),
             2 => self.c.verify_certificate(transcript, cert),
+            3 => self.yr.verify_certificate(transcript, cert),
             _ => self
                 .extra
                 .as_mut()
@@ -154,6 +160,7 @@ impl TlsVerifier<Aes128GcmSha256> for Roots<'_> {
             0 => self.a.verify_signature(verify),
             1 => self.b.verify_signature(verify),
             2 => self.c.verify_signature(verify),
+            3 => self.yr.verify_signature(verify),
             _ => self
                 .extra
                 .as_mut()
@@ -374,25 +381,78 @@ fn ipv4(text: &str) -> Option<[u8; 4]> {
     if n == 4 { Some(ip) } else { None }
 }
 
-fn resolve(host: &str, dns: Option<[u8; 4]>) -> Result<[u8; 4], &'static str> {
+const RESOLVE_BUDGET_MS: u64 = 8_000;
+const QUERY_MS: u64 = 2_000;
+const CNAME_HOPS: usize = 4;
+
+enum Found {
+    Addr([u8; 4]),
+    Cname(usize),
+    Miss,
+}
+
+fn resolve(host: &str, dns: &[[u8; 4]]) -> Result<[u8; 4], &'static str> {
     if let Some(ip) = ipv4(host) {
         return Ok(ip);
     }
-    let Some(dns) = dns else {
-        return Err("dns");
-    };
-    let mut query = [0u8; 512];
-    let id = (time_ms() as u16) ^ 0x4b31;
-    let len = ntp::write_a_query(&mut query, id, host.as_bytes()).ok_or("name")?;
-    let fd = DNS_FD.load(Ordering::Relaxed);
-    if fd < 0 {
+    if dns.is_empty() || DNS_FD.load(Ordering::Relaxed) < 0 {
         return Err("dns");
     }
+    let mut name = [0u8; 253];
+    let bytes = host.as_bytes();
+    if bytes.is_empty() || bytes.len() > name.len() {
+        return Err("name");
+    }
+    name[..bytes.len()].copy_from_slice(bytes);
+    let mut name_len = bytes.len();
+    let budget = time_ms().saturating_add(RESOLVE_BUDGET_MS);
+    for hop in 0..CNAME_HOPS {
+        if time_ms() >= budget {
+            return Err("dns");
+        }
+        let mut current = [0u8; 253];
+        current[..name_len].copy_from_slice(&name[..name_len]);
+        let label = core::str::from_utf8(&current[..name_len]).map_err(|_| "name")?;
+        match ask(label, dns, budget, hop, &mut name)? {
+            Found::Addr(ip) => return Ok(ip),
+            Found::Cname(n) => name_len = n,
+            Found::Miss => return Err("dns"),
+        }
+    }
+    Err("dns")
+}
+
+fn ask(
+    host: &str,
+    dns: &[[u8; 4]],
+    budget: u64,
+    hop: usize,
+    name: &mut [u8; 253],
+) -> Result<Found, &'static str> {
+    for (index, server) in dns.iter().copied().enumerate() {
+        if time_ms() >= budget {
+            break;
+        }
+        let id = (time_ms() as u16) ^ 0x4b31 ^ (hop as u16) ^ ((index as u16) << 4);
+        match ask_one(host, server, budget, id, name) {
+            Found::Miss => continue,
+            found => return Ok(found),
+        }
+    }
+    Ok(Found::Miss)
+}
+
+fn ask_one(host: &str, dns: [u8; 4], budget: u64, id: u16, name: &mut [u8; 253]) -> Found {
+    let mut query = [0u8; 512];
+    let Some(len) = ntp::write_a_query(&mut query, id, host.as_bytes()) else {
+        return Found::Miss;
+    };
+    let fd = DNS_FD.load(Ordering::Relaxed);
     let packed = u32::from_be_bytes(dns);
     if sys(UDP_SEND, fd as u64, query.as_ptr() as u64, len as u64, packed as u64, 53, 0) != 0 {
-        return Err("dns");
+        return Found::Miss;
     }
-    let deadline = time_ms().saturating_add(2000);
+    let deadline = time_ms().saturating_add(QUERY_MS).min(budget);
     let mut buf = [0u8; 512];
     let mut addr = [0u8; 8];
     while time_ms() < deadline {
@@ -406,13 +466,17 @@ fn resolve(host: &str, dns: Option<[u8; 4]>) -> Result<[u8; 4], &'static str> {
             0,
         );
         if n > 0 {
-            if let Some(ip) = ntp::read_a(&buf[..n as usize], id) {
-                return Ok(ip);
+            let packet = &buf[..n as usize];
+            if let Some(ip) = ntp::read_a(packet, id) {
+                return Found::Addr(ip);
+            }
+            if let Some(got) = ntp::read_cname(packet, id, name) {
+                return Found::Cname(got);
             }
         }
         let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
     }
-    Err("dns")
+    Found::Miss
 }
 
 fn load_extra() {
@@ -442,27 +506,43 @@ fn connect(ip: [u8; 4], port: u16) -> Result<i64, &'static str> {
     }
 }
 
-fn http_body(sock: &mut impl Read, cap: usize) -> Result<Vec<u8>, &'static str> {
+fn http_body(
+    sock: &mut impl Read,
+    mut emit: impl FnMut(&[u8]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 1024];
+    let mut header = true;
     loop {
         let n = match sock.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) if !raw.is_empty() => break,
+            Err(_) if !header => break,
             Err(_) => return Err("io"),
         };
-        if raw.len() + n > cap {
-            return Err("size");
+        if header {
+            if raw.len() + n > 4096 {
+                return Err("http");
+            }
+            raw.extend_from_slice(&buf[..n]);
+            let Some(head) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let status = raw.get(..12).ok_or("http")?;
+            if !status.windows(3).any(|w| w == b"200") {
+                return Err("http");
+            }
+            emit(&raw[head + 4..])?;
+            header = false;
+        } else {
+            emit(&buf[..n])?;
         }
-        raw.extend_from_slice(&buf[..n]);
     }
-    let head = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("http")?;
-    let status = raw.get(..12).ok_or("http")?;
-    if !status.windows(3).any(|w| w == b"200") {
-        return Err("http");
+    if header {
+        Err("http")
+    } else {
+        Ok(())
     }
-    Ok(raw.split_off(head + 4))
 }
 
 fn request_bytes(url: &Url<'_>) -> Result<Vec<u8>, &'static str> {
@@ -480,7 +560,12 @@ fn request_bytes(url: &Url<'_>) -> Result<Vec<u8>, &'static str> {
     Ok(req)
 }
 
-pub fn download(url: &str, unix: i64, dns: Option<[u8; 4]>) -> Result<Vec<u8>, &'static str> {
+pub fn download(
+    url: &str,
+    unix: i64,
+    dns: &[[u8; 4]],
+    emit: impl FnMut(&[u8]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let parsed = parse_url(url)?;
     if parsed.https && unix <= 0 {
         return Err("clock");
@@ -493,16 +578,21 @@ pub fn download(url: &str, unix: i64, dns: Option<[u8; 4]>) -> Result<Vec<u8>, &
     let result = if parsed.https {
         UNIX.store(unix, Ordering::Relaxed);
         load_extra();
-        https_get(&mut sock, parsed.host, &req)
+        https_get(&mut sock, parsed.host, &req, emit)
     } else {
         sock.write_all(&req).map_err(|_| "io")?;
-        http_body(&mut sock, blocklist::LIST_MAX_BYTES + 1)
+        http_body(&mut sock, emit)
     };
     let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
     result
 }
 
-fn https_get(sock: &mut Sock, host: &str, req: &[u8]) -> Result<Vec<u8>, &'static str> {
+fn https_get(
+    sock: &mut Sock,
+    host: &str,
+    req: &[u8],
+    emit: impl FnMut(&[u8]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     if host.len() > 63 {
         return Err("host");
     }
@@ -517,6 +607,7 @@ fn https_get(sock: &mut Sock, host: &str, req: &[u8]) -> Result<Vec<u8>, &'stati
             a: Box::new(CertVerifier::new(Certificate::X509(ISRG1))),
             b: Box::new(CertVerifier::new(Certificate::X509(ISRG2))),
             c: Box::new(CertVerifier::new(Certificate::X509(DIGI))),
+            yr: Box::new(CertVerifier::new(Certificate::X509(ISRG_YR))),
             extra,
             winner: 0,
         },
@@ -530,6 +621,6 @@ fn https_get(sock: &mut Sock, host: &str, req: &[u8]) -> Result<Vec<u8>, &'stati
         .map_err(|_| "tls")?;
     tls.write_all(req).map_err(|_| "tls")?;
     tls.flush().map_err(|_| "tls")?;
-    http_body(&mut tls, blocklist::LIST_MAX_BYTES + 1)
+    http_body(&mut tls, emit)
 }
 

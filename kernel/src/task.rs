@@ -668,6 +668,9 @@ fn log_el0_fault(name: &str) {
     // The formatter writes ASCII only.
     let line = unsafe { core::str::from_utf8_unchecked(&raw[..n]) };
     crate::logger::note_fault(line);
+    if crate::percpu::slot() == BLOCK_SLOT && unsafe { SCENARIO } == 0xff {
+        crate::crash::queue_user(line.as_bytes(), esr, elr, far);
+    }
     // The boot self-test plants faults on purpose. A real task that keeps
     // faulting, including a guard-page stack overflow, freezes the line
     // and stops. It does not reboot.

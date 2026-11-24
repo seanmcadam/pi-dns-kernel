@@ -345,6 +345,61 @@ pub fn write_a_query(out: &mut [u8], id: u16, name: &[u8]) -> Option<usize> {
 }
 
 pub fn read_a(packet: &[u8], id: u16) -> Option<[u8; 4]> {
+    let (mut i, count) = answers_at(packet, id)?;
+    let mut seen = 0;
+    while seen < count && seen < 32 {
+        let (kind, class, rdlen, next) = record_at(packet, i)?;
+        if kind == 1 && class == 1 && rdlen == 4 {
+            return Some([packet[next], packet[next + 1], packet[next + 2], packet[next + 3]]);
+        }
+        i = next + rdlen;
+        seen += 1;
+    }
+    None
+}
+
+/// First CNAME in the answer, authority, or additional section.
+/// The name is written without a trailing dot. `None` when this packet is
+/// not a matching response or it has no CNAME.
+pub fn read_cname(packet: &[u8], id: u16, out: &mut [u8]) -> Option<usize> {
+    let (mut i, count) = answers_at(packet, id)?;
+    let mut seen = 0;
+    while seen < count && seen < 32 {
+        let (kind, class, rdlen, next) = record_at(packet, i)?;
+        if kind == 5 && class == 1 {
+            let (_, n) = copy_name(packet, next, out)?;
+            if n > 0 {
+                return Some(n);
+            }
+        }
+        i = next + rdlen;
+        seen += 1;
+    }
+    None
+}
+
+/// Newline- or comma-separated IPv4 addresses. A short or broken token is
+/// skipped so a truncated buffer still yields the complete lines in front
+/// of the cut.
+pub fn parse_resolvers(text: &[u8], out: &mut [[u8; 4]]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < text.len() && n < out.len() {
+        while i < text.len() && matches!(text[i], b'\n' | b'\r' | b',' | b' ' | b'\t') {
+            i += 1;
+        }
+        let start = i;
+        while i < text.len() && !matches!(text[i], b'\n' | b'\r' | b',' | b' ' | b'\t') {
+            i += 1;
+        }
+        if parse_ipv4(&text[start..i], &mut out[n]) {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn answers_at(packet: &[u8], id: u16) -> Option<(usize, usize)> {
     if packet.len() < 12 || u16::from_be_bytes([packet[0], packet[1]]) != id {
         return None;
     }
@@ -353,7 +408,9 @@ pub fn read_a(packet: &[u8], id: u16) -> Option<[u8; 4]> {
         return None;
     }
     let questions = u16::from_be_bytes([packet[4], packet[5]]) as usize;
-    let answers = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let records = u16::from_be_bytes([packet[6], packet[7]]) as usize
+        + u16::from_be_bytes([packet[8], packet[9]]) as usize
+        + u16::from_be_bytes([packet[10], packet[11]]) as usize;
     let mut i = 12;
     let mut q = 0;
     while q < questions {
@@ -364,26 +421,118 @@ pub fn read_a(packet: &[u8], id: u16) -> Option<[u8; 4]> {
         }
         q += 1;
     }
-    let mut a = 0;
-    while a < answers && a < 16 {
-        i = skip_name(packet, i)?;
-        if i + 10 > packet.len() {
-            return None;
-        }
-        let kind = u16::from_be_bytes([packet[i], packet[i + 1]]);
-        let class = u16::from_be_bytes([packet[i + 2], packet[i + 3]]);
-        let rdlen = u16::from_be_bytes([packet[i + 8], packet[i + 9]]) as usize;
-        i += 10;
-        if i + rdlen > packet.len() {
-            return None;
-        }
-        if kind == 1 && class == 1 && rdlen == 4 {
-            return Some([packet[i], packet[i + 1], packet[i + 2], packet[i + 3]]);
-        }
-        i += rdlen;
-        a += 1;
+    Some((i, records))
+}
+
+fn record_at(packet: &[u8], i: usize) -> Option<(u16, u16, usize, usize)> {
+    let next_name = skip_name(packet, i)?;
+    if next_name + 10 > packet.len() {
+        return None;
     }
-    None
+    let kind = u16::from_be_bytes([packet[next_name], packet[next_name + 1]]);
+    let class = u16::from_be_bytes([packet[next_name + 2], packet[next_name + 3]]);
+    let rdlen = u16::from_be_bytes([packet[next_name + 8], packet[next_name + 9]]) as usize;
+    let data = next_name + 10;
+    if data + rdlen > packet.len() {
+        return None;
+    }
+    Some((kind, class, rdlen, data))
+}
+
+fn parse_ipv4(text: &[u8], out: &mut [u8; 4]) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let mut n = 0;
+    let mut value = 0u16;
+    let mut digits = 0u8;
+    let mut i = 0;
+    while i <= text.len() && n < 4 {
+        let done = i == text.len();
+        let byte = if done { b'.' } else { text[i] };
+        if byte == b'.' {
+            if digits == 0 || value > 255 {
+                return false;
+            }
+            out[n] = value as u8;
+            n += 1;
+            value = 0;
+            digits = 0;
+        } else if byte.is_ascii_digit() {
+            digits = digits.saturating_add(1);
+            if digits > 3 {
+                return false;
+            }
+            value = value * 10 + u16::from(byte - b'0');
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    n == 4 && i > text.len()
+}
+
+/// Copy one domain name, following a compression pointer. The returned
+/// offset is where the record continues, which is not the pointer target.
+fn copy_name(packet: &[u8], start: usize, out: &mut [u8]) -> Option<(usize, usize)> {
+    let mut i = start;
+    let mut end = start;
+    let mut jumped = false;
+    let mut n = 0usize;
+    let mut hops = 0;
+    loop {
+        if hops > 16 || i >= packet.len() {
+            return None;
+        }
+        let len = packet[i];
+        if len == 0 {
+            if !jumped {
+                end = i + 1;
+            }
+            return Some((end, n));
+        }
+        if len & 0xc0 == 0xc0 {
+            if i + 1 >= packet.len() {
+                return None;
+            }
+            if !jumped {
+                end = i + 2;
+            }
+            let ptr = ((usize::from(len) & 0x3f) << 8) | usize::from(packet[i + 1]);
+            if ptr >= packet.len() {
+                return None;
+            }
+            i = ptr;
+            jumped = true;
+            hops += 1;
+            continue;
+        }
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        let lab = usize::from(len);
+        i += 1;
+        if i + lab > packet.len() {
+            return None;
+        }
+        if n > 0 {
+            if n >= out.len() {
+                return None;
+            }
+            out[n] = b'.';
+            n += 1;
+        }
+        if n + lab > out.len() {
+            return None;
+        }
+        out[n..n + lab].copy_from_slice(&packet[i..i + lab]);
+        n += lab;
+        i += lab;
+        if !jumped {
+            end = i;
+        }
+        hops += 1;
+    }
 }
 
 pub fn ntp_from_bootreply(frame: &[u8], out: &mut [[u8; 4]]) -> usize {
@@ -682,5 +831,81 @@ mod tests {
         assert_eq!(ntp_from_bootreply(&frame[..start + 11], &mut out), 2);
         assert_eq!(out[0], [10, 0, 2, 2]);
         assert_eq!(out[1], [1, 1, 1, 1]);
+    }
+
+    fn response_for(name: &[u8]) -> (Vec<u8>, usize) {
+        let mut query = [0u8; 96];
+        let n = write_a_query(&mut query, 7, name).unwrap();
+        let mut response = vec![0u8; n + 64];
+        response[..n].copy_from_slice(&query[..n]);
+        response[2] = 0x81;
+        response[3] = 0x80;
+        (response, n)
+    }
+
+    fn put_a(packet: &mut [u8], mut i: usize, ip: [u8; 4]) -> usize {
+        packet[i] = 0xc0;
+        packet[i + 1] = 0x0c;
+        i += 2;
+        packet[i + 1] = 1;
+        packet[i + 3] = 1;
+        packet[i + 9] = 4;
+        packet[i + 10..i + 14].copy_from_slice(&ip);
+        i + 14
+    }
+
+    #[test]
+    fn cname_chain_and_additional_address() {
+        let (mut response, n) = response_for(b"raw.githubusercontent.com");
+        response[7] = 2;
+        let mut i = n;
+        response[i] = 0xc0;
+        response[i + 1] = 0x0c;
+        i += 2;
+        response[i + 1] = 5;
+        response[i + 3] = 1;
+        let target = b"\x03cdn\x07example\x03com\x00";
+        response[i + 9] = target.len() as u8;
+        i += 10;
+        response[i..i + target.len()].copy_from_slice(target);
+        i += target.len();
+        i = put_a(&mut response, i, [185, 199, 108, 153]);
+        assert_eq!(read_a(&response[..i], 7), Some([185, 199, 108, 153]));
+
+        let (mut only, n) = response_for(b"raw.githubusercontent.com");
+        only[7] = 1;
+        let mut i = n;
+        only[i] = 0xc0;
+        only[i + 1] = 0x0c;
+        i += 2;
+        only[i + 1] = 5;
+        only[i + 3] = 1;
+        only[i + 9] = target.len() as u8;
+        i += 10;
+        only[i..i + target.len()].copy_from_slice(target);
+        i += target.len();
+        assert!(read_a(&only[..i], 7).is_none());
+        let mut name = [0u8; 64];
+        let got = read_cname(&only[..i], 7, &mut name).unwrap();
+        assert_eq!(&name[..got], b"cdn.example.com");
+
+        let (mut extra, n) = response_for(b"cdn.example.com");
+        extra[11] = 1;
+        let end = put_a(&mut extra, n, [9, 9, 9, 9]);
+        assert_eq!(read_a(&extra[..end], 7), Some([9, 9, 9, 9]));
+    }
+
+    #[test]
+    fn resolver_list_keeps_complete_lines() {
+        let text = b"8.8.8.8\n172.18.3.1\n";
+        let mut out = [[0u8; 4]; 4];
+        assert_eq!(parse_resolvers(text, &mut out), 2);
+        assert_eq!(out[0], [8, 8, 8, 8]);
+        assert_eq!(out[1], [172, 18, 3, 1]);
+        let cut = b"8.8.8.8\n172.18.3";
+        assert_eq!(parse_resolvers(cut, &mut out), 1);
+        let commas = b"1.1.1.1, 9.9.9.9";
+        assert_eq!(parse_resolvers(commas, &mut out), 2);
+        assert_eq!(out[1], [9, 9, 9, 9]);
     }
 }

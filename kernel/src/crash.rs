@@ -20,6 +20,12 @@ extern "C" {
 }
 
 static BUSY: AtomicBool = AtomicBool::new(false);
+static USER_PENDING: AtomicBool = AtomicBool::new(false);
+static USER_ESR: AtomicU64 = AtomicU64::new(0);
+static USER_ELR: AtomicU64 = AtomicU64::new(0);
+static USER_FAR: AtomicU64 = AtomicU64::new(0);
+static USER_SUM_N: AtomicU8 = AtomicU8::new(0);
+static USER_SUM: [AtomicU8; 96] = [const { AtomicU8::new(0) }; 96];
 static ARMED: AtomicU8 = AtomicU8::new(0);
 static AT: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SAFE: AtomicBool = AtomicBool::new(false);
@@ -313,6 +319,104 @@ pub fn poll() {
 
 pub fn busy() -> bool {
     BUSY.load(Ordering::Acquire)
+}
+
+/// Remember one blocker fault. The exception path does not take the
+/// filesystem lock and does not reboot. `flush_user` writes the file.
+pub fn queue_user(summary: &[u8], esr: u64, elr: u64, far: u64) {
+    if USER_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    let n = summary.len().min(USER_SUM.len());
+    let mut i = 0;
+    while i < n {
+        USER_SUM[i].store(summary[i], Ordering::Relaxed);
+        i += 1;
+    }
+    USER_SUM_N.store(n as u8, Ordering::Relaxed);
+    USER_ESR.store(esr, Ordering::Relaxed);
+    USER_ELR.store(elr, Ordering::Relaxed);
+    USER_FAR.store(far, Ordering::Relaxed);
+    USER_PENDING.store(true, Ordering::Release);
+}
+
+/// Write `CRASH/CRASHnnn.TXT` for a queued blocker fault.
+///
+/// The loop streak and the safe flag stay as they were, and this does not
+/// reset the board. DNS keeps running. A kernel crash that is already in
+/// progress keeps the RAM slot.
+pub fn flush_user() {
+    if !USER_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if busy() {
+        USER_PENDING.store(true, Ordering::Release);
+        return;
+    }
+    let n = USER_SUM_N.load(Ordering::Relaxed) as usize;
+    let mut summary = [0u8; 96];
+    let mut i = 0;
+    while i < n && i < summary.len() {
+        summary[i] = USER_SUM[i].load(Ordering::Relaxed);
+        i += 1;
+    }
+    let raw = slot();
+    let prev = crash_rec::load_loop(raw).unwrap_or(LoopState {
+        streak: 0,
+        safe: 0,
+        seq: 0,
+    });
+    let seq = prev.seq.saturating_add(1);
+    let mut packed = [0u8; crash_rec::RECORD_LEN];
+    let draft = Draft {
+        kind: crash_rec::KIND_FAULT,
+        streak: 0,
+        safe: 0,
+        seq,
+        core: core_id(),
+        uptime_ms: crate::timer::millis(),
+        esr: USER_ESR.load(Ordering::Relaxed),
+        elr: USER_ELR.load(Ordering::Relaxed),
+        far: USER_FAR.load(Ordering::Relaxed),
+        spsr: 0,
+        sp: 0,
+        regs: &[],
+        frames: &[],
+        stack: &[],
+        log: &[],
+        summary: &summary[..i],
+        version: version::VERSION.as_bytes(),
+        boot_id: version::BOOT_ID_STR.as_bytes(),
+        unix_secs: crate::clock::unix_secs().unwrap_or(0).max(0) as u64,
+    };
+    if !crash_rec::store_record(&mut packed, &draft) {
+        return;
+    }
+    let Some(view) = crash_rec::load_record(&packed) else {
+        return;
+    };
+    let mut text = [0u8; 4096];
+    let text_n = crash_rec::render(&view, &mut text);
+    let name = crash_rec::file_name(seq);
+    let Ok(name_str) = core::str::from_utf8(&name) else {
+        return;
+    };
+    if crate::fs::save_crash(name_str, &text[..text_n]).is_err() {
+        return;
+    }
+    if !busy() && !BUSY.swap(true, Ordering::AcqRel) {
+        crash_rec::store_loop(
+            raw,
+            LoopState {
+                streak: prev.streak,
+                safe: prev.safe,
+                seq,
+            },
+        );
+        clean(raw.as_ptr() as u64, crash_rec::SLOT);
+        BUSY.store(false, Ordering::Release);
+    }
+    publish_card(false, &[0; 16], b"", 0);
 }
 
 pub fn from_exception(esr: u64, elr: u64, far: u64, spsr: u64, sp: u64, regs: &[u64]) {

@@ -265,24 +265,14 @@ fn note(index: u8, name: &str, url: &str, err: &str, entries: u32, mtime: i64, n
     let _ = block(6, buf.as_ptr() as u64, n as u64, 0, 0, 0);
 }
 
-fn resolver() -> Option<[u8; 4]> {
-    let mut buf = [0u8; 16];
+fn resolvers(out: &mut [[u8; 4]]) -> usize {
+    let mut buf = [0u8; 320];
     let n = sys(14, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0);
     if n <= 0 {
-        return None;
+        return 0;
     }
-    let text = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-    let first = text.split(',').next().unwrap_or("").trim();
-    let mut ip = [0u8; 4];
-    let mut i = 0;
-    for part in first.split('.') {
-        if i == 4 {
-            return None;
-        }
-        ip[i] = part.parse().ok()?;
-        i += 1;
-    }
-    if i == 4 { Some(ip) } else { None }
+    let end = (n as usize).min(buf.len());
+    ntp::parse_resolvers(&buf[..end], out)
 }
 
 fn load_file(name: &str) -> u32 {
@@ -296,7 +286,7 @@ fn load_file(name: &str) -> u32 {
         if n < 0 {
             break;
         }
-        if n == 0 {
+        if n == 0 || count >= blocklist::LIST_MAX_ENTRIES as u32 {
             break;
         }
         off += n as u64;
@@ -379,36 +369,29 @@ fn index_lines() -> Vec<(alloc::string::String, alloc::string::String)> {
     out
 }
 
-fn feed_bytes(bytes: &[u8]) -> u32 {
-    let mut count = 0u32;
-    let mut start = 0usize;
-    for (i, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            count += feed_line(&bytes[start..i]);
-            start = i + 1;
-        }
+fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
+    let latest = load_cfg();
+    let cfg = if latest.enabled != cfg.enabled || latest.urls != cfg.urls {
+        &latest
+    } else {
+        cfg
+    };
+    if block(0, 0, 0, 0, 0, 0) < 0 {
+        return previous;
     }
-    if start < bytes.len() {
-        count += feed_line(&bytes[start..]);
-    }
-    count
-}
-
-fn publish(cfg: &Cfg, fresh: &[Option<Vec<u8>>; 8]) -> [u32; 8] {
-    let _ = block(0, 0, 0, 0, 0, 0);
-    let cached = index_lines();
     let mut counts = [0u32; 8];
-    for (i, url) in cfg.urls.iter().enumerate().take(8) {
-        if let Some(body) = &fresh[i] {
-            counts[i] = feed_bytes(body);
-            continue;
-        }
-        let name = list_name(url);
-        if cached.iter().any(|(file, _)| file == &name) {
-            counts[i] = load_file(&name);
+    if cfg.enabled && !cfg.urls.is_empty() {
+        let cached = index_lines();
+        for (i, url) in cfg.urls.iter().enumerate().take(8) {
+            let name = list_name(url);
+            if cached.iter().any(|(file, _)| file == &name) {
+                counts[i] = load_file(&name);
+            }
         }
     }
     let _ = block(2, 0, 0, 0, 0, 0);
+    let tail = if cfg.enabled { cfg.urls.len() as u64 } else { 0 };
+    let _ = block(14, tail, 0, 0, 0, 0);
     counts
 }
 
@@ -444,50 +427,120 @@ fn fnv(data: &[u8], hash: u64) -> u64 {
     h
 }
 
-fn save_body(chunks: &[u8]) -> bool {
-    let mut off = 0;
-    while off < chunks.len() {
-        let end = (off + 1024).min(chunks.len());
-        if !file_write(TEMP, &chunks[off..end], off == 0) {
-            return false;
+fn names_in_temp() -> Result<u32, &'static str> {
+    let mut off = 0u64;
+    let mut chunk = [0u8; 1024];
+    let mut hold = [0u8; 300];
+    let mut hold_n = 0usize;
+    let mut count = 0u32;
+    loop {
+        let n = file_read(TEMP, off, &mut chunk);
+        if n < 0 {
+            return Err("disk");
         }
-        off = end;
+        if n == 0 {
+            break;
+        }
+        off += n as u64;
+        let bytes = &chunk[..n as usize];
+        let mut start = 0usize;
+        for (i, byte) in bytes.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            let line = if hold_n > 0 {
+                let room = hold.len() - hold_n;
+                let take = i.min(room);
+                hold[hold_n..hold_n + take].copy_from_slice(&bytes[..take]);
+                let n = hold_n + take;
+                hold_n = 0;
+                &hold[..n]
+            } else {
+                &bytes[start..i]
+            };
+            count = count.saturating_add(names_in_line(line));
+            if count > blocklist::LIST_MAX_ENTRIES as u32 {
+                return Ok(count);
+            }
+            start = i + 1;
+        }
+        let tail = &bytes[start..];
+        if hold_n + tail.len() <= hold.len() {
+            hold[hold_n..hold_n + tail.len()].copy_from_slice(tail);
+            hold_n += tail.len();
+        } else {
+            hold_n = 0;
+        }
     }
+    if hold_n > 0 {
+        count = count.saturating_add(names_in_line(&hold[..hold_n]));
+    }
+    Ok(count)
+}
+
+fn names_in_line(line: &[u8]) -> u32 {
+    let Ok(text) = core::str::from_utf8(line) else {
+        return 0;
+    };
+    let mut n = 0u32;
+    blocklist::parse_line(text, |_| n = n.saturating_add(1));
+    n
+}
+
+fn read_back(expect: u64, len: u64) -> bool {
     let mut check = 0xcbf29ce484222325u64;
     let mut got = 0u64;
     let mut buf = [0u8; 1024];
-    while got < chunks.len() as u64 {
+    while got < len {
         let n = file_read(TEMP, got, &mut buf);
         if n <= 0 {
             return false;
         }
-        check = fnv(&buf[..n as usize], check);
-        got += n as u64;
+        let take = (n as u64).min(len - got) as usize;
+        check = fnv(&buf[..take], check);
+        got += take as u64;
     }
-    check == fnv(chunks, 0xcbf29ce484222325)
+    check == expect
 }
 
-fn refresh_one(
-    url: &str,
-    resolver: Option<[u8; 4]>,
-    unix: i64,
-) -> Result<Vec<u8>, &'static str> {
-    let body = fetch::download(url, unix, resolver)?;
-    if body.len() > blocklist::LIST_MAX_BYTES {
-        return Err("size");
+fn refresh_one(url: &str, dns: &[[u8; 4]], unix: i64) -> Result<(), &'static str> {
+    let mut total = 0usize;
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut started = false;
+    fetch::download(url, unix, dns, |chunk| {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if total.saturating_add(chunk.len()) > blocklist::LIST_MAX_BYTES {
+            return Err("size");
+        }
+        if !file_write(TEMP, chunk, !started) {
+            return Err("disk");
+        }
+        started = true;
+        hash = fnv(chunk, hash);
+        total += chunk.len();
+        Ok(())
+    })?;
+    if total == 0 || !read_back(hash, total as u64) {
+        return Err(if total == 0 { "empty" } else { "disk" });
     }
-    if save_body(&body) {
-        let name = list_name(url);
-        let _ = block(
-            9,
-            TEMP.as_ptr() as u64,
-            TEMP.len() as u64,
-            name.as_ptr() as u64,
-            name.len() as u64,
-            0,
-        );
+    if names_in_temp()? > blocklist::LIST_MAX_ENTRIES as u32 {
+        return Err("full");
     }
-    Ok(body)
+    let name = list_name(url);
+    if block(
+        9,
+        TEMP.as_ptr() as u64,
+        TEMP.len() as u64,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        0,
+    ) < 0
+    {
+        return Err("disk");
+    }
+    Ok(())
 }
 
 #[no_mangle]
@@ -496,8 +549,7 @@ pub extern "C" fn rust_main() -> ! {
     fetch::set_dns(sys(UDP_BIND, 5353, 0, 0, 0, 0, 0));
     let _ = block(13, 1, 0, 0, 0, 0);
     let mut cfg = load_cfg();
-    let mut fresh_body: [Option<Vec<u8>>; 8] = Default::default();
-    let mut counts = publish(&cfg, &fresh_body);
+    let mut counts = publish(&cfg, [0; 8]);
     let _ = block(13, 2, 0, 0, 0, 0);
     let mut errors = [""; 8];
     let mut next = [0i64; 8];
@@ -512,15 +564,15 @@ pub extern "C" fn rust_main() -> ! {
             || loaded.allow != cfg.allow
         {
             cfg = loaded;
-            fresh_body = Default::default();
             let _ = block(13, 1, 0, 0, 0, 0);
-            counts = publish(&cfg, &fresh_body);
+            counts = publish(&cfg, counts);
             let _ = block(13, 2, 0, 0, 0, 0);
             errors = [""; 8];
             next = [0; 8];
         }
         if cfg.enabled && sys(NET_READY, 0, 0, 0, 0, 0, 0) == 1 {
-            let dns = resolver();
+            let mut servers = [[0u8; 4]; 16];
+            let servers_n = resolvers(&mut servers);
             let mut changed = false;
             for (i, url) in cfg.urls.iter().enumerate().take(8) {
                 let name = list_name(url);
@@ -533,9 +585,8 @@ pub extern "C" fn rust_main() -> ! {
                 if !due || (next[i] != 0 && (unix <= 0 || unix < next[i])) || now < hold[i] {
                     continue;
                 }
-                match refresh_one(url, dns, unix) {
-                    Ok(body) => {
-                        fresh_body[i] = Some(body);
+                match refresh_one(url, &servers[..servers_n], unix) {
+                    Ok(()) => {
                         errors[i] = "";
                         changed = true;
                         next[i] = 0;
@@ -553,29 +604,34 @@ pub extern "C" fn rust_main() -> ! {
                 }
             }
             if changed {
+                cfg = load_cfg();
                 write_index(&cfg);
                 let _ = block(13, 1, 0, 0, 0, 0);
-                counts = publish(&cfg, &fresh_body);
+                counts = publish(&cfg, counts);
                 let _ = block(13, 2, 0, 0, 0, 0);
-                fresh_body = Default::default();
             }
         }
-        let cached = index_lines();
-        for (i, url) in cfg.urls.iter().enumerate().take(8) {
-            let name = list_name(url);
-            let mtime = if cached.iter().any(|(file, _)| file == &name) {
-                file_mtime(&name)
-            } else {
-                0
-            };
-            let due = if mtime > 0 {
-                mtime.saturating_add(cfg.refresh)
-            } else if next[i] != 0 {
-                next[i]
-            } else {
-                0
-            };
-            note(i as u8, &name, url, errors[i], counts[i], mtime, due);
+        if cfg.enabled {
+            let cached = index_lines();
+            for (i, url) in cfg.urls.iter().enumerate().take(8) {
+                let name = list_name(url);
+                let mtime = if cached.iter().any(|(file, _)| file == &name) {
+                    file_mtime(&name)
+                } else {
+                    0
+                };
+                let due = if mtime > 0 {
+                    mtime.saturating_add(cfg.refresh)
+                } else if next[i] != 0 {
+                    next[i]
+                } else {
+                    0
+                };
+                note(i as u8, &name, url, errors[i], counts[i], mtime, due);
+            }
+            let _ = block(14, cfg.urls.len() as u64, 0, 0, 0, 0);
+        } else {
+            let _ = block(14, 0, 0, 0, 0, 0);
         }
         let _ = now;
         sleep_ms(1000);
