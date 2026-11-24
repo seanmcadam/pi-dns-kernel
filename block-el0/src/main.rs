@@ -581,6 +581,9 @@ pub extern "C" fn rust_main() -> ! {
             let _ = block(13, 2, 0, 0, 0, 0);
             errors = [""; 8];
             next = [0; 8];
+            // The 60s hold belongs to the previous URL. A new list should
+            // download on this pass, not after that timer.
+            hold = [0; 8];
         }
         if cfg.enabled && sys(NET_READY, 0, 0, 0, 0, 0, 0) == 1 {
             let mut servers = [[0u8; 4]; 16];
