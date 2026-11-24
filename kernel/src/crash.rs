@@ -366,7 +366,20 @@ pub fn flush_user() {
         safe: 0,
         seq: 0,
     });
-    let seq = prev.seq.saturating_add(1);
+    // A firmware reset drops the RAM slot. The files already on the card
+    // still name the next free slot, or the next wrap when all eight exist.
+    let mut present = 0u32;
+    let mut slot_n = 0u32;
+    while slot_n < crash_rec::KEEP {
+        let candidate = crash_rec::file_name(slot_n + 1);
+        if let Ok(name) = core::str::from_utf8(&candidate) {
+            if crate::fs::crash_exists(name) {
+                present |= 1 << slot_n;
+            }
+        }
+        slot_n += 1;
+    }
+    let seq = crash_rec::next_seq(prev.seq, present);
     let mut packed = [0u8; crash_rec::RECORD_LEN];
     let draft = Draft {
         kind: crash_rec::KIND_FAULT,
@@ -416,7 +429,16 @@ pub fn flush_user() {
         clean(raw.as_ptr() as u64, crash_rec::SLOT);
         BUSY.store(false, Ordering::Release);
     }
-    publish_card(false, &[0; 16], b"", 0);
+    let mut ram_file = [0u8; 16];
+    let copy_n = name.len().min(ram_file.len());
+    ram_file[..copy_n].copy_from_slice(&name[..copy_n]);
+    {
+        let mut pub_ = PUB.lock();
+        let copy = text_n.min(pub_.text.len());
+        pub_.text[..copy].copy_from_slice(&text[..copy]);
+        pub_.text_n = copy;
+    }
+    publish_card(true, &ram_file, &summary[..i], draft.uptime_ms);
 }
 
 pub fn from_exception(esr: u64, elr: u64, far: u64, spsr: u64, sp: u64, regs: &[u64]) {

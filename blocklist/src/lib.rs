@@ -151,6 +151,141 @@ pub fn feed(text: &str, mut emit: impl FnMut(&str)) -> usize {
     count
 }
 
+/// Bytes kept when a line is split across reads. A hosts name is at most
+/// 253 bytes, and `0.0.0.0 ` in front of it still fits. A longer line is
+/// skipped through its newline so the next line is not lost with it.
+pub const LINE_HOLD: usize = 512;
+
+pub struct LineSplit {
+    hold: [u8; LINE_HOLD],
+    n: usize,
+    skip: bool,
+}
+
+impl LineSplit {
+    pub const fn new() -> Self {
+        Self {
+            hold: [0; LINE_HOLD],
+            n: 0,
+            skip: false,
+        }
+    }
+
+    /// Emit every complete line in `chunk`. A trailing fragment stays
+    /// buffered until [`Self::finish`] or the next chunk.
+    pub fn push(&mut self, chunk: &[u8], mut emit: impl FnMut(&[u8])) {
+        let mut i = 0;
+        while i < chunk.len() {
+            if self.skip {
+                match chunk[i..].iter().position(|byte| *byte == b'\n') {
+                    Some(rel) => {
+                        self.skip = false;
+                        i += rel + 1;
+                    }
+                    None => return,
+                }
+                continue;
+            }
+            match chunk[i..].iter().position(|byte| *byte == b'\n') {
+                Some(rel) => {
+                    let end = i + rel;
+                    self.emit_line(&chunk[i..end], &mut emit);
+                    i = end + 1;
+                }
+                None => {
+                    self.keep(&chunk[i..]);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn finish(&mut self, mut emit: impl FnMut(&[u8])) {
+        if !self.skip && self.n > 0 {
+            let n = self.n;
+            self.n = 0;
+            emit(&self.hold[..n]);
+        }
+        self.n = 0;
+        self.skip = false;
+    }
+
+    fn emit_line(&mut self, tail: &[u8], emit: &mut impl FnMut(&[u8])) {
+        if self.n == 0 {
+            emit(tail);
+            return;
+        }
+        if self.n + tail.len() <= self.hold.len() {
+            let n = self.n;
+            self.hold[n..n + tail.len()].copy_from_slice(tail);
+            self.n = 0;
+            emit(&self.hold[..n + tail.len()]);
+        } else {
+            self.n = 0;
+        }
+    }
+
+    fn keep(&mut self, tail: &[u8]) {
+        if self.n + tail.len() <= self.hold.len() {
+            self.hold[self.n..self.n + tail.len()].copy_from_slice(tail);
+            self.n += tail.len();
+        } else {
+            self.n = 0;
+            self.skip = true;
+        }
+    }
+}
+
+/// How a download read ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadEnd {
+    /// TCP EOF or a TLS close_notify.
+    Clean,
+    /// Timeout or a broken stream. The bytes so far are not a whole body.
+    Fail,
+}
+
+/// `true` when `got` is a complete HTTP body.
+///
+/// A short read against Content-Length is incomplete even on a clean close.
+/// A failure is incomplete even when the server never sent a length. Callers
+/// that already have every Content-Length byte can stop before this.
+pub fn body_complete(content_length: Option<usize>, got: usize, end: ReadEnd) -> bool {
+    match end {
+        ReadEnd::Fail => false,
+        ReadEnd::Clean => match content_length {
+            Some(n) => got >= n,
+            None => true,
+        },
+    }
+}
+
+/// `Content-Length` from a header block, if the field is present and numeric.
+pub fn content_length(headers: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < headers.len() {
+        let end = headers[i..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|rel| i + rel)
+            .unwrap_or(headers.len());
+        let mut line = &headers[i..end];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        let key = b"content-length:";
+        if line.len() >= key.len() && line[..key.len()].eq_ignore_ascii_case(key) {
+            let text = core::str::from_utf8(line[key.len()..].trim_ascii()).ok()?;
+            return text.parse().ok();
+        }
+        if end == headers.len() {
+            break;
+        }
+        i = end + 1;
+    }
+    None
+}
+
 /// `true` only for a stable published hit. Down, loading, and a generation
 /// that moves during the probe all return false so DNS answers normally.
 pub fn fail_open(gen_before: u64, gen_after: u64, hit: bool) -> bool {
@@ -210,9 +345,12 @@ pub fn count(region: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Start a rebuild. The generation goes odd, so lookups fail open until
-/// [`commit`].
-pub fn begin(region: &mut [u8]) -> bool {
+/// Mark a rebuild in progress without zeroing the slots.
+///
+/// The generation goes odd, so lookups fail open until [`commit`]. The
+/// caller zeros the slots with [`scrub`], in pieces, so a 32 MiB table
+/// does not keep the CPU inside one syscall.
+pub fn open_rebuild(region: &mut [u8]) -> bool {
     if region.len() < HEADER + 8 || region.as_ptr() as usize % 8 != 0 {
         return false;
     }
@@ -220,19 +358,41 @@ pub fn begin(region: &mut [u8]) -> bool {
     write_u64(region, 0, MAGIC);
     write_u64(region, 8, next);
     write_u64(region, 16, 0);
-    let (ptr, len) = {
-        let Some(table) = slots_mut(region) else {
-            return false;
-        };
-        (table.as_mut_ptr(), table.len())
+    let Some(len) = slot_len(region) else {
+        return false;
     };
-    let mut i = 0;
-    while i < len {
-        unsafe { *ptr.add(i) = 0; }
-        i += 1;
-    }
     write_u64(region, 24, len as u64);
     true
+}
+
+fn slot_len(region: &mut [u8]) -> Option<usize> {
+    Some(slots_mut(region)?.len())
+}
+
+/// Zero `count` slots starting at `from`. Returns `(next, len)`.
+/// `next == len` means the table is clear.
+pub fn scrub(region: &mut [u8], from: usize, count: usize) -> Option<(usize, usize)> {
+    let table = slots_mut(region)?;
+    let len = table.len();
+    let start = from.min(len);
+    let end = start.saturating_add(count).min(len);
+    let ptr = table.as_mut_ptr();
+    let mut i = start;
+    while i < end {
+        unsafe {
+            *ptr.add(i) = 0;
+        }
+        i += 1;
+    }
+    Some((end, len))
+}
+
+/// Start a rebuild and zero every slot. Lookups fail open until [`commit`].
+pub fn begin(region: &mut [u8]) -> bool {
+    if !open_rebuild(region) {
+        return false;
+    }
+    scrub(region, 0, usize::MAX).is_some()
 }
 
 pub fn insert(region: &mut [u8], hash: u64) -> bool {
@@ -433,6 +593,76 @@ not a domain line
     }
 
     #[test]
+    fn hosts_split_across_chunk_boundaries_match_one_feed() {
+        let mut body = String::new();
+        let mut i = 0;
+        while i < 20_000 {
+            if i % 17 == 0 {
+                body.push_str("# a comment that is not a name\r\n");
+            } else if i % 19 == 0 {
+                body.push('\n');
+            } else if i % 23 == 0 {
+                body.push_str("0.0.0.0 one.example two.example\n");
+            } else if i % 29 == 0 {
+                body.push_str("plain.example\n");
+            } else {
+                body.push_str(&format!("127.0.0.1 host{i}.example\n"));
+            }
+            i += 1;
+        }
+        body.push_str(&"x".repeat(600));
+        body.push_str("\n0.0.0.0 after-long.example\n");
+        body.push_str("0.0.0.0 tail.example");
+        let reference = feed(&body, |_| {});
+        assert!(reference > 18_000, "reference {reference}");
+        let sizes = [
+            1usize, 2, 3, 7, 17, 63, 64, 127, 128, 255, 256, 299, 300, 301, 511, 512, 513, 1024,
+            1400, 16384,
+        ];
+        let bytes = body.as_bytes();
+        for size in sizes {
+            let mut split = LineSplit::new();
+            let mut got = 0usize;
+            let mut off = 0;
+            while off < bytes.len() {
+                let end = (off + size).min(bytes.len());
+                split.push(&bytes[off..end], |line| {
+                    let Ok(text) = core::str::from_utf8(line) else {
+                        return;
+                    };
+                    parse_line(text, |_| got += 1);
+                });
+                off = end;
+            }
+            split.finish(|line| {
+                let Ok(text) = core::str::from_utf8(line) else {
+                    return;
+                };
+                parse_line(text, |_| got += 1);
+            });
+            assert_eq!(got, reference, "chunk {size}");
+        }
+    }
+
+    #[test]
+    fn a_short_body_is_not_a_complete_download() {
+        assert_eq!(
+            content_length(b"HTTP/1.1 200 OK\r\nContent-Length: 2505650\r\n\r\n"),
+            Some(2_505_650)
+        );
+        assert_eq!(
+            content_length(b"HTTP/1.0 200 OK\r\ncontent-length: 12\r\n"),
+            Some(12)
+        );
+        assert_eq!(content_length(b"HTTP/1.0 200 OK\r\n\r\n"), None);
+        assert!(!body_complete(Some(100), 80, ReadEnd::Clean));
+        assert!(body_complete(Some(100), 100, ReadEnd::Clean));
+        assert!(!body_complete(Some(100), 50, ReadEnd::Fail));
+        assert!(body_complete(None, 10, ReadEnd::Clean));
+        assert!(!body_complete(None, 10, ReadEnd::Fail));
+    }
+
+    #[test]
     fn url_file_names_are_8_3_and_stable() {
         let a = list_file("https://example.com/hosts");
         let b = list_file("https://example.com/hosts");
@@ -455,6 +685,33 @@ not a domain line
         let issuer = cert_name(yr, false).expect("issuer");
         assert_eq!(subject, issuer);
         assert!(subject.windows(7).any(|window| window == b"Root YR"));
+    }
+
+    #[test]
+    fn scrub_in_slices_matches_a_full_begin() {
+        let (mut buf, offset) = aligned(HEADER + 64);
+        let region = &mut buf[offset..offset + HEADER + 64];
+        region.fill(0x5a);
+        assert!(open_rebuild(region));
+        assert_eq!(generation(region) % 2, 1);
+        let mut at = 0;
+        let mut steps = 0;
+        loop {
+            let (next, len) = scrub(region, at, 3).unwrap();
+            steps += 1;
+            if next >= len {
+                break;
+            }
+            at = next;
+            assert!(steps < 8);
+        }
+        let slots =
+            unsafe { core::slice::from_raw_parts(region[HEADER..].as_ptr() as *const u64, 8) };
+        assert!(slots.iter().all(|slot| *slot == 0));
+        assert!(insert(region, name_hash("ads.example")));
+        assert!(!lookup(region, "ads.example"));
+        commit(region);
+        assert!(lookup(region, "ads.example"));
     }
 
     #[test]

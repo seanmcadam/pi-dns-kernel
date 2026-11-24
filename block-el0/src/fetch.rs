@@ -227,9 +227,17 @@ impl embedded_io::Error for IoErr {
     }
 }
 
+const IDLE_MS: u64 = 20_000;
+
 struct Sock {
     fd: i64,
     deadline: u64,
+}
+
+impl Sock {
+    fn note_progress(&mut self) {
+        self.deadline = time_ms().saturating_add(IDLE_MS);
+    }
 }
 
 impl ErrorType for Sock {
@@ -253,6 +261,7 @@ impl Read for Sock {
                 0,
             );
             if n > 0 {
+                self.note_progress();
                 return Ok(n as usize);
             }
             if n == 0 {
@@ -290,6 +299,7 @@ impl Write for Sock {
                 let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
                 continue;
             }
+            self.note_progress();
             sent += n as usize;
         }
         Ok(sent)
@@ -506,19 +516,37 @@ fn connect(ip: [u8; 4], port: u16) -> Result<i64, &'static str> {
     }
 }
 
+enum Stop {
+    /// TLS close_notify. The bytes already received may be the whole body.
+    Clean,
+    /// Timeout or a broken record. A partial body must not be published.
+    Fail,
+}
+
 fn http_body(
-    sock: &mut impl Read,
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, Stop>,
     mut emit: impl FnMut(&[u8]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 1024];
     let mut header = true;
+    let mut expect: Option<usize> = None;
+    let mut got = 0usize;
     loop {
-        let n = match sock.read(&mut buf) {
-            Ok(0) => break,
+        if expect.is_some_and(|max| got >= max) {
+            return Ok(());
+        }
+        let n = match read(&mut buf) {
+            Ok(0) | Err(Stop::Clean) if header => return Err("http"),
+            Ok(0) | Err(Stop::Clean) => {
+                return if blocklist::body_complete(expect, got, blocklist::ReadEnd::Clean) {
+                    Ok(())
+                } else {
+                    Err("short")
+                };
+            }
             Ok(n) => n,
-            Err(_) if !header => break,
-            Err(_) => return Err("io"),
+            Err(Stop::Fail) => return Err(if header { "http" } else { "io" }),
         };
         if header {
             if raw.len() + n > 4096 {
@@ -532,16 +560,26 @@ fn http_body(
             if !status.windows(3).any(|w| w == b"200") {
                 return Err("http");
             }
-            emit(&raw[head + 4..])?;
+            expect = blocklist::content_length(&raw[..head]);
+            let mut body = &raw[head + 4..];
+            if let Some(max) = expect {
+                body = &body[..body.len().min(max)];
+            }
+            if !body.is_empty() {
+                emit(body)?;
+            }
+            got = body.len();
             header = false;
         } else {
-            emit(&buf[..n])?;
+            let mut take = n;
+            if let Some(max) = expect {
+                take = take.min(max.saturating_sub(got));
+            }
+            if take > 0 {
+                emit(&buf[..take])?;
+                got += take;
+            }
         }
-    }
-    if header {
-        Err("http")
-    } else {
-        Ok(())
     }
 }
 
@@ -572,7 +610,7 @@ pub fn download(
     }
     let ip = resolve(parsed.host, dns)?;
     let fd = connect(ip, parsed.port)?;
-    let deadline = time_ms().saturating_add(20_000);
+    let deadline = time_ms().saturating_add(IDLE_MS);
     let mut sock = Sock { fd, deadline };
     let req = request_bytes(&parsed)?;
     let result = if parsed.https {
@@ -581,7 +619,7 @@ pub fn download(
         https_get(&mut sock, parsed.host, &req, emit)
     } else {
         sock.write_all(&req).map_err(|_| "io")?;
-        http_body(&mut sock, emit)
+        http_body(|buf| sock.read(buf).map_err(|_| Stop::Fail), emit)
     };
     let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
     result
@@ -621,6 +659,13 @@ fn https_get(
         .map_err(|_| "tls")?;
     tls.write_all(req).map_err(|_| "tls")?;
     tls.flush().map_err(|_| "tls")?;
-    http_body(&mut tls, emit)
+    http_body(
+        |buf| match tls.read(buf) {
+            Ok(n) => Ok(n),
+            Err(TlsError::ConnectionClosed) => Err(Stop::Clean),
+            Err(_) => Err(Stop::Fail),
+        },
+        emit,
+    )
 }
 

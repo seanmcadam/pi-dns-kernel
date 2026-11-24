@@ -93,6 +93,28 @@ pub fn file_name(seq: u32) -> [u8; 12] {
     name
 }
 
+/// Next sequence for a user-fault file.
+///
+/// `ram_seq` is the last sequence in the RAM slot, or 0 when a reset wiped
+/// that slot. `present` has bit `n` set when `CRASHnnn.TXT` is already on
+/// the card. The next file follows whichever source is further ahead, so a
+/// wiped slot does not overwrite `CRASH000` while later files are still
+/// on the card. A full set of eight still wraps, overwriting the oldest slot.
+pub fn next_seq(ram_seq: u32, present: u32) -> u32 {
+    let mut last = ram_seq;
+    let mut slot = 0u32;
+    while slot < KEEP {
+        if present & (1 << slot) != 0 {
+            let seq_here = slot + 1;
+            if seq_here > last {
+                last = seq_here;
+            }
+        }
+        slot += 1;
+    }
+    last.saturating_add(1)
+}
+
 pub struct Draft<'a> {
     pub kind: u16,
     pub streak: u32,
@@ -546,6 +568,19 @@ mod tests {
         assert_eq!(&file_name(8), b"CRASH007.TXT");
         assert_eq!(&file_name(9), b"CRASH000.TXT");
         assert_eq!(&file_name(0), b"CRASH000.TXT");
+        assert_eq!(next_seq(0, 0), 1);
+        assert_eq!(&file_name(next_seq(0, 0)), b"CRASH000.TXT");
+        // RAM wiped, CRASH000..CRASH004 already on the card: write CRASH005.
+        let five = (1u32 << 5) - 1;
+        assert_eq!(next_seq(0, five), 6);
+        assert_eq!(&file_name(next_seq(0, five)), b"CRASH005.TXT");
+        assert_eq!(next_seq(5, five), 6);
+        assert_eq!(next_seq(0, 1), 2);
+        assert_eq!(&file_name(next_seq(0, 1)), b"CRASH001.TXT");
+        assert_eq!(next_seq(0, 0xff), 9);
+        assert_eq!(&file_name(next_seq(0, 0xff)), b"CRASH000.TXT");
+        assert_eq!(next_seq(20, 0xff), 21);
+        assert_eq!(&file_name(next_seq(20, 0xff)), b"CRASH004.TXT");
         let mut seen = [false; 8];
         let mut seq = 1;
         while seq <= 16 {

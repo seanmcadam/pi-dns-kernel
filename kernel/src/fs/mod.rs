@@ -59,6 +59,66 @@ type Mgr = VolumeManager<DiskDev, Clock, 4, 4, 1>;
 
 static FS: Mutex<Option<Mgr>> = Mutex::new(None);
 
+/// Where the last walk of one file stopped. Opening a file starts the
+/// FAT chain over, so a 1 KiB append at the end of a multi-megabyte list
+/// would otherwise reread every cluster. Touched only while `FS` is held.
+struct ChainHint {
+    name: [u8; 16],
+    name_n: u8,
+    offset: u32,
+    cluster_off: u32,
+    cluster: u32,
+}
+
+static CHAIN: Mutex<Option<ChainHint>> = Mutex::new(None);
+
+fn same_chain(hint: &ChainHint, name: &str) -> bool {
+    hint.name_n as usize == name.len() && &hint.name[..name.len()] == name.as_bytes()
+}
+
+fn chain_for_read(name: &str, offset: u32) -> Option<(u32, u32)> {
+    let guard = CHAIN.lock();
+    let hint = guard.as_ref()?;
+    if !same_chain(hint, name) || hint.cluster_off > offset {
+        return None;
+    }
+    Some((hint.cluster_off, hint.cluster))
+}
+
+fn chain_for_append(name: &str, len: u32) -> Option<(u32, u32)> {
+    let guard = CHAIN.lock();
+    let hint = guard.as_ref()?;
+    if !same_chain(hint, name) || hint.offset != len || hint.cluster_off > len {
+        return None;
+    }
+    Some((hint.cluster_off, hint.cluster))
+}
+
+fn remember_chain(mgr: &Mgr, file: RawFile, name: &str) {
+    if name.len() > 16 {
+        return;
+    }
+    let Ok((offset, cluster_off, cluster)) = mgr.file_chain_pos(file) else {
+        return;
+    };
+    let mut hint = ChainHint {
+        name: [0; 16],
+        name_n: name.len() as u8,
+        offset,
+        cluster_off,
+        cluster,
+    };
+    hint.name[..name.len()].copy_from_slice(name.as_bytes());
+    *CHAIN.lock() = Some(hint);
+}
+
+fn forget_chain(name: &str) {
+    let mut guard = CHAIN.lock();
+    if guard.as_ref().is_some_and(|hint| same_chain(hint, name)) {
+        *guard = None;
+    }
+}
+
 pub fn init() -> Result<(), FsError> {
     let found = crate::board::probe_disk();
     if !found {
@@ -175,6 +235,12 @@ fn with_crash_file<R>(
             if !create_dir {
                 let _ = mgr.close_dir(root);
                 let _ = mgr.close_volume(volume);
+                if matches!(err, embedded_sdmmc::Error::NotFound) {
+                    return Err(FsError::Io {
+                        op: "open crash",
+                        detail: String::from("NotFound"),
+                    });
+                }
                 return Err(fs_err("open crash", err));
             }
             if let Err(err) = mgr.make_dir_in_dir(root, "CRASH") {
@@ -198,6 +264,13 @@ fn with_crash_file<R>(
             let _ = mgr.close_dir(crash);
             let _ = mgr.close_dir(root);
             let _ = mgr.close_volume(volume);
+            // A probe of an unused CRASH00n slot is not a disk error.
+            if !create_dir && matches!(err, embedded_sdmmc::Error::NotFound) {
+                return Err(FsError::Io {
+                    op: "open file",
+                    detail: String::from("NotFound"),
+                });
+            }
             return Err(fs_err("open file", err));
         }
     };
@@ -293,7 +366,12 @@ pub fn read_at(name: &str, offset: u32, out: &mut [u8]) -> Result<usize, FsError
             mgr.file_seek_from_start(file, offset)
                 .map_err(|err| fs_err("seek", err))?;
         }
-        mgr.read(file, out).map_err(|err| fs_err("read", err))
+        if let Some((cluster_off, cluster)) = chain_for_read(name, offset) {
+            let _ = mgr.file_resume_chain(file, cluster_off, cluster);
+        }
+        let n = mgr.read(file, out).map_err(|err| fs_err("read", err))?;
+        remember_chain(mgr, file, name);
+        Ok(n)
     })
 }
 
@@ -558,10 +636,12 @@ fn release(
 }
 
 pub fn write_new(name: &str, data: &[u8]) -> Result<(), FsError> {
+    forget_chain(name);
     with_file(name, Mode::ReadWriteCreateOrTruncate, |mgr, file| {
         if !data.is_empty() {
             mgr.write(file, data).map_err(|err| fs_err("write", err))?;
         }
+        remember_chain(mgr, file, name);
         Ok(())
     })
 }
@@ -571,7 +651,14 @@ pub fn append_bytes(name: &str, data: &[u8]) -> Result<(), FsError> {
         if data.is_empty() {
             return Ok(());
         }
+        let len = mgr
+            .file_length(file)
+            .map_err(|err| fs_err("file length", err))?;
+        if let Some((cluster_off, cluster)) = chain_for_append(name, len) {
+            let _ = mgr.file_resume_chain(file, cluster_off, cluster);
+        }
         mgr.write(file, data).map_err(|err| fs_err("write", err))?;
+        remember_chain(mgr, file, name);
         Ok(())
     })
 }
@@ -596,5 +683,7 @@ pub fn swing_file(from: &str, to: &str) -> Result<(), FsError> {
     if file_exists(to)? {
         delete_file(to)?;
     }
+    forget_chain(from);
+    forget_chain(to);
     rename_file(from, to)
 }

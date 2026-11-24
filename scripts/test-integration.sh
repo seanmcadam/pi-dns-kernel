@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.88" qemu/boot-output.txt && \
+   grep -q "version 0.1.89" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.88"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.89"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -317,7 +317,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.88" not in html:
+if forced.get("version") != plain.get("version") or "0.1.89" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 print("status html", len(html), "json", plain.get("version"))
@@ -2271,12 +2271,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.88" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.89" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.88" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.89" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2292,7 +2292,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.88" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.89" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2539,12 +2539,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.88":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.89":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.88" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.89" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3907,8 +3907,12 @@ cat > /tmp/block-config.json <<EOF
 EOF
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/block-config.json ::CONFIG.JSN
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/TESTCA.DER ::TESTCA.DER
+# A wiped RAM sequence must not rewrite this file. The fault writes the next slot.
+mmd -i qemu/block-disk.img@@${BLOCK_OFF} ::CRASH
+printf 'OLDCRASH\n' > /tmp/CRASH000.TXT
+mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/CRASH000.TXT ::CRASH/CRASH000.TXT
 BLOCK_FWD="hostfwd=udp::${BLOCK_DNS_PORT}-:53,hostfwd=tcp::${BLOCK_HTTP_PORT}-:80"
-timeout 120 qemu-system-aarch64 \
+timeout 180 qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/block-serial.txt \
@@ -3976,9 +3980,19 @@ subprocess.check_output(
      "http://127.0.0.1:%s/debug/crash/block" % http],
     stderr=subprocess.DEVNULL,
 )
-if dig("test.local") != "192.168.1.100":
-    print("dns after crash", dig("test.local"))
-    sys.exit(1)
+# The blocker is down or reloading. Queries must still be answered, and
+# a one-second cap fails the run if they queue behind that reload.
+for n in range(6):
+    try:
+        ans = subprocess.check_output(
+            ["dig", "@127.0.0.1", "-p", dns, "test.local", "A", "+short", "+time=1", "+tries=1"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception as exc:
+        ans = str(exc)
+    if ans != "192.168.1.100":
+        print("dns during restart", n, ans)
+        sys.exit(1)
 listed_crash = None
 for _ in range(20):
     try:
@@ -3992,8 +4006,19 @@ for _ in range(20):
     if b"CRASH" in listed_crash:
         break
     time.sleep(0.25)
-if not listed_crash or b"CRASH" not in listed_crash:
+if not listed_crash or b"CRASH001" not in listed_crash or b"CRASH000" not in listed_crash:
     print("crash list", listed_crash)
+    sys.exit(1)
+try:
+    last_crash = subprocess.check_output(
+        ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
+         "http://127.0.0.1:%s/crash/last" % http],
+        stderr=subprocess.DEVNULL,
+    )
+except Exception:
+    last_crash = b""
+if b"OLDCRASH" in last_crash or b"elfault" not in last_crash.lower():
+    print("crash last", last_crash[:200])
     sys.exit(1)
 after = status()
 if not after or after.get("safe_mode") != 0:
@@ -4004,6 +4029,7 @@ raw = subprocess.check_output(
      "http://127.0.0.1:%s/config/file/config" % http],
     stderr=subprocess.DEVNULL,
 )
+original = json.loads(raw)
 stored = json.loads(raw)
 stored.pop("block", None)
 subprocess.check_output(
@@ -4028,7 +4054,52 @@ else:
 if dig("test.local") != "192.168.1.100":
     print("local after clear", dig("test.local"))
     sys.exit(1)
-print("blocked", doc.get("block_domains"), "mtime", listed[0].get("mtime"), "allow", plain, "crash", listed_crash.decode().strip())
+
+def post_config(doc):
+    subprocess.check_output(
+        ["curl", "-sf", "-u", "admin:admin", "--max-time", "5",
+         "-H", "Content-Type: application/json",
+         "--data-binary", json.dumps(doc),
+         "http://127.0.0.1:%s/config/file/config" % http],
+        stderr=subprocess.DEVNULL,
+    )
+
+def wait_lists(present):
+    for _ in range(40):
+        snap = status()
+        urls = (snap or {}).get("block_urls") or []
+        domains = (snap or {}).get("block_domains")
+        if present and snap and domains >= 2 and urls:
+            return snap
+        if not present and snap and urls == [] and domains == 0:
+            return snap
+        time.sleep(0.5)
+    return None
+
+# A new URL each cycle forces a new download. Parked sockets are reused,
+# so the heap after the later cycles stays with the first one.
+base_url = original["block"]["urls"][0]
+used = []
+for cycle in range(3):
+    again = json.loads(json.dumps(original))
+    again["block"]["urls"] = [base_url + "?n=%d" % cycle]
+    post_config(again)
+    if wait_lists(True) is None:
+        print("reload", cycle)
+        sys.exit(1)
+    post_config(stored)
+    snap = wait_lists(False)
+    if snap is None:
+        print("reclear", cycle)
+        sys.exit(1)
+    used.append(snap["heap_used"])
+    if snap["heap_used"] > snap["heap_peak"] or snap["heap_peak"] > snap["heap_size"]:
+        print("heap water", snap["heap_used"], snap["heap_peak"], snap["heap_size"])
+        sys.exit(1)
+if used[-1] > used[0] + 8192:
+    print("heap grew", used)
+    sys.exit(1)
+print("blocked", doc.get("block_domains"), "mtime", listed[0].get("mtime"), "allow", plain, "crash", listed_crash.decode().strip(), "heap", used)
 sys.exit(0)
 PY
 then
