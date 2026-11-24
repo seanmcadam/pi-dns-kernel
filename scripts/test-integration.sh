@@ -3912,7 +3912,7 @@ mmd -i qemu/block-disk.img@@${BLOCK_OFF} ::CRASH
 printf 'OLDCRASH\n' > /tmp/CRASH000.TXT
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/CRASH000.TXT ::CRASH/CRASH000.TXT
 BLOCK_FWD="hostfwd=udp::${BLOCK_DNS_PORT}-:53,hostfwd=tcp::${BLOCK_HTTP_PORT}-:80"
-timeout 120 qemu-system-aarch64 \
+timeout 180 qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
     -kernel boot/kernel8.img \
     -serial file:qemu/block-serial.txt \
@@ -3980,9 +3980,19 @@ subprocess.check_output(
      "http://127.0.0.1:%s/debug/crash/block" % http],
     stderr=subprocess.DEVNULL,
 )
-if dig("test.local") != "192.168.1.100":
-    print("dns after crash", dig("test.local"))
-    sys.exit(1)
+# The blocker is down or reloading. Queries must still be answered, and
+# a one-second cap fails the run if they queue behind that reload.
+for n in range(6):
+    try:
+        ans = subprocess.check_output(
+            ["dig", "@127.0.0.1", "-p", dns, "test.local", "A", "+short", "+time=1", "+tries=1"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception as exc:
+        ans = str(exc)
+    if ans != "192.168.1.100":
+        print("dns during restart", n, ans)
+        sys.exit(1)
 listed_crash = None
 for _ in range(20):
     try:

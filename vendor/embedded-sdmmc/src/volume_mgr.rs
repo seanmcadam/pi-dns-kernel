@@ -1034,6 +1034,37 @@ where
         Ok(self.open_files[file_idx].current_offset)
     }
 
+    /// `(offset, cluster_file_off, cluster)`. The cluster is where the
+    /// last walk stopped, so the next open of this file can resume it.
+    pub fn file_chain_pos(&self, file: RawFile) -> Result<(u32, u32, u32), Error<D::Error>> {
+        let file_idx = self.get_file_by_id(file)?;
+        let info = &self.open_files[file_idx];
+        Ok((
+            info.current_offset,
+            info.current_cluster.0,
+            info.current_cluster.1 .0,
+        ))
+    }
+
+    /// Continue a chain walk from a previous open. `cluster_off` is the
+    /// file offset of `cluster` and must not be past the current offset.
+    /// Opening a file always restarts the walk at the first cluster;
+    /// seeking does not update it.
+    pub fn file_resume_chain(
+        &mut self,
+        file: RawFile,
+        cluster_off: u32,
+        cluster: u32,
+    ) -> Result<(), Error<D::Error>> {
+        let file_idx = self.get_file_by_id(file)?;
+        let info = &mut self.open_files[file_idx];
+        if cluster_off > info.current_offset {
+            return Ok(());
+        }
+        info.current_cluster = (cluster_off, ClusterId(cluster));
+        Ok(())
+    }
+
     /// Create a directory in a given directory.
     pub fn make_dir_in_dir<N>(
         &mut self,

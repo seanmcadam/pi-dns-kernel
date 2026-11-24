@@ -210,9 +210,12 @@ pub fn count(region: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Start a rebuild. The generation goes odd, so lookups fail open until
-/// [`commit`].
-pub fn begin(region: &mut [u8]) -> bool {
+/// Mark a rebuild in progress without zeroing the slots.
+///
+/// The generation goes odd, so lookups fail open until [`commit`]. The
+/// caller zeros the slots with [`scrub`], in pieces, so a 32 MiB table
+/// does not keep the CPU inside one syscall.
+pub fn open_rebuild(region: &mut [u8]) -> bool {
     if region.len() < HEADER + 8 || region.as_ptr() as usize % 8 != 0 {
         return false;
     }
@@ -220,19 +223,41 @@ pub fn begin(region: &mut [u8]) -> bool {
     write_u64(region, 0, MAGIC);
     write_u64(region, 8, next);
     write_u64(region, 16, 0);
-    let (ptr, len) = {
-        let Some(table) = slots_mut(region) else {
-            return false;
-        };
-        (table.as_mut_ptr(), table.len())
+    let Some(len) = slot_len(region) else {
+        return false;
     };
-    let mut i = 0;
-    while i < len {
-        unsafe { *ptr.add(i) = 0; }
-        i += 1;
-    }
     write_u64(region, 24, len as u64);
     true
+}
+
+fn slot_len(region: &mut [u8]) -> Option<usize> {
+    Some(slots_mut(region)?.len())
+}
+
+/// Zero `count` slots starting at `from`. Returns `(next, len)`.
+/// `next == len` means the table is clear.
+pub fn scrub(region: &mut [u8], from: usize, count: usize) -> Option<(usize, usize)> {
+    let table = slots_mut(region)?;
+    let len = table.len();
+    let start = from.min(len);
+    let end = start.saturating_add(count).min(len);
+    let ptr = table.as_mut_ptr();
+    let mut i = start;
+    while i < end {
+        unsafe {
+            *ptr.add(i) = 0;
+        }
+        i += 1;
+    }
+    Some((end, len))
+}
+
+/// Start a rebuild and zero every slot. Lookups fail open until [`commit`].
+pub fn begin(region: &mut [u8]) -> bool {
+    if !open_rebuild(region) {
+        return false;
+    }
+    scrub(region, 0, usize::MAX).is_some()
 }
 
 pub fn insert(region: &mut [u8], hash: u64) -> bool {
@@ -455,6 +480,33 @@ not a domain line
         let issuer = cert_name(yr, false).expect("issuer");
         assert_eq!(subject, issuer);
         assert!(subject.windows(7).any(|window| window == b"Root YR"));
+    }
+
+    #[test]
+    fn scrub_in_slices_matches_a_full_begin() {
+        let (mut buf, offset) = aligned(HEADER + 64);
+        let region = &mut buf[offset..offset + HEADER + 64];
+        region.fill(0x5a);
+        assert!(open_rebuild(region));
+        assert_eq!(generation(region) % 2, 1);
+        let mut at = 0;
+        let mut steps = 0;
+        loop {
+            let (next, len) = scrub(region, at, 3).unwrap();
+            steps += 1;
+            if next >= len {
+                break;
+            }
+            at = next;
+            assert!(steps < 8);
+        }
+        let slots =
+            unsafe { core::slice::from_raw_parts(region[HEADER..].as_ptr() as *const u64, 8) };
+        assert!(slots.iter().all(|slot| *slot == 0));
+        assert!(insert(region, name_hash("ads.example")));
+        assert!(!lookup(region, "ads.example"));
+        commit(region);
+        assert!(lookup(region, "ads.example"));
     }
 
     #[test]

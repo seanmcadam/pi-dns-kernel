@@ -317,6 +317,8 @@ fn load_file(name: &str) -> u32 {
         if off > blocklist::LIST_MAX_BYTES as u64 {
             break;
         }
+        // Back to the owner so a query is not stuck behind the rest of the file.
+        let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
     }
     if hold_n > 0 {
         count += feed_line(&hold[..hold_n]);
@@ -376,8 +378,23 @@ fn publish(cfg: &Cfg, previous: [u32; 8]) -> [u32; 8] {
     } else {
         cfg
     };
-    if block(0, 0, 0, 0, 0, 0) < 0 {
-        return previous;
+    // Each call zeros a slice and returns. Yielding between slices lets the
+    // owner poll the NIC, so DNS keeps answering while the table is rebuilt.
+    let mut misses = 0;
+    loop {
+        match block(0, 0, 0, 0, 0, 0) {
+            0 => break,
+            1 => {
+                let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
+            }
+            _ => {
+                misses += 1;
+                if misses >= 8 {
+                    return previous;
+                }
+                let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
+            }
+        }
     }
     let mut counts = [0u32; 8];
     if cfg.enabled && !cfg.urls.is_empty() {
@@ -471,6 +488,7 @@ fn names_in_temp() -> Result<u32, &'static str> {
         } else {
             hold_n = 0;
         }
+        let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
     }
     if hold_n > 0 {
         count = count.saturating_add(names_in_line(&hold[..hold_n]));

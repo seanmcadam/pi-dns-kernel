@@ -4,7 +4,7 @@
 //! or the generation is unpublished, the answer is "not blocked" and DNS
 //! keeps going.
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use blocklist::{self, URL_MAX};
 use spin::Mutex;
@@ -16,6 +16,11 @@ const URL_KEEP: usize = 160;
 const ERR_KEEP: usize = 48;
 
 static LOCK: Mutex<()> = Mutex::new(());
+/// Slots already zeroed in the current rebuild. Zero means the next
+/// `begin` starts a new generation. Cleared when the table is fully zero.
+static SCRUB_AT: AtomicUsize = AtomicUsize::new(0);
+/// Two mebibytes of slots per syscall, so the owner can poll DNS between them.
+const SCRUB_CHUNK: usize = 256 * 1024;
 static BLOCKED: AtomicU64 = AtomicU64::new(0);
 static STATE: AtomicU8 = AtomicU8::new(0);
 static ALLOW_N: AtomicU8 = AtomicU8::new(0);
@@ -170,12 +175,21 @@ pub fn call(op: u64, args: [u64; 5]) -> i64 {
 pub fn drop_lists() {
     let _ = clear_rows(0);
     let mut try_n = 0;
-    while try_n < 8 {
-        if begin() == 0 {
-            let _ = commit();
-            return;
+    loop {
+        match begin() {
+            0 => {
+                let _ = commit();
+                return;
+            }
+            // More of the table still needs zeroing. The lock is not held.
+            1 => continue,
+            _ => {
+                try_n += 1;
+                if try_n >= 8 {
+                    return;
+                }
+            }
         }
-        try_n += 1;
     }
 }
 
@@ -200,7 +214,25 @@ fn begin() -> i64 {
     let Some(mem) = region() else {
         return -5;
     };
-    if blocklist::begin(mem) { 0 } else { -5 }
+    let len = mem.len().saturating_sub(32) / 8;
+    let mut at = SCRUB_AT.load(Ordering::Relaxed);
+    if at > len {
+        at = 0;
+    }
+    if at == 0 && !blocklist::open_rebuild(mem) {
+        return -5;
+    }
+    let Some((end, slots)) = blocklist::scrub(mem, at, SCRUB_CHUNK) else {
+        SCRUB_AT.store(0, Ordering::Relaxed);
+        return -5;
+    };
+    if end >= slots {
+        SCRUB_AT.store(0, Ordering::Relaxed);
+        0
+    } else {
+        SCRUB_AT.store(end, Ordering::Relaxed);
+        1
+    }
 }
 
 fn insert(hash: u64) -> i64 {
