@@ -3907,6 +3907,10 @@ cat > /tmp/block-config.json <<EOF
 EOF
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/block-config.json ::CONFIG.JSN
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/TESTCA.DER ::TESTCA.DER
+# A wiped RAM sequence must not rewrite this file. The fault writes the next slot.
+mmd -i qemu/block-disk.img@@${BLOCK_OFF} ::CRASH
+printf 'OLDCRASH\n' > /tmp/CRASH000.TXT
+mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/CRASH000.TXT ::CRASH/CRASH000.TXT
 BLOCK_FWD="hostfwd=udp::${BLOCK_DNS_PORT}-:53,hostfwd=tcp::${BLOCK_HTTP_PORT}-:80"
 timeout 120 qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
@@ -3992,8 +3996,19 @@ for _ in range(20):
     if b"CRASH" in listed_crash:
         break
     time.sleep(0.25)
-if not listed_crash or b"CRASH" not in listed_crash:
+if not listed_crash or b"CRASH001" not in listed_crash or b"CRASH000" not in listed_crash:
     print("crash list", listed_crash)
+    sys.exit(1)
+try:
+    last_crash = subprocess.check_output(
+        ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
+         "http://127.0.0.1:%s/crash/last" % http],
+        stderr=subprocess.DEVNULL,
+    )
+except Exception:
+    last_crash = b""
+if b"OLDCRASH" in last_crash or b"elfault" not in last_crash.lower():
+    print("crash last", last_crash[:200])
     sys.exit(1)
 after = status()
 if not after or after.get("safe_mode") != 0:

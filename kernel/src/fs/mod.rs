@@ -175,6 +175,12 @@ fn with_crash_file<R>(
             if !create_dir {
                 let _ = mgr.close_dir(root);
                 let _ = mgr.close_volume(volume);
+                if matches!(err, embedded_sdmmc::Error::NotFound) {
+                    return Err(FsError::Io {
+                        op: "open crash",
+                        detail: String::from("NotFound"),
+                    });
+                }
                 return Err(fs_err("open crash", err));
             }
             if let Err(err) = mgr.make_dir_in_dir(root, "CRASH") {
@@ -198,6 +204,13 @@ fn with_crash_file<R>(
             let _ = mgr.close_dir(crash);
             let _ = mgr.close_dir(root);
             let _ = mgr.close_volume(volume);
+            // A probe of an unused CRASH00n slot is not a disk error.
+            if !create_dir && matches!(err, embedded_sdmmc::Error::NotFound) {
+                return Err(FsError::Io {
+                    op: "open file",
+                    detail: String::from("NotFound"),
+                });
+            }
             return Err(fs_err("open file", err));
         }
     };
