@@ -144,8 +144,10 @@ const CSRF: u64 = 74;
 const NET_ARM: u64 = 75;
 /// 76 clock(buf, cap) -> 100. synced, stratum, offset_ms, utc, last sync, server.
 /// 77 clock_prefix(buf, cap) -> n. Empty until time is synced.
+/// 78 heap(buf, cap) -> 24. used, peak, size, each a little-endian u64.
 const CLOCK: u64 = 76;
 const CLOCK_PREFIX: u64 = 77;
+const HEAP: u64 = 78;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -265,6 +267,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         NET_ARM => i64::from(crate::config_manager::arm_net_pending()),
         CLOCK => clock_status(args[0], args[1]),
         CLOCK_PREFIX => clock_prefix(args[0], args[1]),
+        HEAP => heap_stats(args[0], args[1]),
         _ => -1,
     };
     value as u64
@@ -279,6 +282,23 @@ fn clock_status(ptr: u64, cap: u64) -> i64 {
     let n = crate::clock::status(&mut raw);
     if n == raw.len() && write_user(ptr, &raw) {
         n as i64
+    } else {
+        EFAULT
+    }
+}
+
+fn heap_stats(ptr: u64, cap: u64) -> i64 {
+    const N: u64 = 24;
+    if cap < N || !crate::mmu::user_write_ok(ptr, N) {
+        return EFAULT;
+    }
+    let (used, peak, size) = crate::memory::ALLOCATOR.stats();
+    let mut raw = [0u8; 24];
+    raw[..8].copy_from_slice(&(used as u64).to_le_bytes());
+    raw[8..16].copy_from_slice(&(peak as u64).to_le_bytes());
+    raw[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+    if write_user(ptr, &raw) {
+        N as i64
     } else {
         EFAULT
     }

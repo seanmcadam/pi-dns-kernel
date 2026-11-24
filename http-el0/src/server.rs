@@ -57,6 +57,7 @@ const DISPLAY_SET: u64 = 56;
 const POWER: u64 = 58;
 const CSRF: u64 = 74;
 const CLOCK: u64 = 76;
+const HEAP: u64 = 78;
 const NET_ARM: u64 = 75;
 const VNC_CTRL: u64 = 59;
 const UPSTREAM_HEALTH: u64 = 61;
@@ -974,6 +975,7 @@ a{{color:#0645ad}}
 <dt>Uptime</dt><dd id="uptime">…</dd>
 <dt>UTC</dt><dd id="utc">…</dd>
 <dt>NTP</dt><dd id="ntp">…</dd>
+<dt>Heap</dt><dd id="heap">…</dd>
 <dt>Board</dt><dd id="board">…</dd>
 </dl>
 <h2>Network</h2>
@@ -1019,6 +1021,7 @@ function fill(d) {{
   text("uptime", d.uptime + " s");
   text("utc", d.time_synced ? d.utc : "not synced");
   text("ntp", (d.ntp_server || "") + " stratum " + d.stratum + " offset " + d.offset_ms + " last " + (d.last_sync || ""));
+  text("heap", d.heap_used + " / " + d.heap_peak + " / " + d.heap_size);
   text("board", d.board + " " + d.board_revision + " " + d.board_source);
   text("nic_irqs", d.nic_irqs);
   text("rxtx", d.rx_packets + " / " + d.tx_packets);
@@ -1049,6 +1052,21 @@ setInterval(load, 5000);
 </body></html>"#
     );
     html_response(&html)
+}
+
+fn heap_fields() -> String {
+    let mut buf = [0u8; 24];
+    let n = sys(HEAP, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0);
+    if n != 24 {
+        return String::from(r#""heap_used":0,"heap_peak":0,"heap_size":0"#);
+    }
+    let used = u64::from_le_bytes(buf[..8].try_into().unwrap_or([0; 8]));
+    let peak = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+    let size = u64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8]));
+    format!(
+        r#""heap_used":{},"heap_peak":{},"heap_size":{}"#,
+        used, peak, size
+    )
 }
 
 fn time_fields() -> String {
@@ -1105,7 +1123,7 @@ fn status_json() -> HttpResponse {
         vclog_status,
     ) = hdmi_status();
     let json = format!(
-        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{}}}"#,
+        r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
         sys(TICK_HZ, 0, 0, 0, 0, 0, 0),
@@ -1149,6 +1167,7 @@ fn status_json() -> HttpResponse {
         boot_fields(),
         board_fields(),
         time_fields(),
+        heap_fields(),
     );
     let mut response = HttpResponse::ok(&json);
     response.add_header("Content-Type", "application/json");

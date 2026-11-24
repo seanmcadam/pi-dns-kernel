@@ -165,16 +165,16 @@ pub fn ntp_view() -> NtpView {
         if view.count as usize >= view.servers.len() {
             break;
         }
-        let Some(parsed) = config::parse_ntp_server(server) else {
+        let Some((host, port, ip)) = config::ntp_server_parts(server) else {
             continue;
         };
         let index = view.count as usize;
-        let bytes = parsed.host.as_bytes();
+        let bytes = host.as_bytes();
         let n = bytes.len().min(view.servers[index].len());
         view.servers[index][..n].copy_from_slice(&bytes[..n]);
         view.lens[index] = n as u8;
-        view.ports[index] = parsed.port;
-        if let Some(ip) = parsed.ip {
+        view.ports[index] = port;
+        if let Some(ip) = ip {
             view.ips[index] = ip;
             view.have_ip[index] = true;
         }

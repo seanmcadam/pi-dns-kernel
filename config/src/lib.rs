@@ -946,7 +946,11 @@ pub struct NtpHost {
     pub ip: Option<[u8; 4]>,
 }
 
-pub fn parse_ntp_server(text: &str) -> Option<NtpHost> {
+/// Host, port, and an IPv4 when the host is one. The host borrows `text`.
+///
+/// The kernel heap never frees. The network poll copies this into a fixed
+/// buffer and must not build a `String` for a name it already holds.
+pub fn ntp_server_parts(text: &str) -> Option<(&str, u16, Option<[u8; 4]>)> {
     let text = text.trim().trim_end_matches('.');
     if text.is_empty() || text.len() > NTP_NAME_MAX {
         return None;
@@ -966,14 +970,19 @@ pub fn parse_ntp_server(text: &str) -> Option<NtpHost> {
         None => (text, 123),
     };
     if host_ok(host) {
-        Some(NtpHost {
-            ip: ipv4(host),
-            host: host.to_string(),
-            port,
-        })
+        Some((host, port, ipv4(host)))
     } else {
         None
     }
+}
+
+pub fn parse_ntp_server(text: &str) -> Option<NtpHost> {
+    let (host, port, ip) = ntp_server_parts(text)?;
+    Some(NtpHost {
+        host: host.to_string(),
+        port,
+        ip,
+    })
 }
 
 pub fn check_ntp(value: &Value) -> Result<(), Error> {
@@ -1325,6 +1334,17 @@ mod tests {
         assert_eq!(host.host, "0.pool.ntp.org");
         assert_eq!(host.port, 123);
         assert!(host.ip.is_none());
+        let mut buf = [0u8; 64];
+        let mut nrep = 0;
+        while nrep < 10_000 {
+            let (name, port, ip) = ntp_server_parts("0.pool.ntp.org").unwrap();
+            assert_eq!(name.len(), 14);
+            assert_eq!(port, 123);
+            assert!(ip.is_none());
+            buf[..name.len()].copy_from_slice(name.as_bytes());
+            nrep += 1;
+        }
+        assert_eq!(&buf[..14], b"0.pool.ntp.org");
         let ip = parse_ntp_server("10.0.2.2:1123").unwrap();
         assert_eq!(ip.ip, Some([10, 0, 2, 2]));
         assert_eq!(ip.port, 1123);
