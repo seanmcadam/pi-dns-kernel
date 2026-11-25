@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.93" qemu/boot-output.txt && \
+   grep -q "version 0.1.94" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.93"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.94"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -328,7 +328,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.93" not in html:
+if forced.get("version") != plain.get("version") or "0.1.94" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 if "<pre>" not in dns_page or "&quot;upstreams&quot;: [" not in dns_page:
@@ -392,7 +392,7 @@ echo ""
 echo "Test 6: HTTP GET / (HTML dashboard)"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/ > qemu/http-root.txt 2>&1; then
-        if grep -q "Raspberry Pi 4 DNS Server" qemu/http-root.txt; then
+        if grep -q "Raspberry Pi 4 DNS Server" qemu/http-root.txt && grep -q 'href="/logfiles"' qemu/http-root.txt; then
             echo "✓ HTTP dashboard accessible"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -766,6 +766,92 @@ then
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo "✗ Sustained load lost names, pinned the network core, or the NIC IRQ stalled"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "Test 65: HTTP connect storm still serves /json/status"
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import socket, struct, subprocess, sys, time, urllib.request
+http_port, dns_port = int(sys.argv[1]), int(sys.argv[2])
+host = "127.0.0.1"
+
+def connect_close():
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        s.connect((host, http_port))
+        s.close()
+        return True
+    except OSError:
+        s.close()
+        return False
+
+fail = 0
+for _ in range(100):
+    if not connect_close():
+        fail += 1
+
+held = []
+for _ in range(8):
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        s.connect((host, http_port))
+        held.append(s)
+    except OSError:
+        fail += 1
+        s.close()
+
+for _ in range(20):
+    s = socket.socket()
+    s.settimeout(2)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    try:
+        s.connect((host, http_port))
+    except OSError:
+        pass
+    s.close()
+
+# Half-open accepts stay blocked until the hardware-timer idle budget.
+time.sleep(6)
+for s in held:
+    s.close()
+
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri="http://%s:%s" % (host, http_port), user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+try:
+    resp = opener.open("http://%s:%s/json/status" % (host, http_port), timeout=8)
+    body = resp.read()
+    status = resp.status
+except Exception as err:
+    print("status", err, "connect_fail", fail)
+    sys.exit(1)
+if status != 200 or b'"status":"running"' not in body:
+    print("bad status", status, body[:160], "connect_fail", fail)
+    sys.exit(1)
+dig = subprocess.run(
+    ["dig", "@127.0.0.1", "-p", str(dns_port), "test.local", "+short", "+time=3", "+tries=1"],
+    check=False, capture_output=True, text=True,
+)
+if "192.168.1.100" not in dig.stdout:
+    print("dns", dig.stdout, dig.stderr, "connect_fail", fail)
+    sys.exit(1)
+if fail > 20:
+    print("too many connect failures", fail)
+    sys.exit(1)
+if not connect_close():
+    print("post-storm connect failed", fail)
+    sys.exit(1)
+print("connect_fail", fail)
+sys.exit(0)
+PY
+then
+    echo "✓ HTTP still accepts after a connect storm, and DNS still answers"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ HTTP listener did not survive the connect storm"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -1303,6 +1389,27 @@ if status != 200:
 doc = json.loads(body)
 if doc.get("version") != 1 or doc.get("max_bytes") != 4096 or doc.get("archives") != 3:
     fail("default LOG.JSN %s" % body[:200])
+status, page = req("GET", "/logfiles", auth=False)
+if status != 401:
+    fail("unauth saved logs %s" % status)
+status, filled = req("POST", "/debug/log-fill", "n=20", {"Content-Type": "application/x-www-form-urlencoded"})
+if status != 200:
+    fail("log fill %s %s" % (status, filled[:120]))
+status, page = req("GET", "/logfiles")
+if status != 200 or b"LOG.TXT" not in page or b"download" not in page:
+    fail("log index %s %s" % (status, page[:200]))
+status, view = req("GET", "/logfiles/LOG.TXT")
+if status != 200 or b"mark 0000" not in view or b"<pre>" not in view:
+    fail("log view %s %s" % (status, view[:200]))
+status, raw = req("GET", "/logfiles/LOG.TXT?download=1")
+if status != 200 or b"mark 0000" not in raw or b"<html" in raw.lower():
+    fail("log download %s %s" % (status, raw[:200]))
+status, denied = req("POST", "/logfiles/LOG.TXT", "x=1")
+if status != 405:
+    fail("log delete %s" % status)
+missing, _ = req("GET", "/logfiles/CONFIG.JSN")
+if missing != 404:
+    fail("log path %s" % missing)
 if body != b'{\n  "version": 1,\n  "max_bytes": 4096,\n  "archives": 3\n}\n':
     fail("default LOG.JSN is not pretty %s" % body[:200])
 if len(body) > 4096:
@@ -2322,12 +2429,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.93" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.94" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.93" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.94" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2343,7 +2450,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.93" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.94" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2590,12 +2697,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.93":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.94":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.93" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.94" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break

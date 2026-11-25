@@ -75,6 +75,8 @@
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::iface::SocketHandle;
@@ -152,6 +154,9 @@ const HEAP: u64 = 78;
 const TCP_CONNECT: u64 = 79;
 /// 80 block(op, ...). Lookups fail open and do not wait on the blocker.
 const BLOCK: u64 = 80;
+/// 81 log_file(op, ...). Read-only `LOG.TXT` and `LOG1.TXT`..`LOG16.TXT`.
+/// Op 0 lists `name len` lines. Op 1 reads at an offset. Op 2 returns the length.
+const LOG_FILE: u64 = 81;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -163,9 +168,13 @@ const EAGAIN: i64 = -11;
 
 const MAX_FD: usize = 24;
 const MAX_PACKET: usize = 4096;
-/// Listeners allocated once. A socket leaves LISTEN on the SYN, and a peer
-/// that stops in FIN-WAIT-2 must not be the only socket on the port.
+/// Listeners allocated once. A socket leaves LISTEN on the SYN. A peer that
+/// closes without sending stays out of `may_recv`, so the slot is put back
+/// into LISTEN on the next poll instead of waiting for the application.
 const LISTENERS: usize = service::TCP_LISTENERS;
+/// Hardware-timer budget for an HTTP recv that sees no bytes, and for a
+/// listen slot that has left LISTEN but still looks readable.
+const TCP_IDLE_MS: u64 = 5_000;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -274,6 +283,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         HEAP => heap_stats(args[0], args[1]),
         TCP_CONNECT => tcp_connect(args[0], args[1]),
         BLOCK => crate::block_tab::call(args[0], [args[1], args[2], args[3], args[4], args[5]]),
+        LOG_FILE => log_file(args),
         _ => -1,
     };
     value as u64
@@ -549,10 +559,14 @@ fn tcp_accept(fd: u64) -> i64 {
     let Some(fd) = fd_index(fd) else {
         return EBADF;
     };
-    let Kind::TcpListen(_, _) = kind_at(fd) else {
-        return EBADF;
+    let port = match kind_at(fd) {
+        Kind::TcpListen(_, port) => port,
+        _ => return EBADF,
     };
     let Some(conn) = find_free() else {
+        if port == 80 {
+            warn_http(&HTTP_ERR_LOG, "HTTP accept failed: no free descriptor");
+        }
         return EMFILE;
     };
     let task = slot();
@@ -566,6 +580,9 @@ fn tcp_accept(fd: u64) -> i64 {
     .is_none()
     {
         set_kind(conn, Kind::Empty);
+        if port == 80 {
+            warn_http(&HTTP_ERR_LOG, "HTTP accept failed: busy");
+        }
         return EAGAIN;
     }
     0
@@ -832,6 +849,10 @@ fn tcp_listen_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::S
         *slot = add_listener(stack, port);
     }
     if slots.iter().all(|slot| slot.is_none()) {
+        if port == 80 {
+            log::warn!("HTTP listen failed on port 80");
+            crate::logger::note_fault("http listen failed");
+        }
         let _lock = FD_LOCK[task].lock();
         table_of(task)[fd] = Kind::Empty;
         return service::Step::Done(EIO);
@@ -888,6 +909,15 @@ fn tcp_accept_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::S
     if live_slots[index] != Some(handle) {
         return service::Step::Pending;
     }
+    // A heal between the two locks may have put this socket back into
+    // LISTEN. Taking it then would hand the application a listener.
+    if !stack
+        .sockets_mut()
+        .get::<tcp::Socket>(handle)
+        .may_recv()
+    {
+        return service::Step::Pending;
+    }
     live_slots[index] = None;
     table_of(task)[fd] = Kind::TcpListen(live_slots, port);
     table_of(task)[conn] = Kind::TcpConn(handle);
@@ -907,17 +937,29 @@ fn tcp_recv_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
     }
     let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
     if !socket.can_recv() {
-        if socket.may_recv()
+        let open = socket.may_recv()
             || matches!(
                 socket.state(),
                 tcp::State::SynSent | tcp::State::SynReceived
-            )
-        {
-            return if nonblock {
-                service::Step::Done(EAGAIN)
-            } else {
-                service::Step::Pending
-            };
+            );
+        let http = socket.local_endpoint().is_some_and(|ep| ep.port == 80);
+        if open {
+            if nonblock {
+                return service::Step::Done(EAGAIN);
+            }
+            if http {
+                let now = crate::timer::millis();
+                let started = service::body(id).user_aux;
+                if started == 0 {
+                    service::body(id).user_aux = now.max(1);
+                    return service::Step::Pending;
+                }
+                if now.saturating_sub(started) >= TCP_IDLE_MS {
+                    warn_http(&HTTP_ERR_LOG, "HTTP connection idle; closed");
+                    return service::Step::Done(0);
+                }
+            }
+            return service::Step::Pending;
         }
         return service::Step::Done(0);
     }
@@ -1122,26 +1164,37 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
         let Kind::Closing(handle) = table[index] else {
             continue;
         };
+        let recyclable = {
+            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+            socket.send_queue() == 0
+                && !matches!(
+                    socket.state(),
+                    tcp::State::Established
+                        | tcp::State::CloseWait
+                        | tcp::State::SynReceived
+                        | tcp::State::SynSent
+                )
+        };
+        if !recyclable {
+            continue;
+        }
         if slots.iter().all(|slot| slot.is_some()) {
-            break;
-        }
-        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-        if socket.send_queue() > 0 {
+            // The listen set is already full. Park the socket so the fd
+            // and its buffers do not stay reserved.
+            give_tcp(stack, handle);
+            table[index] = Kind::Empty;
             continue;
         }
-        if matches!(
-            socket.state(),
-            tcp::State::Established
-                | tcp::State::CloseWait
-                | tcp::State::SynReceived
-                | tcp::State::SynSent
-        ) {
-            continue;
-        }
-        if socket.is_open() {
-            socket.abort();
-        }
-        if socket.listen(port).is_err() {
+        let listened = {
+            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+            if socket.is_open() {
+                socket.abort();
+            }
+            socket.listen(port).is_ok()
+        };
+        if !listened {
+            give_tcp(stack, handle);
+            table[index] = Kind::Empty;
             continue;
         }
         if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
@@ -1149,7 +1202,134 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
             table[index] = Kind::Empty;
         }
     }
+    heal_listen(task, &mut slots, port, stack);
     table[listen_fd] = Kind::TcpListen(slots, port);
+}
+
+enum SlotFate {
+    Listening,
+    Hold(u64),
+    Relisten,
+}
+
+/// First hardware-timer ms at which port 80 had no socket in LISTEN.
+/// Zero means the listener is up. The supervisor reads this without `FD`.
+static HTTP_LISTEN_DOWN: AtomicU64 = AtomicU64::new(0);
+static HTTP_ERR_LOG: AtomicU64 = AtomicU64::new(0);
+static HTTP_HEAL_LOG: AtomicU64 = AtomicU64::new(0);
+static mut LISTEN_BORN: [[u64; LISTENERS]; TASKS] = [[0; LISTENERS]; TASKS];
+
+pub fn http_listen_down_ms() -> u64 {
+    HTTP_LISTEN_DOWN.load(Ordering::Acquire)
+}
+
+pub fn clear_http_listen_down() {
+    HTTP_LISTEN_DOWN.store(0, Ordering::Release);
+}
+
+fn warn_http(last: &AtomicU64, text: &str) {
+    let now = crate::timer::millis();
+    let prev = last.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 1000 {
+        return;
+    }
+    last.store(now, Ordering::Relaxed);
+    log::warn!("{text}");
+}
+
+fn slot_fate(stack: &mut crate::net::NetworkStack, handle: SocketHandle, now: u64, born: u64) -> SlotFate {
+    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+    if socket.state() == tcp::State::Listen {
+        return SlotFate::Listening;
+    }
+    let handshake = matches!(
+        socket.state(),
+        tcp::State::SynReceived | tcp::State::SynSent
+    );
+    // CloseWait with an empty buffer is the connect/close storm: `may_recv`
+    // is false, so accept never takes the socket and it never returns to LISTEN.
+    if !socket.may_recv() && !handshake {
+        return SlotFate::Relisten;
+    }
+    let since = if born == 0 { now.max(1) } else { born };
+    if now.saturating_sub(since) >= TCP_IDLE_MS {
+        SlotFate::Relisten
+    } else {
+        SlotFate::Hold(since)
+    }
+}
+
+fn relisten(stack: &mut crate::net::NetworkStack, handle: SocketHandle, port: u16) -> bool {
+    let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+    if socket.is_open() {
+        socket.abort();
+    }
+    socket.listen(port).is_ok()
+}
+
+fn heal_listen(
+    task: usize,
+    slots: &mut [Option<SocketHandle>; LISTENERS],
+    port: u16,
+    stack: &mut crate::net::NetworkStack,
+) {
+    let now = crate::timer::millis();
+    let mut recovered = 0u32;
+    let mut listening = 0u32;
+    let mut index = 0;
+    while index < LISTENERS {
+        match slots[index] {
+            None => {
+                slots[index] = add_listener(stack, port);
+                unsafe { LISTEN_BORN[task][index] = 0 };
+                if slots[index].is_some() {
+                    listening += 1;
+                }
+            }
+            Some(handle) => {
+                let born = unsafe { LISTEN_BORN[task][index] };
+                match slot_fate(stack, handle, now, born) {
+                    SlotFate::Listening => {
+                        unsafe { LISTEN_BORN[task][index] = 0 };
+                        listening += 1;
+                    }
+                    SlotFate::Hold(since) => unsafe { LISTEN_BORN[task][index] = since },
+                    SlotFate::Relisten => {
+                        let back = if relisten(stack, handle, port) {
+                            true
+                        } else {
+                            give_tcp(stack, handle);
+                            slots[index] = add_listener(stack, port);
+                            slots[index].is_some()
+                        };
+                        unsafe { LISTEN_BORN[task][index] = 0 };
+                        if back {
+                            listening += 1;
+                            recovered += 1;
+                        }
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    if port != 80 {
+        return;
+    }
+    if recovered > 0 {
+        warn_http(&HTTP_HEAL_LOG, "HTTP listen recovered a closed socket");
+    }
+    if listening == 0 {
+        if HTTP_LISTEN_DOWN
+            .compare_exchange(0, now.max(1), Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            log::warn!("HTTP listen failed: no socket is listening");
+            crate::logger::note_fault("http listen stalled");
+        }
+    } else {
+        HTTP_LISTEN_DOWN.store(0, Ordering::Release);
+    }
 }
 
 fn reap_clients(table: &mut [Kind], stack: &mut crate::net::NetworkStack) {
@@ -1791,6 +1971,137 @@ fn file_name(ptr: u64, len: u64) -> Option<[u8; 12]> {
         return None;
     }
     Some(raw)
+}
+
+fn log_file(args: [u64; 6]) -> i64 {
+    match args[0] {
+        0 => log_file_list(args[1], args[2]),
+        1 => log_file_read(args[1], args[2], args[3], args[4], args[5]),
+        2 => log_file_len(args[1], args[2]),
+        _ => EINVAL,
+    }
+}
+
+fn log_disk_name(ptr: u64, len: u64) -> Option<[u8; 12]> {
+    let raw = file_name(ptr, len)?;
+    let text = core::str::from_utf8(&raw[..len as usize]).ok()?;
+    if crate::fs::log_disk_ok(text) {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
+fn log_file_len(name: u64, name_len: u64) -> i64 {
+    let Some(raw) = log_disk_name(name, name_len) else {
+        return EINVAL;
+    };
+    let Ok(text) = core::str::from_utf8(&raw[..name_len as usize]) else {
+        return EINVAL;
+    };
+    match crate::fs::file_len(text) {
+        Ok(len) => len as i64,
+        Err(crate::fs::FsError::NotInitialized) => -1,
+        Err(crate::fs::FsError::Io { detail, .. }) if detail == "NotFound" => -1,
+        Err(_) => EIO,
+    }
+}
+
+fn log_file_read(name: u64, name_len: u64, buf: u64, cap: u64, offset: u64) -> i64 {
+    let Some(raw) = log_disk_name(name, name_len) else {
+        return EINVAL;
+    };
+    if cap == 0 || cap > 1024 || !crate::mmu::user_write_ok(buf, cap) {
+        return EFAULT;
+    }
+    if offset > u32::MAX as u64 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(&raw[..name_len as usize]) else {
+        return EINVAL;
+    };
+    match crate::fs::read_at(text, offset as u32, &mut iobuf()[..cap as usize]) {
+        Ok(0) => 0,
+        Ok(copied) => {
+            if write_user(buf, &iobuf()[..copied]) {
+                copied as i64
+            } else {
+                EFAULT
+            }
+        }
+        Err(crate::fs::FsError::NotInitialized) => -1,
+        Err(crate::fs::FsError::Io { detail, .. }) if detail == "NotFound" => -1,
+        Err(_) => EIO,
+    }
+}
+
+fn log_file_list(buf: u64, cap: u64) -> i64 {
+    if cap == 0 || cap > 1024 || !crate::mmu::user_write_ok(buf, cap) {
+        return EFAULT;
+    }
+    let mut out = [0u8; 512];
+    let mut n = 0usize;
+    let mut index = 0u32;
+    while index <= 16 {
+        let name = if index == 0 {
+            crate::fs::LOG_NAME
+        } else {
+            crate::fs::log_archive_name(index)
+        };
+        if let Ok(true) = crate::fs::file_exists(name) {
+            if let Ok(len) = crate::fs::file_len(name) {
+                if !push_log_line(&mut out, &mut n, name, len) {
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+    if n == 0 {
+        return 0;
+    }
+    let copy = n.min(cap as usize);
+    if write_user(buf, &out[..copy]) {
+        copy as i64
+    } else {
+        EFAULT
+    }
+}
+
+fn push_log_line(out: &mut [u8], n: &mut usize, name: &str, len: u32) -> bool {
+    let mut tmp = [0u8; 32];
+    let mut t = 0usize;
+    let bytes = name.as_bytes();
+    if t + bytes.len() + 12 >= tmp.len() {
+        return false;
+    }
+    tmp[t..t + bytes.len()].copy_from_slice(bytes);
+    t += bytes.len();
+    tmp[t] = b' ';
+    t += 1;
+    let mut val = len;
+    let mut digits = [0u8; 10];
+    let mut d = 10usize;
+    if val == 0 {
+        d -= 1;
+        digits[d] = b'0';
+    }
+    while val > 0 {
+        d -= 1;
+        digits[d] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    let shown = &digits[d..];
+    tmp[t..t + shown.len()].copy_from_slice(shown);
+    t += shown.len();
+    tmp[t] = b'\n';
+    t += 1;
+    if *n + t > out.len() {
+        return false;
+    }
+    out[*n..*n + t].copy_from_slice(&tmp[..t]);
+    *n += t;
+    true
 }
 
 fn file_read(name: u64, name_len: u64, buf: u64, cap: u64) -> i64 {

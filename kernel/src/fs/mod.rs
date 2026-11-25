@@ -520,6 +520,25 @@ fn delete_archive(index: u32) -> Result<(), FsError> {
     delete_file(archive_name(index))
 }
 
+/// `LOG.TXT` or `LOG1.TXT`..`LOG16.TXT`. Nothing else is a saved log.
+pub fn log_disk_ok(name: &str) -> bool {
+    if name == LOG_NAME {
+        return true;
+    }
+    let mut index = 1u32;
+    while index <= 16 {
+        if name == archive_name(index) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+pub fn log_archive_name(index: u32) -> &'static str {
+    archive_name(index)
+}
+
 fn archive_name(index: u32) -> &'static str {
     match index {
         1 => "LOG1.TXT",
