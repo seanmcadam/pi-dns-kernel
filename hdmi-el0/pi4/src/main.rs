@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-core::arch::global_asm!(include_str!("start.s"));
+core::arch::global_asm!(include_str!("../../../user-common/start.s"));
 
 const BOARD: &str = "pi4 hdmi";
 

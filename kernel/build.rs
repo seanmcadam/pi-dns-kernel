@@ -34,6 +34,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/board/virt/link.ld");
     println!("cargo:rerun-if-changed=src/board/pi4/link.ld");
     println!("cargo:rerun-if-changed=src/board/pi5/link.ld");
+    println!("cargo:rerun-if-changed=../user-common/link.ld");
+    println!("cargo:rerun-if-changed=../user-common/start.s");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_VIRT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_PI4");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_PI5");
@@ -76,60 +78,21 @@ fn build_user(out_dir: &Path, manifest_dir: &Path) {
         manifest_dir.join("../user-common/thread.rs").display()
     );
 
-    let elf = out_dir.join("user.elf");
-    let bin = out_dir.join("user.bin");
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
-    let link_arg = format!("link-arg=-T{}", link.display());
-    let status = Command::new(&rustc)
-        .args([
-            "--target",
-            "aarch64-unknown-none",
-            "--edition",
-            "2021",
-            "-C",
-            "panic=abort",
-            "-C",
-            "opt-level=z",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "linker=aarch64-linux-gnu-ld",
-            "-C",
-            &link_arg,
-            "--extern",
-        ])
-        .arg(format!("panic_rt={}", panic_rt.display()))
-        .arg("-o")
-        .arg(&elf)
-        .arg(&src)
-        .status()
-        .unwrap_or_else(|err| panic!("failed to link user-test: {err}"));
-    if !status.success() {
-        panic!("user-test link failed");
-    }
-    let nm = Command::new("aarch64-linux-gnu-nm")
-        .arg(&elf)
-        .output()
-        .unwrap_or_else(|err| panic!("nm user-test: {err}"));
-    let listing = String::from_utf8_lossy(&nm.stdout);
-    let start = listing
-        .lines()
-        .find(|line| line.ends_with(" _start") || line.ends_with(" T _start") || line.contains(" _start"))
-        .unwrap_or_else(|| panic!("user-test has no _start:\n{listing}"));
-    let addr = start.split_whitespace().next().unwrap_or("");
-    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
-        panic!("user-test _start is {addr}, expected 0x100000000");
-    }
-    let status = Command::new("aarch64-linux-gnu-objcopy")
-        .args(["-O", "binary"])
-        .arg(&elf)
-        .arg(&bin)
-        .status()
-        .unwrap_or_else(|err| panic!("objcopy user-test: {err}"));
-    if !status.success() {
-        panic!("user-test objcopy failed");
-    }
+    let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, &rustc);
+    link_el0(
+        out_dir,
+        &rustc,
+        &src,
+        &link,
+        "user",
+        &[
+            format!("panic_rt={}", panic_rt.display()),
+            format!("minfmt={}", minfmt.display()),
+        ],
+        0x1_0002_0000,
+        0x1_0009_1000,
+    );
 }
 
 fn build_dns(out_dir: &Path, manifest_dir: &Path) {
@@ -139,8 +102,6 @@ fn build_dns(out_dir: &Path, manifest_dir: &Path) {
         "src/server.rs",
         "src/failover.rs",
         "src/health.rs",
-        "src/start.s",
-        "link.ld",
     ] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
@@ -158,7 +119,7 @@ fn build_dns(out_dir: &Path, manifest_dir: &Path) {
     );
 
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
+    let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let proto = out_dir.join("libdns_protocol.rlib");
     let cache = out_dir.join("libdns_cache.rlib");
     compile_rlib(
@@ -174,101 +135,26 @@ fn build_dns(out_dir: &Path, manifest_dir: &Path) {
         &cache,
     );
 
-    let elf = out_dir.join("dns.elf");
-    let link = dir.join("link.ld");
-    let link_arg = format!("link-arg=-T{}", link.display());
-    let status = Command::new(&rustc)
-        .args([
-            "--target",
-            "aarch64-unknown-none",
-            "--edition",
-            "2021",
-            "-C",
-            "panic=abort",
-            "-C",
-            "opt-level=z",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "linker=aarch64-linux-gnu-ld",
-            "-C",
-            &link_arg,
-            "--extern",
-        ])
-        .arg(format!("dns_protocol={}", proto.display()))
-        .arg("--extern")
-        .arg(format!("dns_cache={}", cache.display()))
-        .arg("--extern")
-        .arg(format!("panic_rt={}", panic_rt.display()))
-        .arg("-o")
-        .arg(&elf)
-        .arg(dir.join("src/main.rs"))
-        .status()
-        .unwrap_or_else(|err| panic!("failed to link dns-el0: {err}"));
-    if !status.success() {
-        panic!("dns-el0 link failed");
-    }
-
-    let nm = Command::new("aarch64-linux-gnu-nm")
-        .arg(&elf)
-        .output()
-        .unwrap_or_else(|err| panic!("nm dns-el0: {err}"));
-    let listing = String::from_utf8_lossy(&nm.stdout);
-    let start = listing
-        .lines()
-        .find(|line| line.ends_with(" _start"))
-        .unwrap_or_else(|| panic!("dns-el0 has no _start:\n{listing}"));
-    let addr = start.split_whitespace().next().unwrap_or("");
-    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
-        panic!("dns-el0 _start is {addr}, expected 0x100000000");
-    }
-
-    let bin = out_dir.join("dns.bin");
-    let status = Command::new("aarch64-linux-gnu-objcopy")
-        .args(["-O", "binary"])
-        .arg(&elf)
-        .arg(&bin)
-        .status()
-        .unwrap_or_else(|err| panic!("objcopy dns-el0: {err}"));
-    if !status.success() {
-        panic!("dns-el0 objcopy failed");
-    }
-
-    let sections = elf_sections(&elf);
-    let code_limit = 0x1_0008_0000u64;
-    let data_base = 0x1_0009_0000u64;
-    let data_limit = 0x1_000A_0000u64;
-    let mut data_off = 0usize;
-    let mut data_len = 0usize;
-    let mut data_place = 0usize;
-    for (name, addr, size) in &sections {
-        if *size == 0 || *addr == 0 || name.starts_with(".comment") || name.starts_with(".ARM") || name.starts_with(".debug") {
-            continue;
-        }
-        let end = addr + size;
-        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
-        let in_data = *addr >= data_base && end <= data_limit;
-        if !in_code && !in_data {
-            panic!("dns-el0 section {name} at {addr:#x} size {size:#x} is outside the user window");
-        }
-        if name == ".data" {
-            data_off = (*addr - 0x1_0000_0000) as usize;
-            data_len = *size as usize;
-            data_place = (*addr - data_base) as usize;
-        }
-    }
-    fs::write(
-        out_dir.join("dns_meta.rs"),
-        format!(
-            "const DNS_DATA_OFF: usize = {data_off};\nconst DNS_DATA_LEN: usize = {data_len};\nconst DNS_DATA_PLACE: usize = {data_place};\n"
-        ),
-    )
-    .unwrap();
+    link_el0(
+        out_dir,
+        &rustc,
+        &dir.join("src/main.rs"),
+        &manifest_dir.join("../user-common/link.ld"),
+        "dns",
+        &[
+            format!("dns_protocol={}", proto.display()),
+            format!("dns_cache={}", cache.display()),
+            format!("panic_rt={}", panic_rt.display()),
+            format!("minfmt={}", minfmt.display()),
+        ],
+        0x1_0008_0000,
+        0x1_000A_0000,
+    );
 }
 
 fn build_http(out_dir: &Path, manifest_dir: &Path) {
     let dir = manifest_dir.join("../http-el0");
-    for rel in ["src/main.rs", "src/server.rs", "src/firmware.rs", "src/start.s", "link.ld"] {
+    for rel in ["src/main.rs", "src/server.rs", "src/firmware.rs"] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     println!(
@@ -289,7 +175,7 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         manifest_dir.join("../config/src/lib.rs").display()
     );
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
+    let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, &rustc);
     let version = out_dir.join("libversion.rlib");
     compile_rlib(
         &rustc,
@@ -311,199 +197,49 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         "config",
         &config_rlib,
     );
-    let minfmt = compile_minfmt(out_dir, manifest_dir, &rustc);
-
-    let elf = out_dir.join("http.elf");
-    let link = dir.join("link.ld");
-    let link_arg = format!("link-arg=-T{}", link.display());
-    let status = Command::new(&rustc)
-        .args([
-            "--target",
-            "aarch64-unknown-none",
-            "--edition",
-            "2021",
-            "-C",
-            "panic=abort",
-            "-C",
-            "opt-level=z",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "linker=aarch64-linux-gnu-ld",
-            "-C",
-            &link_arg,
-            "--extern",
-        ])
-        .arg(format!("http_server={}", http.display()))
-        .arg("--extern")
-        .arg(format!("panic_rt={}", panic_rt.display()))
-        .arg("--extern")
-        .arg(format!("version={}", version.display()))
-        .arg("--extern")
-        .arg(format!("config={}", config_rlib.display()))
-        .arg("--extern")
-        .arg(format!("minfmt={}", minfmt.display()))
-        .arg("-o")
-        .arg(&elf)
-        .arg(dir.join("src/main.rs"))
-        .status()
-        .unwrap_or_else(|err| panic!("failed to link http-el0: {err}"));
-    if !status.success() {
-        panic!("http-el0 link failed");
-    }
-
-    let nm = Command::new("aarch64-linux-gnu-nm")
-        .arg(&elf)
-        .output()
-        .unwrap_or_else(|err| panic!("nm http-el0: {err}"));
-    let listing = String::from_utf8_lossy(&nm.stdout);
-    let start = listing
-        .lines()
-        .find(|line| line.ends_with(" _start"))
-        .unwrap_or_else(|| panic!("http-el0 has no _start:\n{listing}"));
-    let addr = start.split_whitespace().next().unwrap_or("");
-    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
-        panic!("http-el0 _start is {addr}, expected 0x100000000");
-    }
-
-    let bin = out_dir.join("http.bin");
-    let status = Command::new("aarch64-linux-gnu-objcopy")
-        .args(["-O", "binary"])
-        .arg(&elf)
-        .arg(&bin)
-        .status()
-        .unwrap_or_else(|err| panic!("objcopy http-el0: {err}"));
-    if !status.success() {
-        panic!("http-el0 objcopy failed");
-    }
-
-    let sections = elf_sections(&elf);
-    let code_limit = 0x1_0008_0000u64;
-    let data_base = 0x1_0009_0000u64;
-    let data_limit = 0x1_000A_0000u64;
-    let mut data_off = 0usize;
-    let mut data_len = 0usize;
-    let mut data_place = 0usize;
-    for (name, addr, size) in &sections {
-        if *size == 0 || *addr == 0 || name.starts_with(".comment") || name.starts_with(".ARM") || name.starts_with(".debug") {
-            continue;
-        }
-        let end = addr + size;
-        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
-        let in_data = *addr >= data_base && end <= data_limit;
-        if !in_code && !in_data {
-            panic!("http-el0 section {name} at {addr:#x} size {size:#x} is outside the user window");
-        }
-        if name == ".data" {
-            data_off = (*addr - 0x1_0000_0000) as usize;
-            data_len = *size as usize;
-            data_place = (*addr - data_base) as usize;
-        }
-    }
-    fs::write(
-        out_dir.join("http_meta.rs"),
-        format!(
-            "const HTTP_DATA_OFF: usize = {data_off};\nconst HTTP_DATA_LEN: usize = {data_len};\nconst HTTP_DATA_PLACE: usize = {data_place};\n"
-        ),
-    )
-    .unwrap();
+    link_el0(
+        out_dir,
+        &rustc,
+        &dir.join("src/main.rs"),
+        &manifest_dir.join("../user-common/link.ld"),
+        "http",
+        &[
+            format!("http_server={}", http.display()),
+            format!("panic_rt={}", panic_rt.display()),
+            format!("version={}", version.display()),
+            format!("config={}", config_rlib.display()),
+            format!("minfmt={}", minfmt.display()),
+        ],
+        0x1_0008_0000,
+        0x1_000A_0000,
+    );
 }
 
 fn build_log(out_dir: &Path, manifest_dir: &Path) {
     let dir = manifest_dir.join("../log-el0");
-    for rel in ["src/main.rs", "src/start.s", "link.ld"] {
+    for rel in ["src/main.rs"] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
-    let elf = out_dir.join("log.elf");
-    let link = dir.join("link.ld");
-    let link_arg = format!("link-arg=-T{}", link.display());
-    let status = Command::new(&rustc)
-        .args([
-            "--target",
-            "aarch64-unknown-none",
-            "--edition",
-            "2021",
-            "-C",
-            "panic=abort",
-            "-C",
-            "opt-level=z",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "linker=aarch64-linux-gnu-ld",
-            "-C",
-            &link_arg,
-            "--extern",
-        ])
-        .arg(format!("panic_rt={}", panic_rt.display()))
-        .arg("-o")
-        .arg(&elf)
-        .arg(dir.join("src/main.rs"))
-        .status()
-        .unwrap_or_else(|err| panic!("failed to link log-el0: {err}"));
-    if !status.success() {
-        panic!("log-el0 link failed");
-    }
-    let nm = Command::new("aarch64-linux-gnu-nm")
-        .arg(&elf)
-        .output()
-        .unwrap_or_else(|err| panic!("nm log-el0: {err}"));
-    let listing = String::from_utf8_lossy(&nm.stdout);
-    let start = listing
-        .lines()
-        .find(|line| line.ends_with(" _start"))
-        .unwrap_or_else(|| panic!("log-el0 has no _start:\n{listing}"));
-    let addr = start.split_whitespace().next().unwrap_or("");
-    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
-        panic!("log-el0 _start is {addr}, expected 0x100000000");
-    }
-    let bin = out_dir.join("log.bin");
-    let status = Command::new("aarch64-linux-gnu-objcopy")
-        .args(["-O", "binary"])
-        .arg(&elf)
-        .arg(&bin)
-        .status()
-        .unwrap_or_else(|err| panic!("objcopy log-el0: {err}"));
-    if !status.success() {
-        panic!("log-el0 objcopy failed");
-    }
-    let sections = elf_sections(&elf);
-    let code_limit = 0x1_0002_0000u64;
-    let data_base = 0x1_0009_0000u64;
-    let data_limit = 0x1_0009_1000u64;
-    let mut data_off = 0usize;
-    let mut data_len = 0usize;
-    let mut data_place = 0usize;
-    for (name, addr, size) in &sections {
-        if *size == 0 || *addr == 0 || name.starts_with(".comment") || name.starts_with(".ARM") || name.starts_with(".debug") {
-            continue;
-        }
-        let end = addr + size;
-        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
-        let in_data = *addr >= data_base && end <= data_limit;
-        if !in_code && !in_data {
-            panic!("log-el0 section {name} at {addr:#x} size {size:#x} is outside the user window");
-        }
-        if name == ".data" {
-            data_off = (*addr - 0x1_0000_0000) as usize;
-            data_len = *size as usize;
-            data_place = (*addr - data_base) as usize;
-        }
-    }
-    fs::write(
-        out_dir.join("log_meta.rs"),
-        format!(
-            "const LOG_DATA_OFF: usize = {data_off};\nconst LOG_DATA_LEN: usize = {data_len};\nconst LOG_DATA_PLACE: usize = {data_place};\n"
-        ),
-    )
-    .unwrap();
+    let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, &rustc);
+    link_el0(
+        out_dir,
+        &rustc,
+        &dir.join("src/main.rs"),
+        &manifest_dir.join("../user-common/link.ld"),
+        "log",
+        &[
+            format!("panic_rt={}", panic_rt.display()),
+            format!("minfmt={}", minfmt.display()),
+        ],
+        0x1_0002_0000,
+        0x1_0009_1000,
+    );
 }
 
 fn build_telnet(out_dir: &Path, manifest_dir: &Path) {
     let dir = manifest_dir.join("../telnet-el0");
-    for rel in ["src/main.rs", "src/start.s", "link.ld"] {
+    for rel in ["src/main.rs"] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     println!(
@@ -511,95 +247,25 @@ fn build_telnet(out_dir: &Path, manifest_dir: &Path) {
         manifest_dir.join("../user-common/thread.rs").display()
     );
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let panic_rt = compile_panic_rt(out_dir, manifest_dir, &rustc);
-    let elf = out_dir.join("telnet.elf");
-    let link = dir.join("link.ld");
-    let link_arg = format!("link-arg=-T{}", link.display());
-    let status = Command::new(&rustc)
-        .args([
-            "--target",
-            "aarch64-unknown-none",
-            "--edition",
-            "2021",
-            "-C",
-            "panic=abort",
-            "-C",
-            "opt-level=z",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "linker=aarch64-linux-gnu-ld",
-            "-C",
-            &link_arg,
-            "--extern",
-        ])
-        .arg(format!("panic_rt={}", panic_rt.display()))
-        .arg("-o")
-        .arg(&elf)
-        .arg(dir.join("src/main.rs"))
-        .status()
-        .unwrap_or_else(|err| panic!("failed to link telnet-el0: {err}"));
-    if !status.success() {
-        panic!("telnet-el0 link failed");
-    }
-    let nm = Command::new("aarch64-linux-gnu-nm")
-        .arg(&elf)
-        .output()
-        .unwrap_or_else(|err| panic!("nm telnet-el0: {err}"));
-    let listing = String::from_utf8_lossy(&nm.stdout);
-    let start = listing
-        .lines()
-        .find(|line| line.ends_with(" _start"))
-        .unwrap_or_else(|| panic!("telnet-el0 has no _start:\n{listing}"));
-    let addr = start.split_whitespace().next().unwrap_or("");
-    if addr.trim_start_matches('0') != "100000000" && addr != "0000000100000000" {
-        panic!("telnet-el0 _start is {addr}, expected 0x100000000");
-    }
-    let bin = out_dir.join("telnet.bin");
-    let status = Command::new("aarch64-linux-gnu-objcopy")
-        .args(["-O", "binary"])
-        .arg(&elf)
-        .arg(&bin)
-        .status()
-        .unwrap_or_else(|err| panic!("objcopy telnet-el0: {err}"));
-    if !status.success() {
-        panic!("telnet-el0 objcopy failed");
-    }
-    let sections = elf_sections(&elf);
-    let code_limit = 0x1_0002_0000u64;
-    let data_base = 0x1_0009_0000u64;
-    let data_limit = 0x1_0009_1000u64;
-    let mut data_off = 0usize;
-    let mut data_len = 0usize;
-    let mut data_place = 0usize;
-    for (name, addr, size) in &sections {
-        if *size == 0 || *addr == 0 || name.starts_with(".comment") || name.starts_with(".ARM") || name.starts_with(".debug") {
-            continue;
-        }
-        let end = addr + size;
-        let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
-        let in_data = *addr >= data_base && end <= data_limit;
-        if !in_code && !in_data {
-            panic!("telnet-el0 section {name} at {addr:#x} size {size:#x} is outside the user window");
-        }
-        if name == ".data" {
-            data_off = (*addr - 0x1_0000_0000) as usize;
-            data_len = *size as usize;
-            data_place = (*addr - data_base) as usize;
-        }
-    }
-    fs::write(
-        out_dir.join("telnet_meta.rs"),
-        format!(
-            "const TELNET_DATA_OFF: usize = {data_off};\nconst TELNET_DATA_LEN: usize = {data_len};\nconst TELNET_DATA_PLACE: usize = {data_place};\n"
-        ),
-    )
-    .unwrap();
+    let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, &rustc);
+    link_el0(
+        out_dir,
+        &rustc,
+        &dir.join("src/main.rs"),
+        &manifest_dir.join("../user-common/link.ld"),
+        "telnet",
+        &[
+            format!("panic_rt={}", panic_rt.display()),
+            format!("minfmt={}", minfmt.display()),
+        ],
+        0x1_0002_0000,
+        0x1_0009_1000,
+    );
 }
 
 fn build_vnc(out_dir: &Path, manifest_dir: &Path, rustc: &str, rfb: &Path, console: &Path) {
     let dir = manifest_dir.join("../vnc-el0");
-    for rel in ["src/main.rs", "src/start.s", "link.ld"] {
+    for rel in ["src/main.rs"] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     println!("cargo:rerun-if-changed={}", manifest_dir.join("../rfb/src/lib.rs").display());
@@ -612,18 +278,21 @@ fn build_vnc(out_dir: &Path, manifest_dir: &Path, rustc: &str, rfb: &Path, conso
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../display-console/src/font.rs").display()
     );
-    let panic_rt = compile_panic_rt(out_dir, manifest_dir, rustc);
+    let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, rustc);
     link_el0(
         out_dir,
         rustc,
         &dir.join("src/main.rs"),
-        &dir.join("link.ld"),
+        &manifest_dir.join("../user-common/link.ld"),
         "vnc",
         &[
             format!("rfb={}", rfb.display()),
             format!("display_console={}", console.display()),
             format!("panic_rt={}", panic_rt.display()),
+            format!("minfmt={}", minfmt.display()),
         ],
+        0x1_0002_0000,
+        0x1_0009_1000,
     );
 }
 
@@ -633,7 +302,7 @@ fn build_hdmi(out_dir: &Path, manifest_dir: &Path, rustc: &str, edid: &Path, con
     } else {
         manifest_dir.join("../hdmi-el0/pi4")
     };
-    for rel in ["src/main.rs", "src/start.s", "link.ld"] {
+    for rel in ["src/main.rs"] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     println!(
@@ -645,22 +314,34 @@ fn build_hdmi(out_dir: &Path, manifest_dir: &Path, rustc: &str, edid: &Path, con
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../display-console/src/lib.rs").display()
     );
-    let panic_rt = compile_panic_rt(out_dir, manifest_dir, rustc);
+    let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, rustc);
     link_el0(
         out_dir,
         rustc,
         &dir.join("src/main.rs"),
-        &dir.join("link.ld"),
+        &manifest_dir.join("../user-common/link.ld"),
         "hdmi",
         &[
             format!("edid={}", edid.display()),
             format!("display_console={}", console.display()),
             format!("panic_rt={}", panic_rt.display()),
+            format!("minfmt={}", minfmt.display()),
         ],
+        0x1_0002_0000,
+        0x1_0009_1000,
     );
 }
 
-fn link_el0(out_dir: &Path, rustc: &str, src: &Path, link: &Path, name: &str, externs: &[String]) {
+fn link_el0(
+    out_dir: &Path,
+    rustc: &str,
+    src: &Path,
+    link: &Path,
+    name: &str,
+    externs: &[String],
+    code_limit: u64,
+    data_limit: u64,
+) {
     let elf = out_dir.join(format!("{name}.elf"));
     let link_arg = format!("link-arg=-T{}", link.display());
     let mut cmd = Command::new(rustc);
@@ -679,7 +360,9 @@ fn link_el0(out_dir: &Path, rustc: &str, src: &Path, link: &Path, name: &str, ex
         "linker=aarch64-linux-gnu-ld",
         "-C",
         &link_arg,
+        "-L",
     ]);
+    cmd.arg(out_dir);
     for item in externs {
         cmd.arg("--extern").arg(item);
     }
@@ -716,9 +399,7 @@ fn link_el0(out_dir: &Path, rustc: &str, src: &Path, link: &Path, name: &str, ex
         panic!("{name} objcopy failed");
     }
     let sections = elf_sections(&elf);
-    let code_limit = 0x1_0002_0000u64;
     let data_base = 0x1_0009_0000u64;
-    let data_limit = 0x1_0009_1000u64;
     let mut data_off = 0usize;
     let mut data_len = 0usize;
     let mut data_place = 0usize;
@@ -761,7 +442,7 @@ fn compile_minfmt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> PathBuf {
     out
 }
 
-fn compile_panic_rt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> PathBuf {
+fn compile_panic_rt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> (PathBuf, PathBuf) {
     let src = manifest_dir.join("../user-common/panic_rt.rs");
     println!("cargo:rerun-if-changed={}", src.display());
     println!(
@@ -795,7 +476,7 @@ fn compile_panic_rt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> PathBuf
     if !status.success() {
         panic!("panic_rt rlib failed");
     }
-    out
+    (out, minfmt)
 }
 
 fn compile_rlib(rustc: &str, src: &Path, name: &str, out: &Path) {
@@ -829,8 +510,6 @@ fn build_block(out_dir: &Path, manifest_dir: &Path) {
     for rel in [
         "src/main.rs",
         "src/fetch.rs",
-        "src/start.s",
-        "link.ld",
         "Cargo.toml",
         "roots/isrgx1.der",
         "roots/isrgx2.der",
@@ -838,7 +517,7 @@ fn build_block(out_dir: &Path, manifest_dir: &Path) {
     ] {
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
-    let link = dir.join("link.ld");
+    let link = manifest_dir.join("../user-common/link.ld");
     let target_dir = out_dir.join("block-target");
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let status = Command::new(cargo)

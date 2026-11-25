@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
-core::arch::global_asm!(include_str!("start.s"));
+core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
 mod thread {
     include!("../../user-common/thread.rs");

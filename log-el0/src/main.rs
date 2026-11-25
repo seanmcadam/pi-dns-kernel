@@ -5,7 +5,7 @@
 #![no_std]
 #![no_main]
 
-core::arch::global_asm!(include_str!("start.s"));
+core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
 const DRAIN: u64 = 29;
 const EMIT: u64 = 30;

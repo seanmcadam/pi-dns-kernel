@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-core::arch::global_asm!(include_str!("start.s"));
+core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
 mod fetch;
 
