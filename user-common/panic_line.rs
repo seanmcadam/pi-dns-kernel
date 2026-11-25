@@ -97,26 +97,10 @@ fn lower(byte: u8) -> u8 {
     }
 }
 
-pub(crate) fn push(out: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
-    let mut i = 0;
-    while i < bytes.len() && n < out.len() {
-        out[n] = bytes[i];
-        n += 1;
-        i += 1;
-    }
-    n
+pub(crate) fn push(out: &mut [u8], n: usize, bytes: &[u8]) -> usize {
+    minfmt::push_bytes(out, n, bytes)
 }
 
-pub(crate) fn push_u32(out: &mut [u8], n: usize, mut value: u32) -> usize {
-    let mut buf = [0u8; 10];
-    let mut i = buf.len();
-    if value == 0 {
-        return push(out, n, b"0");
-    }
-    while value > 0 {
-        i -= 1;
-        buf[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    push(out, n, &buf[i..])
+pub(crate) fn push_u32(out: &mut [u8], n: usize, value: u32) -> usize {
+    minfmt::push_dec(out, n, value as u64)
 }

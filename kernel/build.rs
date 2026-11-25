@@ -750,6 +750,14 @@ fn link_el0(out_dir: &Path, rustc: &str, src: &Path, link: &Path, name: &str, ex
     .unwrap();
 }
 
+fn compile_minfmt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> PathBuf {
+    let src = manifest_dir.join("../minfmt/src/lib.rs");
+    println!("cargo:rerun-if-changed={}", src.display());
+    let out = out_dir.join("libminfmt.rlib");
+    compile_rlib(rustc, &src, "minfmt", &out);
+    out
+}
+
 fn compile_panic_rt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> PathBuf {
     let src = manifest_dir.join("../user-common/panic_rt.rs");
     println!("cargo:rerun-if-changed={}", src.display());
@@ -757,8 +765,33 @@ fn compile_panic_rt(out_dir: &Path, manifest_dir: &Path, rustc: &str) -> PathBuf
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../user-common/panic_line.rs").display()
     );
+    let minfmt = compile_minfmt(out_dir, manifest_dir, rustc);
     let out = out_dir.join("libpanic_rt.rlib");
-    compile_rlib(rustc, &src, "panic_rt", &out);
+    let status = Command::new(rustc)
+        .args([
+            "--target",
+            "aarch64-unknown-none",
+            "--edition",
+            "2021",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            "panic_rt",
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=z",
+            "--extern",
+        ])
+        .arg(format!("minfmt={}", minfmt.display()))
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|err| panic!("rustc panic_rt: {err}"));
+    if !status.success() {
+        panic!("panic_rt rlib failed");
+    }
     out
 }
 

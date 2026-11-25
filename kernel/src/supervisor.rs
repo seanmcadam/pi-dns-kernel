@@ -744,51 +744,20 @@ impl Text {
         }
     }
 
-    fn dec(&mut self, mut value: u64) {
+    fn dec(&mut self, value: u64) {
         let mut digits = [0u8; 20];
-        let mut n = 0;
-        if value == 0 {
-            self.push("0");
-            return;
-        }
-        while value > 0 && n < digits.len() {
-            digits[n] = b'0' + (value % 10) as u8;
-            value /= 10;
-            n += 1;
-        }
-        while n > 0 {
-            n -= 1;
-            if self.len < self.data.len() {
-                self.data[self.len] = digits[n];
-                self.len += 1;
-            }
+        let n = minfmt::push_dec(&mut digits, 0, value);
+        if let Ok(text) = core::str::from_utf8(&digits[..n]) {
+            self.push(text);
         }
     }
 
-    fn hex(&mut self, mut value: u64) {
-        self.push("0x");
-        if value == 0 {
-            self.push("0");
-            return;
-        }
-        let mut digits = [0u8; 16];
-        let mut n = 0;
-        while value > 0 && n < digits.len() {
-            let nybble = (value & 0xf) as u8;
-            digits[n] = if nybble < 10 {
-                b'0' + nybble
-            } else {
-                b'a' + (nybble - 10)
-            };
-            value >>= 4;
-            n += 1;
-        }
-        while n > 0 {
-            n -= 1;
-            if self.len < self.data.len() {
-                self.data[self.len] = digits[n];
-                self.len += 1;
-            }
+    fn hex(&mut self, value: u64) {
+        let mut digits = [0u8; 18];
+        let mut n = minfmt::push_bytes(&mut digits, 0, b"0x");
+        n = minfmt::push_hex(&mut digits, n, value, 0);
+        if let Ok(text) = core::str::from_utf8(&digits[..n]) {
+            self.push(text);
         }
     }
 

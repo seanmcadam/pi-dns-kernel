@@ -762,41 +762,14 @@ fn raw_line(bytes: &[u8]) {
     }
 }
 
-fn push(out: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
-    for byte in bytes {
-        if n >= out.len() {
-            return n;
-        }
-        out[n] = *byte;
-        n += 1;
-    }
-    n
+fn push(out: &mut [u8], n: usize, bytes: &[u8]) -> usize {
+    minfmt::push_bytes(out, n, bytes)
 }
 
-fn push_dec(out: &mut [u8], n: usize, mut value: u64) -> usize {
-    let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
-    if value == 0 {
-        i -= 1;
-        tmp[i] = b'0';
-    }
-    while value > 0 && i > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    push(out, n, &tmp[i..])
+fn push_dec(out: &mut [u8], n: usize, value: u64) -> usize {
+    minfmt::push_dec(out, n, value)
 }
 
 fn push_hex2(out: &mut [u8], n: usize, value: u8) -> usize {
-    let digits = [hex_digit(value >> 4), hex_digit(value & 0xf)];
-    push(out, n, &digits)
-}
-
-fn hex_digit(nibble: u8) -> u8 {
-    if nibble < 10 {
-        b'0' + nibble
-    } else {
-        b'a' + nibble - 10
-    }
+    minfmt::push_hex(out, n, value as u64, 2)
 }

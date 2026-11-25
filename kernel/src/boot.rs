@@ -536,45 +536,26 @@ fn raw_line(bytes: &[u8]) {
     }
 }
 
-fn push(out: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
-    for byte in bytes {
-        if n >= out.len() {
-            return n;
-        }
-        out[n] = *byte;
-        n += 1;
-    }
-    n
+fn push(out: &mut [u8], n: usize, bytes: &[u8]) -> usize {
+    minfmt::push_bytes(out, n, bytes)
 }
 
 fn push_hex(out: &mut [u8], mut n: usize, value: u32) -> usize {
-    let bytes = value.to_be_bytes();
+    let mut tmp = [0u8; 8];
+    let width = minfmt::push_hex(&mut tmp, 0, value as u64, 8);
     let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        let hex = b"0123456789abcdef";
+    while i < width {
         if n + 2 > out.len() {
             return n;
         }
-        out[n] = hex[(byte >> 4) as usize];
-        out[n + 1] = hex[(byte & 0xf) as usize];
+        out[n] = tmp[i];
+        out[n + 1] = tmp[i + 1];
         n += 2;
-        i += 1;
+        i += 2;
     }
     n
 }
 
-fn push_dec(out: &mut [u8], n: usize, mut value: u64) -> usize {
-    let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
-    if value == 0 {
-        i -= 1;
-        tmp[i] = b'0';
-    }
-    while value > 0 && i > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    push(out, n, &tmp[i..])
+fn push_dec(out: &mut [u8], n: usize, value: u64) -> usize {
+    minfmt::push_dec(out, n, value)
 }

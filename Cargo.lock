@@ -20,6 +20,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 [[package]]
 name = "blocklist"
 version = "0.1.0"
+dependencies = [
+ "minfmt",
+]
 
 [[package]]
 name = "byteorder"
@@ -124,6 +127,7 @@ dependencies = [
 name = "fault-log"
 version = "0.1.0"
 dependencies = [
+ "minfmt",
  "ntp",
  "smoltcp",
 ]
@@ -193,6 +197,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
+name = "minfmt"
+version = "0.1.0"
+
+[[package]]
 name = "ntp"
 version = "0.1.0"
 
@@ -212,6 +220,7 @@ dependencies = [
  "heapless",
  "kalloc",
  "log",
+ "minfmt",
  "ntp",
  "smoltcp",
  "spin",

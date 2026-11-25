@@ -410,24 +410,7 @@ pub fn render(view: &Record, out: &mut [u8]) -> usize {
 
 /// IEEE CRC-32 of `raw`, with the checksum field treated as zero.
 pub fn checksum(raw: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    let mut i = 0;
-    while i < raw.len() {
-        let byte = if i >= OFF_SUM && i < OFF_SUM + 4 {
-            0
-        } else {
-            raw[i]
-        };
-        crc ^= byte as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            bit += 1;
-        }
-        i += 1;
-    }
-    !crc
+    minfmt::crc32_ieee(raw, OFF_SUM..OFF_SUM + 4)
 }
 
 fn read_u16(raw: &[u8], at: usize) -> u16 {
@@ -456,46 +439,16 @@ fn write_u64(raw: &mut [u8], at: usize, value: u64) {
     raw[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn push(out: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
-    for byte in bytes {
-        if n >= out.len() {
-            return n;
-        }
-        out[n] = *byte;
-        n += 1;
-    }
-    n
+fn push(out: &mut [u8], n: usize, bytes: &[u8]) -> usize {
+    minfmt::push_bytes(out, n, bytes)
 }
 
-fn push_dec(out: &mut [u8], n: usize, mut value: u64) -> usize {
-    let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
-    if value == 0 {
-        i -= 1;
-        tmp[i] = b'0';
-    }
-    while value > 0 && i > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    push(out, n, &tmp[i..])
+fn push_dec(out: &mut [u8], n: usize, value: u64) -> usize {
+    minfmt::push_dec(out, n, value)
 }
 
-fn push_hex(out: &mut [u8], n: usize, mut value: u64) -> usize {
-    let mut tmp = [0u8; 16];
-    let mut i = 16;
-    while i > 0 {
-        i -= 1;
-        let nibble = (value & 0xf) as u8;
-        tmp[i] = if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + nibble - 10
-        };
-        value >>= 4;
-    }
-    push(out, n, &tmp)
+fn push_hex(out: &mut [u8], n: usize, value: u64) -> usize {
+    minfmt::push_hex(out, n, value, 16)
 }
 
 fn push_bytes(out: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
@@ -507,22 +460,11 @@ fn push_bytes(out: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
             n = push(out, n, b" ");
         }
         let byte = bytes[i];
-        let hex = [
-            hex_digit(byte >> 4),
-            hex_digit(byte & 0xf),
-        ];
+        let hex = [minfmt::hex_digit(byte >> 4), minfmt::hex_digit(byte)];
         n = push(out, n, &hex);
         i += 1;
     }
     n
-}
-
-fn hex_digit(nibble: u8) -> u8 {
-    if nibble < 10 {
-        b'0' + nibble
-    } else {
-        b'a' + nibble - 10
-    }
 }
 
 #[cfg(test)]
@@ -557,6 +499,15 @@ mod tests {
         let mut raw = [0u8; SLOT];
         assert!(store_record(&mut raw, &draft));
         raw
+    }
+
+    #[test]
+    fn checksum_matches_crc32_ieee() {
+        let raw = sample();
+        let sum = read_u32(&raw, OFF_SUM);
+        assert_eq!(sum, minfmt::crc32_ieee(&raw[..RECORD_LEN], OFF_SUM..OFF_SUM + 4));
+        assert_eq!(sum, checksum(&raw[..RECORD_LEN]));
+        assert_eq!(sum, 0x8B6E_AE98);
     }
 
     #[test]

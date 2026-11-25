@@ -142,30 +142,15 @@ impl Buf {
 
     #[cfg(feature = "board-pi4")]
     pub fn hex(&mut self, value: u32) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut tmp = [0u8; 8];
-        let mut i = 0;
-        while i < 8 {
-            tmp[i] = HEX[((value >> (28 - i * 4)) & 0xf) as usize];
-            i += 1;
-        }
-        self.push(core::str::from_utf8(&tmp).unwrap_or("00000000"));
+        let n = minfmt::push_hex(&mut tmp, 0, value as u64, 8);
+        self.push(core::str::from_utf8(&tmp[..n]).unwrap_or("00000000"));
     }
 
     pub fn dec(&mut self, value: u32) {
         let mut tmp = [0u8; 10];
-        let mut n = tmp.len();
-        let mut rest = value;
-        if rest == 0 {
-            self.push("0");
-            return;
-        }
-        while rest > 0 && n > 0 {
-            n -= 1;
-            tmp[n] = b'0' + (rest % 10) as u8;
-            rest /= 10;
-        }
-        self.push(core::str::from_utf8(&tmp[n..]).unwrap_or("0"));
+        let n = minfmt::push_dec(&mut tmp, 0, value as u64);
+        self.push(core::str::from_utf8(&tmp[..n]).unwrap_or("0"));
     }
 
     pub fn emit(self) {
@@ -185,27 +170,12 @@ fn copy_cstr(out: &mut [u8], at: usize, width: usize, text: &str) {
 
 #[cfg(feature = "board-pi4")]
 fn push(out: &mut [u8], n: &mut usize, text: &str) {
-    for byte in text.bytes() {
-        if *n >= out.len() {
-            return;
-        }
-        out[*n] = byte;
-        *n += 1;
-    }
+    *n = minfmt::push_bytes(out, *n, text.as_bytes());
 }
 
 #[cfg(feature = "board-pi4")]
-fn push_dec(out: &mut [u8], n: &mut usize, mut value: u32) {
+fn push_dec(out: &mut [u8], n: &mut usize, value: u32) {
     let mut tmp = [0u8; 10];
-    let mut i = tmp.len();
-    if value == 0 {
-        push(out, n, "0");
-        return;
-    }
-    while value > 0 && i > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    push(out, n, core::str::from_utf8(&tmp[i..]).unwrap_or("0"));
+    let end = minfmt::push_dec(&mut tmp, 0, value as u64);
+    push(out, n, core::str::from_utf8(&tmp[..end]).unwrap_or("0"));
 }

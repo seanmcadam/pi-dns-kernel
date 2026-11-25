@@ -81,19 +81,10 @@ fn digit(cpu: usize) -> &'static str {
     }
 }
 
-fn hex_out(mut n: u64) {
-    crate::console::write_str("0x");
-    let mut buf = [0u8; 16];
-    let mut i = 16;
-    while i > 0 {
-        i -= 1;
-        let nib = (n & 0xf) as u8;
-        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
-        n >>= 4;
-        if n == 0 {
-            break;
-        }
-    }
-    let text = core::str::from_utf8(&buf[i..]).unwrap_or("?");
+fn hex_out(n: u64) {
+    let mut buf = [0u8; 18];
+    let mut end = minfmt::push_bytes(&mut buf, 0, b"0x");
+    end = minfmt::push_hex(&mut buf, end, n, 0);
+    let text = core::str::from_utf8(&buf[..end]).unwrap_or("?");
     crate::console::write_str(text);
 }

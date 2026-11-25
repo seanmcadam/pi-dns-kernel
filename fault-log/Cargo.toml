@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ntp = { path = "../ntp" }
+minfmt = { path = "../minfmt" }
 
 [dev-dependencies]
 smoltcp = { workspace = true }

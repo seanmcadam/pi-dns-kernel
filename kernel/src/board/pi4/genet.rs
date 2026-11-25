@@ -336,55 +336,29 @@ impl StatusLine<'_> {
         }
     }
 
-    fn dec(&mut self, mut value: u32) {
+    fn dec(&mut self, value: u32) {
         let mut tmp = [0u8; 10];
-        let mut i = tmp.len();
-        if value == 0 {
-            self.push("0");
-            return;
-        }
-        while value > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (value % 10) as u8;
-            value /= 10;
-        }
-        if let Ok(text) = core::str::from_utf8(&tmp[i..]) {
+        let n = minfmt::push_dec(&mut tmp, 0, value as u64);
+        if let Ok(text) = core::str::from_utf8(&tmp[..n]) {
             self.push(text);
         }
     }
 
     fn hex(&mut self, value: u32) {
-        self.push("0x");
-        for shift in (0..8).rev() {
-            let nibble = ((value >> (shift * 4)) & 0xf) as u8;
-            let digit = if nibble < 10 {
-                b'0' + nibble
-            } else {
-                b'a' + (nibble - 10)
-            };
-            if self.n >= self.buf.len() {
-                return;
-            }
-            self.buf[self.n] = digit;
-            self.n += 1;
+        let mut tmp = [0u8; 10];
+        let mut n = minfmt::push_bytes(&mut tmp, 0, b"0x");
+        n = minfmt::push_hex(&mut tmp, n, value as u64, 8);
+        if let Ok(text) = core::str::from_utf8(&tmp[..n]) {
+            self.push(text);
         }
     }
 
     fn byte(&mut self, value: u8) {
-        let hi = value >> 4;
-        let lo = value & 0xf;
-        let digit = |nibble: u8| {
-            if nibble < 10 {
-                b'0' + nibble
-            } else {
-                b'a' + (nibble - 10)
-            }
-        };
         if self.n + 2 > self.buf.len() {
             return;
         }
-        self.buf[self.n] = digit(hi);
-        self.buf[self.n + 1] = digit(lo);
+        self.buf[self.n] = minfmt::hex_digit(value >> 4);
+        self.buf[self.n + 1] = minfmt::hex_digit(value);
         self.n += 2;
     }
 }
@@ -1410,11 +1384,7 @@ fn say_hex(prefix: &str, value: u32) {
             break;
         }
         let nibble = ((value >> (shift * 4)) & 0xf) as u8;
-        buf[n] = if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + (nibble - 10)
-        };
+        buf[n] = minfmt::hex_digit(nibble);
         n += 1;
     }
     if let Ok(text) = core::str::from_utf8(&buf[..n]) {
@@ -1443,23 +1413,14 @@ fn say_mac(prefix: &str, mac: &[u8; 6]) {
             buf[n] = b' ';
             n += 1;
         }
-        buf[n] = hex_digit(byte >> 4);
-        buf[n + 1] = hex_digit(byte & 0xf);
+        buf[n] = minfmt::hex_digit(*byte >> 4);
+        buf[n + 1] = minfmt::hex_digit(*byte);
         n += 2;
     }
     if let Ok(text) = core::str::from_utf8(&buf[..n]) {
         say(text);
     }
 }
-
-fn hex_digit(nibble: u8) -> u8 {
-    if nibble < 10 {
-        b'0' + nibble
-    } else {
-        b'a' + (nibble - 10)
-    }
-}
-
 
 fn read(offset: usize) -> u32 {
     read_at(BASE + offset)

@@ -856,19 +856,15 @@ fn log_dhcp_dns(servers: &[[u8; 4]]) {
 }
 
 #[allow(dead_code)]
-fn push_dec(buf: &mut [u8], mut n: usize, mut value: u8) -> usize {
+fn push_dec(buf: &mut [u8], mut n: usize, value: u8) -> usize {
     let mut tmp = [0u8; 3];
-    let mut i = 3;
+    let end = minfmt::push_dec(&mut tmp, 0, value as u64);
+    let mut i = 0;
     if value == 0 {
-        buf[n] = b'0';
+        buf[n] = tmp[0];
         return n + 1;
     }
-    while value > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (value % 10);
-        value /= 10;
-    }
-    while i < 3 && n < buf.len() {
+    while i < end && n < buf.len() {
         buf[n] = tmp[i];
         n += 1;
         i += 1;
@@ -1019,19 +1015,10 @@ fn push_slice(out: &mut [u8], used: usize, bytes: &[u8]) -> Option<usize> {
     Some(end)
 }
 
-fn push_u32(out: &mut [u8], mut used: usize, mut value: u32) -> Option<usize> {
+fn push_u32(out: &mut [u8], used: usize, value: u32) -> Option<usize> {
     let mut buf = [0u8; 10];
-    let mut i = buf.len();
-    if value == 0 {
-        return push_slice(out, used, b"0");
-    }
-    while value > 0 {
-        i -= 1;
-        buf[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    used = push_slice(out, used, &buf[i..])?;
-    Some(used)
+    let n = minfmt::push_dec(&mut buf, 0, value as u64);
+    push_slice(out, used, &buf[..n])
 }
 
 fn append_ip(out: &mut [u8], mut used: usize, ip: [u8; 4]) -> Option<usize> {

@@ -107,17 +107,11 @@ fn psci(fid: u64, a1: u64, a2: u64, a3: u64, hvc: bool) -> u64 {
     ret
 }
 
-fn hex_out(mut n: u64) {
-    crate::console::write_str("0x");
-    let mut buf = [0u8; 16];
-    let mut i = 16;
-    while i > 0 {
-        i -= 1;
-        let nib = (n & 0xf) as u8;
-        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
-        n >>= 4;
-    }
-    let text = unsafe { core::str::from_utf8_unchecked(&buf) };
+fn hex_out(n: u64) {
+    let mut buf = [0u8; 18];
+    let mut end = minfmt::push_bytes(&mut buf, 0, b"0x");
+    end = minfmt::push_hex(&mut buf, end, n, 16);
+    let text = unsafe { core::str::from_utf8_unchecked(&buf[..end]) };
     crate::console::write_str(text);
 }
 
