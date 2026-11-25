@@ -13,7 +13,7 @@ mod server;
 
 use core::alloc::{GlobalAlloc, Layout};
 
-core::arch::global_asm!(include_str!("start.s"));
+core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
 pub(crate) const HEAP_VA: usize = 0x1_000A_0000;
 pub(crate) const HEAP_SIZE: usize = 1536 * 1024;

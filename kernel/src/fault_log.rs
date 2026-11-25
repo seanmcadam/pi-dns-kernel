@@ -321,28 +321,11 @@ fn status(dfsc: u64) -> &'static str {
 }
 
 fn push_hex2(out: &mut [u8], n: usize, byte: u8) -> usize {
-    let digits = [hex((byte >> 4) & 0xf), hex(byte & 0xf)];
-    push(out, n, &digits)
+    minfmt::push_hex(out, n, byte as u64, 2)
 }
 
-fn push_hex16(out: &mut [u8], mut n: usize, mut value: u64) -> usize {
-    let mut buf = [0u8; 16];
-    let mut i = 16;
-    while i > 0 {
-        i -= 1;
-        buf[i] = hex((value & 0xf) as u8);
-        value >>= 4;
-    }
-    n = push(out, n, &buf);
-    n
-}
-
-fn hex(nibble: u8) -> u8 {
-    if nibble < 10 {
-        b'0' + nibble
-    } else {
-        b'a' + nibble - 10
-    }
+fn push_hex16(out: &mut [u8], n: usize, value: u64) -> usize {
+    minfmt::push_hex(out, n, value, 16)
 }
 
 #[cfg(test)]

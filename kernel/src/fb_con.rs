@@ -1002,46 +1002,35 @@ fn set_vstatus_counts(state: &str, copied: u32, expect: u32, extra: &str) {
 }
 
 fn push_raw(buf: &mut [u8], n: &mut usize, text: &str) {
-    for byte in text.bytes() {
-        if *n >= buf.len() {
-            return;
-        }
-        buf[*n] = byte;
-        *n += 1;
-    }
+    *n = minfmt::push_bytes(buf, *n, text.as_bytes());
 }
 
 fn push_hex8(buf: &mut [u8], n: &mut usize, value: u32) {
-    let bytes = value.to_be_bytes();
-    let hex = b"0123456789abcdef";
-    for byte in bytes {
+    let mut tmp = [0u8; 8];
+    let width = minfmt::push_hex(&mut tmp, 0, value as u64, 8);
+    let mut i = 0;
+    while i < width {
         if *n + 2 > buf.len() {
             return;
         }
-        buf[*n] = hex[(byte >> 4) as usize];
-        buf[*n + 1] = hex[(byte & 0xf) as usize];
+        buf[*n] = tmp[i];
+        buf[*n + 1] = tmp[i + 1];
         *n += 2;
+        i += 2;
     }
 }
 
-fn push_dec_u(buf: &mut [u8], n: &mut usize, mut value: u32) {
-    let mut digits = [0u8; 10];
-    let mut d = 0usize;
-    loop {
-        digits[d] = b'0' + (value % 10) as u8;
-        value /= 10;
-        d += 1;
-        if value == 0 {
-            break;
-        }
-    }
-    while d > 0 {
-        d -= 1;
+fn push_dec_u(buf: &mut [u8], n: &mut usize, value: u32) {
+    let mut tmp = [0u8; 10];
+    let end = minfmt::push_dec(&mut tmp, 0, value as u64);
+    let mut i = 0;
+    while i < end {
         if *n >= buf.len() {
             return;
         }
-        buf[*n] = digits[d];
+        buf[*n] = tmp[i];
         *n += 1;
+        i += 1;
     }
 }
 
@@ -1700,11 +1689,12 @@ impl Note {
     }
 
     fn hex32(&mut self, value: u32) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut shift = 28i32;
-        while shift >= 0 {
-            self.push(core::str::from_utf8(&[HEX[((value >> shift) & 0xf) as usize]]).unwrap_or("0"));
-            shift -= 4;
+        let mut tmp = [0u8; 8];
+        let n = minfmt::push_hex(&mut tmp, 0, value as u64, 8);
+        let mut i = 0;
+        while i < n {
+            self.push(core::str::from_utf8(&tmp[i..i + 1]).unwrap_or("0"));
+            i += 1;
         }
     }
 
@@ -2072,31 +2062,15 @@ impl Line {
     }
 
     fn hex32(&mut self, value: u32) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut tmp = [0u8; 8];
-        let mut shift = 28i32;
-        let mut i = 0;
-        while i < 8 {
-            tmp[i] = HEX[((value >> shift) & 0xf) as usize];
-            shift -= 4;
-            i += 1;
-        }
-        self.push(core::str::from_utf8(&tmp).unwrap_or("00000000"));
+        let n = minfmt::push_hex(&mut tmp, 0, value as u64, 8);
+        self.push(core::str::from_utf8(&tmp[..n]).unwrap_or("00000000"));
     }
 
-    fn dec(&mut self, mut value: u64) {
+    fn dec(&mut self, value: u64) {
         let mut tmp = [0u8; 20];
-        let mut i = tmp.len();
-        if value == 0 {
-            self.push("0");
-            return;
-        }
-        while value > 0 && i > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (value % 10) as u8;
-            value /= 10;
-        }
-        self.push(core::str::from_utf8(&tmp[i..]).unwrap_or("0"));
+        let n = minfmt::push_dec(&mut tmp, 0, value);
+        self.push(core::str::from_utf8(&tmp[..n]).unwrap_or("0"));
     }
 
     fn text(&self) -> &str {

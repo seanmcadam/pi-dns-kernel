@@ -29,19 +29,11 @@ fn put(s: &str) {
     crate::console::write_str(s);
 }
 
-fn hex64(mut value: u64) {
+fn hex64(value: u64) {
     put("0x");
     let mut buf = [0u8; 16];
-    for slot in buf.iter_mut().rev() {
-        let nibble = (value & 0xf) as u8;
-        *slot = if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + nibble - 10
-        };
-        value >>= 4;
-    }
-    put(unsafe { core::str::from_utf8_unchecked(&buf) });
+    let n = minfmt::push_hex(&mut buf, 0, value, 16);
+    put(unsafe { core::str::from_utf8_unchecked(&buf[..n]) });
 }
 
 fn reg(name: &str) -> u64 {
@@ -207,7 +199,10 @@ pub extern "C" fn exception_handler(frame: *const u64, kind: u64) -> ! {
     put("\r\nESR_EL1: ");
     hex64(esr);
     put("  EC=0x");
-    let ec_byte = [hex_digit((ec >> 4) as u8), hex_digit((ec & 0xf) as u8)];
+    let ec_byte = [
+        minfmt::hex_digit((ec >> 4) as u8),
+        minfmt::hex_digit(ec as u8),
+    ];
     put(unsafe { core::str::from_utf8_unchecked(&ec_byte) });
     put(" ");
     put(ec_name(ec));
@@ -289,46 +284,20 @@ fn pin_and_halt(kind: u64, ec: u64, elr: u64, far: u64) -> ! {
     }
 }
 
-fn pin_push(buf: &mut [u8], mut n: usize, bytes: &[u8]) -> usize {
-    for byte in bytes {
-        if n >= buf.len() {
-            return n;
-        }
-        buf[n] = *byte;
-        n += 1;
-    }
-    n
+fn pin_push(buf: &mut [u8], n: usize, bytes: &[u8]) -> usize {
+    minfmt::push_bytes(buf, n, bytes)
 }
 
 fn pin_hex2(buf: &mut [u8], n: usize, value: u8) -> usize {
-    let digits = [hex_digit(value >> 4), hex_digit(value & 0xf)];
-    pin_push(buf, n, &digits)
+    minfmt::push_hex(buf, n, value as u64, 2)
 }
 
-fn pin_hex16(buf: &mut [u8], n: usize, mut value: u64) -> usize {
-    let mut tmp = [0u8; 16];
-    let mut i = 16;
-    while i > 0 {
-        i -= 1;
-        tmp[i] = hex_digit((value & 0xf) as u8);
-        value >>= 4;
-    }
-    pin_push(buf, n, &tmp)
+fn pin_hex16(buf: &mut [u8], n: usize, value: u64) -> usize {
+    minfmt::push_hex(buf, n, value, 16)
 }
 
-fn pin_dec(buf: &mut [u8], n: usize, mut value: u64) -> usize {
-    let mut tmp = [0u8; 20];
-    let mut i = 20;
-    if value == 0 {
-        i -= 1;
-        tmp[i] = b'0';
-    }
-    while value > 0 && i > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    pin_push(buf, n, &tmp[i..])
+fn pin_dec(buf: &mut [u8], n: usize, value: u64) -> usize {
+    minfmt::push_dec(buf, n, value)
 }
 
 fn halt() -> ! {
@@ -340,14 +309,6 @@ fn halt() -> ! {
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
         }
-    }
-}
-
-fn hex_digit(nibble: u8) -> u8 {
-    if nibble < 10 {
-        b'0' + nibble
-    } else {
-        b'a' + nibble - 10
     }
 }
 

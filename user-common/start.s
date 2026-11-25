@@ -1,4 +1,4 @@
-// EL0 telnet entry. global_asm! treats curly braces as format placeholders,
+// EL0 entry. global_asm! treats curly braces as format placeholders,
 // so this file has none. The kernel sets SP_EL0 before eret.
 
 .section .text.start, "ax"

@@ -116,26 +116,17 @@ pub fn encode_cache_meta(meta: &CacheMeta, out: &mut [u8]) -> Option<usize> {
 }
 
 fn push_bytes(out: &mut [u8], n: &mut usize, bytes: &[u8]) -> bool {
-    if *n + bytes.len() > out.len() {
+    if n.saturating_add(bytes.len()) > out.len() {
         return false;
     }
-    out[*n..*n + bytes.len()].copy_from_slice(bytes);
-    *n += bytes.len();
+    *n = minfmt::push_bytes(out, *n, bytes);
     true
 }
 
-fn push_u32(out: &mut [u8], n: &mut usize, mut value: u32) -> bool {
+fn push_u32(out: &mut [u8], n: &mut usize, value: u32) -> bool {
     let mut buf = [0u8; 10];
-    let mut i = buf.len();
-    if value == 0 {
-        return push_bytes(out, n, b"0");
-    }
-    while value > 0 {
-        i -= 1;
-        buf[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    push_bytes(out, n, &buf[i..])
+    let end = minfmt::push_dec(&mut buf, 0, value as u64);
+    push_bytes(out, n, &buf[..end])
 }
 
 pub fn decode_cache_meta(text: &[u8]) -> Option<CacheMeta> {

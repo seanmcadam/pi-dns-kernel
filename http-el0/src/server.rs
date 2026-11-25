@@ -1957,13 +1957,21 @@ pub(super) fn html_response(body: &str) -> HttpResponse {
     response
 }
 
-fn form_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+/// Form value with the name and the value trimmed.
+///
+/// `config::form_value` matches the raw name and does not trim. The trim
+/// stays here so `confirm=crash`, `clear`, `promote`, and `reboot` still
+/// match spaces around the token. A pair with no `=` is ignored.
+pub(super) fn form_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     for pair in body.split('&') {
-        if let Some((name, value)) = pair.split_once('=') {
-            if name.trim() == key {
-                return Some(value.trim());
-            }
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
         }
+        let raw = config::form_value(body, name).unwrap_or(value);
+        return Some(raw.trim());
     }
     None
 }

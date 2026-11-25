@@ -361,24 +361,7 @@ fn fresh_image(prev_stage: u32, image: [u8; 16]) -> Rec {
 }
 
 pub fn checksum(raw: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    let mut i = 0;
-    while i < raw.len() {
-        let byte = if (OFF_SUM..OFF_SUM + 4).contains(&i) {
-            0
-        } else {
-            raw[i]
-        };
-        crc ^= byte as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            bit += 1;
-        }
-        i += 1;
-    }
-    !crc
+    minfmt::crc32_ieee(raw, OFF_SUM..OFF_SUM + 4)
 }
 
 fn read_u16(raw: &[u8], at: usize) -> u16 {
@@ -405,6 +388,27 @@ mod tests {
         let mut raw = [0u8; LEN];
         assert!(store(&mut raw, rec));
         load(&raw).unwrap()
+    }
+
+    #[test]
+    fn checksum_matches_crc32_ieee() {
+        let mut raw = [0u8; LEN];
+        assert!(store(
+            &mut raw,
+            &Rec {
+                attempts: 2,
+                stage: STAGE_FS,
+                prev_stage: STAGE_NET,
+                fallback: 0,
+                good: 0,
+                restored: 0,
+                image: [0; 16],
+                reset: 0,
+            }
+        ));
+        let sum = read_u32(&raw, OFF_SUM);
+        assert_eq!(sum, minfmt::crc32_ieee(&raw, OFF_SUM..OFF_SUM + 4));
+        assert_eq!(sum, 0xF867_A32E);
     }
 
     #[test]

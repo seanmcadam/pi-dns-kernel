@@ -5,7 +5,7 @@
 
 use core::slice;
 
-core::arch::global_asm!(include_str!("start.s"));
+core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
 const TCP_LISTEN: u64 = 8;
 const TCP_ACCEPT: u64 = 9;
