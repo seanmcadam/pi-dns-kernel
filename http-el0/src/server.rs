@@ -69,6 +69,7 @@ const VCLOG_READ: u64 = 70;
 const CRASH: u64 = 71;
 const BOOT: u64 = 72;
 const BOARD: u64 = 73;
+const LOG_FILE: u64 = 81;
 
 const EAGAIN: i64 = -11;
 
@@ -181,6 +182,14 @@ fn serve(conn: i64) {
                 return;
             }
             Ready::Request(request) => {
+                if let Some(name) = log_download(&request) {
+                    if !check_auth(&request) {
+                        send_response(conn, &HttpResponse::unauthorized());
+                        return;
+                    }
+                    send_log_file(conn, name);
+                    return;
+                }
                 let response = handle(&request);
                 send_response(conn, &response);
                 return;
@@ -232,6 +241,9 @@ fn handle(request: &HttpRequest) -> HttpResponse {
     let (path, query) = http_server::split_target(&request.path);
     if path == "/firmware" || path.starts_with("/firmware/") {
         return firmware::handle(request);
+    }
+    if path == "/logfiles" || path.starts_with("/logfiles/") {
+        return handle_log_files(request, path, query);
     }
     match path {
         "/" => handle_index(),
@@ -973,6 +985,7 @@ fn handle_index() -> HttpResponse {
         <li><a href="/config">Configuration</a></li>
         <li><a href="/records">DNS Records (JSON)</a></li>
         <li><a href="/logs">Log</a></li>
+        <li><a href="/logfiles">Saved logs</a></li>
         <li><a href="/log-config">Log configuration</a></li>
         <li><a href="/display">Display</a></li>
         <li><a href="/dns-config">DNS cache</a></li>
@@ -2027,9 +2040,13 @@ fn read_config(num: u64) -> Option<String> {
 
 fn send_response(conn: i64, response: &HttpResponse) {
     let bytes = response.to_bytes();
+    let _ = send_bytes(conn, &bytes);
+}
+
+fn send_bytes(conn: i64, bytes: &[u8]) -> bool {
     let mut off = 0;
     while off < bytes.len() {
-        let end = (off + 2048).min(bytes.len());
+        let end = (off + 1024).min(bytes.len());
         let n = sys(
             TCP_SEND,
             conn as u64,
@@ -2044,9 +2061,201 @@ fn send_response(conn: i64, response: &HttpResponse) {
         } else if n == EAGAIN {
             yield_now();
         } else {
-            return;
+            return false;
         }
     }
+    true
+}
+
+fn log_download<'a>(request: &'a HttpRequest) -> Option<&'a str> {
+    if request.method != HttpMethod::GET {
+        return None;
+    }
+    let (path, query) = http_server::split_target(&request.path);
+    if !query.split('&').any(|part| part == "download=1") {
+        return None;
+    }
+    log_disk_name(path)
+}
+
+fn log_disk_name(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/logfiles/")?;
+    if rest.len() > 12 || rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    if rest == "LOG.TXT" {
+        return Some(rest);
+    }
+    let num = rest.strip_prefix("LOG")?.strip_suffix(".TXT")?;
+    if num.is_empty() || num.len() > 2 || num.starts_with('0') {
+        return None;
+    }
+    if !num.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = num.parse().ok()?;
+    if (1..=16).contains(&n) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn handle_log_files(request: &HttpRequest, path: &str, query: &str) -> HttpResponse {
+    if request.method != HttpMethod::GET {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    if path == "/logfiles" {
+        return log_file_index();
+    }
+    if query.split('&').any(|part| part == "download=1") {
+        return HttpResponse::not_found();
+    }
+    match log_disk_name(path) {
+        Some(name) => log_file_view(name),
+        None => HttpResponse::not_found(),
+    }
+}
+
+fn log_file_index() -> HttpResponse {
+    let mut buf = [0u8; 512];
+    let n = sys(
+        LOG_FILE,
+        0,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+        0,
+    );
+    let text = if n > 0 {
+        core::str::from_utf8(&buf[..n as usize]).unwrap_or("")
+    } else {
+        ""
+    };
+    let mut rows = String::new();
+    if text.is_empty() {
+        rows.push_str("<p>No saved log files.</p>");
+    } else {
+        rows.push_str("<ul>");
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(name) = parts.next() else {
+                continue;
+            };
+            if log_disk_name(&format!("/logfiles/{name}")).is_none() {
+                continue;
+            }
+            let len = parts.next().unwrap_or("0");
+            rows.push_str(&format!(
+                "<li><a href=\"/logfiles/{name}\">{name}</a> ({len} bytes) <a href=\"/logfiles/{name}?download=1\">download</a></li>"
+            ));
+        }
+        rows.push_str("</ul>");
+    }
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Saved logs</title></head><body><h1>Saved logs</h1><p>Read only. LOG.TXT and the LOG1.TXT through LOG16.TXT archives from LOG.JSN.</p>{rows}<p><a href=\"/\">Home</a></p></body></html>"
+    );
+    html_response(&html)
+}
+
+fn log_file_view(name: &str) -> HttpResponse {
+    const SHOW: usize = 24 * 1024;
+    let mut body = String::new();
+    let mut off = 0u64;
+    let mut chunk = [0u8; 1024];
+    loop {
+        if body.len() >= SHOW {
+            break;
+        }
+        let n = sys(
+            LOG_FILE,
+            1,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            chunk.as_mut_ptr() as u64,
+            chunk.len() as u64,
+            off,
+        );
+        if n < 0 {
+            return HttpResponse::not_found();
+        }
+        if n == 0 {
+            break;
+        }
+        let take = (n as usize).min(SHOW - body.len());
+        let piece = alloc::string::String::from_utf8_lossy(&chunk[..take]);
+        body.push_str(&piece);
+        off += n as u64;
+        if (n as usize) < chunk.len() {
+            break;
+        }
+    }
+    let more = if body.len() >= SHOW {
+        "<p>Showing the first 24576 bytes. Use download for the rest.</p>"
+    } else {
+        ""
+    };
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{name}</title></head><body><h1>{name}</h1><p><a href=\"/logfiles/{name}?download=1\">Download</a> · <a href=\"/logfiles\">All logs</a></p>{more}<pre>{}</pre></body></html>",
+        html_escape(&body)
+    );
+    html_response(&html)
+}
+
+fn send_log_file(conn: i64, name: &str) {
+    let len = sys(
+        LOG_FILE,
+        2,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        0,
+        0,
+        0,
+    );
+    if len < 0 {
+        send_response(conn, &HttpResponse::not_found());
+        return;
+    }
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    if !send_bytes(conn, header.as_bytes()) {
+        return;
+    }
+    let mut off = 0u64;
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = sys(
+            LOG_FILE,
+            1,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            chunk.as_mut_ptr() as u64,
+            chunk.len() as u64,
+            off,
+        );
+        if n < 0 {
+            let _ = send_bytes(conn, b"0\r\n\r\n");
+            return;
+        }
+        if n == 0 {
+            break;
+        }
+        let piece = &chunk[..n as usize];
+        let prefix = format!("{:x}\r\n", piece.len());
+        if !send_bytes(conn, prefix.as_bytes())
+            || !send_bytes(conn, piece)
+            || !send_bytes(conn, b"\r\n")
+        {
+            return;
+        }
+        off += n as u64;
+        if (n as usize) < chunk.len() {
+            break;
+        }
+    }
+    let _ = send_bytes(conn, b"0\r\n\r\n");
 }
 
 fn yield_now() {

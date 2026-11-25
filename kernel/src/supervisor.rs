@@ -38,6 +38,8 @@ struct Svc {
     pending_restart: bool,
     /// Set by `stop`. `finish` then parks the slot instead of counting a crash.
     hold: bool,
+    /// Listener health check. `finish` restarts the slot and does not count a crash.
+    bounce: bool,
     asid: u8,
     restarts: u32,
     backoff_ms: u64,
@@ -58,6 +60,7 @@ const fn blank() -> Svc {
         accounted: false,
         pending_restart: false,
         hold: false,
+        bounce: false,
         asid: 0,
         restarts: 0,
         backoff_ms: BACKOFF_START_MS,
@@ -311,6 +314,7 @@ pub fn died(slot: usize) {
 
 pub fn tick() {
     let now = crate::timer::millis();
+    bounce_stalled_http(now);
     crate::task::nudge_injected(now);
     let mut slot = 0;
     while slot < SLOTS {
@@ -535,7 +539,15 @@ fn finish(slot: usize) {
                 USED_PAGES = USED_PAGES.saturating_sub(pages(slot));
                 row.accounted = false;
             }
-            if row.hold {
+            if row.bounce {
+                row.bounce = false;
+                row.pending_restart = true;
+                row.adopted = false;
+                row.phase = BACKOFF;
+                row.next_ms = crate::timer::millis();
+                row.backoff_ms = BACKOFF_START_MS;
+                3
+            } else if row.hold {
                 row.hold = false;
                 row.pending_restart = false;
                 row.adopted = false;
@@ -551,10 +563,47 @@ fn finish(slot: usize) {
     };
     let label = name(slot);
     match outcome {
+        3 => say(2, label, "listen restart", 0, 0, 0),
         2 => say(1, label, "stopped", 0, 0, 0),
         1 => say(3, label, "gave up", ec, elr, far),
         _ => say(2, label, "fault", ec, elr, far),
     }
+}
+
+/// Port 80 has had no LISTEN socket for the idle budget. Runs from `tick`,
+/// which does not hold `FD`. The flag is set under `FD` and only read here.
+fn bounce_stalled_http(now: u64) {
+    let since = crate::user_fd::http_listen_down_ms();
+    if since == 0 || now.saturating_sub(since) < 5_000 {
+        return;
+    }
+    crate::user_fd::clear_http_listen_down();
+    let slot = 1;
+    let start = {
+        let _hold = guard();
+        if slot >= SLOTS {
+            return;
+        }
+        unsafe {
+            let row = &mut *svc(slot);
+            if row.phase != RUNNING {
+                return;
+            }
+            row.bounce = true;
+            row.hold = false;
+            row.phase = DRAINING;
+            DEAD[slot].store(1, Ordering::Release);
+            true
+        }
+    };
+    if !start {
+        return;
+    }
+    say(2, name(slot), "listen stalled", 0, 0, 0);
+    crate::logger::note_fault("http listen stalled; restarting");
+    crate::task::clear_live(slot);
+    crate::task::kill_slot(slot);
+    finish(slot);
 }
 
 fn record_crash(row: &mut Svc) -> bool {
