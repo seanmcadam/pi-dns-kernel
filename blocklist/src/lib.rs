@@ -169,6 +169,34 @@ pub fn needs_table_reload(
     applied != Some(epoch) || enabled_changed || urls_changed
 }
 
+/// An empty URL list drops the published names, the same as turning the
+/// feature off. A shorter list does not: the published half stays until the
+/// replacement table commits.
+pub fn must_unload(enabled: bool, url_count: usize) -> bool {
+    !enabled || url_count == 0
+}
+
+/// `url` left the configured set. Disabling the feature retires every URL
+/// that was loaded. An allow-list edit does not, because those URLs stay.
+pub fn retire_url(enabled: bool, new_urls: &[&str], url: &str) -> bool {
+    if !enabled {
+        return true;
+    }
+    !new_urls.iter().any(|item| *item == url)
+}
+
+/// Clear the published half's generation so a lookup fails open and the
+/// domain count is zero. The other half is left alone.
+pub fn unpublish_active(region: &mut [u8]) {
+    let active = pair_active(region);
+    let Some(half) = pair_half_mut(region, active) else {
+        return;
+    };
+    if half.len() >= 16 {
+        half[8..16].fill(0);
+    }
+}
+
 pub fn cache_is_complete(meta: Option<CacheMeta>, file_len: u32) -> bool {
     let Some(meta) = meta else {
         return false;
@@ -887,6 +915,57 @@ not a domain line
         assert!(needs_table_reload(Some(2), 2, true, false));
         assert!(needs_table_reload(Some(2), 2, false, true));
         assert!(!needs_table_reload(Some(2), 2, false, false));
+    }
+
+    #[test]
+    fn an_empty_url_list_unloads_like_turning_the_feature_off() {
+        let kept = ["https://example.com/a"];
+        let both = ["https://example.com/a", "https://example.com/b"];
+        assert!(must_unload(true, 0));
+        assert!(must_unload(false, 0));
+        assert!(must_unload(false, 2));
+        assert!(!must_unload(true, 1));
+        assert!(!must_unload(true, 2));
+        assert!(retire_url(true, &[], "https://example.com/a"));
+        assert!(retire_url(false, &kept, "https://example.com/a"));
+        assert!(retire_url(true, &kept, "https://example.com/b"));
+        assert!(!retire_url(true, &kept, "https://example.com/a"));
+        assert!(!retire_url(true, &both, "https://example.com/b"));
+    }
+
+    #[test]
+    fn unpublish_active_drops_the_live_half_only() {
+        let half = HEADER + 64;
+        let bytes = PAIR_HEAD + half * 2;
+        let (mut buf, offset) = aligned(bytes);
+        let region = &mut buf[offset..offset + bytes];
+        region.fill(0);
+        let inactive = pair_inactive(region);
+        {
+            let half = pair_half_mut(region, inactive).unwrap();
+            assert!(begin(half));
+            assert!(insert(half, name_hash("ads.example")));
+            commit(half);
+        }
+        pair_set_active(region, inactive);
+        assert!(pair_lookup(region, "ads.example"));
+        assert_eq!(pair_count(region), 1);
+        let other = pair_inactive(region);
+        let other_gen = {
+            let half = pair_half_mut(region, other).unwrap();
+            assert!(begin(half));
+            assert!(insert(half, name_hash("other.example")));
+            commit(half);
+            generation(half)
+        };
+        unpublish_active(region);
+        assert!(!pair_lookup(region, "ads.example"));
+        assert_eq!(pair_count(region), 0);
+        {
+            let half = pair_half_mut(region, other).unwrap();
+            assert_eq!(generation(half), other_gen);
+            assert!(lookup(half, "other.example"));
+        }
     }
 
     #[test]

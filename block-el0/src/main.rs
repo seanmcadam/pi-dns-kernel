@@ -658,6 +658,9 @@ pub extern "C" fn rust_main() -> ! {
         ) {
             let _ = block(13, 1, 0, 0, 0, 0);
             if let Some(published) = publish(&loaded) {
+                if loaded.urls != cfg.urls || loaded.enabled != cfg.enabled {
+                    write_index(&loaded);
+                }
                 cfg = loaded;
                 applied = Some(cfg.epoch);
                 counts = published;

@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.91" qemu/boot-output.txt && \
+   grep -q "version 0.1.92" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.91"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.92"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -328,7 +328,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.91" not in html:
+if forced.get("version") != plain.get("version") or "0.1.92" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 if "<pre>" not in dns_page or "&quot;upstreams&quot;: [" not in dns_page:
@@ -820,6 +820,21 @@ def get(path, authed=True):
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
         return 0, b""
 
+def post(path, body):
+    headers = dict(auth)
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(base + path, data=body.encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return 0, b""
+
+def arm(path):
+    return post(path, "confirm=crash")
+
 def page():
     status, body = get("/debug")
     if status != 200:
@@ -888,9 +903,26 @@ base_text = page()
 base_count = counters(base_text)
 print("baseline", base_count)
 
+dns_restarts = int(field(page(), "dns", "restarts"))
+status, body = get("/debug/crash/dns")
+if status != 405 or b"armed" in body:
+    fail("dns get %s %s" % (status, body[:80]))
+status, body = get("/debug/crash/block")
+if status != 405 or b"armed" in body:
+    fail("block get %s %s" % (status, body[:80]))
+status, body = post("/debug/crash/block", "confirm=no")
+if status != 400 or b"confirm=crash" not in body:
+    fail("block confirm %s %s" % (status, body[:80]))
+status, body = post("/debug/crash/dns", "kind=abort")
+if status != 400 or b"confirm=crash" not in body:
+    fail("dns confirm %s %s" % (status, body[:80]))
+if int(field(page(), "dns", "restarts")) != dns_restarts:
+    fail("rejected crash still restarted dns")
+print("crash confirm")
+
 for n in range(3):
     before = int(field(page(), "dns", "restarts"))
-    status, body = get("/debug/crash/dns")
+    status, body = arm("/debug/crash/dns")
     if status != 200 or b"armed" not in body:
         fail("dns crash %s %s" % (status, body[:80]))
     if wait_running("dns", before, 8) is None or not dns_up(8):
@@ -918,7 +950,7 @@ if b"elfault dns" not in console or b"ec=24" not in console or b"far=00000000000
 print("dns fault logged")
 
 before = int(field(page(), "http", "restarts"))
-status, body = get("/debug/crash/http")
+status, body = arm("/debug/crash/http")
 if status != 200 or b"armed" not in body:
     fail("http crash %s %s" % (status, body[:80]))
 time.sleep(0.6)
@@ -961,7 +993,7 @@ refusal = read_for(extra, 2, b"busy")
 extra.close()
 if b"busy" not in refusal:
     fail("17th was not refused %s" % refusal[:80])
-status, body = get("/debug/crash/telnet-worker")
+status, body = arm("/debug/crash/telnet-worker")
 if status != 200 or b"armed" not in body:
     fail("worker crash %s %s" % (status, body[:80]))
 name = ("slot%d.local" % int(time.time())).encode()
@@ -1000,7 +1032,7 @@ try:
 except FileNotFoundError:
     mark = 0
 live = clients[0]
-status, body = get("/debug/crash/dns")
+status, body = arm("/debug/crash/dns")
 if status != 200:
     fail("dns crash during telnet %s" % status)
 deadline = time.time() + 6
@@ -1033,12 +1065,12 @@ for sock in clients:
 
 for n in range(4):
     before = int(field(page(), "log", "restarts"))
-    status, body = get("/debug/crash/log")
+    status, body = arm("/debug/crash/log")
     if status != 200 or b"armed" not in body:
         fail("log crash %s %s" % (status, body[:80]))
     if wait_running("log", before, 8) is None:
         fail("log did not return after crash %d\n%s" % (n + 1, page()))
-status, body = get("/debug/crash/log")
+status, body = arm("/debug/crash/log")
 if status != 200 or b"armed" not in body:
     fail("final log crash %s" % status)
 time.sleep(2.5)
@@ -2180,7 +2212,12 @@ except Exception:
 if doc.get("max_bytes") != 4096 or doc.get("archives") != 1:
     fail("settings did not persist %s" % body[:200])
 print("persisted")
-status, armed = req("GET", "/debug/crash/log")
+status, armed = req(
+    "POST",
+    "/debug/crash/log",
+    "confirm=crash",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
 if status != 200 or b"armed" not in armed:
     fail("crash log %s %s" % (status, armed[:80]))
 import time
@@ -2285,12 +2322,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.91" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.92" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.91" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.92" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2306,7 +2343,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.91" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.92" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2553,12 +2590,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.91":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.92":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.91" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.92" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -4084,8 +4121,36 @@ listed = doc.get("block_urls") or []
 if not listed or listed[0].get("entries", 0) < 2 or listed[0].get("mtime", 0) <= 0:
     print("url", listed)
     sys.exit(1)
+got = subprocess.run(
+    ["curl", "-s", "-u", "admin:admin", "--max-time", "3",
+     "-o", "/tmp/block-get.txt", "-w", "%{http_code}",
+     "http://127.0.0.1:%s/debug/crash/block" % http],
+    capture_output=True,
+)
+code = got.stdout.decode().strip()
+body = open("/tmp/block-get.txt", "rb").read()
+if code != "405" or b"armed" in body:
+    print("get crash", code, body[:80])
+    sys.exit(1)
+still = status()
+if not still or still.get("block_domains", 0) < 2:
+    print("get dropped lists", None if still is None else still.get("block_domains"))
+    sys.exit(1)
+bad = subprocess.run(
+    ["curl", "-s", "-u", "admin:admin", "--max-time", "3",
+     "-o", "/tmp/block-bad.txt", "-w", "%{http_code}",
+     "-X", "POST", "-d", "confirm=no",
+     "http://127.0.0.1:%s/debug/crash/block" % http],
+    capture_output=True,
+)
+bad_code = bad.stdout.decode().strip()
+bad_body = open("/tmp/block-bad.txt", "rb").read()
+if bad_code != "400" or b"confirm=crash" not in bad_body:
+    print("bad confirm", bad_code, bad_body[:80])
+    sys.exit(1)
 subprocess.check_output(
     ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
+     "-X", "POST", "-d", "confirm=crash",
      "http://127.0.0.1:%s/debug/crash/block" % http],
     stderr=subprocess.DEVNULL,
 )
@@ -4132,6 +4197,67 @@ if b"OLDCRASH" in last_crash or b"elfault" not in last_crash.lower():
 after = status()
 if not after or after.get("safe_mode") != 0:
     print("safe", None if after is None else after.get("safe_mode"))
+    sys.exit(1)
+back = None
+for _ in range(40):
+    back = status()
+    if back and back.get("block_domains", 0) >= 2:
+        break
+    time.sleep(0.5)
+else:
+    print("restart lists", None if back is None else back.get("block_domains"))
+    sys.exit(1)
+empty = json.loads(json.dumps(allow_edit))
+empty["block"]["enabled"] = 1
+empty["block"]["urls"] = []
+try:
+    fetches = open("qemu/block-serial.txt", "rb").read().count(b"block fetched")
+except OSError:
+    fetches = 0
+subprocess.check_output(
+    ["curl", "-sf", "-u", "admin:admin", "--max-time", "5",
+     "-H", "Content-Type: application/json",
+     "--data-binary", json.dumps(empty),
+     "http://127.0.0.1:%s/config/file/config" % http],
+    stderr=subprocess.DEVNULL,
+)
+cleared_urls = None
+ads = ""
+for _ in range(20):
+    cleared_urls = status()
+    ads = dig("ads.example")
+    urls = (cleared_urls or {}).get("block_urls") or []
+    if cleared_urls and urls == [] and cleared_urls.get("block_domains") == 0 and ads != "0.0.0.0":
+        break
+    time.sleep(0.5)
+else:
+    print("empty urls", None if cleared_urls is None else cleared_urls.get("block_domains"), ads)
+    sys.exit(1)
+subprocess.check_output(
+    ["curl", "-sf", "-u", "admin:admin", "--max-time", "5",
+     "-H", "Content-Type: application/json",
+     "--data-binary", json.dumps(allow_edit),
+     "http://127.0.0.1:%s/config/file/config" % http],
+    stderr=subprocess.DEVNULL,
+)
+reloaded = None
+for _ in range(40):
+    reloaded = status()
+    if reloaded and reloaded.get("block_domains", 0) >= 2 and (reloaded.get("block_urls") or []):
+        break
+    time.sleep(0.5)
+else:
+    print("reload after empty", None if reloaded is None else reloaded.get("block_domains"))
+    sys.exit(1)
+try:
+    fetched_again = open("qemu/block-serial.txt", "rb").read().count(b"block fetched")
+except OSError:
+    fetched_again = fetches
+if fetched_again <= fetches:
+    print("cache reused", fetches, fetched_again)
+    sys.exit(1)
+if dig("ads.example") != "0.0.0.0":
+    print("ads after reload", dig("ads.example"))
     sys.exit(1)
 raw = subprocess.check_output(
     ["curl", "-sf", "-u", "admin:admin", "--max-time", "3",
