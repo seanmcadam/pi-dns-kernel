@@ -4,7 +4,6 @@
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use http_server::{HttpMethod, HttpRequest, HttpResponse};
 
 const FW: u64 = 67;
@@ -306,20 +305,20 @@ fn chunk(request: &HttpRequest) -> HttpResponse {
         return chunk_raw(request);
     }
     let body = core::str::from_utf8(&request.body).unwrap_or("");
-    let kind = match form_value(body, "kind") {
+    let kind = match super::form_value(body, "kind") {
         Some("test") => 1,
         Some("kernel") => 2,
         _ => return super::bad_request("kind must be test or kernel"),
     };
-    let offset: u64 = match form_value(body, "offset").and_then(|text| text.parse().ok()) {
+    let offset: u64 = match super::form_value(body, "offset").and_then(|text| text.parse().ok()) {
         Some(value) => value,
         None => return super::bad_request("offset required"),
     };
-    let total: u64 = match form_value(body, "total").and_then(|text| text.parse().ok()) {
+    let total: u64 = match super::form_value(body, "total").and_then(|text| text.parse().ok()) {
         Some(value) => value,
         None => return super::bad_request("total required"),
     };
-    let data_hex = form_value(body, "data").unwrap_or("");
+    let data_hex = super::form_value(body, "data").unwrap_or("");
     let mut data = [0u8; 1792];
     let Some(n) = decode_hex(data_hex, &mut data) else {
         return super::bad_request("data must be hex");
@@ -332,8 +331,8 @@ fn chunk(request: &HttpRequest) -> HttpResponse {
         offset,
         total,
         &data[..n],
-        form_value(body, "final") == Some("1"),
-        form_value(body, "sha256"),
+        super::form_value(body, "final") == Some("1"),
+        super::form_value(body, "sha256"),
     )
 }
 
@@ -434,17 +433,22 @@ fn config(request: &HttpRequest) -> HttpResponse {
         return apply_config(kind, commit, text);
     }
     let body = core::str::from_utf8(&request.body).unwrap_or("");
-    if form_value(body, "preset") == Some("1") {
-        let commit: u64 = if form_value(body, "commit") == Some("1") {
+    if super::form_value(body, "preset") == Some("1") {
+        let commit: u64 = if super::form_value(body, "commit") == Some("1") {
             1
         } else {
             0
         };
         return preset(commit);
     }
-    let kind = form_value(body, "kind").unwrap_or("");
-    let commit = form_value(body, "commit").unwrap_or("0");
-    let text = percent_decode(form_value(body, "text").unwrap_or(""));
+    let kind = super::form_value(body, "kind").unwrap_or("");
+    let commit = super::form_value(body, "commit").unwrap_or("0");
+    let raw = super::form_value(body, "text").unwrap_or("");
+    let text = match config::decode_form_value(raw) {
+        Ok(text) => text,
+        Err(err) if err.message.contains("4096") => return super::bad_request("too large"),
+        Err(_) => return super::bad_request("malformed form"),
+    };
     apply_config(kind, commit, &text)
 }
 
@@ -497,10 +501,10 @@ fn reboot(request: &HttpRequest) -> HttpResponse {
         return method_not();
     }
     let body = core::str::from_utf8(&request.body).unwrap_or("");
-    if form_value(body, "confirm") != Some("reboot") {
+    if super::form_value(body, "confirm") != Some("reboot") {
         return super::bad_request("Confirmation required");
     }
-    let tryboot: u64 = if form_value(body, "tryboot") == Some("1") {
+    let tryboot: u64 = if super::form_value(body, "tryboot") == Some("1") {
         1
     } else {
         0
@@ -558,10 +562,10 @@ fn promote(request: &HttpRequest) -> HttpResponse {
         return method_not();
     }
     let body = core::str::from_utf8(&request.body).unwrap_or("");
-    if form_value(body, "confirm") != Some("promote") {
+    if super::form_value(body, "confirm") != Some("promote") {
         return super::bad_request("Confirmation required");
     }
-    let force: u64 = if form_value(body, "force") == Some("1") {
+    let force: u64 = if super::form_value(body, "force") == Some("1") {
         1
     } else {
         0
@@ -588,7 +592,7 @@ fn rollback(request: &HttpRequest) -> HttpResponse {
         return method_not();
     }
     let body = core::str::from_utf8(&request.body).unwrap_or("");
-    if form_value(body, "confirm") != Some("rollback") {
+    if super::form_value(body, "confirm") != Some("rollback") {
         return super::bad_request("Confirmation required");
     }
     let rc = super::sys(FW, 11, 0, 0, 0, 0, 0);
@@ -683,72 +687,17 @@ fn json_text(text: &str) -> String {
 }
 
 fn hex_encode(src: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::new();
+    let mut pair = [0u8; 2];
     for byte in src {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0xf) as usize] as char);
+        let n = minfmt::hex_encode(&[*byte], &mut pair);
+        out.push_str(core::str::from_utf8(&pair[..n]).unwrap_or(""));
     }
     out
 }
 
 fn decode_hex(text: &str, out: &mut [u8]) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if bytes.len() % 2 != 0 || bytes.len() / 2 > out.len() {
-        return None;
-    }
-    let n = bytes.len() / 2;
-    let mut i = 0;
-    while i < n {
-        let hi = hex_val(bytes[i * 2])?;
-        let lo = hex_val(bytes[i * 2 + 1])?;
-        out[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    Some(n)
-}
-
-fn hex_val(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn form_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
-    for pair in body.split('&') {
-        if let Some((name, value)) = pair.split_once('=') {
-            if name.trim() == key {
-                return Some(value.trim());
-            }
-        }
-    }
-    None
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_default()
+    minfmt::hex_decode(text.as_bytes(), out)
 }
 
 fn parse_read(path: &str) -> Option<(u64, u64)> {

@@ -311,6 +311,7 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         "config",
         &config_rlib,
     );
+    let minfmt = compile_minfmt(out_dir, manifest_dir, &rustc);
 
     let elf = out_dir.join("http.elf");
     let link = dir.join("link.ld");
@@ -340,6 +341,8 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
         .arg(format!("version={}", version.display()))
         .arg("--extern")
         .arg(format!("config={}", config_rlib.display()))
+        .arg("--extern")
+        .arg(format!("minfmt={}", minfmt.display()))
         .arg("-o")
         .arg(&elf)
         .arg(dir.join("src/main.rs"))
