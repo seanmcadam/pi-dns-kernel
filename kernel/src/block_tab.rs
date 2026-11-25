@@ -23,6 +23,10 @@ static SCRUB_AT: AtomicUsize = AtomicUsize::new(0);
 /// Which half `begin` opened. Inserts and `commit` keep using it after
 /// `SCRUB_AT` returns to zero.
 static SCRUB_HALF: AtomicU64 = AtomicU64::new(0);
+/// Bumped when a config apply drops the published lists. A scrub that
+/// started before the bump must not commit those names back.
+static DROP_TICK: AtomicU64 = AtomicU64::new(0);
+static SCRUB_TICK: AtomicU64 = AtomicU64::new(0);
 /// 256 KiB per syscall. The owner polls DNS between chunks, and the chunk
 /// itself stays short enough that a query is not stuck behind it.
 const SCRUB_CHUNK: usize = 32 * 1024;
@@ -59,6 +63,22 @@ impl UrlRow {
 }
 
 static ROWS: Mutex<[UrlRow; URL_MAX]> = Mutex::new([const { UrlRow::empty() }; URL_MAX]);
+
+/// Drop the published names now. An empty URL list and turning the
+/// feature off both use this, so the status count does not wait for the
+/// blocker to finish a download it already started.
+pub fn unload() {
+    {
+        // Held across the tick and the generation clear so a commit on
+        // another core cannot flip the old half back in between.
+        let _guard = LOCK.lock();
+        DROP_TICK.fetch_add(1, Ordering::AcqRel);
+        if let Some(mem) = region() {
+            blocklist::unpublish_active(mem);
+        }
+    }
+    let _ = clear_rows(0);
+}
 
 pub fn set_allow(names: &[alloc::string::String]) {
     let mut store = ALLOW.lock();
@@ -202,6 +222,7 @@ fn begin() -> i64 {
     let idx = if at == 0 {
         let idx = blocklist::pair_inactive(mem);
         SCRUB_HALF.store(idx, Ordering::Relaxed);
+        SCRUB_TICK.store(DROP_TICK.load(Ordering::Acquire), Ordering::Relaxed);
         idx
     } else {
         SCRUB_HALF.load(Ordering::Relaxed)
@@ -246,6 +267,10 @@ fn commit() -> i64 {
     let Some(_guard) = LOCK.try_lock() else {
         return -11;
     };
+    if DROP_TICK.load(Ordering::Acquire) != SCRUB_TICK.load(Ordering::Relaxed) {
+        SCRUB_AT.store(0, Ordering::Relaxed);
+        return -1;
+    }
     let Some(mem) = region() else {
         return -5;
     };

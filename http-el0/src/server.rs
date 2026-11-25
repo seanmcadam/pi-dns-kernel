@@ -265,14 +265,14 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/debug/cache-plant" => handle_cache_plant(request),
         "/debug" => handle_debug(),
         "/debug/spin" => handle_spin(),
-        "/debug/crash/dns" => handle_crash(0, 0),
-        "/debug/crash/http" => handle_crash(1, 0),
-        "/debug/crash/spin" => handle_crash(2, 0),
-        "/debug/crash/log" => handle_crash(3, 0),
-        "/debug/crash/telnet" => handle_crash(4, 0),
-        "/debug/crash/block" => handle_crash(7, 0),
+        "/debug/crash/dns" => handle_crash(request, 0, 0),
+        "/debug/crash/http" => handle_crash(request, 1, 0),
+        "/debug/crash/spin" => handle_crash(request, 2, 0),
+        "/debug/crash/log" => handle_crash(request, 3, 0),
+        "/debug/crash/telnet" => handle_crash(request, 4, 0),
+        "/debug/crash/block" => handle_crash(request, 7, 0),
         "/blocklist" => blocklist_json(),
-        "/debug/crash/telnet-worker" => handle_crash(4, 1),
+        "/debug/crash/telnet-worker" => handle_crash(request, 4, 1),
         "/debug/fault/guard" => {
             let _ = sys(FAULT_GUARD, 0, 0, 0, 0, 0, 0);
             loop {}
@@ -879,7 +879,14 @@ fn handle_debug() -> HttpResponse {
     response
 }
 
-fn handle_crash(slot: u64, worker: u64) -> HttpResponse {
+fn handle_crash(request: &HttpRequest, slot: u64, worker: u64) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    if form_value(body, "confirm") != Some("crash") {
+        return bad_request("confirm=crash required\n");
+    }
     let rc = sys(DEBUG_CRASH, slot, worker, 0, 0, 0, 0);
     if rc < 0 {
         return HttpResponse::internal_error();

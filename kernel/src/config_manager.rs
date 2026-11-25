@@ -127,8 +127,18 @@ fn publish(config: &Config) {
     let previous = CURRENT.lock().clone();
     crate::block_tab::set_allow(&config.block.allow);
     if let Some(old) = previous.as_ref() {
-        if old.block.enabled != config.block.enabled || old.block.urls != config.block.urls {
+        let urls_changed = old.block.urls != config.block.urls;
+        let enabled_changed = old.block.enabled != config.block.enabled;
+        if urls_changed || enabled_changed {
             BLOCK_EPOCH.fetch_add(1, Ordering::Release);
+            // `CURRENT` is not held. Deleting the cache takes `FS`.
+            retire_block_caches(&old.block.urls, config.block.enabled, &config.block.urls);
+            if blocklist::must_unload(config.block.enabled, config.block.urls.len())
+                && old.block.enabled
+                && !old.block.urls.is_empty()
+            {
+                crate::block_tab::unload();
+            }
         }
     }
     BOARD_DETECT.store(config.board_detect, Ordering::Relaxed);
@@ -925,6 +935,40 @@ pub fn write_http_info(out: &mut [u8]) -> Option<usize> {
     used = push_slice(out, used, b" ")?;
     used = push_slice(out, used, config.http.username.as_bytes())?;
     push_slice(out, used, b"\n")
+}
+
+/// Delete list files that are no longer configured. An empty URL list and
+/// a disabled block section both drop every file the previous config had,
+/// including the index, so the next boot does not reload them.
+fn retire_block_caches(old_urls: &[alloc::string::String], enabled: bool, new_urls: &[alloc::string::String]) {
+    let mut kept = [""; blocklist::URL_MAX];
+    let mut kept_n = 0;
+    if enabled {
+        for url in new_urls {
+            if kept_n >= kept.len() {
+                break;
+            }
+            kept[kept_n] = url.as_str();
+            kept_n += 1;
+        }
+    }
+    let kept = &kept[..kept_n];
+    for url in old_urls {
+        if !blocklist::retire_url(enabled, kept, url) {
+            continue;
+        }
+        let list = blocklist::list_file(url);
+        let meta = blocklist::meta_file(url);
+        if let Ok(name) = core::str::from_utf8(&list) {
+            let _ = crate::fs::delete_file(name);
+        }
+        if let Ok(name) = core::str::from_utf8(&meta) {
+            let _ = crate::fs::delete_file(name);
+        }
+    }
+    if blocklist::must_unload(enabled, new_urls.len()) {
+        let _ = crate::fs::delete_file(blocklist::INDEX_NAME);
+    }
 }
 
 pub fn block_text() -> Result<alloc::string::String, alloc::string::String> {
