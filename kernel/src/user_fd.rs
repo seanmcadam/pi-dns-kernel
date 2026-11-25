@@ -1445,6 +1445,10 @@ fn crash_call(args: [u64; 6]) -> i64 {
         1 => crash_copy(args[1], args[2], crate::crash::status),
         2 => crash_copy(args[1], args[2], crate::crash::last_text),
         3 => crash_copy(args[1], args[2], crate::crash::list_text),
+        // Deletes the crash files. `FD` is already held. `clear` takes
+        // `FS` only. A supervisor action would have to run after this
+        // syscall returns, once `FD` is dropped.
+        4 => crate::crash::clear(),
         _ => EINVAL,
     }
 }

@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.90" qemu/boot-output.txt && \
+   grep -q "version 0.1.91" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.90"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.91"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -303,13 +303,24 @@ echo "Test 62: /status HTML for browsers, JSON for scripts"
 if timeout 5 curl -s -u admin:admin -H 'Accept: text/html' "http://127.0.0.1:${HTTP_HOST_PORT}/status" > qemu/status-html.txt \
     && timeout 5 curl -s -u admin:admin -H 'Accept: text/html' "http://127.0.0.1:${HTTP_HOST_PORT}/status?format=json" > qemu/status-fmt.json \
     && timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/json/status" > qemu/status-json.txt \
-    && python3 - qemu/status-html.txt qemu/status-fmt.json qemu/status-json.txt <<'PY'
+    && timeout 5 curl -s -u admin:admin "http://127.0.0.1:${HTTP_HOST_PORT}/dns-config" > qemu/dns-config-page.txt \
+    && python3 - qemu/status-html.txt qemu/status-fmt.json qemu/status-json.txt qemu/dns-config-page.txt <<'PY'
 import json, sys
 html = open(sys.argv[1], encoding="utf-8").read()
 forced = json.load(open(sys.argv[2]))
 plain = json.load(open(sys.argv[3]))
+dns_page = open(sys.argv[4], encoding="utf-8").read()
 if "<h1" not in html or "boot_good" not in html or "/crash/list" not in html or "/json/status" not in html:
     print("html", html[:240])
+    sys.exit(1)
+if 'value="clear"' not in html or "renderUpstreams" not in html or "entry.ip" not in html:
+    print("status view missing clear or upstream table")
+    sys.exit(1)
+if 'text("upstreams"' in html or "[object Object]" in html:
+    print("upstreams still dumped as text")
+    sys.exit(1)
+if "JSON.stringify(d, null, 2)" not in html or '<pre id="status_json">' not in html:
+    print("status json is not indented")
     sys.exit(1)
 if html.lstrip().startswith("{"):
     print("html was json")
@@ -317,8 +328,11 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.90" not in html:
+if forced.get("version") != plain.get("version") or "0.1.91" not in html:
     print("version", forced.get("version"), plain.get("version"))
+    sys.exit(1)
+if "<pre>" not in dns_page or "&quot;upstreams&quot;: [" not in dns_page:
+    print("dns config is not pretty", dns_page[dns_page.find("<pre>"):dns_page.find("<pre>") + 180])
     sys.exit(1)
 print("status html", len(html), "json", plain.get("version"))
 sys.exit(0)
@@ -2271,12 +2285,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.90" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.91" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.90" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.91" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2292,7 +2306,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.90" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.91" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2539,12 +2553,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.90":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.91":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.90" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.91" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3542,6 +3556,58 @@ for kind, needle in (("abort", b"kind data abort"), ("panic", b"kind panic"), ("
     if doc.get("crash_count", 0) < 1 or "CRASH" not in doc.get("last_crash", ""):
         fail("status crash %s" % doc.get("last_crash"))
 print("crash records", doc.get("crash_count"), doc.get("last_crash"))
+status, body = req(
+    "POST",
+    "/crash/clear",
+    "confirm=no",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 400 or b"confirm=clear" not in body:
+    fail("clear confirm %s %s" % (status, body[:160]))
+status, body = req(
+    "POST",
+    "/crash/clear",
+    "confirm=clear",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200 or b"cleared" not in body:
+    fail("clear %s %s" % (status, body[:160]))
+status, listing = req("GET", "/crash/list")
+if status != 200 or b"CRASH" in listing:
+    fail("list after clear %s %s" % (status, listing[:200]))
+status, raw = req("GET", "/status")
+doc = json.loads(raw)
+if doc.get("crash_count") != 0 or doc.get("last_crash") != "":
+    fail("cleared status %s %s" % (doc.get("crash_count"), doc.get("last_crash")))
+def boot_banners():
+    try:
+        return open(serial_path, "rb").read().count(b"=== Pi4 DNS Server Kernel ===")
+    except OSError:
+        return 0
+
+before_banners = boot_banners()
+status, body = req(
+    "POST",
+    "/power",
+    "action=reboot&confirm=reboot",
+    {"Content-Type": "application/x-www-form-urlencoded"},
+)
+if status != 200 or b"Reboot" not in body:
+    fail("reboot after clear %s %s" % (status, body[:160]))
+deadline = time.time() + 60
+while time.time() < deadline and boot_banners() <= before_banners:
+    time.sleep(0.3)
+if boot_banners() <= before_banners:
+    fail("reboot after clear did not restart")
+wait_up()
+status, listing = req("GET", "/crash/list")
+if status != 200 or b"CRASH" in listing:
+    fail("list after reboot %s %s" % (status, listing[:200]))
+status, raw = req("GET", "/status")
+doc = json.loads(raw)
+if doc.get("crash_count") != 0 or doc.get("last_crash") != "":
+    fail("crash returned %s %s" % (doc.get("crash_count"), doc.get("last_crash")))
+print("crash logs cleared")
 os.kill(pid, signal.SIGTERM)
 sys.exit(0)
 PY

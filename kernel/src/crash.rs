@@ -591,6 +591,37 @@ pub fn list_text(out: &mut [u8]) -> usize {
     n
 }
 
+/// Delete `CRASH000.TXT` through `CRASH007.TXT` and clear the published
+/// count and last-crash text. The loop streak and the safe flag stay, so
+/// a crash loop is not forgotten. HTTP task only.
+///
+/// Called from a syscall that already holds `FD`. This takes `FS` and the
+/// crash publish lock. It does not take the supervisor lock: that lock is
+/// dropped before `FD`.
+pub fn clear() -> i64 {
+    if crate::percpu::slot() != crate::task::HTTP_SLOT {
+        return -3;
+    }
+    let raw = slot();
+    if crash_rec::drop_record(raw) {
+        clean(raw.as_ptr() as u64, crash_rec::SLOT);
+    }
+    let mut failed = false;
+    let mut seq = 1u32;
+    while seq <= crash_rec::KEEP {
+        let name = crash_rec::file_name(seq);
+        if let Ok(name) = core::str::from_utf8(&name) {
+            match crate::fs::delete_crash(name) {
+                Ok(()) | Err(crate::fs::FsError::NotInitialized) => {}
+                Err(_) => failed = true,
+            }
+        }
+        seq += 1;
+    }
+    publish_card(false, &[0; 16], &[], 0);
+    if failed { -5 } else { 0 }
+}
+
 fn core_id() -> u32 {
     let ptr: u64;
     unsafe {

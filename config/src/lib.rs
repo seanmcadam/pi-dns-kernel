@@ -205,6 +205,24 @@ pub fn format_document(value: &Value) -> Result<String, Error> {
     })
 }
 
+/// Indent `text` for a page. The upload limit does not apply. A value this
+/// parser cannot read is returned unchanged.
+pub fn indent_json(text: &str) -> String {
+    let Ok(value) = parse(text) else {
+        return String::from(text);
+    };
+    let mut buf = DocBuf::with_limit(16 * 1024);
+    write_value(&mut buf, &value, 0, true);
+    if buf.fail != Fail::None {
+        return String::from(text);
+    }
+    buf.push_str("\n");
+    if buf.fail != Fail::None {
+        return String::from(text);
+    }
+    buf.out
+}
+
 pub fn check(value: &Value, fields: &[Field]) -> Result<(), Error> {
     check_object(value, fields, "$")
 }
@@ -831,6 +849,7 @@ impl<'a> Parser<'a> {
 struct DocBuf {
     out: String,
     fail: Fail,
+    limit: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -842,9 +861,14 @@ enum Fail {
 
 impl DocBuf {
     fn new() -> Self {
+        Self::with_limit(UPLOAD_MAX)
+    }
+
+    fn with_limit(limit: usize) -> Self {
         Self {
-            out: String::with_capacity(UPLOAD_MAX),
+            out: String::with_capacity(limit.min(UPLOAD_MAX)),
             fail: Fail::None,
+            limit,
         }
     }
 
@@ -857,7 +881,7 @@ impl DocBuf {
         if self.fail != Fail::None {
             return;
         }
-        if self.out.len().saturating_add(text.len()) > UPLOAD_MAX {
+        if self.out.len().saturating_add(text.len()) > self.limit {
             self.fail = Fail::Size;
             return;
         }
@@ -1339,6 +1363,17 @@ mod tests {
             .unwrap_err()
             .message
             .contains("out of bounds"));
+    }
+
+    #[test]
+    fn indent_json_breaks_an_upstream_object_onto_lines() {
+        let raw = r#"{"upstreams":[{"ip":"8.8.8.8","up":true},{"ip":"1.1.1.1","up":false}]}"#;
+        let pretty = indent_json(raw);
+        assert!(pretty.contains('\n'));
+        assert!(pretty.contains("\"ip\": \"8.8.8.8\""));
+        assert!(pretty.contains("\"up\": true"));
+        assert!(pretty.contains("\"up\": false"));
+        assert_eq!(parse(&pretty).unwrap().get("upstreams").and_then(Value::as_array).map(|items| items.len()), Some(2));
     }
 
     #[test]

@@ -242,7 +242,13 @@ fn handle(request: &HttpRequest) -> HttpResponse {
                 status_json()
             }
         }
-        "/json/status" => status_json(),
+        "/json/status" => {
+            if http_server::wants_html(query, request.get_header("Accept")) {
+                status_json_page()
+            } else {
+                status_json()
+            }
+        }
         "/vclog" => handle_vclog(),
         "/config" => handle_config(request),
         "/records" => handle_records(request),
@@ -279,6 +285,7 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/debug/boot" => handle_debug_boot(request),
         "/crash/last" => handle_crash_body(2),
         "/crash/list" => handle_crash_body(3),
+        "/crash/clear" => handle_crash_clear(request),
         _ => HttpResponse::not_found(),
     }
 }
@@ -300,14 +307,15 @@ fn handle_log_config(request: &HttpRequest) -> HttpResponse {
 }
 
 fn log_config_page() -> HttpResponse {
-    let current = read_config_file(1).unwrap_or_default();
+    let current = json_block(&read_config_file(1).unwrap_or_default());
     let html = format!(
         r#"<!DOCTYPE html>
 <html><body>
 <h1>Log configuration</h1>
 <p>File <code>LOG.JSN</code>. Schema version 1.</p>
 <p>max_bytes 4096..=65536. archives 0..=16. max_bytes * (archives + 1) must be &lt;= 1048576.</p>
-<p>Current: {current}</p>
+<p>Current:</p>
+{current}
 <form method="POST" action="/log-config">
 <label>max_bytes <input name="max_bytes" required></label>
 <label>archives <input name="archives" required></label>
@@ -360,7 +368,7 @@ fn handle_dns_config(request: &HttpRequest) -> HttpResponse {
 }
 
 fn dns_config_page() -> HttpResponse {
-    let current = read_config_file(0).unwrap_or_default();
+    let current = json_block(&read_config_file(0).unwrap_or_default());
     let html = format!(
         r#"<!DOCTYPE html>
 <html><body>
@@ -369,7 +377,8 @@ fn dns_config_page() -> HttpResponse {
 <p>cache_size 1..=1024. Each slot reserves 800 bytes for a 255-byte name and a 512-byte response. 1024 slots reserve 823296 bytes, which fits the DNS task heap.</p>
 <p>cache_reap_interval_secs 1..=3600. Default 5. The reaper returns expired slots to the free list. Eviction, when the free list is empty, drops the least recently used live entry.</p>
 <p>cache_size is reserved when dns-el0 starts. A change reports restart. The reap interval is read on each pass.</p>
-<p>Current: {current}</p>
+<p>Current:</p>
+{current}
 <form method="POST" action="/dns-config">
 <label>cache_size <input name="cache_size" required></label>
 <label>cache_reap_interval_secs <input name="cache_reap_interval_secs" required></label>
@@ -521,7 +530,7 @@ fn power_block() -> String {
 }
 
 fn display_page() -> HttpResponse {
-    let current = read_config_file(0).unwrap_or_default();
+    let current = json_block(&read_config_file(0).unwrap_or_default());
     let present = sys(DISPLAY_IO, 7, 0, 0, 0, 0, 0);
     let vnc_block = vnc_block();
     let hdmi = if present == 1 {
@@ -536,7 +545,8 @@ fn display_page() -> HttpResponse {
 <p>VNC is an EL0 RFB 3.8 server. It is off until this form enables it. Default port 5900, bounds 1..=65535. Password 0..=8 printable bytes; empty means no authentication. The console is 640 by 480.</p>
 <p>HDMI is a separate process on Pi 4 and Pi 5. {hdmi}. vnc and hdmi are 0 or 1.</p>
 {vnc_block}
-<p>Current: {current}</p>
+<p>Current:</p>
+{current}
 <form method="POST" action="/display">
 <label>vnc <input name="vnc" required></label>
 <label>vnc_port <input name="vnc_port" required></label>
@@ -700,6 +710,21 @@ fn handle_debug_crash(request: &HttpRequest) -> HttpResponse {
     let mut response = HttpResponse::ok("crashing\n");
     response.add_header("Content-Type", "text/plain; charset=utf-8");
     response
+}
+
+fn handle_crash_clear(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    if form_value(body, "confirm") != Some("clear") {
+        return bad_request("confirm=clear required\n");
+    }
+    let rc = sys(CRASH, 4, 0, 0, 0, 0, 0);
+    if rc < 0 {
+        return bad_request("could not clear crash logs\n");
+    }
+    html_ok("Crash logs cleared.")
 }
 
 fn handle_crash_body(op: u64) -> HttpResponse {
@@ -955,6 +980,7 @@ fn handle_index() -> HttpResponse {
 
 fn status_html() -> HttpResponse {
     let version = version::VERSION;
+    let script = http_server::STATUS_SCRIPT;
     let html = format!(
         r#"<!DOCTYPE html>
 <html><head>
@@ -967,6 +993,9 @@ body{{font:16px/1.45 sans-serif;margin:1rem;max-width:42rem}}
 h1{{font-size:1.35rem;margin:0 0 .4rem}}
 h2{{font-size:1.05rem;margin:1rem 0 .3rem}}
 dl{{margin:0}} dt{{font-weight:600}} dd{{margin:0 0 .35rem}}
+table{{border-collapse:collapse}}
+td,th{{border:1px solid #ccc;padding:.15rem .45rem;text-align:left}}
+pre{{white-space:pre-wrap;font:14px/1.4 ui-monospace,monospace;background:#f6f6f6;padding:.6rem}}
 a{{color:#0645ad}}
 </style>
 </head><body>
@@ -1014,7 +1043,14 @@ a{{color:#0645ad}}
 <dt>Last</dt><dd id="last_crash">…</dd>
 </dl>
 <p><a href="/crash/list">Crash list</a> · <a href="/crash/last">Last crash</a></p>
+<form method="POST" action="/crash/clear" onsubmit="return confirm('Clear crash logs on this machine?');">
+<label><input type="checkbox" name="confirm" value="clear" required> Confirm clear</label>
+<button type="submit">Clear crash logs</button>
+</form>
+<h2>JSON</h2>
+<pre id="status_json"></pre>
 <script>
+{script}
 function text(id, value) {{
   var el = document.getElementById(id);
   if (el) el.textContent = value;
@@ -1037,7 +1073,7 @@ function fill(d) {{
   text("nic_irqs", d.nic_irqs);
   text("rxtx", d.rx_packets + " / " + d.tx_packets);
   text("busy", d.net_busy_ms + " / " + d.net_idle_ms);
-  text("upstreams", d.upstreams);
+  renderUpstreams(d.upstreams);
   text("cache_entries", d.cache_entries);
   text("dns_inflight", d.dns_inflight);
   text("upstream_timeouts", d.upstream_timeouts);
@@ -1051,6 +1087,7 @@ function fill(d) {{
   text("booted_kernel", d.booted_kernel);
   text("crash_count", d.crash_count);
   text("last_crash", d.last_crash);
+  prettyStatus(d);
 }}
 function load() {{
   fetch("/json/status", {{headers: {{Accept: "application/json"}}}})
@@ -1201,6 +1238,13 @@ fn time_fields() -> String {
 }
 
 fn status_json() -> HttpResponse {
+    let json = status_document();
+    let mut response = HttpResponse::ok(&json);
+    response.add_header("Content-Type", "application/json");
+    response
+}
+
+fn status_document() -> String {
     let (nic_irqs, rx_packets, tx_packets, net_busy_ms, net_idle_ms) = net_counters();
     let (
         arp_requests_tx,
@@ -1233,7 +1277,7 @@ fn status_json() -> HttpResponse {
         vclog_bytes,
         vclog_status,
     ) = hdmi_status();
-    let json = format!(
+    format!(
         r#"{{"status":"running","uptime":{},"ticks":{},"tick_hz":{},"dns_port":53,"http_port":80,"cache_entries":{},"upstreams":{},"nic_irqs":{},"rx_packets":{},"tx_packets":{},"net_busy_ms":{},"net_idle_ms":{},"arp_requests_tx":{},"arp_replies_rx":{},"arp_cache_hits":{},"arp_cache_misses":{},"dns_inflight":{},"upstream_timeouts":{},"rx_drops":{},"rx_overruns":{},"rx_queued":{},"forward_full":{},"reply_drops":{},"poll_count":{},"poll_us":{},"poll_max_us":{},"irq_rearms":{},"tx_full":{},"tx_slow":{},"hdmi_state":"{}","hdmi_mode":"{}","hdmi_recoveries":{},"hdmi_diag":"{}","hdmi_last_shut":"{}","hdmi_regs":"{}","hdmi_port":"{}","vclog":"{}","vclog_bytes":{},"vclog_status":"{}",{},{},{},{},{},{},{},{}}}"#,
         sys(UPTIME_SECS, 0, 0, 0, 0, 0, 0),
         sys(2, 0, 0, 0, 0, 0, 0),
@@ -1280,10 +1324,28 @@ fn status_json() -> HttpResponse {
         time_fields(),
         heap_fields(),
         block_fields(),
+    )
+}
+
+/// Browser view of `/json/status`. The JSON API stays one compact line.
+fn status_json_page() -> HttpResponse {
+    let safe = status_document().replace('<', "\\u003c");
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Status JSON</title>
+<style>body{{font:16px/1.45 sans-serif;margin:1rem}} pre{{white-space:pre-wrap;font:14px/1.4 ui-monospace,monospace}}</style>
+</head><body>
+<pre id="doc"></pre>
+<script type="application/json" id="src">{safe}</script>
+<script>
+var raw = document.getElementById("src").textContent;
+document.getElementById("doc").textContent = JSON.stringify(JSON.parse(raw), null, 2);
+</script>
+</body></html>"#
     );
-    let mut response = HttpResponse::ok(&json);
-    response.add_header("Content-Type", "application/json");
-    response
+    html_response(&html)
 }
 
 /// `hdmi_state` is none, up, fallback, or released. `hdmi_mode` is `WxH`.
@@ -1561,6 +1623,10 @@ fn csrf_token() -> String {
         return String::new();
     }
     String::from(core::str::from_utf8(&buf).unwrap_or(""))
+}
+
+fn json_block(text: &str) -> String {
+    format!("<pre>{}</pre>", html_escape(&config::indent_json(text)))
 }
 
 fn html_escape(text: &str) -> String {
