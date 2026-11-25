@@ -259,6 +259,29 @@ pub fn load_record(raw: &[u8]) -> Option<Record> {
     })
 }
 
+/// Drop the crash text and restart the file sequence.
+///
+/// The loop streak and the safe flag stay. A later boot does not write
+/// `CRASH*.TXT` from this slot. Returns false when the slot is empty.
+pub fn drop_record(raw: &mut [u8]) -> bool {
+    let Some(state) = load_loop(raw) else {
+        return false;
+    };
+    store_loop(
+        raw,
+        LoopState {
+            streak: state.streak,
+            safe: state.safe,
+            seq: 0,
+        },
+    );
+    let header = LOOP_LEN as usize;
+    if raw.len() > header {
+        raw[header..].fill(0);
+    }
+    true
+}
+
 /// Write a loop-only slot. The previous crash text is gone.
 pub fn store_loop(raw: &mut [u8], state: LoopState) {
     raw[..LOOP_LEN as usize].fill(0);
@@ -560,6 +583,19 @@ mod tests {
         assert!(load_loop(&raw).is_none());
         assert!(load_loop(&[]).is_none());
         assert!(load_loop(&[0; 32]).is_none());
+    }
+
+    #[test]
+    fn dropping_the_record_keeps_the_loop_and_forgets_the_text() {
+        let mut raw = sample();
+        assert!(load_record(&raw).is_some());
+        assert!(drop_record(&mut raw));
+        assert!(load_record(&raw).is_none());
+        let state = load_loop(&raw).unwrap();
+        assert_eq!(state.streak, 2);
+        assert_eq!(state.safe, 0);
+        assert_eq!(state.seq, 0);
+        assert!(!drop_record(&mut [0; SLOT]));
     }
 
     #[test]

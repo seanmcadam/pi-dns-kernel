@@ -203,6 +203,43 @@ pub fn crash_exists(name: &str) -> bool {
     .is_ok()
 }
 
+/// Remove one `CRASH/CRASHnnn.TXT`. A missing file or directory is success.
+pub fn delete_crash(name: &str) -> Result<(), FsError> {
+    let mut guard = FS.lock();
+    let mgr = guard.as_mut().ok_or(FsError::NotInitialized)?;
+    let volume = match mgr.open_raw_volume(VolumeIdx(0)) {
+        Ok(volume) => volume,
+        Err(err) => return Err(fs_err("open volume", err)),
+    };
+    let root = match mgr.open_root_dir(volume) {
+        Ok(dir) => dir,
+        Err(err) => {
+            let _ = mgr.close_volume(volume);
+            return Err(fs_err("open root", err));
+        }
+    };
+    let crash = match mgr.open_dir(root, "CRASH") {
+        Ok(dir) => dir,
+        Err(err) => {
+            let _ = mgr.close_dir(root);
+            let _ = mgr.close_volume(volume);
+            if matches!(err, embedded_sdmmc::Error::NotFound) {
+                return Ok(());
+            }
+            return Err(fs_err("open crash", err));
+        }
+    };
+    let result = match mgr.delete_file_in_dir(crash, name) {
+        Ok(()) => Ok(()),
+        Err(err) if matches!(err, embedded_sdmmc::Error::NotFound) => Ok(()),
+        Err(err) => Err(fs_err("delete", err)),
+    };
+    let _ = mgr.close_dir(crash);
+    let _ = mgr.close_dir(root);
+    let _ = mgr.close_volume(volume);
+    result
+}
+
 pub fn read_crash(name: &str, out: &mut [u8]) -> Result<usize, FsError> {
     with_crash_file(name, Mode::ReadOnly, false, |mgr, file| {
         let n = mgr.read(file, out).map_err(|err| fs_err("read", err))?;

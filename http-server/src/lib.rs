@@ -14,6 +14,44 @@ pub use auth::*;
 pub use request::*;
 pub use response::*;
 
+/// Status-page helpers. The page calls these after it parses `/json/status`.
+/// Upstream rows are a table. The whole document is indented into a `<pre>`.
+pub const STATUS_SCRIPT: &str = r#"
+function renderUpstreams(list) {
+  var el = document.getElementById("upstreams");
+  if (!el) return;
+  while (el.firstChild) el.removeChild(el.firstChild);
+  if (!list || !list.length) {
+    el.textContent = "none";
+    return;
+  }
+  var table = document.createElement("table");
+  var head = document.createElement("tr");
+  ["Address", "Status"].forEach(function(name) {
+    var th = document.createElement("th");
+    th.textContent = name;
+    head.appendChild(th);
+  });
+  table.appendChild(head);
+  for (var i = 0; i < list.length; i++) {
+    var entry = list[i] || {};
+    var row = document.createElement("tr");
+    var ip = document.createElement("td");
+    ip.textContent = entry.ip || "";
+    var state = document.createElement("td");
+    state.textContent = entry.up ? "up" : "down";
+    row.appendChild(ip);
+    row.appendChild(state);
+    table.appendChild(row);
+  }
+  el.appendChild(table);
+}
+function prettyStatus(d) {
+  var el = document.getElementById("status_json");
+  if (el) el.textContent = JSON.stringify(d, null, 2);
+}
+"#;
+
 /// Path and query from a request target. The query is empty when there is none.
 pub fn split_target(target: &str) -> (&str, &str) {
     match target.split_once('?') {
@@ -53,6 +91,15 @@ fn query_is(query: &str, key: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_script_renders_each_upstream_and_indents_json() {
+        let js = super::STATUS_SCRIPT;
+        assert!(js.contains("entry.ip"));
+        assert!(js.contains("entry.up ? \"up\" : \"down\""));
+        assert!(js.contains("JSON.stringify(d, null, 2)"));
+        assert!(!js.contains("[object Object]"));
+    }
 
     #[test]
     fn test_parse_get_request() {
