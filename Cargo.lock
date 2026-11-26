@@ -203,6 +203,7 @@ dependencies = [
  "config",
  "cortex-a",
  "display-console",
+ "edid",
  "embedded-hal",
  "embedded-sdmmc",
  "fwupd",

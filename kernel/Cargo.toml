@@ -13,7 +13,7 @@ board-virt = []
 # Raspberry Pi 4: link at 0xFFFF000000080000, PL011, EMMC, GENET.
 # Build with --no-default-features --features board-pi4. Enabling it on
 # top of the default features selects two boards and does not compile.
-board-pi4 = ["dep:display-console"]
+board-pi4 = ["dep:display-console", "dep:edid"]
 # Raspberry Pi 5: link at 0xFFFF000000200000, image name kernel_2712.img.
 # Build with --no-default-features --features board-pi5. Enabling it on
 # top of another board feature does not compile. RP1 Ethernet is not driven.
@@ -39,6 +39,7 @@ config = { path = "../config", default-features = false }
 ntp = { path = "../ntp" }
 fwupd = { path = "../fwupd", default-features = false }
 version = { path = "../version" }
+edid = { path = "../edid", optional = true }
 display-console = { path = "../display-console", optional = true }
 
 [[bin]]
