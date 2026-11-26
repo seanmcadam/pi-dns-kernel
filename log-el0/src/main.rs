@@ -7,14 +7,12 @@
 
 core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
-const DRAIN: u64 = 29;
-const EMIT: u64 = 30;
-const PUBLISH: u64 = 39;
-const FILE_WRITE: u64 = 33;
-const LOG_RELOAD: u64 = 45;
-const CLOCK_PREFIX: u64 = 77;
-const YIELD: u64 = 1;
-const EXIT: u64 = 3;
+mod syscall {
+    #![allow(dead_code)]
+    include!("../../user-common/syscall.rs");
+}
+
+use syscall::{sys, CLOCK_PREFIX, EXIT, FILE_WRITE, LOG_DRAIN, LOG_EMIT, LOG_PUBLISH, LOG_RELOAD};
 
 const PERSIST: u8 = 1;
 
@@ -28,7 +26,7 @@ fn run() -> ! {
     let mut raw = [0u8; 96];
     let mut persisted = 0u32;
     loop {
-        let n = sys(DRAIN, raw.as_mut_ptr() as u64, raw.len() as u64, 0, 0, 0, 0);
+        let n = sys(LOG_DRAIN, raw.as_mut_ptr() as u64, raw.len() as u64, 0, 0, 0, 0);
         if n < 2 {
             yield_now();
             continue;
@@ -69,8 +67,8 @@ fn run() -> ! {
         let take = msg.len().min(line.len() - at);
         line[at..at + take].copy_from_slice(&msg[..take]);
         let end = at + take;
-        let _ = sys(EMIT, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
-        let _ = sys(PUBLISH, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
+        let _ = sys(LOG_EMIT, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
+        let _ = sys(LOG_PUBLISH, line.as_ptr() as u64, end as u64, 0, 0, 0, 0);
         if flags & PERSIST != 0 {
             if persisted % 16 == 0 {
                 let _ = sys(LOG_RELOAD, 0, 0, 0, 0, 0, 0);
@@ -115,24 +113,7 @@ fn file_write(name: &[u8], data: &[u8], append: bool) -> i64 {
 }
 
 fn yield_now() {
-    let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
-}
-
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-        );
-    }
-    ret as i64
+    syscall::yield_now();
 }
 
 #[panic_handler]

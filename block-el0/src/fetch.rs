@@ -20,15 +20,7 @@ use embedded_tls::SignatureScheme;
 use p256::ecdsa::{signature::SignerMut, DerSignature, SigningKey};
 use p256::SecretKey;
 
-const YIELD: u64 = 1;
-const TIME_MS: u64 = 4;
-const UDP_RECV: u64 = 6;
-const UDP_SEND: u64 = 7;
-const TCP_RECV: u64 = 10;
-const TCP_SEND: u64 = 11;
-const TCP_CLOSE: u64 = 12;
-const TCP_CONNECT: u64 = 79;
-const BLOCK: u64 = 80;
+use crate::syscall::{sys, BLOCK, TCP_CONNECT, TCP_RECV, TCP_SEND, TIME_MS, UDP_RECV, UDP_SEND, YIELD};
 
 const ISRG1: &[u8] = include_bytes!("../roots/isrgx1.der");
 const ISRG2: &[u8] = include_bytes!("../roots/isrgx2.der");
@@ -308,24 +300,6 @@ impl Write for Sock {
     fn flush(&mut self) -> Result<(), IoErr> {
         Ok(())
     }
-}
-
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let rc: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => rc,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-            options(nostack),
-        );
-    }
-    rc
 }
 
 fn time_ms() -> u64 {
@@ -621,7 +595,7 @@ pub fn download(
         sock.write_all(&req).map_err(|_| "io")?;
         http_body(|buf| sock.read(buf).map_err(|_| Stop::Fail), emit)
     };
-    let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::close_tcp(fd);
     result
 }
 

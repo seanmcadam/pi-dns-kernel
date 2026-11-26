@@ -75,7 +75,7 @@
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -767,6 +767,8 @@ fn udp_bind_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
         table_of(task)[fd] = Kind::Udp(handle);
     }
     if port == 53 {
+        DNS_FD.store(fd as u8, Ordering::Release);
+        DNS_DOWN.store(0, Ordering::Release);
         log::info!("DNS socket bound to port 53");
     } else if port == 53535 {
         log::info!("DNS upstream socket bound to port 53535");
@@ -1169,10 +1171,12 @@ pub fn recycle_all(stack: &mut crate::net::NetworkStack) {
         let _lock = FD_LOCK[task].lock();
         recycle_task(task, stack);
     }
+    trim_tcp_pool(stack);
 }
 
 fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
     let table = table_of(task);
+    watch_dns_socket(task, table);
     let Some(listen_fd) = (0..MAX_FD).find(|index| matches!(table[*index], Kind::TcpListen(_, _)))
     else {
         // A client task (the blocker) has no listener to absorb a closed
@@ -1262,6 +1266,45 @@ static HTTP_HEAL_LOG: AtomicU64 = AtomicU64::new(0);
 static HTTP_HOLD_CLOSE: AtomicBool = AtomicBool::new(false);
 static mut LISTEN_BORN: [[u64; LISTENERS]; TASKS] = [[0; LISTENERS]; TASKS];
 static mut CLOSE_SINCE: [[u64; MAX_FD]; TASKS] = [[0; MAX_FD]; TASKS];
+
+/// Port-53 descriptor, or `0xFF` until the first successful bind.
+/// `DNS_DOWN` is the first ms that descriptor was no longer a UDP socket.
+/// Zero means it is up, or it has never been bound. The supervisor reads
+/// both without `FD`.
+pub const DNS_GONE_MS: u64 = 5_000;
+static DNS_FD: AtomicU8 = AtomicU8::new(0xFF);
+static DNS_DOWN: AtomicU64 = AtomicU64::new(0);
+
+pub fn dns_down_ms() -> u64 {
+    DNS_DOWN.load(Ordering::Acquire)
+}
+
+pub fn clear_dns_down() {
+    DNS_DOWN.store(0, Ordering::Release);
+}
+
+fn watch_dns_socket(task: usize, table: &[Kind; MAX_FD]) {
+    if task != 0 {
+        return;
+    }
+    let fd = DNS_FD.load(Ordering::Acquire);
+    let present = fd != 0xFF && (fd as usize) < MAX_FD && matches!(table[fd as usize], Kind::Udp(_));
+    if present || fd == 0xFF {
+        if present {
+            DNS_DOWN.store(0, Ordering::Release);
+        }
+        return;
+    }
+    let now = crate::timer::millis().max(1);
+    let _ = DNS_DOWN.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// Bound once, then missing, for the whole budget. A task that has not
+/// bound yet does not start the clock.
+#[cfg(test)]
+fn dns_gone(bound: bool, present: bool, age_ms: u64) -> bool {
+    bound && !present && age_ms >= DNS_GONE_MS
+}
 
 pub fn http_listen_down_ms() -> u64 {
     HTTP_LISTEN_DOWN.load(Ordering::Acquire)
@@ -1467,15 +1510,22 @@ fn http_hold(op: u64) -> i64 {
     }
 }
 
-/// Socket buffers are parked here on teardown and taken again the next time
-/// a port is bound, so a restart does not allocate another set. A block-list
-/// download parks the TCP buffers it used. The pools are capped, and the
-/// next download takes a parked socket instead of allocating another, so
-/// repeating an add/remove cycle does not grow the heap. Touched only from
-/// the network owner.
-const TCP_POOL: usize = 64;
+/// Idle TCP buffers. A burst used to park 64 sockets (16 KiB each) and
+/// never return them. Eight covers a short storm. After five quiet seconds
+/// only two stay, so the next accept is still a reuse and the rest of the
+/// heap comes back. Touched only from the network owner.
+const TCP_POOL_CAP: usize = 8;
+const TCP_POOL_FLOOR: usize = 2;
+const TCP_POOL_IDLE_MS: u64 = 5_000;
 const UDP_POOL: usize = 16;
-static mut TCP_POOL_H: [Option<SocketHandle>; TCP_POOL] = [None; TCP_POOL];
+
+#[derive(Clone, Copy)]
+struct ParkedTcp {
+    handle: SocketHandle,
+    since_ms: u64,
+}
+
+static mut TCP_POOL_H: [Option<ParkedTcp>; TCP_POOL_CAP] = [None; TCP_POOL_CAP];
 static mut TCP_POOL_N: usize = 0;
 static mut UDP_POOL_H: [Option<SocketHandle>; UDP_POOL] = [None; UDP_POOL];
 static mut UDP_POOL_N: usize = 0;
@@ -1484,12 +1534,12 @@ fn take_tcp(stack: &mut crate::net::NetworkStack) -> SocketHandle {
     unsafe {
         if TCP_POOL_N > 0 {
             TCP_POOL_N -= 1;
-            if let Some(handle) = TCP_POOL_H[TCP_POOL_N].take() {
-                let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+            if let Some(parked) = TCP_POOL_H[TCP_POOL_N].take() {
+                let socket = stack.sockets_mut().get_mut::<tcp::Socket>(parked.handle);
                 if socket.is_open() {
                     socket.abort();
                 }
-                return handle;
+                return parked.handle;
             }
         }
     }
@@ -1504,13 +1554,45 @@ fn give_tcp(stack: &mut crate::net::NetworkStack, handle: SocketHandle) {
         socket.abort();
     }
     unsafe {
-        if TCP_POOL_N < TCP_POOL {
-            TCP_POOL_H[TCP_POOL_N] = Some(handle);
+        if TCP_POOL_N < TCP_POOL_CAP {
+            TCP_POOL_H[TCP_POOL_N] = Some(ParkedTcp {
+                handle,
+                since_ms: crate::timer::millis(),
+            });
             TCP_POOL_N += 1;
             return;
         }
     }
     stack.sockets_mut().remove(handle);
+}
+
+/// Drop parked sockets that have sat past the idle budget, down to the floor.
+fn trim_tcp_pool(stack: &mut crate::net::NetworkStack) {
+    let now = crate::timer::millis();
+    unsafe {
+        while TCP_POOL_N > TCP_POOL_FLOOR {
+            let Some(oldest) = TCP_POOL_H[0] else {
+                break;
+            };
+            if !pool_reclaim(TCP_POOL_N, TCP_POOL_FLOOR, now.saturating_sub(oldest.since_ms), TCP_POOL_IDLE_MS)
+            {
+                break;
+            }
+            let mut index = 0;
+            while index + 1 < TCP_POOL_N {
+                TCP_POOL_H[index] = TCP_POOL_H[index + 1].take();
+                index += 1;
+            }
+            TCP_POOL_H[TCP_POOL_N - 1] = None;
+            TCP_POOL_N -= 1;
+            stack.sockets_mut().remove(oldest.handle);
+        }
+    }
+}
+
+/// True when the oldest parked socket should go back to the heap.
+fn pool_reclaim(len: usize, floor: usize, oldest_age_ms: u64, idle_ms: u64) -> bool {
+    len > floor && oldest_age_ms >= idle_ms
 }
 
 fn take_udp(stack: &mut crate::net::NetworkStack) -> SocketHandle {
@@ -2366,7 +2448,7 @@ fn display_set(vnc: u64, port: u64, pass_ptr: u64, pass_len: u64, hdmi: u64, err
 
 #[cfg(test)]
 mod tests {
-    use super::close_reap;
+    use super::{close_reap, pool_reclaim};
 
     #[test]
     fn a_drained_close_is_reaped_immediately() {
@@ -2385,6 +2467,23 @@ mod tests {
         assert!(!close_reap(false, false, 0, true));
         assert!(!close_reap(false, false, 4_999, true));
         assert!(close_reap(false, false, 5_000, true));
+    }
+
+    #[test]
+    fn idle_parked_sockets_drop_back_to_the_floor() {
+        assert!(!pool_reclaim(2, 2, 10_000, 5_000));
+        assert!(!pool_reclaim(8, 2, 4_999, 5_000));
+        assert!(pool_reclaim(8, 2, 5_000, 5_000));
+        assert!(pool_reclaim(3, 2, 5_000, 5_000));
+    }
+
+    #[test]
+    fn dns_socket_is_watched_only_after_it_binds() {
+        use super::dns_gone;
+        assert!(!dns_gone(false, false, 60_000));
+        assert!(!dns_gone(true, true, 60_000));
+        assert!(!dns_gone(true, false, 4_999));
+        assert!(dns_gone(true, false, 5_000));
     }
 }
 

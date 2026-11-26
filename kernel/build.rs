@@ -36,6 +36,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/board/pi5/link.ld");
     println!("cargo:rerun-if-changed=../user-common/link.ld");
     println!("cargo:rerun-if-changed=../user-common/start.s");
+    println!("cargo:rerun-if-changed=../user-common/syscall.rs");
+    println!("cargo:rerun-if-changed=../user-common/alloc.rs");
+    println!("cargo:rerun-if-changed=../user-common/thread.rs");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_VIRT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_PI4");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_PI5");

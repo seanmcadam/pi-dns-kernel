@@ -1,30 +1,11 @@
 // User threads and a futex mutex. Included by the EL0 programs.
+// The crate root includes `syscall.rs` as `mod syscall`.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-pub const THREAD_CREATE: u64 = 34;
-pub const THREAD_EXIT: u64 = 35;
-pub const THREAD_JOIN: u64 = 36;
-pub const THREAD_TRY_JOIN: u64 = 44;
-pub const FUTEX_WAIT: u64 = 37;
-pub const FUTEX_WAKE: u64 = 38;
-
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-        );
-    }
-    ret as i64
-}
+use crate::syscall::{
+    sys, FUTEX_WAIT, FUTEX_WAKE, THREAD_CREATE, THREAD_EXIT, THREAD_JOIN, THREAD_TRY_JOIN,
+};
 
 pub fn spawn(entry: extern "C" fn(u64), stack: u64, arg: u64) -> i64 {
     sys(THREAD_CREATE, entry as u64, stack, arg, 0, 0, 0)

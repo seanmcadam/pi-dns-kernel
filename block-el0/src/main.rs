@@ -8,151 +8,33 @@ core::arch::global_asm!(include_str!("../../user-common/start.s"));
 mod fetch;
 
 use alloc::vec::Vec;
-use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
-use core::ptr;
 
-const LOG: u64 = 0;
-const YIELD: u64 = 1;
-const EXIT: u64 = 3;
-const TIME_MS: u64 = 4;
-const UDP_BIND: u64 = 5;
-const NET_READY: u64 = 63;
-const BLOCK: u64 = 80;
+mod syscall {
+    #![allow(dead_code)]
+    include!("../../user-common/syscall.rs");
+}
+
+mod heap {
+    include!("../../user-common/alloc.rs");
+}
+
+use syscall::{sys, BLOCK, EXIT, LOG, NET_READY, TIME_MS, UDP_BIND, YIELD};
 
 const INDEX: &str = "BLOCK.IDX";
 const TEMP: &str = "BLOCK.TMP";
 
-const HEAP_BASE: usize = 0x1_000A_0000;
-const HEAP_SIZE: usize = 1536 * 1024;
-const HEADER: usize = 16;
-
-struct Node {
-    size: usize,
-    next: *mut Node,
-}
-
-static mut FREE: *mut Node = ptr::null_mut();
-
-struct Heap;
-
-unsafe impl GlobalAlloc for Heap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        alloc_block(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr_in: *mut u8, layout: Layout) {
-        free_block(ptr_in, alloc_size(layout));
-    }
-}
-
-fn alloc_size(layout: Layout) -> usize {
-    align(layout.size().max(1), 8).max(HEADER)
-}
-
-fn align(value: usize, to: usize) -> usize {
-    (value + to - 1) & !(to - 1)
-}
-
-unsafe fn alloc_block(layout: Layout) -> *mut u8 {
-    if FREE.is_null() {
-        let node = HEAP_BASE as *mut Node;
-        (*node).size = HEAP_SIZE;
-        (*node).next = ptr::null_mut();
-        FREE = node;
-    }
-    let align_to = layout.align().max(HEADER);
-    let size = alloc_size(layout);
-    let mut prev: *mut Node = ptr::null_mut();
-    let mut node = FREE;
-    while !node.is_null() {
-        let start = node as usize;
-        let region = (*node).size;
-        let aligned = align(start + HEADER, align_to);
-        let padding = aligned.saturating_sub(start);
-        if padding >= HEADER && padding + size <= region {
-            let next = (*node).next;
-            if prev.is_null() {
-                FREE = next;
-            } else {
-                (*prev).next = next;
-            }
-            if padding >= HEADER {
-                let pad = start as *mut Node;
-                (*pad).size = padding;
-                insert_free(pad);
-            }
-            let remain_at = aligned + size;
-            let remain = region - (remain_at - start);
-            if remain >= HEADER {
-                let rest = remain_at as *mut Node;
-                (*rest).size = remain;
-                insert_free(rest);
-            }
-            return aligned as *mut u8;
-        }
-        prev = node;
-        node = (*node).next;
-    }
-    ptr::null_mut()
-}
-
-unsafe fn free_block(user: *mut u8, size: usize) {
-    let node = user as *mut Node;
-    (*node).size = size;
-    insert_free(node);
-}
-
-unsafe fn insert_free(node: *mut Node) {
-    let addr = node as usize;
-    let mut prev: *mut Node = ptr::null_mut();
-    let mut cur = FREE;
-    while !cur.is_null() && (cur as usize) < addr {
-        prev = cur;
-        cur = (*cur).next;
-    }
-    if !cur.is_null() && addr + (*node).size == cur as usize {
-        (*node).size += (*cur).size;
-        (*node).next = (*cur).next;
-    } else {
-        (*node).next = cur;
-    }
-    if !prev.is_null() && (prev as usize) + (*prev).size == node as usize {
-        (*prev).size += (*node).size;
-        (*prev).next = (*node).next;
-    } else if prev.is_null() {
-        FREE = node;
-    } else {
-        (*prev).next = node;
-    }
-}
+pub(crate) const HEAP_VA: usize = 0x1_000A_0000;
+pub(crate) const ALLOC_SIZE: usize = 1536 * 1024;
 
 #[global_allocator]
-static HEAP: Heap = Heap;
+static HEAP: heap::Heap = heap::Heap;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     log("block panic\n");
     sys(EXIT, 1, 0, 0, 0, 0, 0);
     loop {}
-}
-
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let rc: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => rc,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-            options(nostack),
-        );
-    }
-    rc
 }
 
 fn log(text: &str) {

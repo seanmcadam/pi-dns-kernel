@@ -3,6 +3,11 @@
 
 core::arch::global_asm!(include_str!("user.s"));
 
+mod syscall {
+    #![allow(dead_code)]
+    include!("../../user-common/syscall.rs");
+}
+
 mod thread {
     include!("../../user-common/thread.rs");
 }
@@ -80,28 +85,12 @@ fn write_dec(buf: &mut [u8], mut value: u64) -> usize {
 }
 
 fn log(bytes: &[u8]) -> i64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") 0u64,
-            inout("x0") bytes.as_ptr() as u64 => ret,
-            in("x1") bytes.len() as u64,
-        );
-    }
-    ret as i64
+    syscall::sys(syscall::LOG, bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0)
 }
 
 fn exit(code: u64) -> ! {
-    let _: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") 3u64,
-            in("x0") code,
-            options(noreturn),
-        );
-    }
+    let _ = syscall::sys(syscall::EXIT, code, 0, 0, 0, 0, 0);
+    loop {}
 }
 
 #[panic_handler]
