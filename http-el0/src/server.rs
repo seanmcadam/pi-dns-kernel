@@ -70,6 +70,7 @@ const CRASH: u64 = 71;
 const BOOT: u64 = 72;
 const BOARD: u64 = 73;
 const LOG_FILE: u64 = 81;
+const HTTP_HOLD: u64 = 82;
 
 const EAGAIN: i64 = -11;
 
@@ -95,7 +96,7 @@ pub fn run() -> ! {
         }
         if !handoff(conn as u32) {
             serve(conn);
-            let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+            close_conn(conn);
         }
         yield_now();
     }
@@ -120,7 +121,7 @@ extern "C" fn conn_worker(index: u64) {
             continue;
         }
         serve((value - 1) as i64);
-        let _ = sys(TCP_CLOSE, (value - 1) as u64, 0, 0, 0, 0, 0);
+        close_conn((value - 1) as i64);
     }
 }
 
@@ -274,6 +275,7 @@ fn handle(request: &HttpRequest) -> HttpResponse {
         "/config/file/config" => handle_config_file(request, 0),
         "/config/file/log" => handle_config_file(request, 1),
         "/debug/log-fill" => handle_log_fill(request),
+        "/debug/hold-close" => handle_hold_close(request),
         "/debug/cache-plant" => handle_cache_plant(request),
         "/debug" => handle_debug(),
         "/debug/spin" => handle_spin(),
@@ -610,6 +612,25 @@ fn handle_config_file(request: &HttpRequest, which: u64) -> HttpResponse {
         }
         _ => HttpResponse::new(405, "Method Not Allowed"),
     }
+}
+
+fn handle_hold_close(request: &HttpRequest) -> HttpResponse {
+    if request.method != HttpMethod::POST {
+        return HttpResponse::new(405, "Method Not Allowed");
+    }
+    let body = core::str::from_utf8(&request.body).unwrap_or("");
+    let op = match form_value(body, "confirm") {
+        Some("hold") => 1,
+        Some("release") => 0,
+        _ => return bad_request("confirm=hold required\n"),
+    };
+    let rc = sys(HTTP_HOLD, op, 0, 0, 0, 0, 0);
+    if rc < 0 {
+        return HttpResponse::internal_error();
+    }
+    let mut response = HttpResponse::ok(if op == 1 { "holding\n" } else { "released\n" });
+    response.add_header("Content-Type", "text/plain; charset=utf-8");
+    response
 }
 
 fn handle_log_fill(request: &HttpRequest) -> HttpResponse {
@@ -2260,6 +2281,18 @@ fn send_log_file(conn: i64, name: &str) {
 
 fn yield_now() {
     let _ = sys(YIELD, 0, 0, 0, 0, 0, 0);
+}
+
+/// A full job ring returns EAGAIN and puts the descriptor back. Leaving
+/// that unread leaks the fd, so the close is tried again.
+fn close_conn(conn: i64) {
+    loop {
+        let rc = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+        if rc != EAGAIN {
+            return;
+        }
+        yield_now();
+    }
 }
 
 fn exit(code: u64) -> ! {

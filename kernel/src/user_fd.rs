@@ -75,7 +75,7 @@
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -157,6 +157,10 @@ const BLOCK: u64 = 80;
 /// 81 log_file(op, ...). Read-only `LOG.TXT` and `LOG1.TXT`..`LOG16.TXT`.
 /// Op 0 lists `name len` lines. Op 1 reads at an offset. Op 2 returns the length.
 const LOG_FILE: u64 = 81;
+/// 82 http_hold(op). HTTP task only. Op 1 holds a finished close until the
+/// idle budget, op 0 releases that hold, op 2 reads it. A test uses this to
+/// pin `Kind::Closing` descriptors the way a peer that never ACKs would.
+const HTTP_HOLD: u64 = 82;
 
 const EFAULT: i64 = -2;
 const EBADF: i64 = -3;
@@ -172,8 +176,8 @@ const MAX_PACKET: usize = 4096;
 /// closes without sending stays out of `may_recv`, so the slot is put back
 /// into LISTEN on the next poll instead of waiting for the application.
 const LISTENERS: usize = service::TCP_LISTENERS;
-/// Hardware-timer budget for an HTTP recv that sees no bytes, and for a
-/// listen slot that has left LISTEN but still looks readable.
+/// Hardware-timer budget for an idle HTTP recv or send, a listen slot that
+/// has left LISTEN, and a `Kind::Closing` socket whose peer never ACKs.
 const TCP_IDLE_MS: u64 = 5_000;
 
 #[derive(Clone, Copy)]
@@ -284,6 +288,7 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
         TCP_CONNECT => tcp_connect(args[0], args[1]),
         BLOCK => crate::block_tab::call(args[0], [args[1], args[2], args[3], args[4], args[5]]),
         LOG_FILE => log_file(args),
+        HTTP_HOLD => http_hold(args[0]),
         _ => -1,
     };
     value as u64
@@ -565,10 +570,13 @@ fn tcp_accept(fd: u64) -> i64 {
     };
     let Some(conn) = find_free() else {
         if port == 80 {
-            warn_http(&HTTP_ERR_LOG, "HTTP accept failed: no free descriptor");
+            note_http_emfile();
         }
         return EMFILE;
     };
+    if port == 80 {
+        HTTP_EMFILE_SINCE.store(0, Ordering::Release);
+    }
     let task = slot();
     set_kind(conn, Kind::Reserved);
     bump_gen(task, conn);
@@ -991,10 +999,24 @@ fn tcp_send_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
     }
     let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
     if !socket.can_send() {
-        if matches!(
+        let open = matches!(
             socket.state(),
             tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived | tcp::State::SynSent
-        ) {
+        );
+        let http = socket.local_endpoint().is_some_and(|ep| ep.port == 80);
+        if open {
+            if http {
+                let now = crate::timer::millis();
+                let started = service::body(id).user_aux;
+                if started == 0 {
+                    service::body(id).user_aux = now.max(1);
+                    return service::Step::Pending;
+                }
+                if now.saturating_sub(started) >= TCP_IDLE_MS {
+                    warn_http(&HTTP_ERR_LOG, "HTTP connection send timed out");
+                    return service::Step::Done(EIO);
+                }
+            }
             return service::Step::Pending;
         }
         return service::Step::Done(EIO);
@@ -1018,6 +1040,7 @@ fn tcp_close_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::St
             stack.sockets_mut().get_mut::<tcp::Socket>(handle).close();
             let _lock = FD_LOCK[task].lock();
             table_of(task)[fd] = Kind::Closing(handle);
+            unsafe { CLOSE_SINCE[task][fd] = crate::timer::millis().max(1) };
         }
         2 => {
             for handle in slots.into_iter().flatten() {
@@ -1154,7 +1177,7 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
     else {
         // A client task (the blocker) has no listener to absorb a closed
         // connection. Park the finished socket or its buffers stay allocated.
-        reap_clients(table, stack);
+        reap_clients(task, table, stack);
         return;
     };
     let Kind::TcpListen(mut slots, port) = table[listen_fd] else {
@@ -1164,25 +1187,37 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
         let Kind::Closing(handle) = table[index] else {
             continue;
         };
-        let recyclable = {
+        let now = crate::timer::millis();
+        let (queued, connected) = {
             let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-            socket.send_queue() == 0
-                && !matches!(
-                    socket.state(),
-                    tcp::State::Established
-                        | tcp::State::CloseWait
-                        | tcp::State::SynReceived
-                        | tcp::State::SynSent
-                )
+            let queued = socket.send_queue() > 0;
+            let connected = matches!(
+                socket.state(),
+                tcp::State::Established
+                    | tcp::State::CloseWait
+                    | tcp::State::SynReceived
+                    | tcp::State::SynSent
+            );
+            (queued, connected)
         };
-        if !recyclable {
+        let since = unsafe { CLOSE_SINCE[task][index] };
+        let age = if since == 0 {
+            unsafe { CLOSE_SINCE[task][index] = now.max(1) };
+            0
+        } else {
+            now.saturating_sub(since)
+        };
+        let hold = port == 80 && HTTP_HOLD_CLOSE.load(Ordering::Relaxed);
+        if !close_reap(queued, connected, age, hold) {
             continue;
         }
+        let forced = age >= TCP_IDLE_MS;
         if slots.iter().all(|slot| slot.is_some()) {
             // The listen set is already full. Park the socket so the fd
             // and its buffers do not stay reserved.
             give_tcp(stack, handle);
             table[index] = Kind::Empty;
+            note_close_reaped(task, index, port, forced);
             continue;
         }
         let listened = {
@@ -1195,11 +1230,13 @@ fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
         if !listened {
             give_tcp(stack, handle);
             table[index] = Kind::Empty;
+            note_close_reaped(task, index, port, forced);
             continue;
         }
         if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(handle);
             table[index] = Kind::Empty;
+            note_close_reaped(task, index, port, forced);
         }
     }
     heal_listen(task, &mut slots, port, stack);
@@ -1215,9 +1252,16 @@ enum SlotFate {
 /// First hardware-timer ms at which port 80 had no socket in LISTEN.
 /// Zero means the listener is up. The supervisor reads this without `FD`.
 static HTTP_LISTEN_DOWN: AtomicU64 = AtomicU64::new(0);
+/// First hardware-timer ms at which port 80's accept returned EMFILE.
+/// Cleared when a descriptor is freed or an accept is queued. Zero means
+/// the table is not stuck. The supervisor reads this without `FD`.
+static HTTP_EMFILE_SINCE: AtomicU64 = AtomicU64::new(0);
 static HTTP_ERR_LOG: AtomicU64 = AtomicU64::new(0);
+static HTTP_CLOSE_LOG: AtomicU64 = AtomicU64::new(0);
 static HTTP_HEAL_LOG: AtomicU64 = AtomicU64::new(0);
+static HTTP_HOLD_CLOSE: AtomicBool = AtomicBool::new(false);
 static mut LISTEN_BORN: [[u64; LISTENERS]; TASKS] = [[0; LISTENERS]; TASKS];
+static mut CLOSE_SINCE: [[u64; MAX_FD]; TASKS] = [[0; MAX_FD]; TASKS];
 
 pub fn http_listen_down_ms() -> u64 {
     HTTP_LISTEN_DOWN.load(Ordering::Acquire)
@@ -1225,6 +1269,14 @@ pub fn http_listen_down_ms() -> u64 {
 
 pub fn clear_http_listen_down() {
     HTTP_LISTEN_DOWN.store(0, Ordering::Release);
+}
+
+pub fn http_emfile_ms() -> u64 {
+    HTTP_EMFILE_SINCE.load(Ordering::Acquire)
+}
+
+pub fn clear_http_emfile() {
+    HTTP_EMFILE_SINCE.store(0, Ordering::Release);
 }
 
 fn warn_http(last: &AtomicU64, text: &str) {
@@ -1332,26 +1384,86 @@ fn heal_listen(
     }
 }
 
-fn reap_clients(table: &mut [Kind], stack: &mut crate::net::NetworkStack) {
+fn reap_clients(task: usize, table: &mut [Kind], stack: &mut crate::net::NetworkStack) {
+    let now = crate::timer::millis();
     for index in 0..MAX_FD {
         let Kind::Closing(handle) = table[index] else {
             continue;
         };
-        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
-        if socket.send_queue() > 0 {
-            continue;
-        }
-        if matches!(
-            socket.state(),
-            tcp::State::Established
-                | tcp::State::CloseWait
-                | tcp::State::SynReceived
-                | tcp::State::SynSent
-        ) {
+        let (queued, connected) = {
+            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+            let queued = socket.send_queue() > 0;
+            let connected = matches!(
+                socket.state(),
+                tcp::State::Established
+                    | tcp::State::CloseWait
+                    | tcp::State::SynReceived
+                    | tcp::State::SynSent
+            );
+            (queued, connected)
+        };
+        let since = unsafe { CLOSE_SINCE[task][index] };
+        let age = if since == 0 {
+            unsafe { CLOSE_SINCE[task][index] = now.max(1) };
+            0
+        } else {
+            now.saturating_sub(since)
+        };
+        if !close_reap(queued, connected, age, false) {
             continue;
         }
         give_tcp(stack, handle);
         table[index] = Kind::Empty;
+        unsafe { CLOSE_SINCE[task][index] = 0 };
+    }
+}
+
+/// A closing socket is reaped once its send buffer has drained and the
+/// handshake is over. A peer that never ACKs used to pin the descriptor.
+/// `age_ms` is the hardware-timer age of the close. `hold` keeps a finished
+/// close until that budget so a test can fill the fd table.
+fn close_reap(send_queued: bool, connected: bool, age_ms: u64, hold: bool) -> bool {
+    if age_ms >= TCP_IDLE_MS {
+        return true;
+    }
+    if hold {
+        return false;
+    }
+    !send_queued && !connected
+}
+
+fn note_close_reaped(task: usize, index: usize, port: u16, forced: bool) {
+    unsafe { CLOSE_SINCE[task][index] = 0 };
+    if port != 80 {
+        return;
+    }
+    HTTP_EMFILE_SINCE.store(0, Ordering::Release);
+    if forced {
+        warn_http(&HTTP_CLOSE_LOG, "HTTP connection close timed out");
+    }
+}
+
+fn note_http_emfile() {
+    let now = crate::timer::millis().max(1);
+    let _ = HTTP_EMFILE_SINCE.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
+    warn_http(&HTTP_ERR_LOG, "HTTP accept failed: no free descriptor");
+}
+
+fn http_hold(op: u64) -> i64 {
+    if crate::percpu::slot() != crate::task::HTTP_SLOT {
+        return EINVAL;
+    }
+    match op {
+        0 => {
+            HTTP_HOLD_CLOSE.store(false, Ordering::Release);
+            0
+        }
+        1 => {
+            HTTP_HOLD_CLOSE.store(true, Ordering::Release);
+            0
+        }
+        2 => i64::from(HTTP_HOLD_CLOSE.load(Ordering::Acquire)),
+        _ => EINVAL,
     }
 }
 
@@ -2249,6 +2361,30 @@ fn display_set(vnc: u64, port: u64, pass_ptr: u64, pass_len: u64, hdmi: u64, err
             let _ = write_err(err, 160, &message);
             EINVAL
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::close_reap;
+
+    #[test]
+    fn a_drained_close_is_reaped_immediately() {
+        assert!(close_reap(false, false, 0, false));
+    }
+
+    #[test]
+    fn an_unacked_close_is_held_until_the_budget() {
+        assert!(!close_reap(true, false, 0, false));
+        assert!(!close_reap(true, false, 4_999, false));
+        assert!(close_reap(true, true, 5_000, false));
+    }
+
+    #[test]
+    fn a_held_close_fills_the_table_until_the_budget() {
+        assert!(!close_reap(false, false, 0, true));
+        assert!(!close_reap(false, false, 4_999, true));
+        assert!(close_reap(false, false, 5_000, true));
     }
 }
 
