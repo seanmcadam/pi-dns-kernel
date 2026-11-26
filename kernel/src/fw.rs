@@ -22,7 +22,7 @@
 //! moves the live kernel aside, installs the staged file from a temp name,
 //! and puts the old file back if that rename fails.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use spin::Mutex;
 
 use fwupd::{self, Card, CommitError};
@@ -34,6 +34,10 @@ const CHUNK: usize = 16 * 1024;
 /// A multi-megabyte kernel takes several calls so `/status` keeps answering.
 const PUMP_BYTES: usize = 64 * 1024;
 const PUMP_MS: u64 = 40;
+/// Owner-side pumps are at least this far apart, so a promote does not
+/// depend on how fast the browser opens the next status connection.
+const NUDGE_MS: u64 = 150;
+static LAST_NUDGE: AtomicU64 = AtomicU64::new(0);
 const TEST_MAX: u32 = 64 * 1024;
 const KERNEL_MAX: u32 = 8 * 1024 * 1024;
 const STATUS_LEN: usize = 224;
@@ -1434,6 +1438,22 @@ fn start_copy(job: CopyJob) {
     *COPY.lock() = Some(job);
     publish(PH_COPY, 0, total);
     note(label);
+}
+
+/// Move an in-progress promote or rollback from the network owner.
+/// Status polls pump as well. A client that closes after every response
+/// would otherwise stall the copy between handshakes.
+pub fn nudge() {
+    if COPY.lock().is_none() {
+        return;
+    }
+    let now = crate::timer::millis();
+    let prev = LAST_NUDGE.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < NUDGE_MS {
+        return;
+    }
+    LAST_NUDGE.store(now, Ordering::Relaxed);
+    pump_copy();
 }
 
 fn pump_copy() {

@@ -454,6 +454,7 @@ pub fn drive() {
         if let Some(state) = (*state_slot).as_mut() {
             super::poll_device(state);
             crate::user_fd::recycle_all(&mut state.stack);
+            crate::fw::nudge();
             pull();
             run_pending(&mut state.stack);
             pull();
