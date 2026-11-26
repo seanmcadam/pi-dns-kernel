@@ -5,6 +5,8 @@ boot/kernel8.asm
 qemu/*.txt
 qemu/*.img
 qemu/*.pcap
+qemu/*.log
+qemu/*.pid
 boot/pi4/*.img
 boot/pi4-blinktest/*.img
 boot/pi4/card/
