@@ -13,8 +13,8 @@ mod syscall {
 }
 
 use syscall::{
-    sys, DEBUG_STATUS, DISPLAY_IO, EXIT, LOG_RECENT, TCP_ACCEPT, TCP_CLOSE, TCP_LISTEN, TCP_RECV,
-    TCP_SEND, TIMER_FREQ, TIMER_TICKS, YIELD,
+    sys, DEBUG_STATUS, DISPLAY_IO, EXIT, LOG_RECENT, TCP_ACCEPT, TCP_LISTEN, TCP_RECV, TCP_SEND,
+    TIMER_FREQ, TIMER_TICKS, YIELD,
 };
 
 const FB: u64 = 0x1_000A_0000;
@@ -49,7 +49,7 @@ pub extern "C" fn rust_main() -> ! {
             continue;
         }
         session(conn as u64, &password[..pass_len]);
-        let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+        syscall::close_tcp(conn);
     }
 }
 

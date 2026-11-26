@@ -20,7 +20,7 @@ use embedded_tls::SignatureScheme;
 use p256::ecdsa::{signature::SignerMut, DerSignature, SigningKey};
 use p256::SecretKey;
 
-use crate::syscall::{sys, BLOCK, TCP_CLOSE, TCP_CONNECT, TCP_RECV, TCP_SEND, TIME_MS, UDP_RECV, UDP_SEND, YIELD};
+use crate::syscall::{sys, BLOCK, TCP_CONNECT, TCP_RECV, TCP_SEND, TIME_MS, UDP_RECV, UDP_SEND, YIELD};
 
 const ISRG1: &[u8] = include_bytes!("../roots/isrgx1.der");
 const ISRG2: &[u8] = include_bytes!("../roots/isrgx2.der");
@@ -595,7 +595,7 @@ pub fn download(
         sock.write_all(&req).map_err(|_| "io")?;
         http_body(|buf| sock.read(buf).map_err(|_| Stop::Fail), emit)
     };
-    let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::close_tcp(fd);
     result
 }
 

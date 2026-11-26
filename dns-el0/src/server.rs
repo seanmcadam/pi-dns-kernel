@@ -11,8 +11,8 @@ use dns_protocol::{DnsPacket, QueryType, RData, RecordClass, RecordType, Resourc
 use crate::syscall::{
     sys, CACHE_PLANT, CONFIG_BLOCKLIST, CONFIG_CACHE_REAP, CONFIG_CACHE_SIZE, CONFIG_PROBE_SECS,
     CONFIG_RECORDS, CONFIG_UPSTREAMS, EXIT, LOG, LOG_POST, NET_READY, SET_CACHE_STATS, SET_DNS_LOAD,
-    SET_DNS_TOP, SET_UPSTREAM_HEALTH, TCP_ACCEPT, TCP_CLOSE, TCP_LISTEN, TCP_RECV, TCP_SEND,
-    TIME_MS, TIMER_FREQ, TIMER_TICKS, UDP_BIND, UDP_RECV, UDP_SEND, YIELD,
+    SET_DNS_TOP, SET_UPSTREAM_HEALTH, TCP_ACCEPT, TCP_LISTEN, TCP_RECV, TCP_SEND, TIME_MS,
+    TIMER_FREQ, TIMER_TICKS, UDP_BIND, UDP_RECV, UDP_SEND, YIELD,
 };
 
 const UPSTREAM_PORT: u16 = 53535;
@@ -342,7 +342,7 @@ extern "C" fn tcp_worker(_index: u64) {
                 0,
             );
             if n <= 0 {
-                let _ = sys(TCP_CLOSE, accepted as u64, 0, 0, 0, 0, 0);
+                crate::syscall::close_tcp(accepted);
                 break;
             }
             let mut outbound = None;
@@ -425,7 +425,7 @@ fn send_tcp(fd: i64, payload: &[u8]) {
         }
         off += n as usize;
     }
-    let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::close_tcp(fd);
 }
 
 fn handle_client(

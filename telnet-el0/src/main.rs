@@ -17,7 +17,7 @@ mod thread {
     include!("../../user-common/thread.rs");
 }
 
-use syscall::{sys, EAGAIN, EXIT, LOG_FOLLOW, LOG_WAKE, TCP_ACCEPT, TCP_CLOSE, TCP_LISTEN, TCP_RECV, TCP_SEND, YIELD};
+use syscall::{sys, EAGAIN, EXIT, LOG_FOLLOW, LOG_WAKE, TCP_ACCEPT, TCP_LISTEN, TCP_RECV, TCP_SEND, YIELD};
 const MAX_CLIENTS: usize = 16;
 const HEAP_VA: u64 = 0x1_000A_0000;
 const HEAP_SIZE: u64 = 256 * 1024;
@@ -72,7 +72,7 @@ fn run() -> ! {
                 if tid < 0 {
                     FD_LIVE[index].store(0, Ordering::Release);
                     USED[index].store(0, Ordering::Release);
-                    let _ = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
+                    syscall::close_tcp(conn);
                 } else {
                     TID[index].store(tid, Ordering::Release);
                     let _ = sys(LOG_WAKE, 0, 0, 0, 0, 0, 0);
@@ -104,7 +104,7 @@ fn reap() {
                 if code != -11 {
                     if FD_LIVE[index].swap(0, Ordering::AcqRel) == 1 {
                         let fd = FD_NUM[index].load(Ordering::Acquire);
-                        let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
+                        syscall::close_tcp(fd as i64);
                     }
                     TID[index].store(0, Ordering::Release);
                     DONE[index].store(0, Ordering::Release);
@@ -118,7 +118,7 @@ fn reap() {
 
 fn refuse(fd: i64) {
     let _ = send_all(fd, b"busy, try later\r\n");
-    let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
+    syscall::close_tcp(fd);
 }
 
 extern "C" fn reaper(_arg: u64) {
@@ -196,7 +196,7 @@ extern "C" fn client(arg: u64) {
 
 fn finish(index: usize, fd: i64) -> ! {
     FD_LIVE[index].store(0, Ordering::Release);
-    let _ = sys(TCP_CLOSE, fd as u64, 0, 0, 0, 0, 0);
+    syscall::close_tcp(fd);
     DONE[index].store(1, Ordering::Release);
     thread::exit(0);
 }
