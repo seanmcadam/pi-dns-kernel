@@ -907,6 +907,10 @@ status, page = req("GET", "/debug")
 if status != 200 or b"http running restarts=" not in page:
     fail("debug %s %s" % (status, page[:180]))
 before = page.split(b"http running restarts=", 1)[1].split()[0]
+status, warm = req("GET", "/json/status")
+if status != 200 or b'"heap_used":' not in warm:
+    fail("heap before %s %s" % (status, warm[:120]))
+heap_before = int(warm.split(b'"heap_used":', 1)[1].split(b",")[0])
 status, armed = req("POST", "/debug/hold-close", "confirm=hold")
 if status != 200 or b"holding" not in armed:
     fail("arm %s %s" % (status, armed[:80]))
@@ -944,7 +948,15 @@ dig = subprocess.run(
 )
 if "192.168.1.100" not in dig.stdout:
     fail("dns %s" % dig.stdout)
-print("filled", ok, "restarts", after.decode())
+time.sleep(6)
+status, later = req("GET", "/json/status", timeout=5)
+if status != 200 or b'"heap_used":' not in later:
+    fail("heap after %s %s" % (status, later[:120]))
+heap_after = int(later.split(b'"heap_used":', 1)[1].split(b",")[0])
+# Two parked sockets are 32 KiB. A 64-deep pool used to keep the whole burst.
+if heap_after > heap_before + 96 * 1024:
+    fail("heap stayed high %s -> %s" % (heap_before, heap_after))
+print("filled", ok, "restarts", after.decode(), "heap", heap_before, heap_after)
 sys.exit(0)
 PY
 then

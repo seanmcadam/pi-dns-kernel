@@ -1169,6 +1169,7 @@ pub fn recycle_all(stack: &mut crate::net::NetworkStack) {
         let _lock = FD_LOCK[task].lock();
         recycle_task(task, stack);
     }
+    trim_tcp_pool(stack);
 }
 
 fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
@@ -1467,15 +1468,22 @@ fn http_hold(op: u64) -> i64 {
     }
 }
 
-/// Socket buffers are parked here on teardown and taken again the next time
-/// a port is bound, so a restart does not allocate another set. A block-list
-/// download parks the TCP buffers it used. The pools are capped, and the
-/// next download takes a parked socket instead of allocating another, so
-/// repeating an add/remove cycle does not grow the heap. Touched only from
-/// the network owner.
-const TCP_POOL: usize = 64;
+/// Idle TCP buffers. A burst used to park 64 sockets (16 KiB each) and
+/// never return them. Eight covers a short storm. After five quiet seconds
+/// only two stay, so the next accept is still a reuse and the rest of the
+/// heap comes back. Touched only from the network owner.
+const TCP_POOL_CAP: usize = 8;
+const TCP_POOL_FLOOR: usize = 2;
+const TCP_POOL_IDLE_MS: u64 = 5_000;
 const UDP_POOL: usize = 16;
-static mut TCP_POOL_H: [Option<SocketHandle>; TCP_POOL] = [None; TCP_POOL];
+
+#[derive(Clone, Copy)]
+struct ParkedTcp {
+    handle: SocketHandle,
+    since_ms: u64,
+}
+
+static mut TCP_POOL_H: [Option<ParkedTcp>; TCP_POOL_CAP] = [None; TCP_POOL_CAP];
 static mut TCP_POOL_N: usize = 0;
 static mut UDP_POOL_H: [Option<SocketHandle>; UDP_POOL] = [None; UDP_POOL];
 static mut UDP_POOL_N: usize = 0;
@@ -1484,12 +1492,12 @@ fn take_tcp(stack: &mut crate::net::NetworkStack) -> SocketHandle {
     unsafe {
         if TCP_POOL_N > 0 {
             TCP_POOL_N -= 1;
-            if let Some(handle) = TCP_POOL_H[TCP_POOL_N].take() {
-                let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
+            if let Some(parked) = TCP_POOL_H[TCP_POOL_N].take() {
+                let socket = stack.sockets_mut().get_mut::<tcp::Socket>(parked.handle);
                 if socket.is_open() {
                     socket.abort();
                 }
-                return handle;
+                return parked.handle;
             }
         }
     }
@@ -1504,13 +1512,45 @@ fn give_tcp(stack: &mut crate::net::NetworkStack, handle: SocketHandle) {
         socket.abort();
     }
     unsafe {
-        if TCP_POOL_N < TCP_POOL {
-            TCP_POOL_H[TCP_POOL_N] = Some(handle);
+        if TCP_POOL_N < TCP_POOL_CAP {
+            TCP_POOL_H[TCP_POOL_N] = Some(ParkedTcp {
+                handle,
+                since_ms: crate::timer::millis(),
+            });
             TCP_POOL_N += 1;
             return;
         }
     }
     stack.sockets_mut().remove(handle);
+}
+
+/// Drop parked sockets that have sat past the idle budget, down to the floor.
+fn trim_tcp_pool(stack: &mut crate::net::NetworkStack) {
+    let now = crate::timer::millis();
+    unsafe {
+        while TCP_POOL_N > TCP_POOL_FLOOR {
+            let Some(oldest) = TCP_POOL_H[0] else {
+                break;
+            };
+            if !pool_reclaim(TCP_POOL_N, TCP_POOL_FLOOR, now.saturating_sub(oldest.since_ms), TCP_POOL_IDLE_MS)
+            {
+                break;
+            }
+            let mut index = 0;
+            while index + 1 < TCP_POOL_N {
+                TCP_POOL_H[index] = TCP_POOL_H[index + 1].take();
+                index += 1;
+            }
+            TCP_POOL_H[TCP_POOL_N - 1] = None;
+            TCP_POOL_N -= 1;
+            stack.sockets_mut().remove(oldest.handle);
+        }
+    }
+}
+
+/// True when the oldest parked socket should go back to the heap.
+fn pool_reclaim(len: usize, floor: usize, oldest_age_ms: u64, idle_ms: u64) -> bool {
+    len > floor && oldest_age_ms >= idle_ms
 }
 
 fn take_udp(stack: &mut crate::net::NetworkStack) -> SocketHandle {
@@ -2366,7 +2406,7 @@ fn display_set(vnc: u64, port: u64, pass_ptr: u64, pass_len: u64, hdmi: u64, err
 
 #[cfg(test)]
 mod tests {
-    use super::close_reap;
+    use super::{close_reap, pool_reclaim};
 
     #[test]
     fn a_drained_close_is_reaped_immediately() {
@@ -2385,6 +2425,14 @@ mod tests {
         assert!(!close_reap(false, false, 0, true));
         assert!(!close_reap(false, false, 4_999, true));
         assert!(close_reap(false, false, 5_000, true));
+    }
+
+    #[test]
+    fn idle_parked_sockets_drop_back_to_the_floor() {
+        assert!(!pool_reclaim(2, 2, 10_000, 5_000));
+        assert!(!pool_reclaim(8, 2, 4_999, 5_000));
+        assert!(pool_reclaim(8, 2, 5_000, 5_000));
+        assert!(pool_reclaim(3, 2, 5_000, 5_000));
     }
 }
 
