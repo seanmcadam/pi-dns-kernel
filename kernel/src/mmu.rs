@@ -301,10 +301,34 @@ pub fn map_user_window(slot: usize, code_va: u64, data_va: u64, heap_va: u64, st
     prepare_user_root(slot);
     let code = user_leaf(true);
     let data = user_leaf(false);
-    map_user_span(slot, USER_CODE_VA, virt_to_phys(code_va), USER_CODE_BYTES, code);
-    map_user_span(slot, USER_DATA_VA, virt_to_phys(data_va), USER_DATA_BYTES, data);
-    map_user_span(slot, USER_HEAP_VA, virt_to_phys(heap_va), USER_HEAP_BYTES, data);
-    map_user_span(slot, USER_STACK_VA, virt_to_phys(stack_va), USER_STACK_BYTES, data);
+    map_user_span(
+        slot,
+        USER_CODE_VA,
+        virt_to_phys(code_va),
+        USER_CODE_BYTES,
+        code,
+    );
+    map_user_span(
+        slot,
+        USER_DATA_VA,
+        virt_to_phys(data_va),
+        USER_DATA_BYTES,
+        data,
+    );
+    map_user_span(
+        slot,
+        USER_HEAP_VA,
+        virt_to_phys(heap_va),
+        USER_HEAP_BYTES,
+        data,
+    );
+    map_user_span(
+        slot,
+        USER_STACK_VA,
+        virt_to_phys(stack_va),
+        USER_STACK_BYTES,
+        data,
+    );
     // Stacks grow down. Leave the page under each stack unmapped, and the
     // page at each initial SP unmapped. The frames stay in the heap image.
     unmap_user_guards(slot);
@@ -380,7 +404,11 @@ fn prepare_user_root(slot: usize) {
 /// so a store is visible to scanout without a cache clean. `pa` is already
 /// a physical address; it is not run through `virt_to_phys`.
 pub fn map_user_fb(slot: usize, pa: u64, bytes: u64) -> i64 {
-    if slot >= USER_SLOTS || bytes == 0 || bytes > USER_FB_MAX || pa % PAGE != 0 || bytes % PAGE != 0
+    if slot >= USER_SLOTS
+        || bytes == 0
+        || bytes > USER_FB_MAX
+        || pa % PAGE != 0
+        || bytes % PAGE != 0
     {
         return -4;
     }
@@ -601,13 +629,7 @@ pub fn tlbi_asid(asid: u64) {
 /// still executes it.
 pub fn invalidate_icache() {
     unsafe {
-        core::arch::asm!(
-            "dsb ish",
-            "ic ialluis",
-            "dsb ish",
-            "isb",
-            options(nostack),
-        );
+        core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack),);
     }
 }
 
@@ -915,8 +937,7 @@ pub fn map_framebuffer(pa: u64, bytes: u64) -> Option<u64> {
                 (&mut *l2).entries[l2_index] = virt_to_phys(l3 as u64) | VALID | TABLE_OR_PAGE;
             }
             let l3_index = ((va >> 12) & 511) as usize;
-            (&mut *l3).entries[l3_index] =
-                (pa + page_i * PAGE) | flags | VALID | TABLE_OR_PAGE;
+            (&mut *l3).entries[l3_index] = (pa + page_i * PAGE) | flags | VALID | TABLE_OR_PAGE;
             page_i += 1;
         }
         let mut block = pa & !(BLOCK - 1);

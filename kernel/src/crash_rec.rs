@@ -83,11 +83,7 @@ pub fn decide(prev: LoopState, uptime_ms: u64) -> Decision {
 
 /// `CRASH000.TXT` .. `CRASH007.TXT`. `seq` 1 is the first file.
 pub fn file_name(seq: u32) -> [u8; 12] {
-    let slot = if seq == 0 {
-        0
-    } else {
-        (seq - 1) % KEEP
-    };
+    let slot = if seq == 0 { 0 } else { (seq - 1) % KEEP };
     let mut name = *b"CRASH000.TXT";
     name[7] = b'0' + (slot as u8);
     name
@@ -505,7 +501,10 @@ mod tests {
     fn checksum_matches_crc32_ieee() {
         let raw = sample();
         let sum = read_u32(&raw, OFF_SUM);
-        assert_eq!(sum, minfmt::crc32_ieee(&raw[..RECORD_LEN], OFF_SUM..OFF_SUM + 4));
+        assert_eq!(
+            sum,
+            minfmt::crc32_ieee(&raw[..RECORD_LEN], OFF_SUM..OFF_SUM + 4)
+        );
         assert_eq!(sum, checksum(&raw[..RECORD_LEN]));
         assert_eq!(sum, 0x8B6E_AE98);
     }

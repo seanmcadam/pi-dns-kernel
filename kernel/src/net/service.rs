@@ -25,9 +25,9 @@
 //! with DAIF.I set the interrupt stays pending and `wfi` returns.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 #[cfg(feature = "board-pi4")]
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use smoltcp::iface::SocketHandle;
 
@@ -350,12 +350,7 @@ fn note_poll(ticks: u64) {
     POLL_LAST_US.store(us, Ordering::Relaxed);
     let mut cur = POLL_MAX_US.load(Ordering::Relaxed);
     while us > cur {
-        match POLL_MAX_US.compare_exchange_weak(
-            cur,
-            us,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match POLL_MAX_US.compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(seen) => cur = seen,
         }
@@ -420,7 +415,10 @@ pub fn owner_idle() {
         #[cfg(feature = "board-pi4")]
         crate::act::note_core(crate::percpu::id());
         crate::percpu::set_asleep(false);
-        IDLE_TICKS.fetch_add(crate::timer::get_ticks().wrapping_sub(t0), Ordering::Relaxed);
+        IDLE_TICKS.fetch_add(
+            crate::timer::get_ticks().wrapping_sub(t0),
+            Ordering::Relaxed,
+        );
     }
     crate::interrupts::unmask();
 }
@@ -783,10 +781,7 @@ pub fn cancel_task(task: usize) {
         if JOBS[id].state.load(Ordering::Acquire) == QUEUED {
             unsafe {
                 let body = &mut *JOBS[id].body.get();
-                if body.task as usize == task
-                    && body.op != OP_TCP_CLOSE
-                    && body.op != OP_CANCEL
-                {
+                if body.task as usize == task && body.op != OP_TCP_CLOSE && body.op != OP_CANCEL {
                     body.op = OP_CANCEL;
                 }
             }

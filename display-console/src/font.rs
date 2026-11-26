@@ -98,6 +98,10 @@ pub static FONT: [[u8; 8]; 95] = [
     [0x00, 0x66, 0xCC, 0x00, 0x00, 0x00, 0x00, 0x00],
 ];
 pub fn glyph(ch: u8) -> &'static [u8; 8] {
-    let index = if (32..=126).contains(&ch) { (ch - 32) as usize } else { 0 };
+    let index = if (32..=126).contains(&ch) {
+        (ch - 32) as usize
+    } else {
+        0
+    };
     &FONT[index]
 }

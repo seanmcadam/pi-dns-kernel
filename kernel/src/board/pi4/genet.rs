@@ -99,8 +99,7 @@ const DMA_RX_OV: u32 = 0x0001;
 const DMA_RX_NO: u32 = 0x0008;
 const DMA_RX_LG: u32 = 0x0010;
 const DMA_RX_RXER: u32 = 0x0004;
-const DMA_RX_ERRORS: u32 =
-    DMA_RX_CRC_ERROR | DMA_RX_OV | DMA_RX_NO | DMA_RX_LG | DMA_RX_RXER;
+const DMA_RX_ERRORS: u32 = DMA_RX_CRC_ERROR | DMA_RX_OV | DMA_RX_NO | DMA_RX_LG | DMA_RX_RXER;
 const DMA_BUFLENGTH_SHIFT: u32 = 16;
 const DMA_BUFLENGTH_MASK: u32 = 0x0fff;
 /// U-Boot's Pi 4 driver uses 8 for both rings.
@@ -150,8 +149,8 @@ const CM_GENET250_DIV: usize = 0x1ec;
 const CM_GENET125_CTL: usize = 0x210;
 const CM_GENET125_DIV: usize = 0x214;
 const CLKGEN: usize = crate::addr::phys_to_virt(0xFD5E_0048) as usize;
-const CLKGEN_GATES: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
-    | (1 << 8);
+const CLKGEN_GATES: u32 =
+    (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
 
 const GENET_IRQ0: u32 = 32 + 157;
 const GENET_IRQ1: u32 = 32 + 158;
@@ -598,10 +597,7 @@ fn note_tx_arp(frame: &[u8]) {
     if tpa == spa || !arp_log_due(&ARP_TX_LOG_MS) {
         return;
     }
-    log::info!(
-        "arp who-has {}.{}.{}.{}",
-        tpa[0], tpa[1], tpa[2], tpa[3]
-    );
+    log::info!("arp who-has {}.{}.{}.{}", tpa[0], tpa[1], tpa[2], tpa[3]);
 }
 
 fn note_rx_arp(frame: &[u8]) {
@@ -844,7 +840,10 @@ fn init_rx_ring() {
     // A zero threshold does not, so an echo request never wakes the owner
     // and the next look is the 2 s gratuitous ARP.
     write(RDMA_RING + DMA_MBUF_DONE_THRESH, 1);
-    write(RDMA_RING + DMA_FLOW_PERIOD, (5 << 16) | (RX_RING_DESCS as u32 >> 4));
+    write(
+        RDMA_RING + DMA_FLOW_PERIOD,
+        (5 << 16) | (RX_RING_DESCS as u32 >> 4),
+    );
     write(RDMA_REG_BASE + DMA_RING_CFG, 1 << DEFAULT_Q);
     let got_end = read(RDMA_RING + DMA_END_ADDR);
     let got_size = read(RDMA_RING + DMA_RING_BUF_SIZE_REG);
@@ -1084,13 +1083,9 @@ pub fn service_link() {
     };
     let status = mdio_read(phy, MII_BMSR).unwrap_or(first);
     let up = status & BMSR_LSTATUS != 0;
-    let (speed, full) = if up {
-        link_speed(phy)
-    } else {
-        (0, true)
-    };
-    let changed = up != LINK_UP.load(Ordering::Relaxed)
-        || (up && speed != SPEED.load(Ordering::Relaxed));
+    let (speed, full) = if up { link_speed(phy) } else { (0, true) };
+    let changed =
+        up != LINK_UP.load(Ordering::Relaxed) || (up && speed != SPEED.load(Ordering::Relaxed));
     if !changed {
         return;
     }
@@ -1488,8 +1483,14 @@ fn spin(count: u32) {
 }
 
 impl Device for GenetDevice {
-    type RxToken<'a> = GenetRxToken where Self: 'a;
-    type TxToken<'a> = GenetTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = GenetRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = GenetTxToken<'a>
+    where
+        Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         service_link();

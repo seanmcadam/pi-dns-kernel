@@ -89,9 +89,7 @@ pub fn boot(entry_el: u64) {
     if crate::board::el2_blocks_secondaries() {
         // HVC from EL1 is delivered to EL2, and EL2 has no PSCI handler.
         // The default QEMU virt machine does not implement EL2.
-        crate::console::write_str(
-            "EL2 is present, extra cores stay offline\r\n",
-        );
+        crate::console::write_str("EL2 is present, extra cores stay offline\r\n");
         return;
     }
     if STARTED.swap(true, Ordering::AcqRel) {

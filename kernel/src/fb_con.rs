@@ -596,12 +596,7 @@ fn finish_log(msg_phys: u64, assert_vc: Option<u32>) -> bool {
             ))
             .unwrap_or("")
         };
-        store_text(
-            summary,
-            addr_of_mut!(VCLOG).cast(),
-            VCLOG_CAP,
-            &VCLOG_LEN,
-        );
+        store_text(summary, addr_of_mut!(VCLOG).cast(), VCLOG_CAP, &VCLOG_LEN);
     }
     let mut line = Line::new();
     line.push("vclog ");
@@ -700,7 +695,8 @@ fn copy_used(base: u64, log_size: usize, read_off: usize, write_off: usize) -> (
         let left = n - i;
         let room = log_size - off;
         if (pa & 3) == 0 && left >= 4 && room >= 4 && ram_holds(pa, 4) {
-            let word = unsafe { core::ptr::read_volatile(crate::addr::phys_to_virt(pa) as *const u32) };
+            let word =
+                unsafe { core::ptr::read_volatile(crate::addr::phys_to_virt(pa) as *const u32) };
             let bytes = word.to_le_bytes();
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -754,7 +750,10 @@ fn append_assert(dst: *mut u8, cap: usize, at: usize) -> (usize, bool) {
     let src = unsafe { core::slice::from_raw_parts(addr_of!(RAW).cast::<u8>(), src_n) };
     let rest = unsafe { core::slice::from_raw_parts_mut(dst.add(n), cap - n) };
     let rendered = fwupd::vclog_render_asserts(src, rest);
-    (n + rendered.bytes, rendered.complete && held.copied >= held.expect)
+    (
+        n + rendered.bytes,
+        rendered.complete && held.copied >= held.expect,
+    )
 }
 
 /// Look for the `VLOG` table inside the Device window. The walk is
@@ -788,12 +787,7 @@ fn scan_mapped() -> bool {
 }
 
 fn remember_vclog(text: &str) {
-    store_text(
-        text,
-        addr_of_mut!(VCLOG).cast(),
-        VCLOG_CAP,
-        &VCLOG_LEN,
-    );
+    store_text(text, addr_of_mut!(VCLOG).cast(), VCLOG_CAP, &VCLOG_LEN);
     save_line(text);
 }
 
@@ -826,7 +820,12 @@ fn log_fb_tags() {
     msg[0] = (n * 4) as u32;
     let _ = ask_mbox(&mut msg[..n]);
     log_mbox_pair("40003", msg[1], msg[phys_at + 3], msg[phys_at + 4]);
-    log_mbox_pair("40004", msg[virt_at + 2], msg[virt_at + 3], msg[virt_at + 4]);
+    log_mbox_pair(
+        "40004",
+        msg[virt_at + 2],
+        msg[virt_at + 3],
+        msg[virt_at + 4],
+    );
     log_mbox_pair("40005", msg[depth_at + 2], msg[depth_at + 3], 0);
     log_mbox_pair("40008", msg[pitch_at + 2], msg[pitch_at + 3], 0);
 }
@@ -1210,7 +1209,8 @@ pub fn set_status(text: &str) {
     unsafe {
         let bytes = text.as_bytes();
         let n = bytes.len().min(HEADER_CAP);
-        let same = *addr_of!(HEADER_LEN) == n && core::slice::from_raw_parts(addr_of!(HEADER).cast::<u8>(), n) == &bytes[..n];
+        let same = *addr_of!(HEADER_LEN) == n
+            && core::slice::from_raw_parts(addr_of!(HEADER).cast::<u8>(), n) == &bytes[..n];
         if !same {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr_of_mut!(HEADER).cast(), n);
             *addr_of_mut!(HEADER_LEN) = n;
@@ -2351,10 +2351,8 @@ fn exchange(msg: &mut [u32], bus_alias: bool) -> bool {
             log_mbox(bus_alias, "mismatch");
         }
         let phase = PHASE.load(Ordering::Relaxed);
-        let use_second = mismatch
-            && (phase == b'g' || phase == b'p')
-            && !dims_ok(&first)
-            && dims_ok(&second);
+        let use_second =
+            mismatch && (phase == b'g' || phase == b'p') && !dims_ok(&first) && dims_ok(&second);
         let chosen = if use_second { &second } else { &first };
         let mut j = 0;
         while j < n {

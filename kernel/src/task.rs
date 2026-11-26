@@ -540,37 +540,12 @@ fn syscall() -> u64 {
             ctx.x[0] = 0;
             RESUME
         }
-        LOG_RELOAD
-        | CONFIG_READ
-        | CONFIG_WRITE
-        | LOG_FILL
-        | CONFIG_SET_CACHE
-        | CONFIG_CACHE_REAP
-        | TIMER_TICKS
-        | TIMER_FREQ
-        | SET_CACHE_STATS
-        | CACHE_PLANT
-        | DISPLAY_IO
-        | DISPLAY_SET
-        | SET_DNS_TOP
-        | SET_UPSTREAM_HEALTH
-        | UPSTREAM_HEALTH
-        | CONFIG_PROBE_SECS
-        | NET_READY
-        | NET_COUNTERS
-        | SET_DNS_LOAD
-        | NET_EXTRA
-        | FW
-        | SD_STATUS
-        | HDMI_CONSOLE
-        | CRASH
-        | BOOT
-        | BOARD
-        | 74
-        | 75
-        | 76
-        | 77
-        | 78 | 80 | 81 | 82 => {
+        LOG_RELOAD | CONFIG_READ | CONFIG_WRITE | LOG_FILL | CONFIG_SET_CACHE
+        | CONFIG_CACHE_REAP | TIMER_TICKS | TIMER_FREQ | SET_CACHE_STATS | CACHE_PLANT
+        | DISPLAY_IO | DISPLAY_SET | SET_DNS_TOP | SET_UPSTREAM_HEALTH | UPSTREAM_HEALTH
+        | CONFIG_PROBE_SECS | NET_READY | NET_COUNTERS | SET_DNS_LOAD | NET_EXTRA | FW
+        | SD_STATUS | HDMI_CONSOLE | CRASH | BOOT | BOARD | 74 | 75 | 76 | 77 | 78 | 80 | 81
+        | 82 => {
             let args = [ctx.x[0], ctx.x[1], ctx.x[2], ctx.x[3], ctx.x[4], ctx.x[5]];
             ctx.x[0] = crate::user_fd::call(num, args);
             RESUME
@@ -773,7 +748,11 @@ fn hex(mut n: u64) {
     while i > 0 {
         i -= 1;
         let nib = (n & 0xf) as u8;
-        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        buf[i] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        };
         n >>= 4;
     }
     put(unsafe { core::str::from_utf8_unchecked(&buf) });
@@ -1061,7 +1040,11 @@ pub fn start_telnet() -> Result<(), ()> {
     unsafe {
         let code = addr_of_mut!(TELNET_MEM.code) as *mut u8;
         core::ptr::write_bytes(code, 0, TELNET_CODE_BYTES);
-        core::ptr::write_bytes(addr_of_mut!(TELNET_MEM.data).cast::<u8>(), 0, TELNET_DATA_BYTES);
+        core::ptr::write_bytes(
+            addr_of_mut!(TELNET_MEM.data).cast::<u8>(),
+            0,
+            TELNET_DATA_BYTES,
+        );
         core::ptr::write_bytes(
             addr_of_mut!(TELNET_MEM.heap) as *mut u8,
             0,
@@ -1328,7 +1311,11 @@ fn apply_display(slot: usize, cmd: u8) -> u8 {
         }
         2 => {
             let _ = crate::supervisor::stop(slot);
-            if crate::supervisor::is_live(slot) { 2 } else { 0 }
+            if crate::supervisor::is_live(slot) {
+                2
+            } else {
+                0
+            }
         }
         3 => {
             if crate::supervisor::is_live(slot) {
@@ -1405,7 +1392,13 @@ pub fn start_spin() -> Result<(), ()> {
 }
 
 fn resume(slot: usize, task: *mut Task, dns: bool) {
-    let live = unsafe { if dns { DNS_LIVE } else { HTTP_LIVE } };
+    let live = unsafe {
+        if dns {
+            DNS_LIVE
+        } else {
+            HTTP_LIVE
+        }
+    };
     if !live || main_blocked(slot) {
         return;
     }
@@ -1480,7 +1473,11 @@ fn load_image(mem: *mut UserMem, bin: &[u8], data_off: usize, data_len: usize, d
             && data_off + data_len <= bin.len()
             && data_place + data_len <= crate::mmu::USER_DATA_BYTES as usize
         {
-            core::ptr::copy_nonoverlapping(bin.as_ptr().add(data_off), data.add(data_place), data_len);
+            core::ptr::copy_nonoverlapping(
+                bin.as_ptr().add(data_off),
+                data.add(data_place),
+                data_len,
+            );
         }
         // The whole window was zeroed. Lines past the binary are still
         // executable, and a restart leaves the previous image in the
@@ -2270,8 +2267,13 @@ struct LogWait {
 }
 
 const LOG_WAIT_N: usize = 32;
-static mut LOG_WAIT: [LogWait; LOG_WAIT_N] =
-    [const { LogWait { slot: 0, index: 0, live: false } }; LOG_WAIT_N];
+static mut LOG_WAIT: [LogWait; LOG_WAIT_N] = [const {
+    LogWait {
+        slot: 0,
+        index: 0,
+        live: false,
+    }
+}; LOG_WAIT_N];
 
 fn log_publish(ptr: u64, len: u64) -> u64 {
     if crate::percpu::slot() != LOG_SLOT {

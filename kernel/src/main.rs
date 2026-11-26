@@ -6,6 +6,8 @@ extern crate alloc;
 #[cfg(feature = "board-pi4")]
 mod act;
 mod addr;
+mod block_mem;
+mod block_tab;
 mod board;
 mod board_id;
 mod board_rev;
@@ -13,10 +15,10 @@ mod boot;
 mod boot_rec;
 mod clock;
 mod config_manager;
-mod crash;
-mod crash_rec;
 mod console;
 mod cpu_stat;
+mod crash;
+mod crash_rec;
 mod dhcp_rx;
 mod disklog;
 mod dns;
@@ -32,8 +34,6 @@ mod hdmi_hw;
 mod http;
 mod interrupts;
 mod logger;
-mod block_mem;
-mod block_tab;
 mod memory;
 mod mmu;
 mod net;
@@ -313,10 +313,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         // panel and stop.
         #[cfg(feature = "board-pi4")]
         if net::service::drive_age(now) > 2_000 {
-            crash::note(
-                crash_rec::KIND_HANG,
-                b"owner stuck in NIC poll",
-            );
+            crash::note(crash_rec::KIND_HANG, b"owner stuck in NIC poll");
             act::halt_with(
                 "owner stuck in NIC poll\nDHCP or RX callback did not return\nno reboot",
             );

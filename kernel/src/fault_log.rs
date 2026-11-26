@@ -310,10 +310,10 @@ fn detail(ec: u64, iss: u64) -> (&'static str, &'static str) {
 
 fn status(dfsc: u64) -> &'static str {
     match dfsc {
-        0b000100 | 0b000101 | 0b000110 | 0b000111 => "trans",
-        0b001001 | 0b001010 | 0b001011 => "flag",
-        0b001101 | 0b001110 | 0b001111 => "perm",
-        0b000000 | 0b000001 | 0b000010 | 0b000011 => "size",
+        0b000100..=0b000111 => "trans",
+        0b001001..=0b001011 => "flag",
+        0b001101..=0b001111 => "perm",
+        0b000000..=0b000011 => "size",
         0b100001 => "align",
         0b010000 | 0b010100 => "ext",
         _ => "other",
@@ -355,7 +355,14 @@ mod tests {
     #[test]
     fn kfault_fits_and_names_the_access() {
         let mut buf = [0u8; 80];
-        let n = write_kfault(&mut buf, 4, 0x25, (1 << 6) | 0b001101, 0xffff_0000_0008_1234, 0);
+        let n = write_kfault(
+            &mut buf,
+            4,
+            0x25,
+            (1 << 6) | 0b001101,
+            0xffff_0000_0008_1234,
+            0,
+        );
         let line = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(n <= 80, "{line}");
         assert!(line.starts_with("kfault v=4 ec=25 "));
@@ -367,15 +374,7 @@ mod tests {
     #[test]
     fn elfault_worst_case_fits_the_log_slot() {
         let mut buf = [0u8; 96];
-        let n = write_elfault(
-            &mut buf,
-            "telnet",
-            32,
-            0x24,
-            0b000100,
-            0x1_0000_0000,
-            0,
-        );
+        let n = write_elfault(&mut buf, "telnet", 32, 0x24, 0b000100, 0x1_0000_0000, 0);
         assert!(n <= 80, "{}", n);
         let line = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
@@ -405,28 +404,15 @@ mod tests {
     #[test]
     fn stack_overflow_line_names_the_task_and_fits() {
         let mut buf = [0u8; 80];
-        let n = write_stack_overflow(
-            &mut buf,
-            "telnet",
-            32,
-            0x24,
-            0x1_0000_0000,
-            0x1_0021_f000,
-        );
+        let n = write_stack_overflow(&mut buf, "telnet", 32, 0x24, 0x1_0000_0000, 0x1_0021_f000);
         assert!(n <= 80, "{}", n);
         let line = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
             line,
             "STACK OVERFLOW telnet t=32 ec=24 elr=0000000100000000 far=000000010021f000"
         );
-        let n = write_stack_overflow_rows(
-            &mut buf,
-            "telnet",
-            32,
-            0x24,
-            0x1_0000_0000,
-            0x1_0021_f000,
-        );
+        let n =
+            write_stack_overflow_rows(&mut buf, "telnet", 32, 0x24, 0x1_0000_0000, 0x1_0021_f000);
         assert!(n <= 80, "{}", n);
         let rows = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
@@ -543,7 +529,9 @@ mod tests {
             }
             index += 1;
         }
-        assert!(telnet_client_guard_below(TELNET_CLIENTS - 1) >= telnet_reaper_guard_above() + PAGE);
+        assert!(
+            telnet_client_guard_below(TELNET_CLIENTS - 1) >= telnet_reaper_guard_above() + PAGE
+        );
     }
 
     fn guard_pages_unique(slot: usize) -> bool {

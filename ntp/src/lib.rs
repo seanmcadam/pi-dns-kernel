@@ -350,7 +350,12 @@ pub fn read_a(packet: &[u8], id: u16) -> Option<[u8; 4]> {
     while seen < count && seen < 32 {
         let (kind, class, rdlen, next) = record_at(packet, i)?;
         if kind == 1 && class == 1 && rdlen == 4 {
-            return Some([packet[next], packet[next + 1], packet[next + 2], packet[next + 3]]);
+            return Some([
+                packet[next],
+                packet[next + 1],
+                packet[next + 2],
+                packet[next + 3],
+            ]);
         }
         i = next + rdlen;
         seen += 1;

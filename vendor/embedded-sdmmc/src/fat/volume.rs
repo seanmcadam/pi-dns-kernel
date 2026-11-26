@@ -462,19 +462,22 @@ impl FatVolume {
                     // Well none of the blocks in that cluster had any space in
                     // them, let's fetch another one.
                     let mut block_cache = BlockCache::empty();
-                    current_cluster =
-                        match self.follow_dir(block_device, cluster, &mut block_cache, &mut steps)?
-                        {
-                            Some(n) => {
-                                first_dir_block_num = self.cluster_to_block(n);
-                                Some(n)
-                            }
-                            None => {
-                                let c = self.alloc_cluster(block_device, Some(cluster), true)?;
-                                first_dir_block_num = self.cluster_to_block(c);
-                                Some(c)
-                            }
-                        };
+                    current_cluster = match self.follow_dir(
+                        block_device,
+                        cluster,
+                        &mut block_cache,
+                        &mut steps,
+                    )? {
+                        Some(n) => {
+                            first_dir_block_num = self.cluster_to_block(n);
+                            Some(n)
+                        }
+                        None => {
+                            let c = self.alloc_cluster(block_device, Some(cluster), true)?;
+                            first_dir_block_num = self.cluster_to_block(c);
+                            Some(c)
+                        }
+                    };
                 }
                 // We ran out of clusters in the chain, and apparently we weren't
                 // able to make the chain longer, so the disk must be full.
@@ -554,20 +557,16 @@ impl FatVolume {
                 }
             }
             if cluster != ClusterId::ROOT_DIR {
-                current_cluster = match self.follow_dir(
-                    block_device,
-                    cluster,
-                    &mut block_cache,
-                    &mut steps,
-                ) {
-                    Ok(Some(n)) => {
-                        first_dir_block_num = self.cluster_to_block(n);
-                        Some(n)
-                    }
-                    Ok(None) => None,
-                    Err(Error::BadCluster) => return Err(Error::BadCluster),
-                    Err(_) => None,
-                };
+                current_cluster =
+                    match self.follow_dir(block_device, cluster, &mut block_cache, &mut steps) {
+                        Ok(Some(n)) => {
+                            first_dir_block_num = self.cluster_to_block(n);
+                            Some(n)
+                        }
+                        Ok(None) => None,
+                        Err(Error::BadCluster) => return Err(Error::BadCluster),
+                        Err(_) => None,
+                    };
             } else {
                 current_cluster = None;
             }

@@ -260,7 +260,11 @@ fn insert(hash: u64) -> i64 {
     let Some(half) = blocklist::pair_half_mut(mem, SCRUB_HALF.load(Ordering::Relaxed)) else {
         return -5;
     };
-    if blocklist::insert(half, hash) { 1 } else { 0 }
+    if blocklist::insert(half, hash) {
+        1
+    } else {
+        0
+    }
 }
 
 fn commit() -> i64 {
@@ -320,7 +324,11 @@ fn fill_stats(out: &mut [u8]) -> usize {
     if out.len() < 48 {
         return 0;
     }
-    let state = if running() { STATE.load(Ordering::Relaxed) } else { 0 };
+    let state = if running() {
+        STATE.load(Ordering::Relaxed)
+    } else {
+        0
+    };
     out[0] = state;
     let (domains, size) = if let Some(mem) = region() {
         (blocklist::pair_count(mem), mem.len() as u64)
@@ -475,7 +483,11 @@ fn write_file(name_ptr: u64, name_len: u64, buf: u64, len: u64, flags: u64) -> i
     } else {
         crate::fs::append_bytes(name, &tmp[..n])
     };
-    if result.is_ok() { n as i64 } else { -5 }
+    if result.is_ok() {
+        n as i64
+    } else {
+        -5
+    }
 }
 
 fn swing(from_ptr: u64, from_len: u64, to_ptr: u64, to_len: u64) -> i64 {
@@ -496,7 +508,11 @@ fn swing(from_ptr: u64, from_len: u64, to_ptr: u64, to_len: u64) -> i64 {
     if from != "BLOCK.TMP" {
         return -22;
     }
-    if crate::fs::swing_file(from, to).is_ok() { 0 } else { -5 }
+    if crate::fs::swing_file(from, to).is_ok() {
+        0
+    } else {
+        -5
+    }
 }
 
 fn file_len(ptr: u64, len: u64) -> i64 {
@@ -586,4 +602,3 @@ fn copy_out(ptr: u64, cap: u64, data: &[u8]) -> i64 {
     crate::mmu::set_pan(true);
     n as i64
 }
-

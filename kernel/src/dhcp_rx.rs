@@ -298,7 +298,8 @@ pub fn self_check_line() -> &'static str {
                 0x98, 0xfe, 0x54, 0x82, 0x0b, 0x6e, 0x00, 0x00, 0x5e, 0x00, 0x01, 0x01, 0x08, 0x00,
                 0x45, 0x00,
             ];
-    let kept = verdict(&frame[..n], &PHOTO_MAC) == Verdict::Pass && home_router_options(&frame[..n]);
+    let kept =
+        verdict(&frame[..n], &PHOTO_MAC) == Verdict::Pass && home_router_options(&frame[..n]);
     let before = frame;
     let _ = verdict(&frame[..n], &PHOTO_MAC);
     let unchanged = frame == before;
@@ -589,7 +590,11 @@ mod tests {
         let mut iface = iface(&mac);
         let mut sockets = smoltcp::iface::SocketSet::new(Vec::new());
         sockets.add(smoltcp::socket::dhcpv4::Socket::new());
-        let _ = iface.poll(smoltcp::time::Instant::from_millis(0), &mut dev, &mut sockets);
+        let _ = iface.poll(
+            smoltcp::time::Instant::from_millis(0),
+            &mut dev,
+            &mut sockets,
+        );
         let discover = dev.tx.last().cloned().expect("discover");
         assert_eq!(discover[14] >> 4, 4, "discover is not ipv4");
         let xid = u32::from_be_bytes([discover[46], discover[47], discover[48], discover[49]]);
@@ -597,9 +602,15 @@ mod tests {
         let n = write_offer(&mut offer, &mac, &mac, xid);
         dev.rx.push(offer[..n].to_vec());
         let before = dev.tx.len();
-        let _ = iface.poll(smoltcp::time::Instant::from_millis(1_000), &mut dev, &mut sockets);
+        let _ = iface.poll(
+            smoltcp::time::Instant::from_millis(1_000),
+            &mut dev,
+            &mut sockets,
+        );
         assert!(
-            dev.tx[before..].iter().any(|frame| dhcp_type(frame) == Some(3)),
+            dev.tx[before..]
+                .iter()
+                .any(|frame| dhcp_type(frame) == Some(3)),
             "stack did not emit a DHCP REQUEST"
         );
     }
@@ -611,7 +622,11 @@ mod tests {
         let mut iface = iface(&mac);
         let mut sockets = smoltcp::iface::SocketSet::new(Vec::new());
         sockets.add(smoltcp::socket::dhcpv4::Socket::new());
-        let _ = iface.poll(smoltcp::time::Instant::from_millis(0), &mut dev, &mut sockets);
+        let _ = iface.poll(
+            smoltcp::time::Instant::from_millis(0),
+            &mut dev,
+            &mut sockets,
+        );
         let discover = dev.tx.last().cloned().expect("discover");
         let xid = u32::from_be_bytes([discover[46], discover[47], discover[48], discover[49]]);
         let mut other = mac;
@@ -621,9 +636,15 @@ mod tests {
         assert_eq!(verdict(&offer[..n], &mac), Verdict::DropChaddr);
         dev.rx.push(offer[..n].to_vec());
         let before = dev.tx.len();
-        let _ = iface.poll(smoltcp::time::Instant::from_millis(1_000), &mut dev, &mut sockets);
+        let _ = iface.poll(
+            smoltcp::time::Instant::from_millis(1_000),
+            &mut dev,
+            &mut sockets,
+        );
         assert!(
-            dev.tx[before..].iter().all(|frame| dhcp_type(frame) != Some(3)),
+            dev.tx[before..]
+                .iter()
+                .all(|frame| dhcp_type(frame) != Some(3)),
             "a foreign chaddr produced a REQUEST"
         );
     }
@@ -648,7 +669,13 @@ mod tests {
         assert_eq!(&frame[12..14], &[0x08, 0x06]);
         assert_eq!(&frame[20..22], &[0x00, 0x02]);
         assert_eq!(&frame[28..32], &gw_ip);
-        assert!(!stage_gateway_arp(&mac, our_ip, mask, &VRRP_MAC, [8, 8, 8, 8]));
+        assert!(!stage_gateway_arp(
+            &mac,
+            our_ip,
+            mask,
+            &VRRP_MAC,
+            [8, 8, 8, 8]
+        ));
 
         let mut request = [0u8; 60];
         assert_eq!(write_gateway_request(&mut request, &mac, our_ip, gw_ip), 60);
@@ -663,12 +690,17 @@ mod tests {
         let eth = smoltcp::wire::EthernetAddress::from_bytes(&mac);
         let mut config = smoltcp::iface::Config::new(eth.into());
         config.random_seed = 1;
-        let mut iface =
-            smoltcp::iface::Interface::new(config, &mut dev, smoltcp::time::Instant::from_millis(0));
+        let mut iface = smoltcp::iface::Interface::new(
+            config,
+            &mut dev,
+            smoltcp::time::Instant::from_millis(0),
+        );
         let ip = smoltcp::wire::Ipv4Address::from_bytes(&our_ip);
         iface.update_ip_addrs(|addrs| {
             addrs.clear();
-            addrs.push(smoltcp::wire::IpCidr::new(ip.into(), 24)).unwrap();
+            addrs
+                .push(smoltcp::wire::IpCidr::new(ip.into(), 24))
+                .unwrap();
         });
         iface
             .routes_mut()
@@ -676,7 +708,11 @@ mod tests {
             .unwrap();
         dev.rx.push(frame[..n].to_vec());
         let mut sockets = smoltcp::iface::SocketSet::new(Vec::new());
-        let _ = iface.poll(smoltcp::time::Instant::from_millis(1), &mut dev, &mut sockets);
+        let _ = iface.poll(
+            smoltcp::time::Instant::from_millis(1),
+            &mut dev,
+            &mut sockets,
+        );
 
         let rx = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::storage::PacketMetadata::EMPTY; 2],
@@ -700,7 +736,11 @@ mod tests {
             )
             .unwrap();
         let before = dev.tx.len();
-        let _ = iface.poll(smoltcp::time::Instant::from_millis(2), &mut dev, &mut sockets);
+        let _ = iface.poll(
+            smoltcp::time::Instant::from_millis(2),
+            &mut dev,
+            &mut sockets,
+        );
         let sent = dev.tx[before..]
             .iter()
             .find(|pkt| pkt.len() >= 34 && pkt[12] == 0x08 && pkt[13] == 0x00)

@@ -73,12 +73,7 @@ pub fn clock_div(base_hz: u32, target_hz: u32) -> u16 {
     }
     let step = target_hz.saturating_mul(2).max(1);
     let mut n = base_hz.saturating_add(step - 1) / step;
-    if n == 0 {
-        n = 1;
-    }
-    if n > 0x3ff {
-        n = 0x3ff;
-    }
+    n = n.clamp(1, 0x3ff);
     let low = ((n & 0xff) as u16) << 8;
     let high = ((n & 0x300) >> 8) as u16;
     low | (high << 6)

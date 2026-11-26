@@ -120,6 +120,10 @@ impl DnsCache {
         self.used as usize
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+
     pub fn stats(&self) -> CacheStats {
         let reserved = self.slots.len() * core::mem::size_of::<Slot>()
             + self.buckets.len() * core::mem::size_of::<u32>();
@@ -457,7 +461,10 @@ mod tests {
     fn hit_miss_and_refresh() {
         let mut cache = DnsCache::new(4);
         assert!(cache.insert("Example.COM.", 1, 1, &[9, 9, 9, 9], 500, 100));
-        assert_eq!(take(&mut cache, "example.com", 200).unwrap(), vec![9, 9, 9, 9]);
+        assert_eq!(
+            take(&mut cache, "example.com", 200).unwrap(),
+            vec![9, 9, 9, 9]
+        );
         assert!(take(&mut cache, "example.com", 500).is_none());
         assert!(cache.insert("example.com", 1, 1, &[1, 2], 800, 500));
         assert_eq!(cache.len(), 1);
