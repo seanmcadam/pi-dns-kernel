@@ -563,21 +563,33 @@ fn finish(slot: usize) {
     };
     let label = name(slot);
     match outcome {
-        3 => say(2, label, "listen restart", 0, 0, 0),
+        3 => say(2, label, "forced restart", 0, 0, 0),
         2 => say(1, label, "stopped", 0, 0, 0),
         1 => say(3, label, "gave up", ec, elr, far),
         _ => say(2, label, "fault", ec, elr, far),
     }
 }
 
-/// Port 80 has had no LISTEN socket for the idle budget. Runs from `tick`,
-/// which does not hold `FD`. The flag is set under `FD` and only read here.
+/// How long port 80 may stay out of descriptors before a restart.
+/// Longer than the close budget (`user_fd::TCP_IDLE_MS`, 5s): a table
+/// full of `Kind::Closing` sockets is reaped, and that reap clears this
+/// clock, before the bounce. A leak that nothing reaps still restarts.
+const HTTP_EMFILE_MS: u64 = 10_000;
+
+/// Port 80 has had no LISTEN socket, or accept has been out of descriptors,
+/// long enough to be stuck. A freed descriptor clears the exhaustion clock,
+/// so a service that is making progress is not restarted. Runs from `tick`,
+/// which does not hold `FD`.
 fn bounce_stalled_http(now: u64) {
-    let since = crate::user_fd::http_listen_down_ms();
-    if since == 0 || now.saturating_sub(since) < 5_000 {
+    let listen_down = crate::user_fd::http_listen_down_ms();
+    let emfile = crate::user_fd::http_emfile_ms();
+    let accept = emfile != 0 && now.saturating_sub(emfile) >= HTTP_EMFILE_MS;
+    let listen = listen_down != 0 && now.saturating_sub(listen_down) >= 5_000;
+    if !accept && !listen {
         return;
     }
     crate::user_fd::clear_http_listen_down();
+    crate::user_fd::clear_http_emfile();
     let slot = 1;
     let start = {
         let _hold = guard();
@@ -599,8 +611,18 @@ fn bounce_stalled_http(now: u64) {
     if !start {
         return;
     }
-    say(2, name(slot), "listen stalled", 0, 0, 0);
-    crate::logger::note_fault("http listen stalled; restarting");
+    let why = if accept {
+        "accept stalled"
+    } else {
+        "listen stalled"
+    };
+    let fault = if accept {
+        "http accept stalled; restarting"
+    } else {
+        "http listen stalled; restarting"
+    };
+    say(2, name(slot), why, 0, 0, 0);
+    crate::logger::note_fault(fault);
     crate::task::clear_live(slot);
     crate::task::kill_slot(slot);
     finish(slot);

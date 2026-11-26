@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.1.94" qemu/boot-output.txt && \
+   grep -q "version 0.1.95" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.94"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.1.95"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -328,7 +328,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.1.94" not in html:
+if forced.get("version") != plain.get("version") or "0.1.95" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 if "<pre>" not in dns_page or "&quot;upstreams&quot;: [" not in dns_page:
@@ -860,6 +860,112 @@ echo ""
 echo "Stopping QEMU..."
 kill $QEMU_PID 2>/dev/null || true
 wait $QEMU_PID 2>/dev/null || true
+
+# A peer that never ACKs the FIN used to pin Kind::Closing until the
+# descriptor table was full. The hold hook keeps finished closes for the
+# same idle budget, so this guest can fill the table and then must recover
+# without a supervisor restart.
+echo ""
+echo "Test 66: Stalled closes do not exhaust HTTP descriptors"
+rm -f qemu/close-reap.txt
+timeout 70 qemu-system-aarch64 \
+    -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
+    -kernel boot/kernel8.img \
+    -serial file:qemu/close-reap.txt \
+    -display none -monitor none -nographic \
+    -netdev user,id=net0,${HOSTFWD} \
+    -device virtio-net-device,netdev=net0 \
+    >/tmp/qemu-close-reap.txt 2>&1 &
+CLOSE_PID=$!
+sleep 8
+if python3 - "$HTTP_HOST_PORT" "$DNS_HOST_PORT" <<'PY'
+import subprocess, sys, time, urllib.error, urllib.request
+http, dns = sys.argv[1], sys.argv[2]
+base = "http://127.0.0.1:%s" % http
+auth = urllib.request.HTTPBasicAuthHandler()
+auth.add_password(realm="DNS Server", uri=base, user="admin", passwd="admin")
+opener = urllib.request.build_opener(auth)
+
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+
+def req(method, path, body=None, timeout=3):
+    data = body.encode() if isinstance(body, str) else body
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if body is not None:
+        r.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        resp = opener.open(r, timeout=timeout)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except Exception as err:
+        return 0, str(err).encode()
+
+status, page = req("GET", "/debug")
+if status != 200 or b"http running restarts=" not in page:
+    fail("debug %s %s" % (status, page[:180]))
+before = page.split(b"http running restarts=", 1)[1].split()[0]
+status, armed = req("POST", "/debug/hold-close", "confirm=hold")
+if status != 200 or b"holding" not in armed:
+    fail("arm %s %s" % (status, armed[:80]))
+ok = 0
+blocked = 0
+for _ in range(30):
+    status, _ = req("GET", "/json/status", timeout=2)
+    if status == 200:
+        ok += 1
+    else:
+        blocked += 1
+        break
+if ok < 8 or blocked != 1:
+    fail("table did not fill ok=%s blocked=%s" % (ok, blocked))
+time.sleep(8)
+status, body = req("GET", "/json/status", timeout=5)
+if status != 200 or b'"status":"running"' not in body:
+    fail("after reap %s %s" % (status, body[:120]))
+status, page = req("GET", "/debug")
+if status != 200:
+    fail("debug after %s" % status)
+after = page.split(b"http running restarts=", 1)[1].split()[0]
+if after != before:
+    fail("supervisor restarted http %s -> %s" % (before, after))
+status, released = req("POST", "/debug/hold-close", "confirm=release")
+if status != 200 or b"released" not in released:
+    fail("release %s %s" % (status, released[:80]))
+for _ in range(10):
+    status, body = req("GET", "/json/status", timeout=3)
+    if status != 200:
+        fail("after release %s %s" % (status, body[:80]))
+dig = subprocess.run(
+    ["dig", "@127.0.0.1", "-p", dns, "test.local", "+short", "+time=3", "+tries=1"],
+    check=False, capture_output=True, text=True,
+)
+if "192.168.1.100" not in dig.stdout:
+    fail("dns %s" % dig.stdout)
+print("filled", ok, "restarts", after.decode())
+sys.exit(0)
+PY
+then
+    if ! grep -q "HTTP connection close timed out" qemu/close-reap.txt; then
+        echo "✗ Stalled close was not reaped"
+        tail -30 qemu/close-reap.txt 2>/dev/null || true
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    elif grep -q "forced restart\|accept stalled" qemu/close-reap.txt; then
+        echo "✗ Supervisor restarted HTTP during close reap"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    else
+        echo "✓ Stalled closes were reaped and HTTP kept its descriptors"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    fi
+else
+    echo "✗ Stalled closes exhausted HTTP descriptors"
+    tail -30 qemu/close-reap.txt 2>/dev/null || true
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+kill "$CLOSE_PID" 2>/dev/null || true
+wait "$CLOSE_PID" 2>/dev/null || true
 
 # Supervisor checks use their own guest so a crash loop cannot eat the
 # first QEMU's 120s budget or the 26 tests above.
@@ -2429,12 +2535,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.1.94" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.1.95" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.94" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.1.95" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2450,7 +2556,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.94" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.1.95" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2697,12 +2803,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.94":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.1.95":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.1.94" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.1.95" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
