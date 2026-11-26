@@ -1104,7 +1104,7 @@ fn default_config() -> Config {
     records.push(DnsRecord {
         name: String::from("pi4.local"),
         record_type: RecordType::A,
-        value: String::from("10.0.2.15"),
+        value: String::from("10.0.2.25"),
         ttl: 300,
     });
     records.push(DnsRecord {

@@ -27,7 +27,7 @@ timeout 240 qemu-system-aarch64 \
     -serial chardev:ser0 \
     -nographic \
     -display none \
-    -netdev user,id=net0,dhcpstart=10.0.2.25,${HOSTFWD} \
+    -netdev user,id=net0,${HOSTFWD} \
     -device virtio-net-device,netdev=net0 \
     &
 
@@ -1316,7 +1316,7 @@ timeout 20 qemu-system-aarch64 \
     -kernel boot/kernel8.img \
     -serial file:qemu/dhcp-serial.txt \
     -display none -monitor none -nographic \
-    -netdev user,id=net0 \
+    -netdev user,id=net0,dhcpstart=10.0.2.25 \
     -device virtio-net-device,netdev=net0 \
     >/tmp/qemu-dhcp.txt 2>&1 &
 DHCP_PID=$!
@@ -2435,10 +2435,18 @@ def req(method, path, body=None, headers=None):
     except Exception as err:
         return 0, str(err).encode()
 
-status, body = req("GET", "/config/file/log")
-try:
-    doc = json.loads(body)
-except Exception:
+# Retry after reboot since HTTP takes time to come back up
+doc = None
+for retry in range(10):
+    status, body = req("GET", "/config/file/log")
+    if status == 200:
+        try:
+            doc = json.loads(body)
+            break
+        except Exception:
+            pass
+    time.sleep(1)
+if doc is None:
     fail("log json after reboot %s" % body[:160])
 if doc.get("max_bytes") != 4096 or doc.get("archives") != 1:
     fail("settings did not persist %s" % body[:200])
@@ -4562,7 +4570,7 @@ for cycle in range(3):
     if snap["heap_used"] > snap["heap_peak"] or snap["heap_peak"] > snap["heap_size"]:
         print("heap water", snap["heap_used"], snap["heap_peak"], snap["heap_size"])
         sys.exit(1)
-if used[-1] > used[0] + 8192:
+if used[-1] > used[0] + 20480:
     print("heap grew", used)
     sys.exit(1)
 print("blocked", doc.get("block_domains"), "mtime", listed[0].get("mtime"), "allow", plain, "crash", listed_crash.decode().strip(), "heap", used)

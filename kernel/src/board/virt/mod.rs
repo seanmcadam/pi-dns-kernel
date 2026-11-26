@@ -95,7 +95,7 @@ fn default_network() -> NetworkMode {
     #[cfg(feature = "dhcp-default")]
     {
         NetworkMode::Dhcp {
-            fallback_ip: [10, 0, 2, 15],
+            fallback_ip: [10, 0, 2, 25],
             fallback_netmask: [255, 255, 255, 0],
             fallback_gateway: [10, 0, 2, 2],
             timeout_ms: 4_000,
