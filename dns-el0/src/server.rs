@@ -8,33 +8,12 @@ use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use dns_cache::DnsCache;
 use dns_protocol::{DnsPacket, QueryType, RData, RecordClass, RecordType, ResourceRecord};
 
-const LOG: u64 = 0;
-const YIELD: u64 = 1;
-const EXIT: u64 = 3;
-const TIME_MS: u64 = 4;
-const UDP_BIND: u64 = 5;
-const UDP_RECV: u64 = 6;
-const UDP_SEND: u64 = 7;
-const TCP_LISTEN: u64 = 8;
-const TCP_ACCEPT: u64 = 9;
-const TCP_RECV: u64 = 10;
-const TCP_SEND: u64 = 11;
-const TCP_CLOSE: u64 = 12;
-const CONFIG_RECORDS: u64 = 13;
-const CONFIG_UPSTREAMS: u64 = 14;
-const CONFIG_BLOCKLIST: u64 = 15;
-const CONFIG_CACHE_SIZE: u64 = 16;
-const LOG_POST: u64 = 28;
-const CONFIG_CACHE_REAP: u64 = 50;
-const TIMER_TICKS: u64 = 51;
-const TIMER_FREQ: u64 = 52;
-const SET_CACHE_STATS: u64 = 53;
-const CACHE_PLANT: u64 = 54;
-const SET_DNS_TOP: u64 = 57;
-const SET_UPSTREAM_HEALTH: u64 = 60;
-const CONFIG_PROBE_SECS: u64 = 62;
-const NET_READY: u64 = 63;
-const SET_DNS_LOAD: u64 = 65;
+use crate::syscall::{
+    sys, CACHE_PLANT, CONFIG_BLOCKLIST, CONFIG_CACHE_REAP, CONFIG_CACHE_SIZE, CONFIG_PROBE_SECS,
+    CONFIG_RECORDS, CONFIG_UPSTREAMS, EXIT, LOG, LOG_POST, NET_READY, SET_CACHE_STATS, SET_DNS_LOAD,
+    SET_DNS_TOP, SET_UPSTREAM_HEALTH, TCP_ACCEPT, TCP_CLOSE, TCP_LISTEN, TCP_RECV, TCP_SEND,
+    TIME_MS, TIMER_FREQ, TIMER_TICKS, UDP_BIND, UDP_RECV, UDP_SEND, YIELD,
+};
 
 const UPSTREAM_PORT: u16 = 53535;
 const UPSTREAM_WAIT_MS: u64 = 2_000;
@@ -1407,21 +1386,4 @@ mod tests {
         assert!(!forward_room(super::MAX_PENDING));
         assert_eq!(super::MAX_PENDING, 128);
     }
-}
-
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-        );
-    }
-    ret as i64
 }

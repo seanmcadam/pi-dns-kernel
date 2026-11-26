@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use http_server::{HttpMethod, HttpRequest, HttpResponse};
 
-const FW: u64 = 67;
+use crate::syscall::{sys, FW};
 
 struct View {
     staged: u32,
@@ -377,7 +377,7 @@ fn store_chunk(
     final_chunk: bool,
     sha_hex: Option<&str>,
 ) -> HttpResponse {
-    let rc = super::sys(
+    let rc = sys(
         FW,
         1,
         kind,
@@ -399,9 +399,9 @@ fn store_chunk(
         if decode_hex(hexed, &mut sha) != Some(32) {
             return super::bad_request("sha256 must be 32 bytes of hex");
         }
-        super::sys(FW, 2, kind, sha.as_ptr() as u64, 0, 0, 0)
+        sys(FW, 2, kind, sha.as_ptr() as u64, 0, 0, 0)
     } else {
-        super::sys(FW, 9, kind, 0, 0, 0, 0)
+        sys(FW, 9, kind, 0, 0, 0, 0)
     };
     if rc < 0 {
         return fw_error(rc);
@@ -464,7 +464,7 @@ fn apply_config(kind: &str, commit: &str, text: &str) -> HttpResponse {
     };
     let commit: u64 = if commit == "1" { 1 } else { 0 };
     let mut err = [0u8; 160];
-    let rc = super::sys(
+    let rc = sys(
         FW,
         5,
         kind,
@@ -478,7 +478,7 @@ fn apply_config(kind: &str, commit: &str, text: &str) -> HttpResponse {
 
 fn preset(commit: u64) -> HttpResponse {
     let mut err = [0u8; 160];
-    let rc = super::sys(FW, 8, commit, err.as_mut_ptr() as u64, 0, 0, 0);
+    let rc = sys(FW, 8, commit, err.as_mut_ptr() as u64, 0, 0, 0);
     config_result(rc, &err, commit == 1)
 }
 
@@ -509,7 +509,7 @@ fn reboot(request: &HttpRequest) -> HttpResponse {
     } else {
         0
     };
-    let rc = super::sys(FW, 6, tryboot, 0, 0, 0, 0);
+    let rc = sys(FW, 6, tryboot, 0, 0, 0, 0);
     if rc < 0 {
         return match (tryboot, rc) {
             (1, -5) => super::bad_request("tryboot is not supported on this board"),
@@ -531,12 +531,12 @@ fn reboot(request: &HttpRequest) -> HttpResponse {
 
 fn read_file(kind: u64, offset: u64) -> HttpResponse {
     let mut sha = [0u8; 32];
-    let total = super::sys(FW, 7, kind, sha.as_mut_ptr() as u64, 0, 0, 0);
+    let total = sys(FW, 7, kind, sha.as_mut_ptr() as u64, 0, 0, 0);
     if total < 0 {
         return HttpResponse::not_found();
     }
     let mut buf = [0u8; 512];
-    let n = super::sys(
+    let n = sys(
         FW,
         4,
         kind,
@@ -570,7 +570,7 @@ fn promote(request: &HttpRequest) -> HttpResponse {
     } else {
         0
     };
-    let rc = super::sys(FW, 10, force, 0, 0, 0, 0);
+    let rc = sys(FW, 10, force, 0, 0, 0, 0);
     if rc < 0 {
         return match rc {
             -14 => super::bad_request("promote is not supported on this board"),
@@ -595,7 +595,7 @@ fn rollback(request: &HttpRequest) -> HttpResponse {
     if super::form_value(body, "confirm") != Some("rollback") {
         return super::bad_request("Confirmation required");
     }
-    let rc = super::sys(FW, 11, 0, 0, 0, 0, 0);
+    let rc = sys(FW, 11, 0, 0, 0, 0, 0);
     if rc < 0 {
         return match rc {
             -14 => super::bad_request("rollback is not supported on this board"),
@@ -613,7 +613,7 @@ fn rollback(request: &HttpRequest) -> HttpResponse {
 
 fn view() -> Option<View> {
     let mut raw = [0u8; 224];
-    let n = super::sys(FW, 3, raw.as_mut_ptr() as u64, raw.len() as u64, 0, 0, 0);
+    let n = sys(FW, 3, raw.as_mut_ptr() as u64, raw.len() as u64, 0, 0, 0);
     if n < 224 {
         return None;
     }

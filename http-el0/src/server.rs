@@ -25,54 +25,14 @@ static WAITING: [AtomicU32; HTTP_WORKERS] = [
     AtomicU32::new(0),
 ];
 
-const YIELD: u64 = 1;
-const EXIT: u64 = 3;
-const TCP_LISTEN: u64 = 8;
-const TCP_ACCEPT: u64 = 9;
-const TCP_RECV: u64 = 10;
-const TCP_SEND: u64 = 11;
-const TCP_CLOSE: u64 = 12;
-const CONFIG_RECORDS: u64 = 13;
-const AUTH: u64 = 18;
-const CONFIG_ADD: u64 = 19;
-const CONFIG_REMOVE: u64 = 20;
-const UPTIME_SECS: u64 = 21;
-const CACHE_ENTRIES: u64 = 22;
-const FAULT_GUARD: u64 = 23;
-const FAULT_TEXT: u64 = 24;
-const HTTP_INFO: u64 = 25;
-const TICK_HZ: u64 = 26;
-const DEBUG_SPIN: u64 = 27;
-const LOG_RECENT: u64 = 31;
-const DEBUG_STATUS: u64 = 42;
-const DEBUG_CRASH: u64 = 43;
-const LOG_RELOAD: u64 = 45;
-const CONFIG_READ: u64 = 46;
-const CONFIG_WRITE: u64 = 47;
-const LOG_FILL: u64 = 48;
-const CONFIG_SET_CACHE: u64 = 49;
-const CACHE_PLANT: u64 = 54;
-const DISPLAY_IO: u64 = 55;
-const DISPLAY_SET: u64 = 56;
-const POWER: u64 = 58;
-const CSRF: u64 = 74;
-const CLOCK: u64 = 76;
-const HEAP: u64 = 78;
-const NET_ARM: u64 = 75;
-const VNC_CTRL: u64 = 59;
-const UPSTREAM_HEALTH: u64 = 61;
-const NET_COUNTERS: u64 = 64;
-const NET_EXTRA: u64 = 66;
-const SD_STATUS: u64 = 68;
-const HDMI_CONSOLE: u64 = 69;
-const VCLOG_READ: u64 = 70;
-const CRASH: u64 = 71;
-const BOOT: u64 = 72;
-const BOARD: u64 = 73;
-const LOG_FILE: u64 = 81;
-const HTTP_HOLD: u64 = 82;
-
-const EAGAIN: i64 = -11;
+use crate::syscall::{
+    sys, AUTH, BOOT, BOARD, CACHE_ENTRIES, CACHE_PLANT, CLOCK, CONFIG_ADD, CONFIG_READ,
+    CONFIG_RECORDS, CONFIG_REMOVE, CONFIG_SET_CACHE, CONFIG_WRITE, CRASH, CSRF, DEBUG_CRASH,
+    DEBUG_SPIN, DEBUG_STATUS, DISPLAY_IO, DISPLAY_SET, EAGAIN, EXIT, FAULT_GUARD, FAULT_TEXT, HEAP,
+    HDMI_CONSOLE, HTTP_HOLD, HTTP_INFO, LOG_FILE, LOG_FILL, LOG_RECENT, LOG_RELOAD, NET_ARM,
+    NET_COUNTERS, NET_EXTRA, POWER, SD_STATUS, TCP_ACCEPT, TCP_LISTEN, TCP_RECV, TCP_SEND, TICK_HZ,
+    UPTIME_SECS, UPSTREAM_HEALTH, VCLOG_READ, VNC_CTRL, YIELD,
+};
 
 pub fn run() -> ! {
     let listen = sys(TCP_LISTEN, 80, 0, 0, 0, 0, 0);
@@ -2286,13 +2246,7 @@ fn yield_now() {
 /// A full job ring returns EAGAIN and puts the descriptor back. Leaving
 /// that unread leaks the fd, so the close is tried again.
 fn close_conn(conn: i64) {
-    loop {
-        let rc = sys(TCP_CLOSE, conn as u64, 0, 0, 0, 0, 0);
-        if rc != EAGAIN {
-            return;
-        }
-        yield_now();
-    }
+    crate::syscall::close_tcp(conn);
 }
 
 fn exit(code: u64) -> ! {
@@ -2300,19 +2254,3 @@ fn exit(code: u64) -> ! {
     loop {}
 }
 
-pub(super) fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-        );
-    }
-    ret as i64
-}

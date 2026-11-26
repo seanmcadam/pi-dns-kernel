@@ -8,21 +8,16 @@ use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
 core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
+mod syscall {
+    #![allow(dead_code)]
+    include!("../../user-common/syscall.rs");
+}
+
 mod thread {
     include!("../../user-common/thread.rs");
 }
 
-const TCP_LISTEN: u64 = 8;
-const TCP_ACCEPT: u64 = 9;
-const TCP_RECV: u64 = 10;
-const TCP_SEND: u64 = 11;
-const TCP_CLOSE: u64 = 12;
-const LOG_FOLLOW: u64 = 40;
-const LOG_WAKE: u64 = 41;
-const YIELD: u64 = 1;
-const EXIT: u64 = 3;
-
-const EAGAIN: i64 = -11;
+use syscall::{sys, EAGAIN, EXIT, LOG_FOLLOW, LOG_WAKE, TCP_ACCEPT, TCP_CLOSE, TCP_LISTEN, TCP_RECV, TCP_SEND, YIELD};
 const MAX_CLIENTS: usize = 16;
 const HEAP_VA: u64 = 0x1_000A_0000;
 const HEAP_SIZE: u64 = 256 * 1024;
@@ -350,23 +345,6 @@ fn yield_now() {
 fn exit_now(code: u64) -> ! {
     let _ = sys(EXIT, code, 0, 0, 0, 0, 0);
     loop {}
-}
-
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-        );
-    }
-    ret as i64
 }
 
 #[panic_handler]

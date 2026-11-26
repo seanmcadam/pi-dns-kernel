@@ -7,18 +7,15 @@ use core::slice;
 
 core::arch::global_asm!(include_str!("../../user-common/start.s"));
 
-const TCP_LISTEN: u64 = 8;
-const TCP_ACCEPT: u64 = 9;
-const TCP_RECV: u64 = 10;
-const TCP_SEND: u64 = 11;
-const TCP_CLOSE: u64 = 12;
-const LOG_RECENT: u64 = 31;
-const DEBUG_STATUS: u64 = 42;
-const TIMER_TICKS: u64 = 51;
-const TIMER_FREQ: u64 = 52;
-const YIELD: u64 = 1;
-const EXIT: u64 = 3;
-const DISPLAY_IO: u64 = 55;
+mod syscall {
+    #![allow(dead_code)]
+    include!("../../user-common/syscall.rs");
+}
+
+use syscall::{
+    sys, DEBUG_STATUS, DISPLAY_IO, EXIT, LOG_RECENT, TCP_ACCEPT, TCP_CLOSE, TCP_LISTEN, TCP_RECV,
+    TCP_SEND, TIMER_FREQ, TIMER_TICKS, YIELD,
+};
 
 const FB: u64 = 0x1_000A_0000;
 const NAME: &[u8] = b"console";
@@ -295,23 +292,6 @@ fn send_all(fd: u64, ptr: *const u8, len: usize) -> bool {
         off += n as usize;
     }
     true
-}
-
-fn sys(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") num,
-            inout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-        );
-    }
-    ret as i64
 }
 
 fn yield_now() {
