@@ -25,8 +25,6 @@ phy-100 = []
 
 [dependencies]
 cortex-a = { workspace = true }
-tock-registers = { workspace = true }
-aarch64-cpu = { workspace = true }
 smoltcp = { workspace = true }
 heapless = { workspace = true }
 spin = { workspace = true }
@@ -41,7 +39,6 @@ config = { path = "../config", default-features = false }
 ntp = { path = "../ntp" }
 fwupd = { path = "../fwupd", default-features = false }
 version = { path = "../version" }
-edid = { path = "../edid" }
 display-console = { path = "../display-console", optional = true }
 
 [[bin]]

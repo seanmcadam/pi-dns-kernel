@@ -47,7 +47,10 @@ jobs:
         sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
     
     - name: Build kernel
-      run: ./scripts/build.sh
+      run: |
+        # Unset RUSTFLAGS to avoid overriding .cargo/config.toml linker script flags
+        unset RUSTFLAGS
+        ./scripts/build.sh
     
     - name: Upload kernel artifact
       uses: actions/upload-artifact@v4
