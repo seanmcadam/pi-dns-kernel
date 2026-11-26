@@ -136,7 +136,8 @@ mod tests {
     fn an_explicit_connection_header_is_kept() {
         let mut response = HttpResponse::ok("x");
         response.add_header("Connection", "keep-alive");
-        let output = String::from_utf8_lossy(&response.to_bytes());
+        let bytes = response.to_bytes();
+        let output = String::from_utf8_lossy(&bytes);
         assert!(output.contains("Connection: keep-alive"));
         assert_eq!(output.matches("Connection:").count(), 1);
     }
