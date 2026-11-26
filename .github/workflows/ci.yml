@@ -83,7 +83,10 @@ jobs:
         path: boot/
     
     - name: Run integration tests
-      run: ./scripts/test-integration.sh
+      run: |
+        # Unset RUSTFLAGS to avoid overriding .cargo/config.toml linker script flags
+        unset RUSTFLAGS
+        ./scripts/test-integration.sh
     
     - name: Upload test results
       if: always()
