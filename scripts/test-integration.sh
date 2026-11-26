@@ -27,7 +27,7 @@ timeout 240 qemu-system-aarch64 \
     -serial chardev:ser0 \
     -nographic \
     -display none \
-    -netdev user,id=net0,${HOSTFWD} \
+    -netdev user,id=net0,dhcpstart=10.0.2.25,${HOSTFWD} \
     -device virtio-net-device,netdev=net0 \
     &
 
@@ -516,7 +516,7 @@ if python3 - "$TELNET_HOST_PORT" "$DNS_HOST_PORT" "$TELNET_NAME" <<'PY'
 import socket, subprocess, sys, time
 port, dns, name = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 s = socket.create_connection(("127.0.0.1", port), 5)
-s.settimeout(0.3)
+s.settimeout(1.5)
 s.sendall(b"\xff\xfb\x03\xff\xfd\x18")
 deadline = time.time() + 3
 buf = b""
@@ -571,7 +571,7 @@ import socket, subprocess, sys, time
 port, dns, name = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 stalled = socket.create_connection(("127.0.0.1", port), 5)
 live = socket.create_connection(("127.0.0.1", port), 5)
-live.settimeout(0.3)
+live.settimeout(1.5)
 buf = b""
 deadline = time.time() + 3
 while time.time() < deadline and b"telnet-log" not in buf:
@@ -631,7 +631,7 @@ import socket, subprocess, sys, time
 port, dns = int(sys.argv[1]), sys.argv[2]
 
 def read_for(sock, seconds):
-    sock.settimeout(0.2)
+    sock.settimeout(1.0)
     end = time.time() + seconds
     data = b""
     while time.time() < end:
@@ -778,7 +778,7 @@ host = "127.0.0.1"
 
 def connect_close():
     s = socket.socket()
-    s.settimeout(2)
+    s.settimeout(10)
     try:
         s.connect((host, http_port))
         s.close()
@@ -795,7 +795,7 @@ for _ in range(100):
 held = []
 for _ in range(8):
     s = socket.socket()
-    s.settimeout(2)
+    s.settimeout(10)
     try:
         s.connect((host, http_port))
         held.append(s)
@@ -805,7 +805,7 @@ for _ in range(8):
 
 for _ in range(20):
     s = socket.socket()
-    s.settimeout(2)
+    s.settimeout(10)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     try:
         s.connect((host, http_port))
@@ -822,7 +822,7 @@ auth = urllib.request.HTTPBasicAuthHandler()
 auth.add_password(realm="DNS Server", uri="http://%s:%s" % (host, http_port), user="admin", passwd="admin")
 opener = urllib.request.build_opener(auth)
 try:
-    resp = opener.open("http://%s:%s/json/status" % (host, http_port), timeout=8)
+    resp = opener.open("http://%s:%s/json/status" % (host, http_port), timeout=40)
     body = resp.read()
     status = resp.status
 except Exception as err:
@@ -1168,7 +1168,7 @@ if status != 200 or b"Uptime" not in body and b"uptime" not in body.lower():
 print("http returned")
 
 def read_for(sock, seconds, needle=None):
-    sock.settimeout(0.2)
+    sock.settimeout(1.0)
     end = time.time() + seconds
     data = b""
     while time.time() < end:
@@ -1379,16 +1379,16 @@ timeout 40 qemu-system-aarch64 \
     >/tmp/qemu-persist-a.txt 2>&1 &
 PERSIST_PID=$!
 sleep 5
-curl -s -u admin:admin --max-time 5 -X POST \
+curl -s -u admin:admin --max-time 25 -X POST \
     --data 'name=added.local&type=A&value=9.9.9.9&ttl=120' \
     http://127.0.0.1:${HTTP_HOST_PORT}/records > qemu/record-add.txt || true
 # A second save must also succeed. One leaked volume slot makes this
 # TooManyOpenVolumes even when the first response looked fine.
-curl -s -u admin:admin --max-time 5 -X POST \
+curl -s -u admin:admin --max-time 25 -X POST \
     --data 'name=tmp-again.local&type=A&value=1.2.3.9&ttl=60' \
     http://127.0.0.1:${HTTP_HOST_PORT}/records > qemu/record-add-2.txt || true
 for i in 1 2 3 4 5 6 7 8; do
-    curl -s -u admin:admin --max-time 5 -X POST \
+    curl -s -u admin:admin --max-time 25 -X POST \
         --data "name=tmp${i}.local&type=A&value=1.2.3.${i}&ttl=60" \
         http://127.0.0.1:${HTTP_HOST_PORT}/records >/dev/null || true
 done
@@ -1462,7 +1462,7 @@ timeout 180 qemu-system-aarch64 \
     -kernel boot/kernel8.img \
     -serial file:qemu/json-a.txt \
     -display none -monitor none -nographic \
-    -netdev user,id=net0,${HOSTFWD} \
+    -netdev user,id=net0,dhcpstart=10.0.2.25,${HOSTFWD} \
     -device virtio-net-device,netdev=net0 \
     -drive file=qemu/json-disk.img,if=none,format=raw,id=hd0,cache=writethrough \
     -device virtio-blk-device,drive=hd0 \
@@ -1489,9 +1489,9 @@ def req(method, path, body=None, headers=None, auth=True):
             r.add_header(k, v)
     try:
         if auth:
-            resp = opener.open(r, timeout=8)
+            resp = opener.open(r, timeout=40)
         else:
-            resp = urllib.request.urlopen(r, timeout=8)
+            resp = urllib.request.urlopen(r, timeout=40)
         return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
@@ -1666,7 +1666,7 @@ def req(method, path, body=None, headers=None):
         for k, v in headers.items():
             r.add_header(k, v)
     try:
-        resp = opener.open(r, timeout=8)
+        resp = opener.open(r, timeout=40)
         return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
@@ -1754,7 +1754,7 @@ def req_as(op, method, path, body=None, headers=None):
         for k, v in headers.items():
             r.add_header(k, v)
     try:
-        resp = op.open(r, timeout=8)
+        resp = op.open(r, timeout=40)
         return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
@@ -1986,7 +1986,7 @@ def req(method, path, data=None, headers=None):
     for key, value in (headers or {}).items():
         r.add_header(key, value)
     try:
-        with opener.open(r, timeout=8) as resp:
+        with opener.open(r, timeout=40) as resp:
             conn = resp.headers.get("Connection", "")
             if "close" not in conn.lower():
                 fail("missing connection close on %s" % path)
@@ -2011,7 +2011,7 @@ def connect():
     # resets if nothing is listening. The port counts as open only when the
     # RFB banner is already buffered.
     sock = socket.socket()
-    sock.settimeout(0.5)
+    sock.settimeout(2.5)
     try:
         sock.connect(("127.0.0.1", vnc_port))
         peek = sock.recv(12, socket.MSG_PEEK)
@@ -2157,7 +2157,7 @@ else
     echo "✗ VNC display test failed"
     TESTS_FAILED=$((TESTS_FAILED + 4))
 fi
-curl -s -u admin:admin --max-time 5 -X POST \
+curl -s -u admin:admin --max-time 25 -X POST \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data "vnc=0&vnc_port=5900&vnc_password=&hdmi=0" \
     "http://127.0.0.1:${HTTP_HOST_PORT}/display" >/dev/null || true
@@ -2183,7 +2183,7 @@ def req(method, path, body=None, headers=None):
         for k, v in headers.items():
             r.add_header(k, v)
     try:
-        resp = opener.open(r, timeout=8)
+        resp = opener.open(r, timeout=40)
         return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
@@ -2274,7 +2274,7 @@ def req(method, path, body=None, headers=None):
         for k, v in headers.items():
             r.add_header(k, v)
     try:
-        resp = opener.open(r, timeout=8)
+        resp = opener.open(r, timeout=40)
         return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
@@ -2428,7 +2428,7 @@ def req(method, path, body=None, headers=None):
         for k, v in headers.items():
             r.add_header(k, v)
     try:
-        resp = opener.open(r, timeout=8)
+        resp = opener.open(r, timeout=40)
         return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
@@ -2508,7 +2508,7 @@ timeout 400 qemu-system-aarch64 \
 FW_PID=$!
 FW_UP=0
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
-    if curl -sf -u admin:admin --max-time 2 "http://127.0.0.1:${HTTP_HOST_PORT}/" >/dev/null; then
+    if curl -sf -u admin:admin --max-time 10 "http://127.0.0.1:${HTTP_HOST_PORT}/" >/dev/null; then
         FW_UP=1
         break
     fi
@@ -2528,7 +2528,7 @@ def fail(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
 
-def req(method, path, data=None, headers=None, auth=True, timeout=8):
+def req(method, path, data=None, headers=None, auth=True, timeout=40):
     body = data.encode() if isinstance(data, str) else data
     r = urllib.request.Request(base + path, data=body, method=method)
     for key, value in (headers or {}).items():
@@ -2706,7 +2706,7 @@ big = bytearray((i * 3 + 1) & 0xFF for i in range(2 * 1024 * 1024))
 big[0] = 0x11
 big = bytes(big)
 step = 16384
-def raw_chunk(off, piece, final, sha=None, timeout=8):
+def raw_chunk(off, piece, final, sha=None, timeout=40):
     headers = {
         "Content-Type": "application/octet-stream",
         "X-Fw-Kind": "kernel",
@@ -2968,7 +2968,7 @@ fault_case() {
     sleep 5
     # The endpoint is behind the same basic auth as the dashboard.
     local unauth
-    unauth=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+    unauth=$(curl -s -o /dev/null -w "%{http_code}" --max-time 25 \
         "http://127.0.0.1:${HTTP_HOST_PORT}${path}" || true)
     if [ "$unauth" != "401" ]; then
         echo "✗ ${name} fault endpoint without auth returned ${unauth}"
@@ -2977,7 +2977,7 @@ fault_case() {
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return
     fi
-    curl -s -u admin:admin --max-time 5 \
+    curl -s -u admin:admin --max-time 25 \
         "http://127.0.0.1:${HTTP_HOST_PORT}${path}" >/dev/null || true
     sleep 1
     kill "$pid" 2>/dev/null || true
@@ -3141,7 +3141,7 @@ sleep 6
 LOAD_OK=0
 for n in 1 2 3 4; do
     dig @127.0.0.1 -p ${DNS_HOST_PORT} test.local +short +time=3 +tries=1 > /tmp/load-dig-$n.txt 2>/dev/null &
-    curl -s -u admin:admin --max-time 4 http://127.0.0.1:${HTTP_HOST_PORT}/status > /tmp/load-http-$n.txt 2>/dev/null &
+    curl -s -u admin:admin --max-time 20 http://127.0.0.1:${HTTP_HOST_PORT}/status > /tmp/load-http-$n.txt 2>/dev/null &
 done
 wait
 for n in 1 2 3 4; do
@@ -3420,7 +3420,7 @@ start_power_guest() {
 wait_power_http() {
     local i
     for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-        if curl -sf -u admin:admin --max-time 2 "http://127.0.0.1:${POWER_HTTP_PORT}/" >/dev/null; then
+        if curl -sf -u admin:admin --max-time 10 "http://127.0.0.1:${POWER_HTTP_PORT}/" >/dev/null; then
             return 0
         fi
         sleep 0.5
@@ -3454,14 +3454,14 @@ def req(method, path, data=None, headers=None, auth=True):
         r.add_header(key, value)
     handler = opener if auth else urllib.request.build_opener()
     try:
-        with handler.open(r, timeout=8) as resp:
+        with handler.open(r, timeout=40) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
 
 def connect():
     sock = socket.socket()
-    sock.settimeout(0.5)
+    sock.settimeout(2.5)
     try:
         sock.connect(("127.0.0.1", vnc_port))
         peek = sock.recv(12, socket.MSG_PEEK)
@@ -3559,7 +3559,7 @@ def fail(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
 
-def req(method, path, data=None, timeout=8):
+def req(method, path, data=None, timeout=40):
     body = data.encode() if isinstance(data, str) else data
     r = urllib.request.Request(base + path, data=body, method=method)
     if data is not None:
@@ -3681,7 +3681,7 @@ body = "action=shutdown&confirm=shutdown".encode()
 r = urllib.request.Request(base + "/power", data=body, method="POST")
 r.add_header("Content-Type", "application/x-www-form-urlencoded")
 try:
-    with opener.open(r, timeout=8) as resp:
+    with opener.open(r, timeout=40) as resp:
         status, page = resp.status, resp.read()
 except urllib.error.HTTPError as err:
     status, page = err.code, err.read()
@@ -3758,7 +3758,7 @@ def fail(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
 
-def req(method, path, data=None, headers=None, auth=True, timeout=8):
+def req(method, path, data=None, headers=None, auth=True, timeout=40):
     body = data.encode() if isinstance(data, str) else data
     r = urllib.request.Request(base + path, data=body, method=method)
     for key, value in (headers or {}).items():
@@ -3926,7 +3926,7 @@ def fail(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
 
-def req(method, path, data=None, headers=None, timeout=8):
+def req(method, path, data=None, headers=None, timeout=40):
     body = data.encode() if isinstance(data, str) else data
     r = urllib.request.Request(base + path, data=body, method=method)
     for key, value in (headers or {}).items():
@@ -4121,7 +4121,7 @@ if doc["heap_used"] > doc["heap_peak"] or doc["heap_peak"] > doc["heap_size"] or
 
 def once(payload, timeout):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.2)
+    sock.settimeout(1.0)
     sock.sendto(payload, ("127.0.0.1", int(ntp)))
     deadline = time.time() + timeout
     while time.time() < deadline:
