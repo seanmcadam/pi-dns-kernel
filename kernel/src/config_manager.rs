@@ -450,9 +450,7 @@ static CSRF_WORD: AtomicU64 = AtomicU64::new(0);
 pub fn csrf_bytes() -> [u8; 16] {
     let mut token = CSRF_WORD.load(Ordering::Acquire);
     if token == 0 {
-        let mixed = crate::timer::millis()
-            ^ (u64::from(version::BOOT_ID[20]) << 32)
-            ^ 0xC5F5_001D;
+        let mixed = crate::timer::millis() ^ (u64::from(version::BOOT_ID[20]) << 32) ^ 0xC5F5_001D;
         let mixed = if mixed == 0 { 1 } else { mixed };
         let _ = CSRF_WORD.compare_exchange(0, mixed, Ordering::AcqRel, Ordering::Acquire);
         token = CSRF_WORD.load(Ordering::Acquire);
@@ -472,9 +470,10 @@ pub fn csrf_bytes() -> [u8; 16] {
 /// Arm the static-address watchdog. A later boot that never installs an
 /// address copies `CONFIG.BAK` back. DHCP is left to its own fallback.
 pub fn arm_net_pending() -> bool {
-    let static_mode = CURRENT.lock().as_ref().is_some_and(|config| {
-        matches!(config.network.mode, NetworkMode::Static { .. })
-    });
+    let static_mode = CURRENT
+        .lock()
+        .as_ref()
+        .is_some_and(|config| matches!(config.network.mode, NetworkMode::Static { .. }));
     if !static_mode {
         return false;
     }
@@ -513,9 +512,10 @@ pub fn poll_net_pending() {
             at
         }
     };
-    let static_mode = CURRENT.lock().as_ref().is_some_and(|config| {
-        matches!(config.network.mode, NetworkMode::Static { .. })
-    });
+    let static_mode = CURRENT
+        .lock()
+        .as_ref()
+        .is_some_and(|config| matches!(config.network.mode, NetworkMode::Static { .. }));
     let word = config::net_watch(config::NetWatch {
         pending: true,
         static_mode,
@@ -936,7 +936,11 @@ pub fn write_http_info(out: &mut [u8]) -> Option<usize> {
 /// Delete list files that are no longer configured. An empty URL list and
 /// a disabled block section both drop every file the previous config had,
 /// including the index, so the next boot does not reload them.
-fn retire_block_caches(old_urls: &[alloc::string::String], enabled: bool, new_urls: &[alloc::string::String]) {
+fn retire_block_caches(
+    old_urls: &[alloc::string::String],
+    enabled: bool,
+    new_urls: &[alloc::string::String],
+) {
     let mut kept = [""; blocklist::URL_MAX];
     let mut kept_n = 0;
     if enabled {
@@ -1038,11 +1042,14 @@ pub fn add_record(name: &str, record_type: &str, value: &str, ttl: u32) -> Resul
         return Err(String::from("invalid record"));
     }
     let record_type = RecordType::parse(record_type).ok_or_else(|| String::from("invalid type"))?;
-        let ttl = ttl.clamp(1, 86_400);
+    let ttl = ttl.clamp(1, 86_400);
     {
         let mut config = CURRENT.lock();
         let config = config.as_mut().ok_or_else(|| String::from("no config"))?;
-        config.dns.records.retain(|record| !names_eq(&record.name, name));
+        config
+            .dns
+            .records
+            .retain(|record| !names_eq(&record.name, name));
         config.dns.records.push(DnsRecord {
             name: name.to_string(),
             record_type,
@@ -1078,7 +1085,10 @@ pub fn remove_record(name: &str) -> Result<bool, String> {
 }
 
 fn save_current() -> Result<(), String> {
-    let config = CURRENT.lock().clone().ok_or_else(|| String::from("no config"))?;
+    let config = CURRENT
+        .lock()
+        .clone()
+        .ok_or_else(|| String::from("no config"))?;
     let text = serialize_config(&config)?;
     crate::fs::write_config(&text)
 }
@@ -1345,9 +1355,8 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
     if let Some(items) = dns.get("upstreams").and_then(Value::as_array) {
         for (index, item) in items.iter().enumerate() {
             let text = item.as_str().unwrap_or("");
-            let ip = parse_ipv4(text).ok_or_else(|| {
-                alloc::format!("dns.upstreams[{index}]: expected ipv4 address")
-            })?;
+            let ip = parse_ipv4(text)
+                .ok_or_else(|| alloc::format!("dns.upstreams[{index}]: expected ipv4 address"))?;
             upstreams.push(ip);
         }
     }
@@ -1371,7 +1380,10 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
             if !valid_label(name) || !valid_label(data) {
                 return Err(alloc::format!("dns.records[{index}]: out of bounds"));
             }
-            if records.iter().any(|record: &DnsRecord| names_eq(&record.name, name)) {
+            if records
+                .iter()
+                .any(|record: &DnsRecord| names_eq(&record.name, name))
+            {
                 return Err(alloc::format!("dns.records[{index}].name: duplicate"));
             }
             let record_type = RecordType::parse(kind)
@@ -1389,7 +1401,11 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
         .ok_or_else(|| String::from("display: missing field"))?;
     let vnc = display.get("vnc").and_then(Value::as_u64).unwrap_or(0) != 0;
     let hdmi = display.get("hdmi").and_then(Value::as_u64).unwrap_or(0) != 0;
-    let board_detect = match value.get("board").and_then(|board| board.get("detect")).and_then(Value::as_u64) {
+    let board_detect = match value
+        .get("board")
+        .and_then(|board| board.get("detect"))
+        .and_then(Value::as_u64)
+    {
         None | Some(1) => crate::board_rev::DETECT_DEFAULT,
         Some(0) => false,
         Some(_) => return Err(String::from("board.detect: out of bounds (0..=1)")),
@@ -1504,7 +1520,11 @@ fn config_from_value(value: &Value) -> Result<Config, String> {
             timeout_ms,
         }
     } else {
-        NetworkMode::Static { ip, netmask, gateway }
+        NetworkMode::Static {
+            ip,
+            netmask,
+            gateway,
+        }
     };
     Ok(Config {
         network: NetworkConfig {
@@ -1566,7 +1586,11 @@ fn needs_restart(old: &Config, new: &Config) -> bool {
 fn same_mode(left: &NetworkMode, right: &NetworkMode) -> bool {
     match (left, right) {
         (
-            NetworkMode::Static { ip, netmask, gateway },
+            NetworkMode::Static {
+                ip,
+                netmask,
+                gateway,
+            },
             NetworkMode::Static {
                 ip: ip2,
                 netmask: mask2,
@@ -1654,7 +1678,10 @@ fn parse_legacy(text: &str) -> Option<Config> {
                 let name = parts.next()?;
                 let record_type = RecordType::parse(parts.next()?)?;
                 let data = parts.next()?;
-                let ttl = parts.next().and_then(|text| text.parse().ok()).unwrap_or(300);
+                let ttl = parts
+                    .next()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(300);
                 if !valid_label(name) || !valid_label(data) {
                     continue;
                 }
@@ -1684,7 +1711,11 @@ fn parse_legacy(text: &str) -> Option<Config> {
             timeout_ms,
         }
     } else {
-        NetworkMode::Static { ip, netmask, gateway }
+        NetworkMode::Static {
+            ip,
+            netmask,
+            gateway,
+        }
     };
     config.timeout_ms = timeout_ms;
     Some(config)
@@ -1696,9 +1727,11 @@ fn serialize_config(config: &Config) -> Result<String, String> {
 
 fn config_value(config: &Config) -> Value {
     let (mode, ip, netmask, gateway, timeout_ms) = match config.network.mode {
-        NetworkMode::Static { ip, netmask, gateway } => {
-            ("static", ip, netmask, gateway, config.timeout_ms)
-        }
+        NetworkMode::Static {
+            ip,
+            netmask,
+            gateway,
+        } => ("static", ip, netmask, gateway, config.timeout_ms),
         NetworkMode::Dhcp {
             fallback_ip,
             fallback_netmask,
@@ -1733,7 +1766,10 @@ fn config_value(config: &Config) -> Value {
         ]));
     }
     let mut fields = vec![
-        (String::from("version"), Value::Number(config::SCHEMA_VERSION)),
+        (
+            String::from("version"),
+            Value::Number(config::SCHEMA_VERSION),
+        ),
         (
             String::from("network"),
             Value::Object(vec![
@@ -1775,7 +1811,10 @@ fn config_value(config: &Config) -> Value {
         (
             String::from("http"),
             Value::Object(vec![
-                (String::from("port"), Value::Number(u64::from(config.http.port))),
+                (
+                    String::from("port"),
+                    Value::Number(u64::from(config.http.port)),
+                ),
                 (
                     String::from("username"),
                     Value::String(config.http.username.clone()),
@@ -1867,10 +1906,7 @@ fn display_fields(config: &Config) -> Vec<(String, Value)> {
         ),
     ];
     if config.display.hdmi_reset {
-        fields.push((
-            String::from("hdmi_reset"),
-            Value::Number(1),
-        ));
+        fields.push((String::from("hdmi_reset"), Value::Number(1)));
     }
     fields
 }
@@ -1904,9 +1940,9 @@ fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
 fn valid_label(text: &str) -> bool {
     let len = text.len();
     (1..=64).contains(&len)
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b':')
+        && text.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b':'
+        })
 }
 
 fn names_eq(left: &str, right: &str) -> bool {

@@ -47,9 +47,8 @@ impl<'a> Bpb<'a> {
         // because the root directory is a cluster chain. Classifying that
         // by cluster count marks it FAT16, and the FAT16 root has length 0,
         // so creating a file fails with NotEnoughSpace.
-        let explicit_fat32 = bpb.fat_size16() == 0
-            && bpb.fat_size32() != 0
-            && bpb.root_entries_count() == 0;
+        let explicit_fat32 =
+            bpb.fat_size16() == 0 && bpb.fat_size32() != 0 && bpb.root_entries_count() == 0;
         if explicit_fat32 {
             bpb.fat_type = FatType::Fat32;
         } else if bpb.cluster_count < 4085 {

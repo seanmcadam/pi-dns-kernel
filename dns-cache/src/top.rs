@@ -40,8 +40,7 @@ impl<const N: usize, const K: usize> Table<N, K> {
                 if empty.is_none() {
                     empty = Some(index);
                 }
-            } else if self.len[index] as usize == key.len()
-                && &self.key[index][..key.len()] == key
+            } else if self.len[index] as usize == key.len() && &self.key[index][..key.len()] == key
             {
                 found = Some(index);
                 break;
@@ -107,6 +106,12 @@ impl<const N: usize, const K: usize> Table<N, K> {
     }
 }
 
+impl<const N: usize, const K: usize> Default for Table<N, K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Item<'a> {
     pub key: &'a [u8],
@@ -152,14 +157,29 @@ impl Traffic {
     /// Version 1 blob. Layout is documented on `write`. Returns 0 if `out` is short.
     pub fn write(&mut self, now_ms: u64, out: &mut [u8]) -> usize {
         let rate = self.rate(now_ms);
-        let mut names = [Item { key: b"".as_slice(), count: 0 }; NAMES];
-        let mut types = [Item { key: b"".as_slice(), count: 0 }; KINDS];
-        let mut sources = [Item { key: b"".as_slice(), count: 0 }; SOURCES];
+        let mut names = [Item {
+            key: b"".as_slice(),
+            count: 0,
+        }; NAMES];
+        let mut types = [Item {
+            key: b"".as_slice(),
+            count: 0,
+        }; KINDS];
+        let mut sources = [Item {
+            key: b"".as_slice(),
+            count: 0,
+        }; SOURCES];
         let name_n = self.names.rank(&mut names);
         let type_n = self.types.rank(&mut types);
         let src_n = self.sources.rank(&mut sources);
-        let need = 4 + 8 + 8 + 1
-            + names[..name_n].iter().map(|item| 1 + item.key.len() + 4).sum::<usize>()
+        let need = 4
+            + 8
+            + 8
+            + 1
+            + names[..name_n]
+                .iter()
+                .map(|item| 1 + item.key.len() + 4)
+                .sum::<usize>()
             + 1
             + type_n * 6
             + 1
@@ -230,6 +250,12 @@ impl Traffic {
     }
 }
 
+impl Default for Traffic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn put_u16(out: &mut [u8], n: usize, value: u16) -> usize {
     out[n..n + 2].copy_from_slice(&value.to_le_bytes());
     n + 2
@@ -255,7 +281,10 @@ mod tests {
         table.observe(b"a.test");
         table.observe(b"a.test");
         table.observe(b"b.test");
-        let mut ranked = [Item { key: b"".as_slice(), count: 0 }; 4];
+        let mut ranked = [Item {
+            key: b"".as_slice(),
+            count: 0,
+        }; 4];
         let n = table.rank(&mut ranked);
         assert_eq!(n, 2);
         assert_eq!(ranked[0].key, b"a.test");
@@ -276,7 +305,10 @@ mod tests {
         table.observe(b"a");
         table.observe(b"a");
         table.observe(b"e");
-        let mut ranked = [Item { key: b"".as_slice(), count: 0 }; 4];
+        let mut ranked = [Item {
+            key: b"".as_slice(),
+            count: 0,
+        }; 4];
         let n = table.rank(&mut ranked);
         assert_eq!(n, 4);
         assert_eq!(ranked[0].key, b"a");
@@ -291,7 +323,10 @@ mod tests {
         let mut table = Table::<2, 4>::new();
         table.observe(b"abcdef");
         table.observe(b"abcdZZ");
-        let mut ranked = [Item { key: b"".as_slice(), count: 0 }; 2];
+        let mut ranked = [Item {
+            key: b"".as_slice(),
+            count: 0,
+        }; 2];
         let n = table.rank(&mut ranked);
         assert_eq!(n, 1);
         assert_eq!(ranked[0].key, b"abcd");
@@ -316,6 +351,9 @@ mod tests {
         cursor += 1;
         assert_eq!(&out[cursor..cursor + len], b"alpha.console.local");
         cursor += len;
-        assert_eq!(u32::from_le_bytes(out[cursor..cursor + 4].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(out[cursor..cursor + 4].try_into().unwrap()),
+            2
+        );
     }
 }

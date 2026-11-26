@@ -157,7 +157,11 @@ pub fn copy_upstream_health(out: &mut [u8]) -> usize {
             return 0;
         }
         unsafe {
-            core::ptr::copy_nonoverlapping(HEALTH_BUF.bytes.get().cast::<u8>(), out.as_mut_ptr(), n);
+            core::ptr::copy_nonoverlapping(
+                HEALTH_BUF.bytes.get().cast::<u8>(),
+                out.as_mut_ptr(),
+                n,
+            );
         }
         if HEALTH_GEN.load(Ordering::Acquire) == gen {
             return n;
@@ -171,7 +175,11 @@ pub fn copy_upstream_health(out: &mut [u8]) -> usize {
 /// Readers retry if a publish is in progress. No lock, so this stays off the
 /// scheduler and the FD lock order.
 pub fn set_top(bytes: &[u8]) {
-    let n = if bytes.len() < TOP_CAP { bytes.len() } else { TOP_CAP };
+    let n = if bytes.len() < TOP_CAP {
+        bytes.len()
+    } else {
+        TOP_CAP
+    };
     let gen = TOP_GEN.load(Ordering::Relaxed) & !1;
     TOP_GEN.store(gen.wrapping_add(1), Ordering::Release);
     unsafe {
@@ -296,7 +304,10 @@ fn parse_top(raw: &[u8]) -> Option<TopView> {
         }
         let mut name = [0u8; 48];
         name[..len].copy_from_slice(&raw[cursor..cursor + len]);
-        if name[..len].iter().any(|byte| *byte <= 0x20 || *byte >= 0x7f || *byte == b'=') {
+        if name[..len]
+            .iter()
+            .any(|byte| *byte <= 0x20 || *byte >= 0x7f || *byte == b'=')
+        {
             return None;
         }
         cursor += len;

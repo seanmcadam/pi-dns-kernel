@@ -13,7 +13,7 @@ impl NetworkStack {
     pub fn new(device: &mut EthernetDevice) -> Self {
         let mac = device.mac_address();
         let ethernet_addr = EthernetAddress::from_bytes(&mac);
-        
+
         let mut config = Config::new(ethernet_addr.into());
         // A zero seed makes every board pick the same DHCP xid and TCP ISN.
         let mut seed = 0xA5A5_u64;
@@ -22,13 +22,10 @@ impl NetworkStack {
         }
         config.random_seed = seed;
         let iface = Interface::new(config, device, Instant::ZERO);
-        
+
         let sockets = SocketSet::new(Vec::new());
-        
-        Self {
-            iface,
-            sockets,
-        }
+
+        Self { iface, sockets }
     }
 
     pub fn configure_static(&mut self, ip: [u8; 4], netmask: [u8; 4], gateway: [u8; 4]) {

@@ -59,8 +59,14 @@ impl TxToken for Rp1Tx {
 }
 
 impl Device for Rp1Nic {
-    type RxToken<'a> = Rp1Rx where Self: 'a;
-    type TxToken<'a> = Rp1Tx where Self: 'a;
+    type RxToken<'a>
+        = Rp1Rx
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = Rp1Tx
+    where
+        Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         None

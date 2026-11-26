@@ -24,7 +24,7 @@ pub const TEMP_NAME: &str = "BLOCK.TMP";
 pub const CA_NAME: &str = "TESTCA.DER";
 
 const HEADER: usize = 32;
-const MAGIC: u64 = 0x3148_5442_4B4C_42;
+const MAGIC: u64 = 0x0031_4854_424B_4C42;
 
 pub fn fnv1a32(data: &[u8]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
@@ -46,7 +46,11 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
 
 pub fn name_hash(name: &str) -> u64 {
     let hash = fnv1a64(name.as_bytes());
-    if hash == 0 { 1 } else { hash }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
 }
 
 /// `XXXXXXXX.LST`, eight uppercase hex digits from FNV-1a of the URL.
@@ -173,7 +177,7 @@ pub fn retire_url(enabled: bool, new_urls: &[&str], url: &str) -> bool {
     if !enabled {
         return true;
     }
-    !new_urls.iter().any(|item| *item == url)
+    !new_urls.contains(&url)
 }
 
 /// Clear the published half's generation so a lookup fails open and the
@@ -201,7 +205,10 @@ pub fn normalize_into(name: &str, out: &mut [u8]) -> Option<usize> {
     if name.is_empty() || name.len() > out.len() || name.len() > 253 {
         return None;
     }
-    if name.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.') {
+    if name
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
         return None;
     }
     let mut labels = 0;
@@ -288,6 +295,12 @@ pub struct LineSplit {
     hold: [u8; LINE_HOLD],
     n: usize,
     skip: bool,
+}
+
+impl Default for LineSplit {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LineSplit {
@@ -417,11 +430,11 @@ pub fn content_length(headers: &[u8]) -> Option<usize> {
 /// `true` only for a stable published hit. Down, loading, and a generation
 /// that moves during the probe all return false so DNS answers normally.
 pub fn fail_open(gen_before: u64, gen_after: u64, hit: bool) -> bool {
-    gen_before != 0 && gen_before % 2 == 0 && gen_before == gen_after && hit
+    gen_before != 0 && gen_before.is_multiple_of(2) && gen_before == gen_after && hit
 }
 
 fn slots(region: &[u8]) -> Option<&[u64]> {
-    if region.len() < HEADER + 8 || region.as_ptr() as usize % 8 != 0 {
+    if region.len() < HEADER + 8 || !(region.as_ptr() as usize).is_multiple_of(8) {
         return None;
     }
     let rest = &region[HEADER..];
@@ -430,7 +443,7 @@ fn slots(region: &[u8]) -> Option<&[u64]> {
 }
 
 fn slots_mut(region: &mut [u8]) -> Option<&mut [u64]> {
-    if region.len() < HEADER + 8 || region.as_ptr() as usize % 8 != 0 {
+    if region.len() < HEADER + 8 || !(region.as_ptr() as usize).is_multiple_of(8) {
         return None;
     }
     let n = (region.len() - HEADER) / 8;
@@ -479,7 +492,7 @@ pub fn count(region: &[u8]) -> u64 {
 /// caller zeros the slots with [`scrub`], in pieces, so a 32 MiB table
 /// does not keep the CPU inside one syscall.
 pub fn open_rebuild(region: &mut [u8]) -> bool {
-    if region.len() < HEADER + 8 || region.as_ptr() as usize % 8 != 0 {
+    if region.len() < HEADER + 8 || !(region.as_ptr() as usize).is_multiple_of(8) {
         return false;
     }
     let next = generation(region).wrapping_add(1) | 1;
@@ -526,7 +539,7 @@ pub fn begin(region: &mut [u8]) -> bool {
 pub fn insert(region: &mut [u8], hash: u64) -> bool {
     let hash = if hash == 0 { 1 } else { hash };
     let gen = read_gen(region);
-    if gen == 0 || gen % 2 == 0 {
+    if gen == 0 || gen.is_multiple_of(2) {
         return false;
     }
     let count = {
@@ -548,7 +561,9 @@ pub fn insert(region: &mut [u8], hash: u64) -> bool {
     while step < PROBE_MAX && step < len {
         let slot = unsafe { *ptr.add(index) };
         if slot == 0 {
-            unsafe { *ptr.add(index) = hash; }
+            unsafe {
+                *ptr.add(index) = hash;
+            }
             write_u64(region, 16, (count + 1) as u64);
             return true;
         }
@@ -587,7 +602,7 @@ fn pair_half_len(region_len: usize) -> Option<usize> {
 }
 
 fn active_word(region: &[u8]) -> Option<&core::sync::atomic::AtomicU64> {
-    if region.len() < PAIR_HEAD || region.as_ptr() as usize % 8 != 0 {
+    if region.len() < PAIR_HEAD || !(region.as_ptr() as usize).is_multiple_of(8) {
         return None;
     }
     Some(unsafe { &*region.as_ptr().cast::<core::sync::atomic::AtomicU64>() })
@@ -604,7 +619,7 @@ pub fn pair_inactive(region: &[u8]) -> u64 {
 }
 
 pub fn pair_set_active(region: &mut [u8], index: u64) {
-    if region.len() < PAIR_HEAD || region.as_ptr() as usize % 8 != 0 {
+    if region.len() < PAIR_HEAD || !(region.as_ptr() as usize).is_multiple_of(8) {
         return;
     }
     unsafe {
@@ -652,7 +667,7 @@ pub fn pair_count(region: &[u8]) -> u64 {
 
 pub fn lookup(region: &[u8], name: &str) -> bool {
     let before = generation(region);
-    if before == 0 || before % 2 != 0 {
+    if before == 0 || !before.is_multiple_of(2) {
         return false;
     }
     let Some(table) = slots(region) else {

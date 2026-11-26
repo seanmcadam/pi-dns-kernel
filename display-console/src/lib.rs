@@ -76,7 +76,15 @@ pub fn draw(buf: &mut [u8], pitch: usize, title: &str, page: &str, log_text: &st
     fill_rows(buf, pitch, 0, 10, &BAR);
     text(buf, pitch, rows, 2, 1, title, &FG);
     band(buf, pitch, rows, SYSTEM_LABEL_Y, "system");
-    paint_lines(buf, pitch, rows, SYSTEM_TEXT_Y, SYSTEM_TEXT_ROWS, page, Kind::System);
+    paint_lines(
+        buf,
+        pitch,
+        rows,
+        SYSTEM_TEXT_Y,
+        SYSTEM_TEXT_ROWS,
+        page,
+        Kind::System,
+    );
     band(buf, pitch, rows, DNS_LABEL_Y, "dns");
     paint_lines(buf, pitch, rows, DNS_TEXT_Y, DNS_TEXT_ROWS, page, Kind::Dns);
     band(buf, pitch, rows, LOG_LABEL_Y, "log");
@@ -123,7 +131,15 @@ enum Kind {
     Dns,
 }
 
-fn paint_lines(buf: &mut [u8], pitch: usize, rows: usize, y0: usize, max: usize, page: &str, kind: Kind) {
+fn paint_lines(
+    buf: &mut [u8],
+    pitch: usize,
+    rows: usize,
+    y0: usize,
+    max: usize,
+    page: &str,
+    kind: Kind,
+) {
     let mut y = y0;
     let mut seen = 0;
     for line in split_lines(page) {
@@ -274,9 +290,18 @@ mod tests {
     #[test]
     fn sections_stack_from_top_to_bottom() {
         let mut buf = vec![0u8; BYTES];
-        draw(&mut buf, STRIDE, "CONSOLE", "cpu 0 user=1\ntop-name a.test=1\n", "line\n");
+        draw(
+            &mut buf,
+            STRIDE,
+            "CONSOLE",
+            "cpu 0 user=1\ntop-name a.test=1\n",
+            "line\n",
+        );
         assert_eq!(&buf[..4], &BAR);
-        assert_eq!(&buf[SYSTEM_LABEL_Y * STRIDE..SYSTEM_LABEL_Y * STRIDE + 4], &BAR);
+        assert_eq!(
+            &buf[SYSTEM_LABEL_Y * STRIDE..SYSTEM_LABEL_Y * STRIDE + 4],
+            &BAR
+        );
         assert_eq!(&buf[DNS_LABEL_Y * STRIDE..DNS_LABEL_Y * STRIDE + 4], &BAR);
         assert_eq!(&buf[LOG_LABEL_Y * STRIDE..LOG_LABEL_Y * STRIDE + 4], &BAR);
         let at = SYSTEM_TEXT_Y * STRIDE + (2 + 2) * 4;

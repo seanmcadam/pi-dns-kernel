@@ -105,9 +105,9 @@ pub fn init(config: &crate::config_manager::NetworkConfig) -> Result<(), Network
             return Err(NetworkError::DeviceNotFound);
         }
     };
-    
+
     let mut stack = NetworkStack::new(&mut device);
-    
+
     match config.mode {
         NetworkMode::Static {
             ip,
@@ -221,10 +221,7 @@ fn poll_device_inner(state: &mut NetworkState) {
     let fallback_gateway = dhcp.fallback_gateway;
 
     let action = {
-        let socket = state
-            .stack
-            .sockets_mut()
-            .get_mut::<dhcpv4::Socket>(handle);
+        let socket = state.stack.sockets_mut().get_mut::<dhcpv4::Socket>(handle);
         match socket.poll() {
             Some(dhcpv4::Event::Configured(config)) => {
                 let ip = config.address.address().0;
@@ -306,7 +303,10 @@ fn poll_device_inner(state: &mut NetworkState) {
                     if request_gateway(&mut state.device, ip, gateway) {
                         log::info!(
                             "gateway arp request {}.{}.{}.{}",
-                            gateway[0], gateway[1], gateway[2], gateway[3]
+                            gateway[0],
+                            gateway[1],
+                            gateway[2],
+                            gateway[3]
                         );
                     }
                     remember_gateway(ip, mask, gateway, mac);
@@ -339,7 +339,10 @@ fn poll_device_inner(state: &mut NetworkState) {
             DHCP_IP.store(u32::from_be_bytes(fallback_ip), Ordering::Relaxed);
             log::info!(
                 "DHCP timeout, using static {}.{}.{}.{}",
-                fallback_ip[0], fallback_ip[1], fallback_ip[2], fallback_ip[3]
+                fallback_ip[0],
+                fallback_ip[1],
+                fallback_ip[2],
+                fallback_ip[3]
             );
             console_line_ip("[WARN] DHCP timeout, static", fallback_ip);
         }
@@ -691,4 +694,3 @@ fn push_dec(buf: &mut [u8], n: &mut usize, mut value: u32) {
         push(buf, n, text);
     }
 }
-

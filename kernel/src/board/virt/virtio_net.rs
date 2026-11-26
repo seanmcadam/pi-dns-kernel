@@ -4,7 +4,6 @@
 /// RX and TX use a single descriptor per packet: a 10-byte virtio-net header
 /// followed by the Ethernet frame. Buffers live in BSS so they are in guest RAM
 /// and stay put for the life of the kernel.
-
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -308,8 +307,14 @@ impl VirtioNetDevice {
 }
 
 impl Device for VirtioNetDevice {
-    type RxToken<'a> = VirtioRxToken where Self: 'a;
-    type TxToken<'a> = VirtioTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = VirtioRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtioTxToken<'a>
+    where
+        Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if let Some(len) = crate::dhcp_rx::take_len() {

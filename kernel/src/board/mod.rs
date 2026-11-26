@@ -528,7 +528,8 @@ pub fn fb_bus_to_phys(bus: u64, bytes: u64) -> Option<(u64, u64)> {
     }
     let phys = bus & 0x3FFF_FFFF;
     let bytes = (bytes + 4095) & !4095;
-    if bytes == 0 || bytes > crate::mmu::USER_FB_MAX || phys < 16 * 1024 * 1024 || phys % 4096 != 0 {
+    if bytes == 0 || bytes > crate::mmu::USER_FB_MAX || phys < 16 * 1024 * 1024 || phys % 4096 != 0
+    {
         return None;
     }
     let end = phys.checked_add(bytes)?;

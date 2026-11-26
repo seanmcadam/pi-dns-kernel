@@ -98,7 +98,7 @@ pub fn hex_val(byte: u8) -> Option<u8> {
 
 /// Decode even-length hex. `None` when a digit is bad or `out` is short.
 pub fn hex_decode(text: &[u8], out: &mut [u8]) -> Option<usize> {
-    if text.len() % 2 != 0 || text.len() / 2 > out.len() {
+    if !text.len().is_multiple_of(2) || text.len() / 2 > out.len() {
         return None;
     }
     let mut n = 0;
@@ -198,9 +198,9 @@ mod tests {
     #[test]
     fn crc32_matches_the_stored_boot_record() {
         let raw: [u8; 64] = [
-            66, 79, 79, 84, 2, 0, 0, 0, 64, 0, 0, 0, 46, 163, 103, 248, 2, 0, 0, 0, 5, 0,
-            0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            66, 79, 79, 84, 2, 0, 0, 0, 64, 0, 0, 0, 46, 163, 103, 248, 2, 0, 0, 0, 5, 0, 0, 0, 7,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(crc32_ieee(&raw, 12..16), 0xF867_A32E);
         assert_eq!(&raw[12..16], &0xF867_A32Eu32.to_le_bytes());

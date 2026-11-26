@@ -97,7 +97,11 @@ impl Heap {
                     let (ps, _) = read_hdr(prev);
                     write_hdr(prev, ps, taken);
                 }
-                let got = if leftover >= HEADER + ALIGN { need } else { bsize };
+                let got = if leftover >= HEADER + ALIGN {
+                    need
+                } else {
+                    bsize
+                };
                 self.used += got;
                 if self.used > self.peak {
                     self.peak = self.used;

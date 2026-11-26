@@ -106,9 +106,7 @@ pub fn classify(tryboot: bool, kernel: &str) {
 pub fn forget() {
     let image = boot_rec::image_id(version::BOOT_ID_STR.as_bytes());
     let prev = saved();
-    let stopped = prev
-        .map(|rec| boot_rec::stopped_at(&rec))
-        .unwrap_or(0);
+    let stopped = prev.map(|rec| boot_rec::stopped_at(&rec)).unwrap_or(0);
     let was_good = prev.is_some_and(|rec| rec.good != 0 || rec.stage == boot_rec::STAGE_GOOD);
     let mut rec = boot_rec::reconcile(None, boot_rec::Arrival::Staged, image).0;
     rec.prev_stage = stopped;
@@ -414,7 +412,8 @@ fn hold_hang() {
 /// record is what the next boot reports.
 fn note_watchdog_hold() {
     let image = boot_rec::image_id(version::BOOT_ID_STR.as_bytes());
-    let mut rec = saved().unwrap_or_else(|| boot_rec::reconcile(None, boot_rec::Arrival::Same, image).0);
+    let mut rec =
+        saved().unwrap_or_else(|| boot_rec::reconcile(None, boot_rec::Arrival::Same, image).0);
     rec.reset = boot_rec::RESET_WATCHDOG;
     remember(&rec);
 }

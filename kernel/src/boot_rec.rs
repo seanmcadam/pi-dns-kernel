@@ -172,15 +172,9 @@ pub fn reconcile(prev: Option<Rec>, arrival: Arrival, image: [u8; 16]) -> (Rec, 
     }
     let attempts = prev.attempts.saturating_add(1);
     if attempts >= FAIL_LIMIT {
-        return (
-            owned(attempts, stopped, FB_RESET, image),
-            Action::Fallback,
-        );
+        return (owned(attempts, stopped, FB_RESET, image), Action::Fallback);
     }
-    (
-        owned(attempts, stopped, FB_NONE, image),
-        Action::Continue,
-    )
+    (owned(attempts, stopped, FB_NONE, image), Action::Continue)
 }
 
 fn backup_arrival(prev: Rec, image: [u8; 16]) -> (Rec, Action) {

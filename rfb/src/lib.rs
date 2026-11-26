@@ -72,7 +72,11 @@ fn store_be(block: u64, out: &mut [u8]) {
 /// Encrypt a 16-byte challenge with an 8-byte VNC password (zero padded).
 pub fn encrypt_challenge(password: &[u8], challenge: &[u8; 16], out: &mut [u8; 16]) {
     let mut key = [0u8; 8];
-    let n = if password.len() < 8 { password.len() } else { 8 };
+    let n = if password.len() < 8 {
+        password.len()
+    } else {
+        8
+    };
     key[..n].copy_from_slice(&password[..n]);
     store_be(vnc_block(load_be(&challenge[..8]), &key), &mut out[..8]);
     store_be(vnc_block(load_be(&challenge[8..]), &key), &mut out[8..]);
@@ -158,15 +162,18 @@ mod tests {
     #[test]
     fn vnc_password_challenge() {
         let mut out = [0u8; 16];
-        let challenge = [0x11u8; 8].into_iter().chain([0x22u8; 8]).collect::<Vec<_>>();
+        let challenge = [0x11u8; 8]
+            .into_iter()
+            .chain([0x22u8; 8])
+            .collect::<Vec<_>>();
         let mut block = [0u8; 16];
         block.copy_from_slice(&challenge);
         encrypt_challenge(b"password", &block, &mut out);
         assert_eq!(
             out,
             [
-                0x10, 0x12, 0xb7, 0x74, 0x52, 0xf3, 0x1b, 0xcc, 0xf5, 0x69, 0xdb, 0xc7, 0xce,
-                0x82, 0xc8, 0xc1
+                0x10, 0x12, 0xb7, 0x74, 0x52, 0xf3, 0x1b, 0xcc, 0xf5, 0x69, 0xdb, 0xc7, 0xce, 0x82,
+                0xc8, 0xc1
             ]
         );
     }

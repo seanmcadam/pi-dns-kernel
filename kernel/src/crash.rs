@@ -619,7 +619,11 @@ pub fn clear() -> i64 {
         seq += 1;
     }
     publish_card(false, &[0; 16], &[], 0);
-    if failed { -5 } else { 0 }
+    if failed {
+        -5
+    } else {
+        0
+    }
 }
 
 fn core_id() -> u32 {

@@ -15,9 +15,10 @@ impl LockedAllocator {
     }
 
     pub unsafe fn init(&self) {
-        self.0
-            .lock()
-            .init(&__heap_start as *const u8 as *mut u8, &__heap_end as *const u8 as *mut u8);
+        self.0.lock().init(
+            &__heap_start as *const u8 as *mut u8,
+            &__heap_end as *const u8 as *mut u8,
+        );
     }
 
     /// `(used, size)` in bytes. `used` falls when allocations are freed.

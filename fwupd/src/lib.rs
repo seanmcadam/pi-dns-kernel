@@ -514,7 +514,10 @@ fn under_chosen(path: &[&str], depth: usize) -> bool {
 }
 
 fn under_bootloader(path: &[&str], depth: usize) -> bool {
-    depth >= 2 && depth <= path.len() && path[depth - 2] == "chosen" && path[depth - 1] == "bootloader"
+    depth >= 2
+        && depth <= path.len()
+        && path[depth - 2] == "chosen"
+        && path[depth - 1] == "bootloader"
 }
 
 fn tryboot_value(value: &[u8]) -> bool {
@@ -607,7 +610,9 @@ pub fn chosen_log(blob: &[u8]) -> Option<(u32, u32)> {
                 }
                 let value = &blob[p..p + len];
                 p = (p + len + 3) & !3;
-                if under_chosen(&path, depth) && cstr_at(strings, nameoff) == Some("log") && value.len() >= 8
+                if under_chosen(&path, depth)
+                    && cstr_at(strings, nameoff) == Some("log")
+                    && value.len() >= 8
                 {
                     let start = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
                     let size = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
@@ -946,8 +951,15 @@ fn render_log(src: &[u8], out: &mut [u8], assert_log: bool) -> VclogRender {
 }
 
 fn write_msg_line(time: u32, payload: &[u8], out: &mut [u8], n: &mut usize) -> bool {
-    let text = if payload.len() > 4 { &payload[4..] } else { &[] };
-    let end = text.iter().position(|byte| *byte == 0).unwrap_or(text.len());
+    let text = if payload.len() > 4 {
+        &payload[4..]
+    } else {
+        &[]
+    };
+    let end = text
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(text.len());
     let text = &text[..end];
     write_stamped(time, out, n, |dst, at| {
         let at = copy_literal(b": ", dst, at);
@@ -988,14 +1000,22 @@ fn assert_parts(payload: &[u8]) -> Option<(&[u8], u32, &[u8])> {
         payload[file_len + 4],
     ]);
     let cond = &payload[cond_at..];
-    let cond_end = cond.iter().position(|byte| *byte == 0).unwrap_or(cond.len());
+    let cond_end = cond
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(cond.len());
     Some((&payload[..file_len], line, &cond[..cond_end]))
 }
 
 /// `body` writes the text after the timestamp and returns the new length.
 /// The timestamp is `vclog`'s `%06i.%03i`. A line that does not fit is not
 /// started.
-fn write_stamped(time: u32, out: &mut [u8], n: &mut usize, body: impl FnOnce(&mut [u8], usize) -> usize) -> bool {
+fn write_stamped(
+    time: u32,
+    out: &mut [u8],
+    n: &mut usize,
+    body: impl FnOnce(&mut [u8], usize) -> usize,
+) -> bool {
     let start = *n;
     let sec_len = digit_len(time / 1000).max(6);
     let prefix = sec_len + 1 + 3;
@@ -1125,7 +1145,10 @@ pub fn vclog_tail(buf: &[u8], read_off: usize, write_off: usize, out: &mut [u8])
         let payload = &buf[pos + 8..pos + size];
         if payload.len() > 4 {
             let text = &payload[4..];
-            let end = text.iter().position(|byte| *byte == 0).unwrap_or(text.len());
+            let end = text
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(text.len());
             if end > 0 {
                 if n > 0 {
                     if n + 3 >= out.len() {
@@ -1155,8 +1178,6 @@ pub fn vclog_tail(buf: &[u8], read_off: usize, write_off: usize, out: &mut [u8])
 fn json_safe(byte: u8) -> u8 {
     if byte.is_ascii_graphic() && byte != b'"' && byte != b'\\' {
         byte
-    } else if byte == b' ' || byte == b'\t' {
-        b' '
     } else {
         b' '
     }
@@ -2157,7 +2178,10 @@ mod fdt_tests {
 
     #[test]
     fn chosen_log_is_the_vclog_pair() {
-        assert_eq!(chosen_log(&log_tree(0x3e00_0000, 4096)), Some((0x3e00_0000, 4096)));
+        assert_eq!(
+            chosen_log(&log_tree(0x3e00_0000, 4096)),
+            Some((0x3e00_0000, 4096))
+        );
         assert_eq!(chosen_log(&blob(Some(&be(1)))), None);
         assert_eq!(chosen_log(&[0; 64]), None);
     }
@@ -2194,7 +2218,11 @@ mod fdt_tests {
         assert_eq!(win.start, 0x3FFA_0000);
         assert!(vclog_covers(FAR, 4, win));
         assert_eq!(
-            vclog_window(Some((0x3FFA_0000, 0x1000)), Some((0x1000_0000, 0x1000)), RAM_END),
+            vclog_window(
+                Some((0x3FFA_0000, 0x1000)),
+                Some((0x1000_0000, 0x1000)),
+                RAM_END
+            ),
             Err(VclogDeny::OutsideChosen)
         );
         assert_eq!(vclog_window(None, None, RAM_END), Err(VclogDeny::NoSource));
@@ -2327,23 +2355,29 @@ mod boot_pick_tests {
 
     #[test]
     fn file_id_beats_a_missing_tree_and_boot_mode_is_not_tryboot() {
-        assert_eq!(
-            choose_booted(Some(false), Some(true), None),
-            BootPick::New
-        );
+        assert_eq!(choose_booted(Some(false), Some(true), None), BootPick::New);
         assert_eq!(choose_booted(Some(true), None, Some(true)), BootPick::Img);
         assert_eq!(
             choose_booted(Some(true), Some(true), Some(true)),
             BootPick::New
         );
-        assert_eq!(choose_booted(Some(true), Some(true), None), BootPick::Unknown);
+        assert_eq!(
+            choose_booted(Some(true), Some(true), None),
+            BootPick::Unknown
+        );
         assert_eq!(
             choose_booted(Some(false), Some(false), Some(true)),
             BootPick::New
         );
         assert_eq!(choose_booted(None, None, None), BootPick::Unknown);
-        assert!(contains_bytes(b"xxpi4dns-boot-id:0.1.65yy", b"pi4dns-boot-id:0.1.65"));
-        assert!(!contains_bytes(b"pi4dns-boot-id:0.1.64", b"pi4dns-boot-id:0.1.65"));
+        assert!(contains_bytes(
+            b"xxpi4dns-boot-id:0.1.65yy",
+            b"pi4dns-boot-id:0.1.65"
+        ));
+        assert!(!contains_bytes(
+            b"pi4dns-boot-id:0.1.64",
+            b"pi4dns-boot-id:0.1.65"
+        ));
         assert!(contains_bytes(
             b"pi4dns-boot-id:0.1.65\0",
             b"pi4dns-boot-id:0.1.65\0"

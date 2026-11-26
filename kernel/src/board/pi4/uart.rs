@@ -1,6 +1,5 @@
 /// Pi 4 PL011 UART at physical 0xFE201000. QEMU uses `console` instead.
 /// This module is compiled only for the Pi 4 image, which is untested on hardware.
-
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
 

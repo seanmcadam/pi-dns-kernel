@@ -879,9 +879,7 @@ where
                 let bytes = burst_n * Block::LEN;
                 let mut at = written;
                 for block in &mut blocks[..burst_n] {
-                    block
-                        .contents
-                        .copy_from_slice(&buffer[at..at + Block::LEN]);
+                    block.contents.copy_from_slice(&buffer[at..at + Block::LEN]);
                     at += Block::LEN;
                 }
                 self.block_device

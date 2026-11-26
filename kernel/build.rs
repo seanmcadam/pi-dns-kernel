@@ -53,7 +53,12 @@ fn main() {
     let edid = out_dir.join("libedid.rlib");
     let console = out_dir.join("libdisplay_console.rlib");
     compile_rlib(&rustc, &manifest_dir.join("../rfb/src/lib.rs"), "rfb", &rfb);
-    compile_rlib(&rustc, &manifest_dir.join("../edid/src/lib.rs"), "edid", &edid);
+    compile_rlib(
+        &rustc,
+        &manifest_dir.join("../edid/src/lib.rs"),
+        "edid",
+        &edid,
+    );
     compile_rlib(
         &rustc,
         &manifest_dir.join("../display-console/src/lib.rs"),
@@ -220,7 +225,8 @@ fn build_http(out_dir: &Path, manifest_dir: &Path) {
 
 fn build_log(out_dir: &Path, manifest_dir: &Path) {
     let dir = manifest_dir.join("../log-el0");
-    for rel in ["src/main.rs"] {
+    {
+        let rel = "src/main.rs";
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
@@ -242,7 +248,8 @@ fn build_log(out_dir: &Path, manifest_dir: &Path) {
 
 fn build_telnet(out_dir: &Path, manifest_dir: &Path) {
     let dir = manifest_dir.join("../telnet-el0");
-    for rel in ["src/main.rs"] {
+    {
+        let rel = "src/main.rs";
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     println!(
@@ -268,18 +275,27 @@ fn build_telnet(out_dir: &Path, manifest_dir: &Path) {
 
 fn build_vnc(out_dir: &Path, manifest_dir: &Path, rustc: &str, rfb: &Path, console: &Path) {
     let dir = manifest_dir.join("../vnc-el0");
-    for rel in ["src/main.rs"] {
+    {
+        let rel = "src/main.rs";
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
-    println!("cargo:rerun-if-changed={}", manifest_dir.join("../rfb/src/lib.rs").display());
-    println!("cargo:rerun-if-changed={}", manifest_dir.join("../rfb/src/des.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../rfb/src/lib.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../rfb/src/des.rs").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../display-console/src/lib.rs").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
-        manifest_dir.join("../display-console/src/font.rs").display()
+        manifest_dir
+            .join("../display-console/src/font.rs")
+            .display()
     );
     let (panic_rt, minfmt) = compile_panic_rt(out_dir, manifest_dir, rustc);
     link_el0(
@@ -305,14 +321,18 @@ fn build_hdmi(out_dir: &Path, manifest_dir: &Path, rustc: &str, edid: &Path, con
     } else {
         manifest_dir.join("../hdmi-el0/pi4")
     };
-    for rel in ["src/main.rs"] {
+    {
+        let rel = "src/main.rs";
         println!("cargo:rerun-if-changed={}", dir.join(rel).display());
     }
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../hdmi-el0/runner.rs").display()
     );
-    println!("cargo:rerun-if-changed={}", manifest_dir.join("../edid/src/lib.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../edid/src/lib.rs").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../display-console/src/lib.rs").display()
@@ -335,6 +355,7 @@ fn build_hdmi(out_dir: &Path, manifest_dir: &Path, rustc: &str, edid: &Path, con
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn link_el0(
     out_dir: &Path,
     rustc: &str,
@@ -419,7 +440,9 @@ fn link_el0(
         let in_code = *addr >= 0x1_0000_0000 && end <= code_limit;
         let in_data = *addr >= data_base && end <= data_limit;
         if !in_code && !in_data {
-            panic!("{name} section {sec_name} at {addr:#x} size {size:#x} is outside the user window");
+            panic!(
+                "{name} section {sec_name} at {addr:#x} size {size:#x} is outside the user window"
+            );
         }
         if sec_name == ".data" {
             data_off = (*addr - 0x1_0000_0000) as usize;

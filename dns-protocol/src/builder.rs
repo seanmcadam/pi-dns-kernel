@@ -99,8 +99,8 @@ fn write_name(
         let suffix = parts[i..].join(".");
         if let Some(&offset) = name_map.get(&suffix) {
             // Write uncompressed prefix
-            for j in 0..i {
-                let label = parts[j];
+            for part in parts.iter().take(i) {
+                let label = *part;
                 if label.len() > 63 {
                     return Err(BuildError::InvalidData);
                 }

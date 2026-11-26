@@ -53,7 +53,7 @@ if grep -q "DNS Server ready" qemu/boot-output.txt && \
    grep -q "MMU and caches enabled" qemu/boot-output.txt && \
    grep -q "Entered at EL1" qemu/boot-output.txt && \
    grep -q "Running at EL1" qemu/boot-output.txt && \
-   grep -q "version 0.2.1" qemu/boot-output.txt && \
+   grep -q "version 0.2.2" qemu/boot-output.txt && \
    grep -q "boot unknown" qemu/boot-output.txt; then
     echo "✓ Kernel booted successfully"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -117,8 +117,8 @@ echo "Test 3: DNS query for pi4.local"
 if command -v dig &> /dev/null; then
     if timeout 5 dig @127.0.0.1 -p ${DNS_HOST_PORT} pi4.local +short > qemu/dns-pi4-local.txt 2>&1; then
         RESULT=$(cat qemu/dns-pi4-local.txt)
-        if echo "$RESULT" | grep -q "10.0.2.15"; then
-            echo "✓ DNS query successful: pi4.local -> 10.0.2.15"
+        if echo "$RESULT" | grep -q "10.0.2.25"; then
+            echo "✓ DNS query successful: pi4.local -> 10.0.2.25"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
             echo "✗ DNS query returned unexpected result: $RESULT"
@@ -155,7 +155,7 @@ echo "Test 5: HTTP GET /status"
 if command -v curl &> /dev/null; then
     if timeout 5 curl -s -u admin:admin http://127.0.0.1:${HTTP_HOST_PORT}/status > qemu/http-status.txt 2>&1; then
         RESULT=$(cat qemu/http-status.txt)
-        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.2.1"'; then
+        if echo "$RESULT" | grep -q '"status":"running"' && echo "$RESULT" | grep -q '"version":"0.2.2"'; then
             echo "✓ HTTP request successful, server is running"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -328,7 +328,7 @@ if html.lstrip().startswith("{"):
 if forced.get("status") != "running" or plain.get("status") != "running":
     print("json", forced.get("status"), plain.get("status"))
     sys.exit(1)
-if forced.get("version") != plain.get("version") or "0.2.1" not in html:
+if forced.get("version") != plain.get("version") or "0.2.2" not in html:
     print("version", forced.get("version"), plain.get("version"))
     sys.exit(1)
 if "<pre>" not in dns_page or "&quot;upstreams&quot;: [" not in dns_page:
@@ -1323,8 +1323,8 @@ DHCP_PID=$!
 sleep 6
 kill $DHCP_PID 2>/dev/null || true
 wait $DHCP_PID 2>/dev/null || true
-if grep -q "DHCP configured 10.0.2.15" qemu/dhcp-serial.txt; then
-    echo "✓ QEMU user-net DHCP leased 10.0.2.15"
+if grep -q "DHCP configured 10.0.2.25" qemu/dhcp-serial.txt; then
+    echo "✓ QEMU user-net DHCP leased 10.0.2.25"
     grep "DHCP configured" qemu/dhcp-serial.txt
     timeout 20 qemu-system-aarch64 \
         -M virt,gic-version=2 -cpu cortex-a72 -smp 4 -m 512M \
@@ -1338,9 +1338,9 @@ if grep -q "DHCP configured 10.0.2.15" qemu/dhcp-serial.txt; then
     sleep 6
     kill $FALLBACK_PID 2>/dev/null || true
     wait $FALLBACK_PID 2>/dev/null || true
-    if grep -q "DHCP timeout, using static 10.0.2.15" qemu/dhcp-fallback.txt \
-        || grep -q "DHCP timeout, static 10.0.2.15" qemu/dhcp-fallback.txt; then
-        echo "✓ DHCP timeout fell back to static 10.0.2.15"
+    if grep -q "DHCP timeout, using static 10.0.2.25" qemu/dhcp-fallback.txt \
+        || grep -q "DHCP timeout, static 10.0.2.25" qemu/dhcp-fallback.txt; then
+        echo "✓ DHCP timeout fell back to static 10.0.2.25"
         grep "DHCP timeout" qemu/dhcp-fallback.txt
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -1349,7 +1349,7 @@ if grep -q "DHCP configured 10.0.2.15" qemu/dhcp-serial.txt; then
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 else
-    echo "✗ DHCP did not configure 10.0.2.15"
+    echo "✗ DHCP did not configure 10.0.2.25"
     cat qemu/dhcp-serial.txt
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
@@ -1454,7 +1454,7 @@ label: dos
 start=2048, type=c
 EOF
 mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/json-disk.img >/dev/null
-printf 'record=legacy.local A 9.8.7.6 300\nmode=static\nip=10.0.2.15\nnetmask=255.255.255.0\ngateway=10.0.2.2\n' \
+printf 'record=legacy.local A 9.8.7.6 300\nmode=static\nip=10.0.2.25\nnetmask=255.255.255.0\ngateway=10.0.2.2\n' \
     > /tmp/legacy-config.txt
 mcopy -i qemu/json-disk.img@@${DISK_OFF} /tmp/legacy-config.txt ::CONFIG.TXT
 timeout 180 qemu-system-aarch64 \
@@ -2195,7 +2195,7 @@ if status != 200:
     fail("config download %s" % status)
 doc = json.loads(kept)
 doc["dns"]["probe_interval_secs"] = 1
-doc["dns"]["upstreams"] = ["192.0.2.1", "10.0.2.3"]
+doc["dns"]["upstreams"] = ["192.0.2.2", "10.0.2.3"]
 body = json.dumps(doc, separators=(",", ":"))
 status, applied = req("POST", "/config/file/config", body, {"Content-Type": "application/json"})
 if status != 200 or b"applied" not in applied:
@@ -2208,7 +2208,7 @@ while time.time() < deadline:
     if status == 200:
         seen = json.loads(page).get("upstreams") or []
         by_ip = {item["ip"]: item["up"] for item in seen}
-        if by_ip.get("192.0.2.1") is False and by_ip.get("10.0.2.3") is True:
+        if by_ip.get("192.0.2.2") is False and by_ip.get("10.0.2.3") is True:
             break
     time.sleep(0.4)
 else:
@@ -2241,7 +2241,7 @@ if status != 200 or b"applied" not in restored:
 if ok < 18:
     fail("load lost %s of 20" % (20 - ok))
 log = open("qemu/json-a.txt", errors="replace").read()
-if "dns upstream down 192.0.2.1" not in log:
+if "dns upstream down 192.0.2.2" not in log:
     fail("dead server was not logged down")
 print("dead upstream left the rotation")
 PY
@@ -2285,7 +2285,7 @@ status, kept = req("GET", "/config/file/config")
 if status != 200:
     fail("config download %s" % status)
 doc = json.loads(kept)
-doc["dns"]["upstreams"] = ["192.0.2.1"]
+doc["dns"]["upstreams"] = ["192.0.2.2"]
 doc["dns"]["probe_interval_secs"] = 5
 body = json.dumps(doc, separators=(",", ":"))
 status, applied = req("POST", "/config/file/config", body, {"Content-Type": "application/json"})
@@ -2553,12 +2553,12 @@ def uptime():
     return json.loads(page)
 
 status, home, _ = req("GET", "/")
-if status != 200 or b'href="/firmware"' not in home or b"0.2.1" not in home:
+if status != 200 or b'href="/firmware"' not in home or b"0.2.2" not in home:
     fail("home missing firmware link %s" % home[:300])
 status, page, _ = req("GET", "/firmware")
 if status != 200 or b"Firmware update" not in page or b"FWTEST.BIN" not in page:
     fail("firmware page %s %s" % (status, page[:300]))
-if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.2.1" not in page or b"Promote" not in page or b"Rollback" not in page:
+if b"tryboot flag: no" not in page or b"confirm('Reboot this machine?')" not in page or b"0.2.2" not in page or b"Promote" not in page or b"Rollback" not in page:
     fail("firmware page flags %s" % page[:400])
 status, _, _ = req("GET", "/firmware", auth=False)
 if status != 401:
@@ -2574,7 +2574,7 @@ doc = uptime()
 for key in ("version", "fw_staged", "fw_bytes", "fw_backup", "fw_tryboot", "fw_tryboot_hw", "fw_tryboot_file", "fw_temp", "fw_sha256", "fw_result", "fw_phase", "fw_progress", "fw_total", "fw_booted", "fw_boot_sha256", "fw_bak"):
     if key not in doc:
         fail("status missing %s" % key)
-if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.2.1" or doc["fw_booted"] != "unknown":
+if doc["fw_backup"] != 1 or doc["fw_tryboot_hw"] != 0 or doc["fw_tryboot"] != 0 or doc["fw_tryboot_file"] != 0 or doc["fw_staged"] != 0 or doc["version"] != "0.2.2" or doc["fw_booted"] != "unknown":
     fail("initial firmware status %s" % doc)
 if doc.get("fs_mounted") != 1 or doc.get("sd_state") != "virtio" or doc.get("sd_blocks", 0) < 1 or doc.get("sd_error") != "" or doc.get("sd_mode") != "none" or doc.get("sd_clock_hz") != 0:
     fail("sd status %s" % {k: doc.get(k) for k in ("sd_state", "sd_error", "sd_blocks", "fs_mounted", "sd_mode", "sd_clock_hz")})
@@ -2821,12 +2821,12 @@ while time.time() < deadline:
         serial = open(serial_path, "rb").read()
         if b"power: reboot" not in serial or b"power: psci reset" not in serial:
             fail("firmware reboot did not log the reset")
-        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.2.1":
+        if doc.get("fw_booted") != "unknown" or doc.get("fw_result") == "reboot requested" or doc.get("version") != "0.2.2":
             fail("boot report %s" % {k: doc.get(k) for k in ("fw_booted", "fw_result", "version")})
         if doc.get("fw_result") != "normal boot":
             fail("stale reboot result %s" % doc.get("fw_result"))
         serial_now = open(serial_path, "rb").read()
-        if b"version 0.2.1" not in serial_now or b"boot unknown" not in serial_now:
+        if b"version 0.2.2" not in serial_now or b"boot unknown" not in serial_now:
             fail("boot log missing version")
         print("reboot", before, doc["uptime"], "banners", old_n, new_n)
         break
@@ -3271,7 +3271,7 @@ start=2048, type=c
 EOF
     mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/raspi4b-sd.img >/dev/null
     RASPI_OFF=$((2048 * 512))
-    printf 'record=pi4.local A 10.0.2.15 300\n' > /tmp/raspi-config.txt
+    printf 'record=pi4.local A 10.0.2.25 300\n' > /tmp/raspi-config.txt
     mcopy -i "qemu/raspi4b-sd.img@@${RASPI_OFF}" /tmp/raspi-config.txt ::CONFIG.TXT
     # The guest stays up and reprints status, so this budget ends the
     # process. Exit 124 is that stop. A boot that already printed every
@@ -4049,7 +4049,7 @@ EOF
 mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/ntp-disk.img >/dev/null
 NTP_OFF=$((2048 * 512))
 cat > /tmp/ntp-config.json <<EOF
-{"version":1,"network":{"mode":"dhcp","ip":"10.0.2.15","netmask":"255.255.255.0","gateway":"10.0.2.2","timeout_ms":3000},"dns":{"cache_size":1024,"cache_reap_interval_secs":5,"upstreams":["8.8.8.8","10.0.2.3"],"blocklist":[],"records":[{"name":"test.local","type":"A","value":"192.168.1.100","ttl":300}]},"http":{"port":80,"username":"admin","password":"admin"},"display":{"vnc":0,"vnc_port":5900,"vnc_password":"","hdmi":0},"ntp":{"servers":["10.0.2.2:${NTP_STUB_PORT}"],"interval_secs":30,"serve":1}}
+{"version":1,"network":{"mode":"dhcp","ip":"10.0.2.25","netmask":"255.255.255.0","gateway":"10.0.2.2","timeout_ms":3000},"dns":{"cache_size":1024,"cache_reap_interval_secs":5,"upstreams":["8.8.8.8","10.0.2.3"],"blocklist":[],"records":[{"name":"test.local","type":"A","value":"192.168.1.100","ttl":300}]},"http":{"port":80,"username":"admin","password":"admin"},"display":{"vnc":0,"vnc_port":5900,"vnc_password":"","hdmi":0},"ntp":{"servers":["10.0.2.2:${NTP_STUB_PORT}"],"interval_secs":30,"serve":1}}
 EOF
 mcopy -i qemu/ntp-disk.img@@${NTP_OFF} /tmp/ntp-config.json ::CONFIG.JSN
 NTP_FWD="hostfwd=udp::${NTP_DNS_PORT}-:53,hostfwd=tcp::${NTP_HTTP_PORT}-:80,hostfwd=udp::${NTP_HOST_PORT}-:123"
@@ -4237,7 +4237,7 @@ EOF
 mkfs.vfat -F 32 -n PI4DNS --offset 2048 qemu/block-disk.img >/dev/null
 BLOCK_OFF=$((2048 * 512))
 cat > /tmp/block-config.json <<EOF
-{"version":1,"network":{"mode":"dhcp","ip":"10.0.2.15","netmask":"255.255.255.0","gateway":"10.0.2.2","timeout_ms":3000},"dns":{"cache_size":1024,"cache_reap_interval_secs":5,"upstreams":["8.8.8.8","10.0.2.3"],"blocklist":[],"records":[{"name":"test.local","type":"A","value":"192.168.1.100","ttl":300}]},"http":{"port":80,"username":"admin","password":"admin"},"display":{"vnc":0,"vnc_port":5900,"vnc_password":"","hdmi":0},"ntp":{"servers":["10.0.2.2:${BLOCK_NTP_PORT}"],"interval_secs":30,"serve":0},"block":{"enabled":1,"refresh_secs":86400,"urls":["https://10.0.2.2:${BLOCK_TLS_PORT}/list.txt"],"allow":["plain.example"]}}
+{"version":1,"network":{"mode":"dhcp","ip":"10.0.2.25","netmask":"255.255.255.0","gateway":"10.0.2.2","timeout_ms":3000},"dns":{"cache_size":1024,"cache_reap_interval_secs":5,"upstreams":["8.8.8.8","10.0.2.3"],"blocklist":[],"records":[{"name":"test.local","type":"A","value":"192.168.1.100","ttl":300}]},"http":{"port":80,"username":"admin","password":"admin"},"display":{"vnc":0,"vnc_port":5900,"vnc_password":"","hdmi":0},"ntp":{"servers":["10.0.2.2:${BLOCK_NTP_PORT}"],"interval_secs":30,"serve":0},"block":{"enabled":1,"refresh_secs":86400,"urls":["https://10.0.2.2:${BLOCK_TLS_PORT}/list.txt"],"allow":["plain.example"]}}
 EOF
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/block-config.json ::CONFIG.JSN
 mcopy -i qemu/block-disk.img@@${BLOCK_OFF} /tmp/TESTCA.DER ::TESTCA.DER

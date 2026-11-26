@@ -20,7 +20,8 @@ pub const UPLOAD_MAX: usize = 4096;
 
 /// Canonical `LOG.JSN` written when the file is missing. Version 1,
 /// `max_bytes` 4096, `archives` 3.
-pub const DEFAULT_LOG_JSON: &str = "{\n  \"version\": 1,\n  \"max_bytes\": 4096,\n  \"archives\": 3\n}\n";
+pub const DEFAULT_LOG_JSON: &str =
+    "{\n  \"version\": 1,\n  \"max_bytes\": 4096,\n  \"archives\": 3\n}\n";
 
 /// Active log file size, in bytes.
 pub const LOG_MIN_BYTES: u64 = 4096;
@@ -65,11 +66,7 @@ pub const NTP_NAME_MAX: usize = 64;
 pub const NTP_INTERVAL_MIN: u64 = 30;
 pub const NTP_INTERVAL_MAX: u64 = 86_400;
 pub const NTP_INTERVAL_DEFAULT: u64 = 3_600;
-pub const NTP_DEFAULT_SERVERS: &[&str] = &[
-    "0.pool.ntp.org",
-    "1.pool.ntp.org",
-    "2.pool.ntp.org",
-];
+pub const NTP_DEFAULT_SERVERS: &[&str] = &["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org"];
 /// Downloaded block lists. Missing `block` means off, no URLs, a 24 hour
 /// refresh, and an empty allow list. `dns.blocklist` is still the small
 /// exact-name list and is unrelated.
@@ -119,7 +116,10 @@ impl Value {
         let Value::Object(items) = self else {
             return None;
         };
-        items.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+        items
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
     }
 
     pub fn as_u64(&self) -> Option<u64> {
@@ -228,11 +228,11 @@ pub fn check(value: &Value, fields: &[Field]) -> Result<(), Error> {
 }
 
 pub fn log_fields() -> &'static [Field] {
-    &LOG_FIELDS
+    LOG_FIELDS
 }
 
 pub fn main_fields() -> &'static [Field] {
-    &MAIN_FIELDS
+    MAIN_FIELDS
 }
 
 /// `max_bytes * (archives + 1)` has to stay within [`LOG_MAX_TOTAL`].
@@ -300,7 +300,10 @@ const RECORD_FIELDS: &[Field] = &[
     Field {
         name: "ttl",
         required: true,
-        kind: FieldKind::U64 { min: 1, max: TTL_MAX },
+        kind: FieldKind::U64 {
+            min: 1,
+            max: TTL_MAX,
+        },
     },
 ];
 
@@ -406,7 +409,10 @@ const HTTP_FIELDS: &[Field] = &[
     Field {
         name: "port",
         required: true,
-        kind: FieldKind::U64 { min: 1, max: PORT_MAX },
+        kind: FieldKind::U64 {
+            min: 1,
+            max: PORT_MAX,
+        },
     },
     Field {
         name: "username",
@@ -528,13 +534,11 @@ const NTP_FIELDS: &[Field] = &[
     },
 ];
 
-const BOARD_FIELDS: &[Field] = &[
-    Field {
-        name: "detect",
-        required: true,
-        kind: FieldKind::U64 { min: 0, max: 1 },
-    },
-];
+const BOARD_FIELDS: &[Field] = &[Field {
+    name: "detect",
+    required: true,
+    kind: FieldKind::U64 { min: 0, max: 1 },
+}];
 
 const MAIN_FIELDS: &[Field] = &[
     Field {
@@ -1049,10 +1053,7 @@ pub fn check_block_url(text: &str) -> bool {
         return false;
     }
     let host = if let Some((host, port)) = authority.rsplit_once(':') {
-        if port.is_empty()
-            || port.len() > 5
-            || !port.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if port.is_empty() || port.len() > 5 || !port.bytes().all(|byte| byte.is_ascii_digit()) {
             return false;
         }
         let Ok(port) = port.parse::<u16>() else {
@@ -1267,10 +1268,10 @@ pub fn csrf_matches(expected: &str, body: &str) -> bool {
 }
 
 pub fn reboot_confirmed(body: &str) -> bool {
-    match form_value(body, "reboot") {
-        Some("1") | Some("yes") | Some("on") | Some("true") => true,
-        _ => false,
-    }
+    matches!(
+        form_value(body, "reboot"),
+        Some("1") | Some("yes") | Some("on") | Some("true")
+    )
 }
 
 pub fn posted_json(body: &str) -> Result<String, Error> {
@@ -1334,7 +1335,10 @@ mod tests {
     fn log_schema_rejects_bad_documents() {
         assert!(parse("{").unwrap_err().message.contains("malformed"));
         let missing = parse(r#"{"version":1,"max_bytes":4096}"#).unwrap();
-        assert!(check(&missing, log_fields()).unwrap_err().message.contains("missing"));
+        assert!(check(&missing, log_fields())
+            .unwrap_err()
+            .message
+            .contains("missing"));
         let wrong = parse(r#"{"version":1,"max_bytes":"4096","archives":1}"#).unwrap();
         assert!(check(&wrong, log_fields())
             .unwrap_err()
@@ -1373,7 +1377,14 @@ mod tests {
         assert!(pretty.contains("\"ip\": \"8.8.8.8\""));
         assert!(pretty.contains("\"up\": true"));
         assert!(pretty.contains("\"up\": false"));
-        assert_eq!(parse(&pretty).unwrap().get("upstreams").and_then(Value::as_array).map(|items| items.len()), Some(2));
+        assert_eq!(
+            parse(&pretty)
+                .unwrap()
+                .get("upstreams")
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1386,7 +1397,10 @@ mod tests {
         let formatted = format_document(&value).unwrap();
         assert_eq!(formatted, DEFAULT_LOG_JSON);
         assert!(formatted.len() <= UPLOAD_MAX);
-        assert_eq!(format_document(&parse(&formatted).unwrap()).unwrap(), formatted);
+        assert_eq!(
+            format_document(&parse(&formatted).unwrap()).unwrap(),
+            formatted
+        );
     }
 
     #[test]
@@ -1403,7 +1417,10 @@ mod tests {
         assert!(formatted.contains("\\n"));
         assert!(formatted.contains("\\u0001"));
         assert_eq!(parse(&formatted).unwrap(), value);
-        assert_eq!(format_document(&parse(&formatted).unwrap()).unwrap(), formatted);
+        assert_eq!(
+            format_document(&parse(&formatted).unwrap()).unwrap(),
+            formatted
+        );
         assert!(formatted.len() <= UPLOAD_MAX);
     }
 
@@ -1425,15 +1442,24 @@ mod tests {
         let mut items = Vec::new();
         let mut index = 0;
         while index < 300 {
-            items.push((alloc::format!("k{index:03}"), Value::String(String::from("z"))));
+            items.push((
+                alloc::format!("k{index:03}"),
+                Value::String(String::from("z")),
+            ));
             index += 1;
         }
         let value = Value::Object(items);
         let formatted = format_document(&value).unwrap();
         assert!(formatted.len() <= UPLOAD_MAX);
-        assert!(!formatted.contains('\n'), "compact fallback must not be truncated pretty text");
+        assert!(
+            !formatted.contains('\n'),
+            "compact fallback must not be truncated pretty text"
+        );
         assert_eq!(parse(&formatted).unwrap(), value);
-        assert_eq!(format_document(&parse(&formatted).unwrap()).unwrap(), formatted);
+        assert_eq!(
+            format_document(&parse(&formatted).unwrap()).unwrap(),
+            formatted
+        );
     }
 
     #[test]
@@ -1441,7 +1467,9 @@ mod tests {
         let mut items = Vec::new();
         let mut index = 0;
         while index < 400 {
-            items.push(Value::String(String::from("abcdefghijklmnopqrstuvwxyz012345")));
+            items.push(Value::String(String::from(
+                "abcdefghijklmnopqrstuvwxyz012345",
+            )));
             index += 1;
         }
         let err = format_document(&Value::Array(items)).unwrap_err();
@@ -1552,11 +1580,12 @@ mod tests {
                 Value::Object(alloc::vec![
                     (
                         String::from("servers"),
-                        Value::Array(alloc::vec![Value::String(String::from(
-                            "0.pool.ntp.org",
-                        ))]),
+                        Value::Array(alloc::vec![Value::String(String::from("0.pool.ntp.org",))]),
                     ),
-                    (String::from("interval_secs"), Value::Number(NTP_INTERVAL_DEFAULT)),
+                    (
+                        String::from("interval_secs"),
+                        Value::Number(NTP_INTERVAL_DEFAULT)
+                    ),
                     (String::from("serve"), Value::Number(1)),
                 ]),
             ));
@@ -1615,9 +1644,7 @@ mod tests {
         let mut nine = parse(&sample_config("")).unwrap();
         if let Value::Object(items) = &mut nine {
             let urls = (0..9)
-                .map(|index| {
-                    Value::String(alloc::format!("https://example.com/{index}"))
-                })
+                .map(|index| Value::String(alloc::format!("https://example.com/{index}")))
                 .collect();
             items.push((
                 String::from("block"),

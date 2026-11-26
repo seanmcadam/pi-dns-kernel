@@ -342,7 +342,11 @@ pub fn arm(slot: usize, worker: bool) -> i64 {
     if worker {
         crate::task::inject_worker(slot)
     } else {
-        let delay = if crate::percpu::slot() == slot { 500 } else { 0 };
+        let delay = if crate::percpu::slot() == slot {
+            500
+        } else {
+            0
+        };
         crate::task::inject_main(slot, delay)
     }
 }

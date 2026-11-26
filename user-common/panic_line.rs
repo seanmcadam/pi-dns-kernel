@@ -62,7 +62,7 @@ fn basename(file: &[u8]) -> &[u8] {
     &file[start..]
 }
 
-fn tail<'a>(bytes: &'a [u8], max: usize) -> &'a [u8] {
+fn tail(bytes: &[u8], max: usize) -> &[u8] {
     if bytes.len() > max {
         &bytes[bytes.len() - max..]
     } else {

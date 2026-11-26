@@ -295,7 +295,8 @@ pub fn call(num: u64, args: [u64; 6]) -> u64 {
 }
 
 fn clock_status(ptr: u64, cap: u64) -> i64 {
-    if cap < crate::clock::STATUS_LEN as u64 || !crate::mmu::user_write_ok(ptr, crate::clock::STATUS_LEN as u64)
+    if cap < crate::clock::STATUS_LEN as u64
+        || !crate::mmu::user_write_ok(ptr, crate::clock::STATUS_LEN as u64)
     {
         return EFAULT;
     }
@@ -921,11 +922,7 @@ fn tcp_accept_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::S
     }
     // A heal between the two locks may have put this socket back into
     // LISTEN. Taking it then would hand the application a listener.
-    if !stack
-        .sockets_mut()
-        .get::<tcp::Socket>(handle)
-        .may_recv()
-    {
+    if !stack.sockets_mut().get::<tcp::Socket>(handle).may_recv() {
         return service::Step::Pending;
     }
     live_slots[index] = None;
@@ -1003,7 +1000,10 @@ fn tcp_send_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
     if !socket.can_send() {
         let open = matches!(
             socket.state(),
-            tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived | tcp::State::SynSent
+            tcp::State::Established
+                | tcp::State::CloseWait
+                | tcp::State::SynReceived
+                | tcp::State::SynSent
         );
         let http = socket.local_endpoint().is_some_and(|ep| ep.port == 80);
         if open {
@@ -1103,7 +1103,9 @@ pub fn idle(task: usize) -> bool {
         return false;
     }
     let _lock = FD_LOCK[task].lock();
-    table_of(task).iter().all(|kind| matches!(kind, Kind::Empty))
+    table_of(task)
+        .iter()
+        .all(|kind| matches!(kind, Kind::Empty))
 }
 
 pub fn open_fds() -> u32 {
@@ -1288,7 +1290,8 @@ fn watch_dns_socket(task: usize, table: &[Kind; MAX_FD]) {
         return;
     }
     let fd = DNS_FD.load(Ordering::Acquire);
-    let present = fd != 0xFF && (fd as usize) < MAX_FD && matches!(table[fd as usize], Kind::Udp(_));
+    let present =
+        fd != 0xFF && (fd as usize) < MAX_FD && matches!(table[fd as usize], Kind::Udp(_));
     if present || fd == 0xFF {
         if present {
             DNS_DOWN.store(0, Ordering::Release);
@@ -1332,7 +1335,12 @@ fn warn_http(last: &AtomicU64, text: &str) {
     log::warn!("{text}");
 }
 
-fn slot_fate(stack: &mut crate::net::NetworkStack, handle: SocketHandle, now: u64, born: u64) -> SlotFate {
+fn slot_fate(
+    stack: &mut crate::net::NetworkStack,
+    handle: SocketHandle,
+    now: u64,
+    born: u64,
+) -> SlotFate {
     let socket = stack.sockets_mut().get_mut::<tcp::Socket>(handle);
     if socket.state() == tcp::State::Listen {
         return SlotFate::Listening;
@@ -1574,8 +1582,12 @@ fn trim_tcp_pool(stack: &mut crate::net::NetworkStack) {
             let Some(oldest) = TCP_POOL_H[0] else {
                 break;
             };
-            if !pool_reclaim(TCP_POOL_N, TCP_POOL_FLOOR, now.saturating_sub(oldest.since_ms), TCP_POOL_IDLE_MS)
-            {
+            if !pool_reclaim(
+                TCP_POOL_N,
+                TCP_POOL_FLOOR,
+                now.saturating_sub(oldest.since_ms),
+                TCP_POOL_IDLE_MS,
+            ) {
                 break;
             }
             let mut index = 0;
@@ -1729,7 +1741,10 @@ fn config_add(ptr: u64, len: u64) -> i64 {
     let Some(value) = parts.next() else {
         return EINVAL;
     };
-    let ttl = parts.next().and_then(|text| text.parse().ok()).unwrap_or(300);
+    let ttl = parts
+        .next()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(300);
     match crate::config_manager::add_record(name, kind, value, ttl) {
         Ok(()) => 0,
         Err(_) => EINVAL,
@@ -1779,7 +1794,11 @@ fn hdmi_console(ptr: u64, cap: u64) -> i64 {
     let bytes = crate::board::hdmi_vclog_bytes();
     raw[736..740].copy_from_slice(&bytes.to_le_bytes());
     let _ = crate::board::hdmi_vclog_status(&mut raw[740..836]);
-    if write_user(ptr, &raw) { N as i64 } else { EFAULT }
+    if write_user(ptr, &raw) {
+        N as i64
+    } else {
+        EFAULT
+    }
 }
 
 fn vclog_read(ptr: u64, cap: u64, offset: u64) -> i64 {
@@ -1969,7 +1988,11 @@ fn net_counters(ptr: u64, cap: u64) -> i64 {
         let off = index * 8;
         raw[off..off + 8].copy_from_slice(&word.to_le_bytes());
     }
-    if write_user(ptr, &raw) { N as i64 } else { EFAULT }
+    if write_user(ptr, &raw) {
+        N as i64
+    } else {
+        EFAULT
+    }
 }
 
 fn set_dns_load(inflight: u64, timeouts: u64, forward_full: u64, reply_drops: u64) -> i64 {
@@ -2014,7 +2037,11 @@ fn net_extra(ptr: u64, cap: u64) -> i64 {
         let off = index * 8;
         raw[off..off + 8].copy_from_slice(&word.to_le_bytes());
     }
-    if write_user(ptr, &raw) { N as i64 } else { EFAULT }
+    if write_user(ptr, &raw) {
+        N as i64
+    } else {
+        EFAULT
+    }
 }
 
 fn upstream_health(ptr: u64, cap: u64) -> i64 {
@@ -2382,7 +2409,11 @@ fn hdmi_caller() -> bool {
 }
 
 fn mailbox_user(ptr: u64, len: u64) -> i64 {
-    if len < 16 || len > 1024 || len % 4 != 0 || ptr % 4 != 0 || !crate::mmu::user_write_ok(ptr, len)
+    if len < 16
+        || len > 1024
+        || len % 4 != 0
+        || ptr % 4 != 0
+        || !crate::mmu::user_write_ok(ptr, len)
     {
         return EINVAL;
     }
