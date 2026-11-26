@@ -60,8 +60,18 @@ impl HttpResponse {
         let mut response =
             format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text).into_bytes();
 
+        let mut connection = false;
         for (key, value) in &self.headers {
+            if key.eq_ignore_ascii_case("connection") {
+                connection = true;
+            }
             response.extend_from_slice(format!("{}: {}\r\n", key, value).as_bytes());
+        }
+        // The server closes after every response. Without this header a
+        // client pipelines the next request onto a socket that is already
+        // finished, and the retry sees a reset instead of a status line.
+        if !connection {
+            response.extend_from_slice(b"Connection: close\r\n");
         }
 
         response.extend_from_slice(b"\r\n");

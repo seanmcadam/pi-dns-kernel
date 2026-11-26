@@ -290,6 +290,9 @@ fn send_all(fd: u64, ptr: *const u8, len: usize) -> bool {
             continue;
         }
         off += n as usize;
+        if off % 8192 < n as usize {
+            yield_now();
+        }
     }
     true
 }

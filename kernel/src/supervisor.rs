@@ -315,6 +315,7 @@ pub fn died(slot: usize) {
 pub fn tick() {
     let now = crate::timer::millis();
     bounce_stalled_http(now);
+    bounce_stalled_dns(now);
     crate::task::nudge_injected(now);
     let mut slot = 0;
     while slot < SLOTS {
@@ -623,6 +624,44 @@ fn bounce_stalled_http(now: u64) {
     };
     say(2, name(slot), why, 0, 0, 0);
     crate::logger::note_fault(fault);
+    crate::task::clear_live(slot);
+    crate::task::kill_slot(slot);
+    finish(slot);
+}
+
+/// Port 53 disappeared after a successful bind. Same non-crash restart as
+/// the HTTP listener. `block-el0` is not on a timer: a list download is
+/// supposed to run for the whole transfer, and DNS keeps answering from
+/// the last published table while that task is down.
+fn bounce_stalled_dns(now: u64) {
+    let since = crate::user_fd::dns_down_ms();
+    if since == 0 || now.saturating_sub(since) < crate::user_fd::DNS_GONE_MS {
+        return;
+    }
+    crate::user_fd::clear_dns_down();
+    let slot = 0;
+    let start = {
+        let _hold = guard();
+        if slot >= SLOTS {
+            return;
+        }
+        unsafe {
+            let row = &mut *svc(slot);
+            if row.phase != RUNNING {
+                return;
+            }
+            row.bounce = true;
+            row.hold = false;
+            row.phase = DRAINING;
+            DEAD[slot].store(1, Ordering::Release);
+            true
+        }
+    };
+    if !start {
+        return;
+    }
+    say(2, name(slot), "socket stalled", 0, 0, 0);
+    crate::logger::note_fault("dns socket stalled; restarting");
     crate::task::clear_live(slot);
     crate::task::kill_slot(slot);
     finish(slot);

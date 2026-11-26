@@ -75,7 +75,7 @@
 //!
 //! Each EL0 task has its own fd table. The scheduler selects it before eret.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -767,6 +767,8 @@ fn udp_bind_job(id: usize, stack: &mut crate::net::NetworkStack) -> service::Ste
         table_of(task)[fd] = Kind::Udp(handle);
     }
     if port == 53 {
+        DNS_FD.store(fd as u8, Ordering::Release);
+        DNS_DOWN.store(0, Ordering::Release);
         log::info!("DNS socket bound to port 53");
     } else if port == 53535 {
         log::info!("DNS upstream socket bound to port 53535");
@@ -1174,6 +1176,7 @@ pub fn recycle_all(stack: &mut crate::net::NetworkStack) {
 
 fn recycle_task(task: usize, stack: &mut crate::net::NetworkStack) {
     let table = table_of(task);
+    watch_dns_socket(task, table);
     let Some(listen_fd) = (0..MAX_FD).find(|index| matches!(table[*index], Kind::TcpListen(_, _)))
     else {
         // A client task (the blocker) has no listener to absorb a closed
@@ -1263,6 +1266,45 @@ static HTTP_HEAL_LOG: AtomicU64 = AtomicU64::new(0);
 static HTTP_HOLD_CLOSE: AtomicBool = AtomicBool::new(false);
 static mut LISTEN_BORN: [[u64; LISTENERS]; TASKS] = [[0; LISTENERS]; TASKS];
 static mut CLOSE_SINCE: [[u64; MAX_FD]; TASKS] = [[0; MAX_FD]; TASKS];
+
+/// Port-53 descriptor, or `0xFF` until the first successful bind.
+/// `DNS_DOWN` is the first ms that descriptor was no longer a UDP socket.
+/// Zero means it is up, or it has never been bound. The supervisor reads
+/// both without `FD`.
+pub const DNS_GONE_MS: u64 = 5_000;
+static DNS_FD: AtomicU8 = AtomicU8::new(0xFF);
+static DNS_DOWN: AtomicU64 = AtomicU64::new(0);
+
+pub fn dns_down_ms() -> u64 {
+    DNS_DOWN.load(Ordering::Acquire)
+}
+
+pub fn clear_dns_down() {
+    DNS_DOWN.store(0, Ordering::Release);
+}
+
+fn watch_dns_socket(task: usize, table: &[Kind; MAX_FD]) {
+    if task != 0 {
+        return;
+    }
+    let fd = DNS_FD.load(Ordering::Acquire);
+    let present = fd != 0xFF && (fd as usize) < MAX_FD && matches!(table[fd as usize], Kind::Udp(_));
+    if present || fd == 0xFF {
+        if present {
+            DNS_DOWN.store(0, Ordering::Release);
+        }
+        return;
+    }
+    let now = crate::timer::millis().max(1);
+    let _ = DNS_DOWN.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// Bound once, then missing, for the whole budget. A task that has not
+/// bound yet does not start the clock.
+#[cfg(test)]
+fn dns_gone(bound: bool, present: bool, age_ms: u64) -> bool {
+    bound && !present && age_ms >= DNS_GONE_MS
+}
 
 pub fn http_listen_down_ms() -> u64 {
     HTTP_LISTEN_DOWN.load(Ordering::Acquire)
@@ -2433,6 +2475,15 @@ mod tests {
         assert!(!pool_reclaim(8, 2, 4_999, 5_000));
         assert!(pool_reclaim(8, 2, 5_000, 5_000));
         assert!(pool_reclaim(3, 2, 5_000, 5_000));
+    }
+
+    #[test]
+    fn dns_socket_is_watched_only_after_it_binds() {
+        use super::dns_gone;
+        assert!(!dns_gone(false, false, 60_000));
+        assert!(!dns_gone(true, true, 60_000));
+        assert!(!dns_gone(true, false, 4_999));
+        assert!(dns_gone(true, false, 5_000));
     }
 }
 

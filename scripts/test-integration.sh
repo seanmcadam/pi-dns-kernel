@@ -1987,8 +1987,14 @@ def req(method, path, data=None, headers=None):
         r.add_header(key, value)
     try:
         with opener.open(r, timeout=8) as resp:
+            conn = resp.headers.get("Connection", "")
+            if "close" not in conn.lower():
+                fail("missing connection close on %s" % path)
             return resp.status, resp.read()
     except urllib.error.HTTPError as err:
+        conn = err.headers.get("Connection", "") if err.headers is not None else ""
+        if "close" not in conn.lower():
+            fail("missing connection close on %s" % path)
         return err.code, err.read()
 
 def recvn(sock, n):
